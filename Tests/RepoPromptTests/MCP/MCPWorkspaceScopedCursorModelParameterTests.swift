@@ -68,6 +68,13 @@ final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
             on: session,
             compareAndSetInWorkspaceID: workspace.id
         ))
+        XCTAssertNotNil(session.operationAdmissionFailureMessage, "A new binding requires its own restoration proof")
+        // Model-parameter resume starts from a restored session, after binding installation.
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        _ = try XCTUnwrap(
+            session.operationAdmissionFailureMessage == nil ? session : nil,
+            "The restored fixture must reach the model-parameter admission being tested"
+        )
         // Bind the session to the worktree whose logical root is the workspace repo path; the
         // effective workspace path must then be the worktree root, not `repoPaths.first`.
         session.worktreeBindings = [
@@ -377,6 +384,13 @@ final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
             on: session,
             compareAndSetInWorkspaceID: workspace.id
         ))
+        XCTAssertNotNil(session.operationAdmissionFailureMessage, "A new binding requires its own restoration proof")
+        // Model-parameter resume starts from a restored session, after binding installation.
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        _ = try XCTUnwrap(
+            session.operationAdmissionFailureMessage == nil ? session : nil,
+            "The restored fixture must reach the model-parameter admission being tested"
+        )
         session.runState = .running
 
         let service = makeManageService(window: window)
@@ -533,9 +547,19 @@ final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
         let viewModel = window.agentModeViewModel
         let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
         let sessionID = UUID()
+        let sourceTabID = UUID()
+        // Resume reconstructs a cold existing session; its index entry must have a real payload.
+        let persisted = AgentSession(
+            id: sessionID, workspaceID: workspace.id, composeTabID: sourceTabID,
+            name: "Cursor public ownership",
+            items: [AgentChatItemPersist(from: .user("Existing conversation", sequenceIndex: 0))],
+            agentKind: AgentProviderKind.cursor.rawValue, agentModel: "grok-4.6",
+            lastRunState: AgentSessionRunState.completed.rawValue, autoEditEnabled: false
+        )
+        _ = try await AgentSessionDataService.shared.saveAgentSession(persisted, for: workspace)
         viewModel.upsertSessionIndex(
             sessionID: sessionID,
-            tabID: UUID(),
+            tabID: sourceTabID,
             name: "Cursor public ownership",
             lastUserMessageAt: nil,
             savedAt: Date(timeIntervalSince1970: 1_800_000_000),
@@ -713,6 +737,7 @@ final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
             tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: nil
         )
         let sessionID = try XCTUnwrap(target.sessionID)
+        try await configureAndSaveExistingFixture(target, in: viewModel)
         let oldContext = try await viewModel.mcpActivateControlContext(
             forTabID: target.tabID, sessionID: sessionID, originatingConnectionID: UUID()
         )
@@ -955,6 +980,7 @@ final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
             sessionName: nil
         )
         let sessionID = try XCTUnwrap(target.sessionID)
+        try await configureAndSaveExistingFixture(target, in: agentModeVM)
         agentModeVM.mcpAcceptSessionTarget(target)
         _ = try await agentModeVM.mcpStageModelParameterSelections(
             tabID: tabID,
@@ -1036,6 +1062,7 @@ final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
             createIfNeeded: true,
             sessionName: nil
         )
+        try await configureAndSaveExistingFixture(initialTarget, in: agentModeVM)
         _ = try await agentModeVM.mcpStageModelParameterSelections(
             tabID: tabID,
             agentRaw: AgentProviderKind.cursor.rawValue,
@@ -1072,6 +1099,24 @@ final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
         AgentModelSelectionID(agentRaw: AgentProviderKind.cursor.rawValue, modelRaw: "grok-4.6").rawValue
     }
 
+    /// These downstream rollback/control tests need an existing configured session. Complete its
+    /// real first save; accepting a provisional target alone does not earn session readiness.
+    private func configureAndSaveExistingFixture(
+        _ target: AgentModeViewModel.MCPSessionTarget, in viewModel: AgentModeViewModel
+    ) async throws {
+        let creationHandle = try XCTUnwrap(target.creationHandle)
+        XCTAssertTrue(creationHandle.session.qualifiedRestorationReadiness.isCreating)
+        XCTAssertNotNil(creationHandle.session.operationAdmissionFailureMessage)
+        try await viewModel.mcpConfigureSession(
+            tabID: target.tabID, agentRaw: AgentProviderKind.cursor.rawValue,
+            modelRaw: "grok-4.6", reasoningEffortRaw: nil, creationHandle: creationHandle
+        )
+        let committed = await viewModel.commitConfiguredSessionCreation(target: target)
+        _ = try XCTUnwrap(committed ? creationHandle.session : nil, "Fixture first save must succeed")
+        XCTAssertTrue(creationHandle.session.permitsBoundOperationAndSave)
+        XCTAssertNil(creationHandle.session.operationAdmissionFailureMessage)
+    }
+
     private func makeFixture() throws -> Fixture {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("rpce-cursor-mcp-\(UUID().uuidString)", isDirectory: true)
@@ -1085,6 +1130,7 @@ final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
         let window = WindowState()
         WindowStatesManager.shared.registerWindowState(window)
         GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        await window.workspaceManager.awaitInitialized()
         window.apiSettingsViewModel.isCursorConnected = true
         let workspace = window.workspaceManager.createWorkspace(
             name: name,

@@ -263,7 +263,8 @@ enum MCPAgentRoleDefaultsService {
         let modelIsExecutable = agent == .codexExec
             || agent == .cursor
             || AgentModelCatalog.isValid(rawModel: parsed.modelRaw, for: agent, availability: availability)
-        guard AgentModelCatalog.isAgentAvailable(agent, availability: availability), modelIsExecutable else { return nil }
+        guard AgentModelCatalog.AgentSelectionSurface.general.allows(agent),
+              AgentModelCatalog.isAgentAvailable(agent, availability: availability), modelIsExecutable else { return nil }
 
         let selection = AgentModelCatalog.NormalizedAgentSelection(agent: agent, modelRaw: parsed.modelRaw)
         // A stored bucket is authoritative only for a valid explicit choice matching its

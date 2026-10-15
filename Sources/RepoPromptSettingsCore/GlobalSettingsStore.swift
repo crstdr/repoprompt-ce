@@ -47,6 +47,8 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
     @Published package private(set) var codeMapsGloballyDisabled: Bool = false
     @Published package private(set) var nonGitCodeMapsEnabled: Bool = false
     @Published package private(set) var modelRouterSettingsRevision: UInt64 = 0
+    @Published package private(set) var autoEffortSettingsRevision: UInt64 = 0
+    private var routerDemandObservers: [UUID: AsyncStream<RoutingSettingsSnapshot>.Continuation] = [:]
     /// Non-nil when the on-disk settings file is blocked (unreadable or a newer schema).
     /// UI surfaces this when the store cannot safely repair the document automatically.
     @Published package private(set) var persistenceBlockReason: GlobalSettingsPersistenceBlockReason? {
@@ -1038,15 +1040,56 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
     }
 
     /// Independent of Model Router. Missing settings retain the manual-effort path.
+    package func routingSettingsSnapshot() -> RoutingSettingsSnapshot {
+        .init(
+            routerEnabled: scalarPreferences.modelRouter?.enabled == true,
+            selectedBackendRawValue: scalarPreferences.modelRouter?.selectedBackendRawValue,
+            autoEffortEnabled: autoEffortEnabled(),
+            routerRevision: modelRouterSettingsRevision,
+            autoEffortBackendRawValue: scalarPreferences.agentMode?.autoEffortBackendRawValue,
+            autoEffortRevision: autoEffortSettingsRevision
+        )
+    }
+
+    package func routingSettingsUpdates() -> AsyncStream<RoutingSettingsSnapshot> {
+        let id = UUID()
+        return AsyncStream { continuation in
+            routerDemandObservers[id] = continuation
+            continuation.yield(routingSettingsSnapshot())
+            continuation.onTermination = { [weak self] _ in
+                Task { @MainActor in self?.routerDemandObservers.removeValue(forKey: id) }
+            }
+        }
+    }
+
+    private func publishRouterDemand() {
+        let snapshot = routingSettingsSnapshot()
+        for continuation in routerDemandObservers.values {
+            continuation.yield(snapshot)
+        }
+    }
+
+    package func setAutoEffortBackendRaw(_ raw: String, commit: Bool = true) {
+        guard scalarPreferences.agentMode?.autoEffortBackendRawValue != raw else { return }
+        updateAgentModeScalar(commit: false) { $0.autoEffortBackendRawValue = raw }
+        autoEffortSettingsRevision &+= 1
+        publishRouterDemand()
+        if commit { save() }
+    }
+
     package func autoEffortEnabled() -> Bool {
         scalarPreferences.agentMode?.autoEffortEnabled == true
     }
 
     package func setAutoEffortEnabled(_ enabled: Bool, commit: Bool = true) {
-        updateAgentModeScalar(commit: commit) { settings in
+        guard autoEffortEnabled() != enabled else { return }
+        updateAgentModeScalar(commit: false) { settings in
             // Clearing returns to the baseline scalar shape for older CE builds.
             settings.autoEffortEnabled = enabled ? true : nil
         }
+        autoEffortSettingsRevision &+= 1
+        publishRouterDemand()
+        if commit { save() }
     }
 
     package func setCodexMemoriesEnabled(_ enabled: Bool, commit: Bool = true) {
@@ -1456,6 +1499,7 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
         }
         if before != scalarPreferences.modelRouter {
             modelRouterSettingsRevision &+= 1
+            publishRouterDemand()
         }
         if commit {
             save()
@@ -1955,6 +1999,17 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
     // MARK: - Persistence
 
     private func load(notifyAgentModelsChanges: Bool = false) {
+        let oldRouterSettings = scalarPreferences.modelRouter
+        let oldEnabled = autoEffortEnabled()
+        let oldBackend = scalarPreferences.agentMode?.autoEffortBackendRawValue
+        defer {
+            if oldRouterSettings != scalarPreferences.modelRouter { modelRouterSettingsRevision &+= 1 }
+            if oldEnabled != autoEffortEnabled() || oldBackend != scalarPreferences.agentMode?.autoEffortBackendRawValue {
+                autoEffortSettingsRevision &+= 1
+            }
+            publishRouterDemand()
+        }
+
         let oldGlobalProfile = globalAgentModelsProfile()
         let oldWorkspaceSettings = agentModelsSettingsByWorkspaceID
         let fileExists = FileManager.default.fileExists(atPath: fileStore.fileURL.path)
@@ -2071,6 +2126,17 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
 
     @discardableResult
     package func reloadFromDisk() -> Bool {
+        let oldRouterSettings = scalarPreferences.modelRouter
+        let oldEnabled = autoEffortEnabled()
+        let oldBackend = scalarPreferences.agentMode?.autoEffortBackendRawValue
+        defer {
+            if oldRouterSettings != scalarPreferences.modelRouter { modelRouterSettingsRevision &+= 1 }
+            if oldEnabled != autoEffortEnabled() || oldBackend != scalarPreferences.agentMode?.autoEffortBackendRawValue {
+                autoEffortSettingsRevision &+= 1
+            }
+            publishRouterDemand()
+        }
+
         do {
             let oldGlobalProfile = globalAgentModelsProfile()
             let oldWorkspaceSettings = agentModelsSettingsByWorkspaceID

@@ -362,7 +362,16 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         let session = viewModel.session(for: tabID)
         session.selectedAgent = .codexExec
         session.hasLoadedPersistedState = true
-        let sessionID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
+        // Provider dispatch exercises an existing restored session, not first-save preparation.
+        let sessionID = UUID()
+        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
+            sessionID: sessionID, on: session, updateWorkspaceMetadata: true
+        ))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        _ = try XCTUnwrap(
+            session.permitsBoundOperationAndSave ? session.currentRestorationBindingToken : nil,
+            "The fixture must establish restoration before exercising provider dispatch."
+        )
         let inventory = MonitorInventoryPublisher(
             viewModel: viewModel,
             observerSessionID: sessionID,
@@ -2043,7 +2052,16 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         let session = viewModel.session(for: tabID)
         session.selectedAgent = agent
         session.hasLoadedPersistedState = true
-        let sessionID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
+        // Provider dispatch exercises an existing restored session, not first-save preparation.
+        let sessionID = UUID()
+        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
+            sessionID: sessionID, on: session, updateWorkspaceMetadata: true
+        ))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        _ = try XCTUnwrap(
+            session.permitsBoundOperationAndSave ? session.currentRestorationBindingToken : nil,
+            "The fixture must establish restoration before exercising provider dispatch."
+        )
         return Fixture(
             viewModel: viewModel,
             session: session,
@@ -2192,8 +2210,9 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         let targetEndpoint = try XCTUnwrap(target.viewModel.agentSessionLinkObserverEndpoint(tabID: target.tabID))
         let observerEndpoint = try XCTUnwrap(observer.viewModel.agentSessionLinkObserverEndpoint(tabID: observer.tabID))
         let host = AgentSessionLinkRuntimeBridgeTests.FakeEndpointHost()
-        func candidate(_ endpoint: DomainAgentSessionLinkEndpointIdentity, provider: String) -> AgentSessionLinkEndpointCandidate {
-            .init(
+        func candidate(_ endpoint: DomainAgentSessionLinkEndpointIdentity, provider: String) throws -> AgentSessionLinkEndpointCandidate {
+            let bindingGeneration = try XCTUnwrap(endpoint.persistentBindingGeneration)
+            return .init(
                 windowID: endpoint.windowID,
                 workspaceID: endpoint.workspaceID,
                 tabID: endpoint.tabID,
@@ -2209,10 +2228,20 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                 roleAllowsOutboundMonitoring: true,
                 displayName: provider,
                 providerDisplayName: provider,
-                locationLabel: nil
+                locationLabel: nil,
+                restorationReadiness: .authoritative(
+                    AgentSessionRestorationBindingToken(
+                        bindingIdentity: AgentPersistentSessionBindingIdentity(
+                            tabID: endpoint.tabID, sessionID: endpoint.sessionID,
+                            generation: bindingGeneration
+                        ),
+                        bindingTransitionGeneration: endpoint.bindingTransitionGeneration
+                    ),
+                    .persistedPayloadApplied
+                )
             )
         }
-        host.candidates = [candidate(observerEndpoint, provider: "Claude Code"), candidate(targetEndpoint, provider: "Codex CLI")]
+        host.candidates = try [candidate(observerEndpoint, provider: "Claude Code"), candidate(targetEndpoint, provider: "Codex CLI")]
         host.promptViewModel = observer.viewModel
         host.localInputSnapshotOverride = { endpoint, includeRecords in
             guard endpoint == targetEndpoint else { return nil }
@@ -2797,6 +2826,11 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         session.selectedAgent = .claudeCode
         session.hasLoadedPersistedState = true
         session.testInstallPersistentSessionBinding(sessionID: UUID())
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        _ = try XCTUnwrap(
+            session.permitsBoundOperationAndSave ? session.currentRestorationBindingToken : nil,
+            "The fixture must establish restoration before exercising provider dispatch."
+        )
         session.installRunID(UUID())
         session.claudeController = fake
         let intent = try claudeRunIntent(for: session, source: "test.claude.lost-fake-refusal")
@@ -2829,7 +2863,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         )
     }
 
-    func testClaudeNativeActiveSteeringFailsClosedWithoutRecyclingOwnedEventStream() async {
+    func testClaudeNativeActiveSteeringFailsClosedWithoutRecyclingOwnedEventStream() async throws {
         let controller = MonitorFakeNativeController()
         var factoryCalls = 0
         let coordinator = ClaudeAgentModeCoordinator(
@@ -2844,6 +2878,11 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         session.selectedAgent = .claudeCode
         session.hasLoadedPersistedState = true
         session.testInstallPersistentSessionBinding(sessionID: UUID())
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        _ = try XCTUnwrap(
+            session.permitsBoundOperationAndSave ? session.currentRestorationBindingToken : nil,
+            "The fixture must establish restoration before exercising provider dispatch."
+        )
         let runID = UUID()
         session.installRunID(runID)
         session.runState = .running
@@ -2921,6 +2960,11 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         session.selectedAgent = .claudeCode
         session.hasLoadedPersistedState = true
         session.testInstallPersistentSessionBinding(sessionID: UUID())
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        _ = try XCTUnwrap(
+            session.permitsBoundOperationAndSave ? session.currentRestorationBindingToken : nil,
+            "The fixture must establish restoration before exercising provider dispatch."
+        )
         let runID = UUID()
         session.installRunID(runID)
         session.runState = .running
@@ -2985,7 +3029,8 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         XCTAssertEqual(firstSentCount, 0)
         XCTAssertEqual(firstShutdownCount, 1)
         XCTAssertEqual(firstResumeIDs.count, 1)
-        XCTAssertNil(firstResumeIDs[0])
+        let firstResumeID = try XCTUnwrap(firstResumeIDs.first)
+        XCTAssertNil(firstResumeID)
         XCTAssertEqual(replacementResumeIDs, ["monitor-native-session"])
         XCTAssertEqual(replacementMessages, ["continue oversight"])
         XCTAssertEqual(session.runID, runID, "route recovery preserves the logical process run")

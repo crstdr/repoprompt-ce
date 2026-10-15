@@ -316,7 +316,7 @@ extension AgentSessionLinkRuntimeBridgeTests {
         let session = vm.session(for: tabID)
         session.hasLoadedPersistedState = true
         session.selectedAgent = .claudeCode
-        _ = try XCTUnwrap(vm.test_ensureSessionBoundToTab(session))
+        _ = try installRestoredFixtureBinding(session, in: vm)
         let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() }, sessionLinkHost: vm)
         let runner = ClaudeIntegratedAgentModeRunner(claudeCoordinator: vm.test_claudeCoordinator, hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier())
         defer { session.agentTask?.cancel()
@@ -759,7 +759,7 @@ extension AgentSessionLinkRuntimeBridgeTests {
         session.selectedAgent = agent
         session.hasLoadedPersistedState = true
         session.installRunID(runID)
-        let sessionID = try XCTUnwrap(vm.test_ensureSessionBoundToTab(session))
+        let sessionID = try installRestoredFixtureBinding(session, in: vm)
         let candidate = try XCTUnwrap(vm.agentSessionLinkCandidate(tabID: tabID, sessionID: sessionID, tabName: "Ring peer", isWindowClosing: false))
         vm.test_initializeRunService()
         if agent == .codexExec {
@@ -991,7 +991,7 @@ extension AgentSessionLinkRuntimeBridgeTests {
         session.selectedAgent = agent
         session.hasLoadedPersistedState = true
         session.installRunID(UUID())
-        let sessionID = try XCTUnwrap(vm.test_ensureSessionBoundToTab(session))
+        let sessionID = try installRestoredFixtureBinding(session, in: vm)
         let target = try XCTUnwrap(vm.agentSessionLinkCandidate(tabID: tabID, sessionID: sessionID, tabName: "Native target", isWindowClosing: false))
         let endpoint = target.domainEndpoint
         let observerVM = AgentModeViewModel(testWindowID: 2, testWorkspacePath: FileManager.default.temporaryDirectory.path, shouldManageCodexTooling: false, codexControllerFactory: { _, _, _, _, _, _ in LifecycleNoopCodexController(recorder: LifecycleRecorder()) })
@@ -1001,7 +1001,7 @@ extension AgentSessionLinkRuntimeBridgeTests {
         observerSession.selectedAgent = .openCode
         observerSession.hasLoadedPersistedState = true
         observerSession.oversight.autoWakeOnUpdates = true
-        let observerID = try XCTUnwrap(observerVM.test_ensureSessionBoundToTab(observerSession))
+        let observerID = try installRestoredFixtureBinding(observerSession, in: observerVM)
         let observer = try XCTUnwrap(observerVM.agentSessionLinkCandidate(tabID: observerTab, sessionID: observerID, tabName: "Observer", isWindowClosing: false))
         let host = FakeEndpointHost()
         host.candidates = [observer, target]

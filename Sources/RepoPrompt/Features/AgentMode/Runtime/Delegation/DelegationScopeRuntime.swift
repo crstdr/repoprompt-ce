@@ -81,6 +81,62 @@ enum DelegationScopeRequestError: Error, Equatable {
 /// Held by `AgentSessionLinkRuntimeBridge.shared.delegationScopes`; it is not itself a singleton.
 @MainActor
 final class DelegationScopeRuntime: ObservableObject {
+    enum PersistenceMode: Equatable {
+        case requiresStore
+        case ephemeral
+    }
+
+    enum Availability: Equatable {
+        case awaitingStore
+        case ready
+        case ephemeral
+        case blocked(String)
+        case terminating
+    }
+
+    @Published private(set) var availability: Availability
+
+    var canUseAuthority: Bool {
+        availability == .ready || availability == .ephemeral
+    }
+
+    var authorityUnavailableReason: String? {
+        switch availability {
+        case .ready, .ephemeral: nil
+        case .awaitingStore: "Delegation approval is unavailable while saved authority is being opened."
+        case let .blocked(message): message
+        case .terminating: "Delegation authority is closed because RepoPrompt is quitting."
+        }
+    }
+
+    /// A physical session removal may invalidate saved grant anchors. Production must hold an
+    /// acknowledged open scope document before deletion can begin, even when no scope is currently
+    /// live. Explicit ephemeral fixtures have no durable authority to invalidate; a suppressed
+    /// production launch is different because it has deliberately left the shared file untouched.
+    var durableDeletionUnavailableReason: String? {
+        switch availability {
+        case .ready:
+            nil
+        case .ephemeral:
+            persistenceMode == .ephemeral ? nil
+                : "This launch suppresses delegation persistence. Restart RepoPrompt normally before deleting saved sessions."
+        case .awaitingStore:
+            "Saved delegation authority has not opened safely yet. Wait for startup to finish before deleting saved sessions."
+        case let .blocked(message):
+            message
+        case .terminating:
+            "RepoPrompt is quitting."
+        }
+    }
+
+    var persistenceStatusMessage: String? {
+        if let authorityUnavailableReason { return authorityUnavailableReason }
+        if persistenceFailed {
+            return "Delegation changes could not be saved. Revocations still apply in this launch."
+        }
+        return nil
+    }
+
     static let maxPendingRequestsPerSession = 4
     static let maxReasonUTF8Bytes = 500
     static let minimumExpirySeconds = 60
@@ -94,13 +150,13 @@ final class DelegationScopeRuntime: ObservableObject {
     @Published private(set) var requests: [UUID: DelegationScopeRequest] = [:]
     /// Bumped on every authority change so presentation can refresh.
     @Published private(set) var revision: UInt64 = 0
-    /// Last durable write outcome, published so the delegations list can surface a failure. A
-    /// failed write is retried on the next change; until then a revocation is enforced in memory and
-    /// by its tombstone at the next successful write, but not yet on disk.
+    /// Last durable write outcome, published so the delegations list can surface a failure. Every
+    /// change is written durably before the mutating call returns; a revocation also applies
+    /// immediately in memory even when its write fails.
     @Published private(set) var lastPersistenceOutcome: DelegationScopeWriteOutcome?
 
     var persistenceFailed: Bool {
-        lastPersistenceOutcome == .writeFailed
+        lastPersistenceOutcome == .writeFailed || lastPersistenceOutcome == .blocked
     }
 
     let confirmations: BatchConfirmationCoordinator
@@ -110,7 +166,8 @@ final class DelegationScopeRuntime: ObservableObject {
     private var reservations: [UUID: DelegationScopeReservation] = [:]
     private var requestOrder: [UUID] = []
     private var requestIDByKey: [String: UUID] = [:]
-    private var persistChain: Task<Void, Never>?
+    let persistenceMode: PersistenceMode
+    private var frozenSnapshot: (grants: [DomainDelegationScopeGrant], revoked: [UUID])?
     /// Revoked/released scope IDs, newest last. Persisted as tombstones honored by `reactivate`.
     private var revokedScopeIDs: [UUID] = []
     private let windows: @MainActor () -> [WindowState]
@@ -119,6 +176,7 @@ final class DelegationScopeRuntime: ObservableObject {
     private let notifyCatalogChanged: (UUID) -> Void
 
     init(
+        persistenceMode: PersistenceMode,
         now: @escaping () -> Date = Date.init,
         makeUUID: @escaping () -> UUID = UUID.init,
         confirmations: BatchConfirmationCoordinator? = nil,
@@ -129,6 +187,8 @@ final class DelegationScopeRuntime: ObservableObject {
             Task { await ServerNetworkManager.shared.notifyToolListChangedForAgentSession(sessionID, forceRelist: true) }
         }
     ) {
+        self.persistenceMode = persistenceMode
+        availability = persistenceMode == .ephemeral ? .ephemeral : .awaitingStore
         self.windows = windows
         self.now = now
         self.makeUUID = makeUUID
@@ -138,70 +198,101 @@ final class DelegationScopeRuntime: ObservableObject {
 
     // MARK: - Launch
 
-    /// Loads durable grants once and reactivates them under fresh generations.
+    /// The store must acknowledge the open-launch fence before any persisted authority is installed.
     func bootstrap(store: DelegationScopeStore) async {
-        guard self.store == nil else { return }
+        guard persistenceMode == .requiresStore, self.store == nil,
+              availability == .awaitingStore else { return }
         self.store = store
-        guard case let .ready(_, grants, revoked) = await store.loadForLaunch() else { return }
-        revokedScopeIDs = revoked
-        let installed = authority.reactivate(grants, revokedScopeIDs: Set(revoked), now: now())
-        // A reload may drop expired or orphaned rows; persisting keeps the file equal to authority.
-        didChange(grantees: Set(installed.map(\.grant.granteeSessionID)), invalidated: [])
-    }
-
-    /// Waits for every queued write. Tests and shutdown use this as a linearization point.
-    func flushPersistence() async {
-        await persistChain?.value
-    }
-
-    /// Synchronous, bounded write of the current grants and tombstones for `applicationWillTerminate`.
-    ///
-    /// Queued main-actor writes cannot run while the main thread is terminating, so this writes the
-    /// latest state straight through the store actor (which runs off the main thread) and waits at
-    /// most `timeout`. The store serializes it after any write already in flight, so the newest state
-    /// lands last.
-    func flushForTermination(timeout: TimeInterval = 2) {
-        guard let store else { return }
-        let grants = authority.activeGrants
-        let revoked = revokedScopeIDs
-        let semaphore = DispatchSemaphore(value: 0)
-        Task.detached {
-            _ = await store.replace(with: grants, revokedScopeIDs: revoked)
-            semaphore.signal()
+        // Loads whatever is on disk, however the previous launch ended: every change was durable
+        // when it happened, so there is no unsealed state to distrust.
+        let loaded = store.loadForLaunch()
+        guard availability == .awaitingStore else { return }
+        switch loaded {
+        case let .ready(_, grants, revoked):
+            revokedScopeIDs = revoked
+            let installed = authority.reactivate(grants, revokedScopeIDs: Set(revoked), now: now())
+            availability = .ready
+            didChange(grantees: Set(installed.map(\.grant.granteeSessionID)), invalidated: [])
+        case let .blocked(reason):
+            availability = .blocked(reason.message)
+            lastPersistenceOutcome = .blocked
+        case .suppressed:
+            // Explicit launch policy, never a fallback from failed production I/O.
+            availability = .ephemeral
         }
-        _ = semaphore.wait(timeout: .now() + timeout)
+    }
+
+    /// Writes are synchronous and durable; retained for callers that sequence on persistence.
+    func flushPersistence() async {}
+
+    /// Closes authority for quit. Nothing needs sealing: every change is already on disk, so this
+    /// only stops further mutation. `allowRestoration` is retained for call-site compatibility and
+    /// no longer affects what the next launch restores.
+    func freezeForTermination(allowRestoration _: Bool = true) {
+        guard availability != .terminating else { return }
+        let active = authority.activeGrants
+        if availability == .ready {
+            frozenSnapshot = (active, revokedScopeIDs)
+        }
+        availability = .terminating
+        revision &+= 1
+        for grant in active {
+            confirmations.invalidate(scopeID: grant.id)
+        }
+    }
+
+    /// One final synchronous write of the frozen snapshot. Correctness never depends on it.
+    func settleForTermination(timeout _: TimeInterval = 2) async -> Bool {
+        if availability != .terminating { freezeForTermination() }
+        guard let store, let frozenSnapshot else { return true }
+        let outcome = store.finishLaunch(with: frozenSnapshot.grants, revokedScopeIDs: frozenSnapshot.revoked)
+        lastPersistenceOutcome = outcome
+        return outcome == .applied || outcome == .unchanged
     }
 
     // MARK: - Queries
 
+    /// Catalog discovery is read-only, including memory-only tool admission. Time-based
+    /// eligibility fails closed without expiring other grants or scheduling persistence.
+    func hasLiveScopeForCatalog(grantedTo sessionID: UUID) -> Bool {
+        guard canUseAuthority else { return false }
+        return authority.hasLiveScope(grantedTo: sessionID, now: now())
+    }
+
     func hasLiveScope(grantedTo sessionID: UUID) -> Bool {
+        guard canUseAuthority else { return false }
         expireDueScopes()
         return authority.hasLiveScope(grantedTo: sessionID, now: now())
     }
 
     func liveScopes(grantedTo sessionID: UUID) -> [DomainDelegationScopeRecord] {
+        guard canUseAuthority else { return [] }
         expireDueScopes()
         return authority.liveScopes(grantedTo: sessionID, now: now())
     }
 
     func scopes(grantedTo sessionID: UUID) -> [DomainDelegationScopeRecord] {
+        guard canUseAuthority else { return [] }
         expireDueScopes()
         return authority.scopes(grantedTo: sessionID)
     }
 
     func record(id: UUID) -> DomainDelegationScopeRecord? {
+        guard canUseAuthority else { return nil }
         expireDueScopes()
         return authority.record(id: id)
     }
 
     func scopeChain(from scopeID: UUID) -> [DomainDelegationScopeRecord] {
-        authority.scopeChain(from: scopeID)
+        guard canUseAuthority else { return [] }
+        return authority.scopeChain(from: scopeID)
     }
 
     /// Every live scope, for the user's "Active delegations" list. A pure query (safe from a view
     /// body): expired-by-time scopes are filtered out without mutating state.
     func allLiveScopes() -> [DomainDelegationScopeRecord] {
-        authority.activeGrants
+        guard canUseAuthority else { return [] }
+        return authority.activeGrants
             .compactMap { authority.liveRecord(id: $0.id, now: now()) }
             .sorted { $0.grant.grantedAt < $1.grant.grantedAt }
     }
@@ -216,7 +307,7 @@ final class DelegationScopeRuntime: ObservableObject {
         let reservation = DelegationScopeReservation(
             id: makeUUID(), scopeIDs: Array(Set(scopeIDs)), sessions: sessions, worktrees: worktrees, worktreeIDs: worktreeIDs
         )
-        reservations[reservation.id] = reservation
+        if canUseAuthority { reservations[reservation.id] = reservation }
         return reservation
     }
 
@@ -248,6 +339,7 @@ final class DelegationScopeRuntime: ObservableObject {
         operation: DomainAgentSessionTargetOperation,
         usageByScopeID: [UUID: DomainDelegationScopeUsage]
     ) -> DomainDelegationScopeDenial? {
+        guard canUseAuthority else { return .unknownScope }
         expireDueScopes()
         return authority.evaluateGuardrails(scopeID: scopeID, operation: operation, usageByScopeID: usageByScopeID)
     }
@@ -265,6 +357,7 @@ final class DelegationScopeRuntime: ObservableObject {
 
     /// Roots of every live `.tree` scope, for placement decisions (`reparent`, `adopt`).
     func liveTreeScopeRoots() -> [DomainDelegationTreeScopeRoot] {
+        guard canUseAuthority else { return [] }
         expireDueScopes()
         return authority.liveRecords(now: now()).compactMap { record in
             guard case let .tree(rootSessionID) = record.grant.kind else { return nil }
@@ -302,6 +395,7 @@ final class DelegationScopeRuntime: ObservableObject {
 
     /// Decision steps 1–5 against current state. The only scope authorization entry point.
     func authorize(_ request: DomainDelegationScopeAuthorizationRequest) -> DomainDelegationScopeAuthorizationOutcome {
+        guard canUseAuthority else { return .denied(.unknownScope, sessionID: nil) }
         expireDueScopes()
         return authority.authorize(request, now: now())
     }
@@ -310,6 +404,7 @@ final class DelegationScopeRuntime: ObservableObject {
     /// suspension point before mutating, exactly like link leases: a revocation, release, or expiry
     /// that lands mid-operation stops authority immediately.
     func isCurrent(_ lease: DomainDelegationScopeLease) -> Bool {
+        guard canUseAuthority else { return false }
         expireDueScopes()
         return authority.isCurrent(lease, now: now())
     }
@@ -329,6 +424,7 @@ final class DelegationScopeRuntime: ObservableObject {
         requesterTitle: String? = nil,
         workspaceName: String? = nil
     ) -> Result<DelegationScopeRequest, DelegationScopeRequestError> {
+        guard availability != .terminating else { return .failure(.invalid(.unknownScope)) }
         var guardrails = requestedGuardrails
         guardrails.expiresAt = nil
         // An agent may only propose guardrails at least as strict as the defaults; loosening the bulk
@@ -437,6 +533,7 @@ final class DelegationScopeRuntime: ObservableObject {
         capabilities: Set<DomainDelegationScopeCapability>? = nil,
         guardrails: DomainDelegationScopeGuardrails? = nil
     ) -> Result<DomainDelegationScopeRecord, DomainDelegationScopeDenial> {
+        guard canUseAuthority else { return .failure(.unknownScope) }
         guard var request = requests[requestID], request.state == .pending else { return .failure(.unknownScope) }
         let approvedCapabilities = capabilities ?? request.capabilities
         guard approvedCapabilities.isSubset(of: request.capabilities) else {
@@ -475,11 +572,23 @@ final class DelegationScopeRuntime: ObservableObject {
         requests[requestID] = request
     }
 
+    /// The requester may withdraw its own undecided card. Retaining its identity makes retries
+    /// deterministic and prevents a delayed approval action from granting a cancelled request.
+    func withdrawRequest(id: UUID, requesterSessionID: UUID) -> DelegationScopeRequest? {
+        guard var request = requests[id], request.requesterSessionID == requesterSessionID else { return nil }
+        if request.state == .pending {
+            request.state = .cancelled(reason: "Withdrawn by the requesting session.")
+            requests[id] = request
+        }
+        return request
+    }
+
     // MARK: - Revocation
 
     /// User revocation (sidebar, monitor pill, or settings). Cascades to attenuated descendants.
     @discardableResult
     func revoke(scopeID: UUID) -> [DomainDelegationScopeRecord] {
+        guard canUseAuthority else { return [] }
         let changed = authority.revoke(scopeID: scopeID)
         recordRevocations(changed)
         return changed
@@ -488,6 +597,8 @@ final class DelegationScopeRuntime: ObservableObject {
     /// Revokes every scope granted to, or rooted at, a durably deleted session.
     @discardableResult
     func revokeAll(involving sessionID: UUID) -> [DomainDelegationScopeRecord] {
+        if availability == .terminating { return revokeAllWhileTerminating(involving: sessionID) }
+        guard canUseAuthority else { return [] }
         let changed = authority.revokeAll(involving: sessionID)
         recordRevocations(changed)
         return changed
@@ -498,6 +609,7 @@ final class DelegationScopeRuntime: ObservableObject {
         scopeID: UUID,
         caller: DomainAgentSessionCallerIdentity
     ) -> Result<[DomainDelegationScopeRecord], DomainDelegationScopeDenial> {
+        guard canUseAuthority else { return .failure(.unknownScope) }
         let result = authority.release(scopeID: scopeID, caller: caller)
         if case let .success(changed) = result {
             recordRevocations(changed)
@@ -515,6 +627,7 @@ final class DelegationScopeRuntime: ObservableObject {
         capabilities: Set<DomainDelegationScopeCapability>,
         guardrails: DomainDelegationScopeGuardrails
     ) -> Result<DomainDelegationScopeRecord, DomainDelegationScopeDenial> {
+        guard canUseAuthority else { return .failure(.unknownScope) }
         expireDueScopes()
         let result = authority.attenuate(
             parentScopeID: parentScopeID,
@@ -536,9 +649,25 @@ final class DelegationScopeRuntime: ObservableObject {
     // MARK: - Private
 
     private func expireDueScopes() {
+        guard canUseAuthority else { return }
         let expired = authority.expire(now: now())
         guard !expired.isEmpty else { return }
         didChange(grantees: Set(expired.map(\.grant.granteeSessionID)), invalidated: expired.map(\.id))
+    }
+
+    /// A committed deletion is a proven-permanent fact, so it is recorded even while quitting: the
+    /// next launch must not restore authority granted to, or rooted at, a deleted session.
+    private func revokeAllWhileTerminating(involving sessionID: UUID) -> [DomainDelegationScopeRecord] {
+        guard frozenSnapshot != nil, let store else { return [] }
+        let changed = authority.revokeAll(involving: sessionID)
+        guard !changed.isEmpty else { return [] }
+        revokedScopeIDs.append(contentsOf: changed.map(\.id))
+        if revokedScopeIDs.count > Self.maxRevokedScopeIDs {
+            revokedScopeIDs.removeFirst(revokedScopeIDs.count - Self.maxRevokedScopeIDs)
+        }
+        frozenSnapshot = (authority.activeGrants, revokedScopeIDs)
+        lastPersistenceOutcome = store.replace(with: authority.activeGrants, revokedScopeIDs: revokedScopeIDs)
+        return changed
     }
 
     private func recordRevocations(_ changed: [DomainDelegationScopeRecord]) {
@@ -561,24 +690,21 @@ final class DelegationScopeRuntime: ObservableObject {
         }
     }
 
-    /// Serialized write-through of the authority's active grants.
+    /// Synchronous durable write-through of the authority's active grants and tombstones.
     ///
-    /// Each write carries the authority's *current* grants, so any later change (including the next
-    /// expiry check) rewrites a previously failed revocation. A failed write is retried once
-    /// immediately; the outcome is retained for diagnostics.
+    /// Runs inside the mutating call (grant, revoke, release, expiry), so a change is on disk before
+    /// it is acknowledged and a crash can never resurrect a revoked grant. Each write carries the
+    /// *current* state, so any later change rewrites a previously failed one. A failed write is
+    /// retried once immediately; the outcome is retained for diagnostics.
     private func persist() {
-        guard let store else { return }
+        guard availability == .ready, let store else { return }
         let grants = authority.activeGrants
         let revoked = revokedScopeIDs
-        let previous = persistChain
-        persistChain = Task { @MainActor [weak self] in
-            await previous?.value
-            var outcome = await store.replace(with: grants, revokedScopeIDs: revoked)
-            if outcome == .writeFailed {
-                outcome = await store.replace(with: grants, revokedScopeIDs: revoked)
-            }
-            self?.lastPersistenceOutcome = outcome
+        var outcome = store.replace(with: grants, revokedScopeIDs: revoked)
+        if outcome == .writeFailed {
+            outcome = store.replace(with: grants, revokedScopeIDs: revoked)
         }
+        lastPersistenceOutcome = outcome
     }
 
     private func trimRequestRetention() {

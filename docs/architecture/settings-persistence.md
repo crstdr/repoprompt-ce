@@ -208,7 +208,15 @@ scalarPreferences.modelRouter.customInstructions
 
 The base group is a schema-v9 feature fence. Its absence leaves the document's minimum schema unchanged; any presence requires v9 so older typed writers reject the document instead of silently dropping router consent. A nonnil primary provider, subagent provider, or custom guidance field requires v10. Clearing all three returns the content-derived minimum to v9. The group stores no API keys or backend secrets. Unknown nonblank backend, role, and provider raws are preserved during sibling edits and ignored by current runtime validation. An unknown backend is never replaced by the first registered backend.
 
-Missing values resolve disabled and do not materialize defaults. First enable explicitly writes the selected backend plus the current known role/provider policy; subsequently discovered roles/providers are not silently authorized. Scope provider fields are optional limits over the allowed-provider set. Custom guidance is trimmed on supported writes, removed when empty, and bounded to 1,000 characters and 4,096 UTF-8 bytes. `GlobalSettingsStore.modelRouterSettingsRevision` is process-local and changes only after an actual in-memory router mutation. Future/foreign blocking, compatible import, raw unknown-field preservation, and rollback rules remain those of the owning global settings document.
+Missing values resolve disabled. Production materializes Jev only for an absent Router service raw value before initial demand reconciliation; blank/unknown raw values are preserved and unavailable, not normalized into a different service. Provider scope fields are optional preferences: an available selected provider narrows that scope's candidates to it, while an unavailable selection falls back to the other connected providers. The legacy candidate-role and allowed-provider arrays remain for schema/rollback preservation but no longer authorize the provider-catalog frontier. Custom guidance is trimmed on supported writes, removed when empty, and bounded to 1,000 characters and 4,096 UTF-8 bytes. `GlobalSettingsStore.modelRouterSettingsRevision` is process-local and changes only after an actual in-memory Router mutation. Future/foreign blocking, compatible import, raw unknown-field preservation, and rollback rules remain those of the owning global settings document.
+
+## Independent Auto Effort service selection
+
+The existing `scalarPreferences.agentMode.autoEffortEnabled` flag remains a separate, default-off user intent. The optional `scalarPreferences.agentMode.autoEffortBackendRawValue` is an **independent exact decision-service selection**. An absent field resolves to Jev in memory for existing users without writing or raising the document schema. An explicit known, blank, or unknown raw value is preserved through unrelated edits; blank/unknown values resolve unavailable and never silently select Jev or the Router's service. Writing the explicit field requires schema v12, so an older v11 writer rejects the document rather than silently reinterpreting a non-Jev selection. For its service selection, Auto Effort persists only the raw value; its revision is process-local, held in memory, and advances only on actual enablement/selection/install changes. Removing a decision-service credential does not clear this flag or selection; the feature keeps manual effort until its selected service is usable.
+
+## Legacy routing-profile settings
+
+`scalarPreferences.modelRoutingProfiles.remoteUpdatesDisabled` and `lastCheckAt` are deprecated, inert optional fields retained for schema-v12 Codable and rollback compatibility. The content-derived schema fence still requires v12 whenever either value is present. Current code has no active manager reader/writer for them: it does not materialize, update, clear, or migrate them. Unrelated settings edits preserve both values and continue to write a schema-v12-compatible document, allowing an older v12-aware app to read them after rollback. These fields do not control any current profile behavior; bundled routing profiles are the only source. See [model routing](model-routing.md) and the [bundled profile publication boundary](routing-profile-publication.md).
 
 ## Agent Mode Handoff instructions
 
@@ -396,24 +404,31 @@ and follows the same preserve-first rules:
 - Owner: `DelegationScopeStore` (`Features/AgentMode/Runtime/Delegation`), bootstrapped by
   `WindowStatesManager` with the same `AgentSessionOversightPersistenceMode` as
   `agentSessionOversightLinks.json`. Suppressed launches perform no file I/O.
-- Payload: a versioned document (`version`, `scopes`, optional `revoked_scope_ids`) holding only the
-  **active** grants: scope ID, grantee session, kind, capabilities, guardrails (including the
-  per-scope bulk confirmation threshold), origin (user or attenuated parent), and grant time.
-  Revoked and expired scopes are removed. `revoked_scope_ids` is a bounded (1,024, oldest dropped)
-  tombstone list: a tombstoned grant, or a child of one, is never reactivated even if a stale copy of
-  the file still lists it. Generations, leases, pending `request_scope` cards, and batch
-  confirmations are process-local and never written.
-- Writes are serialized write-through, retried once on failure, and surfaced in the "Active
-  delegations" list when they fail. `applicationWillTerminate` performs a bounded synchronous
-  flush so a revocation made just before quitting is durable.
-- Launch: the file is read once, and every grant is reactivated under a **fresh generation**.
-  Grants past their expiry, tombstoned grants, and attenuated grants whose parent is missing,
-  inactive, or no longer satisfies the attenuation invariants (tree rooted at the grantee,
-  capabilities a subset, guardrails no looser) are not reactivated, so a reload can never undo a
-  cascade or widen a child.
-- Recovery: a future `version` is preserved and blocks writes; malformed bytes are moved intact to
+- Payload: a versioned document (`version`, `scopes`, optional `revoked_scope_ids`, and a legacy
+  `clean_shutdown` field) holding only the **active** grants: scope ID, grantee session, kind,
+  capabilities, guardrails (including the per-scope bulk confirmation threshold), origin (user or
+  attenuated parent), and grant time. Revoked and expired scopes are removed from `scopes`.
+  `revoked_scope_ids` is a bounded (1,024, oldest dropped) tombstone list: a tombstoned grant, or a
+  child of one, is never reactivated even if a stale copy of the file still lists it. Generations,
+  leases, pending `request_scope` cards, and batch confirmations are process-local and never written.
+- **Crash-safe by construction.** Every grant, revocation, release, and expiry is written
+  synchronously and durably (temp file, `F_FULLFSYNC`, `rename`, directory fsync —
+  `DurableAtomicFileWriter`) inside the mutating call, before it returns. Nothing is sealed at quit and
+  correctness never depends on a graceful termination; the quit-time write is a final no-op-or-write.
+  A failed write leaves the revocation in effect in memory, is surfaced in "Active delegations", and is
+  carried by the next successful write. `clean_shutdown` is ignored on load and always written `true`
+  so older builds that still gate on it keep the grants.
+- Launch: the file is read once and every grant is reactivated under a **fresh generation**, however
+  the previous launch ended. v1 documents migrate their grants to v2. Grants past their expiry,
+  tombstoned grants, and attenuated grants whose parent is missing, inactive, or no longer satisfies
+  the attenuation invariants (tree rooted at the grantee, capabilities a subset, guardrails no looser)
+  are not reactivated, so a reload can never undo a cascade or widen a child. The opening write
+  rewrites exactly the loaded rows, never an empty list in place of loaded grants.
+- Recovery: an undecodable row (or tombstone) is dropped alone and its siblings still load; a future
+  `version` is preserved and blocks writes; a wholly malformed file is moved intact to
   `Backups/delegationScopes.corrupt.<stamp>.<uuid>.json` and the store starts empty; oversized files
-  and row counts are preserved and block writes. Nothing is ever partially salvaged or evicted.
+  and row counts are preserved and block writes. A deletion that commits while quitting still records
+  its revocation.
 
 ### Organizational placement and delegated worktree ownership
 

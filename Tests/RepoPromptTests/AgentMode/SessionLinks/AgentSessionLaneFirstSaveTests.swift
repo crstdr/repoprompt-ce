@@ -115,6 +115,66 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
         WindowStatesManager.shared.unregisterWindowState(window)
     }
 
+    func testFreshForegroundSessionPublishesToolbarEligibilityAfterConfiguredSave() async throws {
+        try await withFixture(ephemeral: false) { fixture in
+            let viewModel = fixture.window.agentModeViewModel
+            let host = WindowStatesManager.shared
+            let authority = DomainAgentSessionLinkAuthority(identity: DomainRuntimeIdentity(
+                runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: Date()
+            ))
+            let bridge = AgentSessionLinkRuntimeBridge(
+                authority: authority, host: host, toolAdvertisementInvalidator: { _ in }
+            )
+            let retirements = AdvertisementRecorder()
+            let previousRetirementSink = installLocalRetirementSink(retirements)
+            defer {
+                viewModel.test_afterFreshForegroundSessionCreation = nil
+                AgentSessionLinkInvalidationSink.overseerActivationRetired = previousRetirementSink
+            }
+            var preparingSnapshot: AgentMonitorPillProps?
+            viewModel.test_afterFreshForegroundSessionCreation = { handle in
+                XCTAssertTrue(handle.session.qualifiedRestorationReadiness.isCreating)
+                XCTAssertEqual(viewModel.currentTabID, handle.session.tabID)
+                // Model the foreground publication while the new tab's first save is pending.
+                // No explicit UI refresh is allowed after persistence acknowledges readiness.
+                viewModel.applySessionToBindings(handle.session)
+                preparingSnapshot = viewModel.ui.statusPills.snapshot.monitor
+            }
+
+            let createdTabID = await viewModel.createAndActivateSessionTab()
+            let tabID = try XCTUnwrap(createdTabID)
+            let session = try XCTUnwrap(viewModel.sessions[tabID])
+            let sessionID = try XCTUnwrap(session.activeAgentSessionID)
+            let preparing = try XCTUnwrap(preparingSnapshot)
+            XCTAssertNil(preparing.overseerBootstrapState)
+            XCTAssertNotNil(preparing.canAddReason)
+            guard case .authoritative(_, .freshBindingDurablyCreated) = session.qualifiedRestorationReadiness else {
+                return XCTFail("The foreground session must earn readiness from its configured first save")
+            }
+            // Capture before another suspension can incidentally repaint the toolbar.
+            let rendered = viewModel.ui.statusPills.snapshot.monitor
+            XCTAssertEqual(rendered, viewModel.currentMonitorPillProps(), "The toolbar cannot retain the pre-save loading snapshot")
+            let endpoint = try XCTUnwrap(rendered.endpoint)
+            let expected = try XCTUnwrap(rendered.overseerBootstrapState)
+            XCTAssertNil(expected.activation)
+            let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+            let payload = try await AgentSessionDataService.shared.loadAgentSession(id: sessionID, for: workspace)
+            XCTAssertEqual(payload?.id, sessionID)
+            XCTAssertEqual(payload?.toLiveItems(), [])
+            let enabled = await bridge.enableOverseerFromToolbar(
+                endpoint: endpoint, expected: expected, isEnabled: { true }
+            )
+            XCTAssertTrue(enabled)
+            XCTAssertNotNil(viewModel.ui.statusPills.snapshot.monitor.overseerBootstrapState?.activation)
+            XCTAssertFalse(viewModel.ui.statusPills.snapshot.monitor.isOverseer)
+            XCTAssertNil(session.oversight.pendingAutoWake)
+            XCTAssertNil(session.runID)
+            XCTAssertTrue(session.items.isEmpty)
+            let links = await authority.links(forObserver: sessionID)
+            XCTAssertTrue(links.items.isEmpty, "Toolbar consent must not manufacture oversight grants")
+        }
+    }
+
     func testToolbarActivatedNoLinkCreatorDurablyCreatesFirstLaneInAnotherWindowWorkspace() async throws {
         try await exerciseActivatedFirstLaneFromAnotherWindow(toolbar: true)
     }
@@ -235,7 +295,11 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             XCTAssertEqual(result, .sessionNotFound)
             XCTAssertEqual(session.activeAgentSessionID, sessionID, "failed route leaves the same session on screen")
             XCTAssertFalse(session.bindingTransitionInProgress)
+            XCTAssertTrue(session.permitsBoundOperationAndSave, "The failed route must leave the original saved session usable.")
+            XCTAssertNil(session.operationAdmissionFailureMessage)
             XCTAssertNil(session.oversight.overseerActivation)
+            let saveResult = await viewModel.flushSaveRequired(for: tabID, workspaceID: fixture.workspaceID)
+            guard case .success = saveResult else { return XCTFail("The unchanged session must remain saveable: \(saveResult)") }
             if activated {
                 try await AsyncTestWait.waitUntil("retired advertisement", timeout: 10) { retirements() == 1 }
             }
@@ -1229,65 +1293,113 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
         }
     }
 
-    func testDrivenFirstSaveWaitsForPreviouslyEnteredSaveAndPersistsProvenance() async throws {
-        try await withFixture { fixture in
+    func testPreparingLaneRejectsGenericSaveAndSubmitBeforeConfiguredFirstSave() async throws {
+        try await withFixture(ephemeral: false) { fixture in
             let viewModel = fixture.window.agentModeViewModel
             let creatorID = UUID()
-            let fileURL = fixture.root.appendingPathComponent("lane.json")
-            let firstSaveEntered = expectation(description: "ordinary save entered")
-            let completed = expectation(description: "driven lane save settled")
-            var provisionRelease: CheckedContinuation<Void, Never>?
-            var staleSaveRelease: CheckedContinuation<Void, Never>?
+            let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
             var saveCount = 0
-            viewModel.test_afterOversightLaneProvision = { tabID in
-                Task { @MainActor in await viewModel.flushSave(for: tabID) }
-                await withCheckedContinuation { provisionRelease = $0 }
-            }
-            viewModel.test_setAgentSessionSaver { session, _, _ in
+            var savedFileURL: URL?
+            var provisionedSession: AgentTabSession?
+            var provisionedBindingToken: AgentSessionRestorationBindingToken?
+            viewModel.test_setAgentSessionSaver { session, workspace, canonicalItemCount in
                 saveCount += 1
-                if saveCount == 1 {
-                    provisionRelease?.resume()
-                    firstSaveEntered.fulfill()
-                    await withCheckedContinuation { staleSaveRelease = $0 }
-                }
-                let data = try JSONEncoder().encode(session)
-                try data.write(to: fileURL, options: .atomic)
+                let fileURL = try await AgentSessionDataService.shared.saveAgentSession(
+                    session, for: workspace, preparation: .alreadyCanonicalTranscript,
+                    trustedCanonicalItemCount: canonicalItemCount
+                )
+                savedFileURL = fileURL
                 return fileURL
             }
-            var outcome: AgentModeViewModel.MCPOversightLaneCreationOutcome?
-            Task { @MainActor in
-                outcome = try? await viewModel.mcpCreateOversightLane(
-                    creatorSessionID: creatorID, sessionName: "Persisted lane",
-                    selection: fixture.selection, expectedWorkspaceID: fixture.workspaceID
-                )
-                completed.fulfill()
+            viewModel.test_afterOversightLaneProvision = { tabID in
+                do {
+                    let lane = try XCTUnwrap(viewModel.sessions[tabID])
+                    let sessionID = try XCTUnwrap(lane.activeAgentSessionID)
+                    provisionedSession = lane
+                    provisionedBindingToken = try XCTUnwrap(lane.currentRestorationBindingToken)
+                    XCTAssertTrue(lane.qualifiedRestorationReadiness.isCreating)
+                    XCTAssertFalse(lane.restorationReadiness.isAuthoritative)
+                    XCTAssertNil(viewModel.captureSessionCreationRetry(for: lane), "Preparation has no configured payload to retry.")
+                    XCTAssertTrue(lane.items.isEmpty)
+
+                    let requiredSave = await viewModel.flushSaveRequired(
+                        for: tabID, workspaceID: fixture.workspaceID
+                    )
+                    guard case let .failure(failure) = requiredSave else {
+                        return XCTFail("A generic required save must not persist a preparing lane.")
+                    }
+                    XCTAssertEqual(failure.operation, .save)
+                    XCTAssertEqual(failure.tabID, tabID)
+                    await viewModel.flushSave(for: tabID)
+                    let blocker = try XCTUnwrap(lane.operationAdmissionFailureMessage)
+                    let submission = viewModel.submitUserTurn(text: "Do not dispatch while preparing", tabID: tabID)
+                    guard case let .blocked(message) = submission else {
+                        return XCTFail("A preparing lane must refuse submission before admitting a user row.")
+                    }
+                    XCTAssertEqual(message, blocker)
+                    let files = try await AgentSessionDataService.shared.listAgentSessions(for: workspace)
+                    XCTAssertFalse(files.contains { $0.lastPathComponent == "AgentSession-\(sessionID.uuidString).json" })
+                    XCTAssertEqual(saveCount, 0, "Neither generic save may enter the real saver before configuration.")
+                    XCTAssertTrue(lane.items.isEmpty)
+                    XCTAssertFalse(lane.runState.isActive)
+                    XCTAssertNil(lane.runID)
+                    XCTAssertNil(lane.provider)
+                    XCTAssertNil(lane.codexController)
+                    XCTAssertNil(lane.claudeController)
+                    XCTAssertNil(lane.acpController)
+                    XCTAssertNil(viewModel.captureSessionCreationRetry(for: lane))
+                    XCTAssertFalse(lane.restorationReadiness.isAuthoritative)
+                } catch {
+                    XCTFail("Preparing lane assertions failed: \(error)")
+                }
             }
-            await fulfillment(of: [firstSaveEntered], timeout: 3)
-            XCTAssertEqual(saveCount, 1)
-            staleSaveRelease?.resume()
-            await fulfillment(of: [completed], timeout: 5)
-            guard let outcome, case let .created(sessionID, tabID, bindingToken) = outcome else {
-                let lane = viewModel.sessions.values.first(where: {
-                    $0.createdByOverseerSessionID == creatorID
-                })
-                return XCTFail("lane did not establish a durable first-save proof: \(String(describing: outcome)); saves=\(saveCount), readiness=\(String(describing: lane?.restorationReadiness)), model=\(String(describing: lane?.selectedModelRaw)), expected=\(fixture.selection.modelRaw), dirty=\(String(describing: lane?.isDirty))")
+            defer { viewModel.test_afterOversightLaneProvision = nil }
+
+            let outcome = try await viewModel.mcpCreateOversightLane(
+                creatorSessionID: creatorID, sessionName: "Persisted lane",
+                selection: fixture.selection, expectedWorkspaceID: fixture.workspaceID
+            )
+            guard case let .created(sessionID, tabID, bindingToken) = outcome else {
+                return XCTFail("Configured lane did not establish its durable first-save proof: \(outcome)")
             }
+            let fileURL = try XCTUnwrap(savedFileURL)
+            let expectedFileURL = WorkspaceSessionSidecarMigration.workspaceDirectory(
+                for: workspace, root: AgentSessionDataService.defaultWorkspaceRootURL()
+            ).appendingPathComponent("AgentSessions").appendingPathComponent("AgentSession-\(sessionID.uuidString).json")
+            XCTAssertEqual(fileURL.resolvingSymlinksInPath().path, expectedFileURL.resolvingSymlinksInPath().path)
             let saved = try JSONDecoder().decode(AgentSession.self, from: Data(contentsOf: fileURL))
             XCTAssertEqual(saved.id, sessionID)
+            XCTAssertEqual(saved.workspaceID, fixture.workspaceID)
+            XCTAssertEqual(saved.composeTabID, tabID)
+            let loaded = try await AgentSessionDataService.shared.loadAgentSession(id: sessionID, for: workspace)
+            let reopened = try XCTUnwrap(loaded)
+            XCTAssertEqual(reopened.id, sessionID)
+            XCTAssertEqual(reopened.workspaceID, fixture.workspaceID)
+            XCTAssertEqual(reopened.composeTabID, tabID)
             XCTAssertEqual(saved.createdByOverseerSessionID, creatorID)
+            XCTAssertEqual(saved.agentKind, fixture.selection.agentRaw)
             XCTAssertEqual(
                 CodexModelSpecifier(raw: saved.agentModel).baseModel,
                 CodexModelSpecifier(raw: fixture.selection.modelRaw).baseModel
             )
             XCTAssertEqual(saved.agentReasoningEffort, fixture.selection.reasoningEffortRaw)
-            XCTAssertGreaterThanOrEqual(saveCount, 2)
+            XCTAssertNil(saved.parentSessionID)
+            XCTAssertEqual(saveCount, 1, "Only the configured owner may perform the lane's first save.")
             let lane = try XCTUnwrap(viewModel.sessions[tabID])
+            XCTAssertTrue(lane === provisionedSession)
+            XCTAssertEqual(bindingToken, provisionedBindingToken)
             XCTAssertEqual(
                 lane.restorationReadiness,
                 .authoritative(bindingToken, .freshBindingDurablyCreated)
             )
+            XCTAssertTrue(lane.items.isEmpty)
             XCTAssertFalse(lane.runState.isActive)
             XCTAssertFalse(lane.isMCPOriginated)
+            XCTAssertNil(lane.runID)
+            XCTAssertNil(lane.provider)
+            XCTAssertNil(lane.codexController)
+            XCTAssertNil(lane.claudeController)
+            XCTAssertNil(lane.acpController)
         }
     }
 
@@ -1585,7 +1697,8 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "Child",
                 parentSessionID: parentID, expectedWorkspaceID: fixture.workspaceID
             )
-            viewModel.mcpAcceptSessionTarget(childTarget)
+            let committedChildTarget = await viewModel.commitConfiguredSessionCreation(target: childTarget)
+            XCTAssertTrue(committedChildTarget, "The descendant fixture must finish its real first payload save.")
             let child = try XCTUnwrap(viewModel.sessions[childTarget.tabID])
             let childID = try XCTUnwrap(child.activeAgentSessionID)
             let endpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: parentTabID))
@@ -1610,7 +1723,8 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "Grandchild",
                 parentSessionID: childID, expectedWorkspaceID: fixture.workspaceID
             )
-            viewModel.mcpAcceptSessionTarget(grandchildTarget)
+            let committedGrandchildTarget = await viewModel.commitConfiguredSessionCreation(target: grandchildTarget)
+            XCTAssertTrue(committedGrandchildTarget, "The descendant fixture must finish its real first payload save.")
             let grandchild = try XCTUnwrap(viewModel.sessions[grandchildTarget.tabID])
             grandchild.runState = .waitingForApproval
             XCTAssertFalse(childrenSettled(), "an active grandchild must also block the stash cascade")
@@ -1657,7 +1771,8 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "Live grandchild",
                 parentSessionID: diskOnlyChild.id, expectedWorkspaceID: fixture.workspaceID
             )
-            viewModel.mcpAcceptSessionTarget(target)
+            let committedTarget = await viewModel.commitConfiguredSessionCreation(target: target)
+            XCTAssertTrue(committedTarget, "The descendant fixture must finish its real first payload save.")
             let grandchild = try XCTUnwrap(viewModel.sessions[target.tabID])
             grandchild.runState = .completed
             grandchild.isDirty = true
@@ -1696,7 +1811,8 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "Finished child",
                 parentSessionID: parentID, expectedWorkspaceID: fixture.workspaceID
             )
-            viewModel.mcpAcceptSessionTarget(target)
+            let committedTarget = await viewModel.commitConfiguredSessionCreation(target: target)
+            XCTAssertTrue(committedTarget, "The descendant fixture must finish its real first payload save.")
             let child = try XCTUnwrap(viewModel.sessions[target.tabID])
             child.runState = .completed
             child.isDirty = true
@@ -1994,7 +2110,8 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                     sessionName: "Finished child \(index)", parentSessionID: lane.sessionID,
                     expectedWorkspaceID: fixture.workspaceID
                 )
-                viewModel.mcpAcceptSessionTarget(target)
+                let committedTarget = await viewModel.commitConfiguredSessionCreation(target: target)
+                XCTAssertTrue(committedTarget, "The descendant fixture must finish its real first payload save.")
                 let child = try XCTUnwrap(viewModel.sessions[target.tabID])
                 try children.append((XCTUnwrap(child.activeAgentSessionID), target.tabID))
                 child.runState = .running
@@ -2130,7 +2247,8 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 sessionName: "Settled child", parentSessionID: lane.sessionID,
                 expectedWorkspaceID: fixture.workspaceID
             )
-            viewModel.mcpAcceptSessionTarget(target)
+            let committedTarget = await viewModel.commitConfiguredSessionCreation(target: target)
+            XCTAssertTrue(committedTarget, "The descendant fixture must finish its real first payload save.")
             let child = try XCTUnwrap(viewModel.sessions[target.tabID])
             child.runState = .idle
             child.isDirty = true
@@ -2212,7 +2330,8 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             sessionName: "Mid-hydration child", parentSessionID: laneSessionID,
             expectedWorkspaceID: fixture.workspaceID
         )
-        viewModel.mcpAcceptSessionTarget(target)
+        let committedTarget = await viewModel.commitConfiguredSessionCreation(target: target)
+        XCTAssertTrue(committedTarget, "The descendant fixture must finish its real first payload save.")
         let child = try XCTUnwrap(viewModel.sessions[target.tabID])
         let childSessionID = try XCTUnwrap(child.activeAgentSessionID)
         child.runState = .idle
@@ -2448,7 +2567,8 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 sessionName: "Unrelated parent", parentSessionID: nil,
                 expectedWorkspaceID: fixture.workspaceID
             )
-            viewModel.mcpAcceptSessionTarget(otherTarget)
+            let committedOtherTarget = await viewModel.commitConfiguredSessionCreation(target: otherTarget)
+            XCTAssertTrue(committedOtherTarget, "The descendant fixture must finish its real first payload save.")
             let otherParent = try XCTUnwrap(viewModel.sessions[otherTarget.tabID])
             let otherParentSessionID = try XCTUnwrap(otherParent.activeAgentSessionID)
             let target = try await viewModel.mcpResolveOrCreateSessionTarget(
@@ -2456,7 +2576,8 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 sessionName: "Cross-tier child", parentSessionID: otherParentSessionID,
                 expectedWorkspaceID: fixture.workspaceID
             )
-            viewModel.mcpAcceptSessionTarget(target)
+            let committedTarget = await viewModel.commitConfiguredSessionCreation(target: target)
+            XCTAssertTrue(committedTarget, "The descendant fixture must finish its real first payload save.")
             let child = try XCTUnwrap(viewModel.sessions[target.tabID])
             let childSessionID = try XCTUnwrap(child.activeAgentSessionID)
             child.runState = .idle
@@ -2508,7 +2629,8 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 sessionName: "Disk-orphaned child", parentSessionID: lane.sessionID,
                 expectedWorkspaceID: fixture.workspaceID
             )
-            viewModel.mcpAcceptSessionTarget(target)
+            let committedTarget = await viewModel.commitConfiguredSessionCreation(target: target)
+            XCTAssertTrue(committedTarget, "The descendant fixture must finish its real first payload save.")
             let child = try XCTUnwrap(viewModel.sessions[target.tabID])
             let childSessionID = try XCTUnwrap(child.activeAgentSessionID)
             child.runState = .idle
@@ -2560,7 +2682,8 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 sessionName: "Repudiated child", parentSessionID: lane.sessionID,
                 expectedWorkspaceID: fixture.workspaceID
             )
-            viewModel.mcpAcceptSessionTarget(target)
+            let committedTarget = await viewModel.commitConfiguredSessionCreation(target: target)
+            XCTAssertTrue(committedTarget, "The descendant fixture must finish its real first payload save.")
             let child = try XCTUnwrap(viewModel.sessions[target.tabID])
             child.runState = .idle
             child.isDirty = true
