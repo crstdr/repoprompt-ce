@@ -1184,3 +1184,28 @@ This channel observes existing authority; it does not add a refresh receipt, ret
 state machine, or provider policy. Its purpose is to distinguish future failures where RepoPrompt never
 publishes the tool from failures where the server projection is ready but the provider/model catalog
 does not converge.
+
+### Local quiet transcript display
+
+Quiet verdicts mask only the local transcript UI. The session's canonical items, structured
+transcript/projections, Read/replay/save/export, previews and completion notifications remain intact.
+The UI synchronization owner prepares one derived presentation keyed by exact session/binding,
+base presentation revision and internal display-mask revision. Getters never rebuild it. Every
+archive install/reset invalidates it; unchanged reads reuse the same archived array buffer.
+Terminal sealing only changes membership/revision and requests the existing transcript-runtime
+refresh. Inline UI synchronization during the terminal barrier waits for its existing phase-end
+signal before preparing a mask; hiding never bumps the canonical presentation revision.
+
+Masks follow positively retained source anchors, including a synthetic conclusion's original source
+ID. Mixed groups retain ordinary siblings and rebuild counts/narration/anchors with the existing
+formatters. Aggregate-only groups carry lightweight, nonpersisted summary inputs in their existing
+materialized render-block values: identities/count facts and independently copied narration under
+the existing 120-character policy, never full source/tool payloads. Full groups reuse their sections;
+only a buffered leading narration source omitted from those sections needs summary metadata.
+Those inputs share the projection/cache lifetime, not a separate history store or ID index.
+Reload without materialized verdict proof shows those rows again. A still-admissible unmaterialized
+marker instead retains its exclusion until its last producer or exact source binding retires.
+
+The passive reducer's existing value also suppresses equal queue publications and duplicate receipts.
+This is not an admission cache: readiness waiters, catalog readiness, selection changes and the
+existing shared snooze/interval deadline continue to reevaluate genuinely owed work independently.

@@ -122,7 +122,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     func syncTranscriptUIState() {
-        ui.transcript.update(makeTranscriptUISnapshot())
+        if prepareQuietTranscriptDisplay() { ui.transcript.update(makeTranscriptUISnapshot()) }
         // The same publication point reports the initial selected restoration to the sidebar join and
         // propagates owner-pending transitions to the sidebar projection (§5.3/§5.5).
         synchronizeSidebarRestoreSelectedSide()
@@ -5002,6 +5002,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             // deferral cannot make durability depend on derived UI refresh work.
             scheduleSave(for: session.tabID)
             scheduleDerivedTranscriptRefresh(for: session, reason: .liveMutation, mutation: mutation)
+        }
+        newSession.onQuietDisplayMaskChanged = { [weak self] session in
+            self?.requestUIRefresh(tabID: session.tabID, scope: .transcriptRuntime)
         }
         newSession.onOverseerActivationRetired = { [weak self] session, retired in
             self?.agentSessionLinkOverseerActivationRetired(session: session, retired: retired)

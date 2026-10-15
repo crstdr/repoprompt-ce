@@ -41,7 +41,12 @@ final class AgentTabSession: ObservableObject {
     var workingTranscriptProjection: AgentTranscriptProjection = .empty
     var transcriptProjection: AgentTranscriptProjection = .empty
     var turnProjectionCaches: [UUID: AgentTranscriptTurnProjectionCache] = [:]
-    var archivedTranscriptSnapshot: AgentArchivedTranscriptSnapshot = .empty
+    var archivedTranscriptSnapshot: AgentArchivedTranscriptSnapshot = .empty {
+        didSet { quietTranscriptDisplayCache = nil }
+    }
+
+    var quietTranscriptDisplayCache: AgentQuietTranscriptDisplayCache?
+    var onQuietDisplayMaskChanged: ((AgentTabSession) -> Void)?
     var isCompressedHistoryRevealed: Bool = false
     var isTranscriptWindowExpanded: Bool = false
     var transcriptProjectionProtection: AgentTranscriptProjectionProtection = .none
@@ -1486,7 +1491,11 @@ final class AgentTabSession: ObservableObject {
         // The lifecycle facade owns terminal-commit phase state, so bridge it into the explicit
         // oversight change channel from that authority.
         runLifecycle.onTerminalCommitPhaseChange = { [weak self] in
-            self?.noteMonitorObservationInputsChanged()
+            guard let self else { return }
+            noteMonitorObservationInputsChanged()
+            if !terminalCommitInProgress, quietTranscriptDisplayCache == nil, !quietLedger.hiddenSourceIDs.isEmpty {
+                onQuietDisplayMaskChanged?(self)
+            }
         }
     }
 
@@ -1611,7 +1620,7 @@ final class AgentTabSession: ObservableObject {
     @discardableResult
     func beginPersistentBindingTransition() -> UInt64 {
         // The existing full endpoint is retired by this generation change. No saved verdicts.
-        quietLedger = AgentRunQuietLedger()
+        resetQuietLedgerForBinding()
         oversight.clearWakeSuppression()
         oversight.overseerActivation = nil
         // Clear the outgoing proof before the generation moves so it cannot be observed under the
@@ -1633,7 +1642,7 @@ final class AgentTabSession: ObservableObject {
         if persistentSessionBindingIdentity != binding {
             oversight.overseerActivation = nil
             oversight.clearWakeSuppression()
-            quietLedger = AgentRunQuietLedger()
+            resetQuietLedgerForBinding()
         }
         persistentSessionBindingIdentity = binding
         persistentSessionBindingDidChange?()
@@ -2014,11 +2023,13 @@ final class AgentTabSession: ObservableObject {
         // array offset: binary-search the already ordered live suffix. Missing retained rows fail open.
         let start = normal && terminalState == .completed && !hasSuccessor ? quietLedger.candidateStartKey(owner: owner) : nil
         let rows = start.map { quietSourceSuffix(in: items, startKey: $0) } ?? items[items.endIndex...]
+        let maskRevision = quietLedger.displayMaskRevision
         quietLedger.settle(
             owner: owner, terminalState: terminalState, classifiesQuietCheckIn: normal,
             hasSuccessor: hasSuccessor, endKey: nextSequenceIndex - 1,
             rangeIsComplete: start != nil, rows: rows
         )
+        quietDisplayMaskDidChange(since: maskRevision)
     }
 
     func quietRunFacts(capturedState: AgentSessionRunState) -> AgentRunQuietFacts? {
@@ -2054,16 +2065,39 @@ final class AgentTabSession: ObservableObject {
     func reconcileQuietSourceIDs(previousLiveIDs: Set<UUID> = [], previousAnchors: [UUID: AgentTranscriptAnchor] = [:]) {
         let currentIDs = liveItemIDs
         let currentAnchors = fullTranscriptProjection.rowAnchorIndex
+        let maskRevision = quietLedger.displayMaskRevision
         quietLedger.reconcileSourceIDs(
             wasMaterialized: { previousLiveIDs.contains($0) || previousAnchors[$0] != nil },
             isRetained: { currentIDs.contains($0) || currentAnchors[$0] != nil }
         )
+        quietDisplayMaskDidChange(since: maskRevision)
     }
 
     private func discardMaterializedQuietSourceProof() {
         let ids = liveItemIDs
         let anchors = fullTranscriptProjection.rowAnchorIndex
+        let maskRevision = quietLedger.displayMaskRevision
         quietLedger.discardSourceProof(isMaterialized: { ids.contains($0) || anchors[$0] != nil })
+        quietDisplayMaskDidChange(since: maskRevision)
+    }
+
+    func retireQuietUnmaterializedWake(_ wakeID: UUID) {
+        let revision = quietLedger.displayMaskRevision
+        quietLedger.retireUnmaterializedWake(wakeID)
+        quietDisplayMaskDidChange(since: revision)
+    }
+
+    private func resetQuietLedgerForBinding() {
+        let hadMask = !quietLedger.hiddenSourceIDs.isEmpty
+        quietLedger = AgentRunQuietLedger()
+        quietTranscriptDisplayCache = nil
+        if hadMask { onQuietDisplayMaskChanged?(self) }
+    }
+
+    private func quietDisplayMaskDidChange(since revision: UInt64) {
+        guard quietLedger.displayMaskRevision != revision else { return }
+        quietTranscriptDisplayCache = nil
+        onQuietDisplayMaskChanged?(self)
     }
 
     private func quietSourceSuffix(in rows: [AgentChatItem], startKey: Int) -> ArraySlice<AgentChatItem> {
@@ -2515,7 +2549,9 @@ final class AgentTabSession: ObservableObject {
         if let previousItem, previousItem.id != updatedItem?.id {
             liveItemIDs.remove(previousItem.id)
             if fullTranscriptProjection.rowAnchorIndex[previousItem.id] == nil {
+                let maskRevision = quietLedger.displayMaskRevision
                 quietLedger.retireSourceIDs([previousItem.id])
+                quietDisplayMaskDidChange(since: maskRevision)
             }
             setEphemeralToolResultPayload(nil, for: previousItem.id)
         }

@@ -32,7 +32,7 @@ final class AgentQuietMarkerProducerLifetime: @unchecked Sendable {
     deinit {
         Task { @MainActor [weak session, binding, wakeID] in
             guard let session, session.currentRestorationBindingToken == binding else { return }
-            session.quietLedger.retireUnmaterializedWake(wakeID)
+            session.retireQuietUnmaterializedWake(wakeID)
         }
     }
 }
@@ -65,6 +65,7 @@ struct AgentRunQuietLedger {
     private(set) var facts: AgentRunQuietFacts?
     private(set) var hostMarkerIDs: Set<UUID> = []
     private(set) var hiddenSourceIDs: Set<UUID> = []
+    private(set) var displayMaskRevision: UInt64 = 0
 
     /// Nonzero initial facts are useful for deterministic exhaustion tests, not restoration.
     init(initialFacts: AgentRunQuietFacts = .zero) {
@@ -189,10 +190,12 @@ struct AgentRunQuietLedger {
            )
         {
             quiet = true
-            hiddenSourceIDs.formUnion(hiddenIDs)
-            if current.markerProducerFinished, !hostMarkerIDs.contains(wakeID) {
-                hiddenSourceIDs.remove(wakeID)
+            var changed = false
+            for id in hiddenIDs {
+                if id == wakeID, current.markerProducerFinished, !hostMarkerIDs.contains(wakeID) { continue }
+                changed = hiddenSourceIDs.insert(id).inserted || changed
             }
+            if changed { displayMaskRevision &+= 1 }
         }
         advance(quiet: quiet)
         let seal = Seal(ownership: owner, isQuiet: quiet, facts: facts)
@@ -237,23 +240,27 @@ struct AgentRunQuietLedger {
     /// Pass only actual retired row/anchor IDs, never absent IDs found by scanning this projection.
     /// Absence from a working suffix, claim store or pending-wake slot is not retirement proof.
     mutating func retireSourceIDs(_ ids: Set<UUID>) {
+        let count = hiddenSourceIDs.count
         hiddenSourceIDs.subtract(ids)
         hostMarkerIDs.subtract(ids)
+        if hiddenSourceIDs.count != count { displayMaskRevision &+= 1 }
     }
 
     /// Producer settlement proves no admissible callback (including queued MainActor work) remains.
     mutating func retireUnmaterializedWake(_ wakeID: UUID) {
         if attempt?.routineWakeID == wakeID { attempt?.markerProducerFinished = true }
         guard !hostMarkerIDs.contains(wakeID) else { return }
-        hiddenSourceIDs.remove(wakeID)
+        if hiddenSourceIDs.remove(wakeID) != nil { displayMaskRevision &+= 1 }
     }
 
     /// Existing mutation owners supply indexed materialization/retention proof, not a history scan.
     /// Never infer retirement for an unmaterialized wake from its absence in a source projection.
     mutating func reconcileSourceIDs(wasMaterialized: (UUID) -> Bool, isRetained: (UUID) -> Bool) {
         guard !hiddenSourceIDs.isEmpty || !hostMarkerIDs.isEmpty else { return }
+        let count = hiddenSourceIDs.count
         hiddenSourceIDs = hiddenSourceIDs.filter { !wasMaterialized($0) || isRetained($0) }
         hostMarkerIDs = hostMarkerIDs.filter { !wasMaterialized($0) || isRetained($0) }
+        if hiddenSourceIDs.count != count { displayMaskRevision &+= 1 }
     }
 
     /// Reload loses MATERIALIZED verdict proof; rows reappear. Still-admissible unmaterialized
@@ -261,8 +268,10 @@ struct AgentRunQuietLedger {
     /// A surviving binding must NOT reset its aggregate facts.
     mutating func discardSourceProof(isMaterialized: (UUID) -> Bool) {
         let registered = hostMarkerIDs
+        let count = hiddenSourceIDs.count
         hiddenSourceIDs = hiddenSourceIDs.filter { !registered.contains($0) && !isMaterialized($0) }
         hostMarkerIDs.removeAll()
+        if hiddenSourceIDs.count != count { displayMaskRevision &+= 1 }
         if attempt?.seal == nil { attempt?.rangeIsComplete = false }
     }
 

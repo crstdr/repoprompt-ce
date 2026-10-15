@@ -2958,6 +2958,14 @@ final class MonitorFakeCodexController: CodexSessionControllerPassiveStubDefault
     private var startOrResumeHook: (@Sendable () async -> Void)?
     private var startGate: CatalogAuthorityGate?
     private var failStartAfterGate = false
+    private var startSuspension: (@Sendable () async -> Void)?
+
+    func setStartFailure(_ value: Bool, onStart: @escaping @Sendable () async -> Void) {
+        lock.withLock {
+            failStartAfterGate = value
+            startSuspension = onStart
+        }
+    }
 
     fileprivate func setStartGate(_ gate: CatalogAuthorityGate, fail: Bool) {
         lock.withLock { startGate = gate
@@ -3055,7 +3063,8 @@ final class MonitorFakeCodexController: CodexSessionControllerPassiveStubDefault
         started.append(text)
         lock.unlock()
         let submissionNumber = dispatches.recordStart(text)
-        let (gate, fail) = lock.withLock { (startGate, failStartAfterGate) }
+        let (gate, fail, suspension) = lock.withLock { (startGate, failStartAfterGate, startSuspension) }
+        await suspension?()
         if let gate { _ = await gate.requirement() }
         if fail { throw NativeAgentRuntimeControllerError.processNotRunning }
         return CodexTurnStartReceipt(provisionalSubmissionID: "sub-\(submissionNumber)")

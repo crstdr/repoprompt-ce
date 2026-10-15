@@ -6021,7 +6021,9 @@ final class AgentSessionLinkRuntimeBridge {
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity
     ) {
         guard var notices = passiveNoticesByObserver[observerEndpoint] else { return }
+        let previousRevision = notices.queueRevision
         notices.apply(receipt)
+        guard notices.queueRevision != previousRevision else { return }
         passiveNoticesByObserver[observerEndpoint] = notices
         // No row repaint: the dashboard renders live status, never queue contents.
         publishPassiveNotices(notices.snapshot, to: observerEndpoint)
@@ -6086,7 +6088,10 @@ final class AgentSessionLinkRuntimeBridge {
         } else {
             passiveNoticesByObserver[endpoint] = notices
         }
-        return snapshot
+        // The reducer already owns the last exact endpoint value. Compare only its bounded queue
+        // projection, not source history or a second publication cache. Equal authoritative passes
+        // must not enqueue another UI/wake publication; lifecycle/readiness has its own hooks.
+        return existing?.snapshot == snapshot ? nil : snapshot
     }
 
     private func publishPassiveNotices(
