@@ -21860,7 +21860,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     func endActiveAssistantSegment(_ session: TabSession) {
-        session.mutateItemsBatch(touchActivity: false) { items in
+        // Only streaming flags change here; source identity, text and order remain complete.
+        session.mutateItemsBatch(touchActivity: false, preservesQuietRange: true) { items in
             for index in items.indices where items[index].kind == .assistant && items[index].isStreaming {
                 items[index].isStreaming = false
             }

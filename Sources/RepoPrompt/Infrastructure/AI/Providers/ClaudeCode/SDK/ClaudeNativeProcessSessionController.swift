@@ -1712,7 +1712,11 @@ final actor ClaudeNativeProcessSessionController {
         case "stream_event":
             guard let event = payload["event"] as? [String: Any] else { return true }
             switch event["type"] as? String {
-            case "message_start": return event["message"] as? [String: Any] == nil
+            case "message_start":
+                guard let message = event["message"] as? [String: Any],
+                      let messageID = message["id"] as? String, !messageID.isEmpty
+                else { return true }
+                return false
             case "message_delta", "message_stop", "content_block_stop": return false
             case "content_block_start":
                 let block = event["content_block"] as? [String: Any]

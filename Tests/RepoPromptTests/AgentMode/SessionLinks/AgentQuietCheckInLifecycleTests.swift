@@ -259,6 +259,113 @@ final class AgentQuietCheckInLifecycleTests: XCTestCase {
         }
     }
 
+    func testClaudeControllerStreamingFinalizationPreservesExactMessageRange() async {
+        let start = #"{"type":"stream_event","event":{"type":"message_start","message":{"id":"one","type":"message","role":"assistant","content":[]}}}"#
+        let blockStart = #"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#
+        let blockStop = #"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#
+        let stop = #"{"type":"stream_event","event":{"type":"message_stop"}}"#
+        for text in ["[ack]", "prose"] {
+            let delta = #"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\#(text)"}}}"#
+            await assertClaudeControllerQuietCompletion([start, blockStart, delta, blockStop, stop], quiet: true, expectedTexts: ["[ack]"])
+        }
+        // A final authoritative result may replace streaming text in the same message, but
+        // must never erase a separate completed message from the quiet grammar's range.
+        let prose = #"{"type":"assistant","message":{"id":"one","content":[{"type":"text","text":"prose"}]}}"#
+        let ack = #"{"type":"assistant","message":{"id":"two","content":[{"type":"text","text":"[ack]"}]}}"#
+        await assertClaudeControllerQuietCompletion([prose, stop, ack, stop], quiet: false, expectedTexts: ["prose", "[ack]"])
+        await assertClaudeControllerQuietCompletion([], quiet: true, expectedTexts: ["[ack]"])
+        await assertClaudeControllerQuietCompletion([], quiet: true, expectedTexts: [], finalText: nil)
+    }
+
+    func testClaudeControllerMalformedMessageStartCannotBorrowFinishedMessageQuietProof() async {
+        for message in [#"{}"#, #"{"id":7}"#, #"{"id":""}"#] {
+            await assertClaudeControllerQuietCompletion([
+                #"{"type":"assistant","message":{"id":"one","content":[{"type":"text","text":"prose"}]}}"#,
+                #"{"type":"stream_event","event":{"type":"message_stop"}}"#,
+                #"{"type":"stream_event","event":{"type":"message_start","message":\#(message)}}"#
+            ], quiet: false, expectedTexts: ["[ack]"], expectsUncertainty: true)
+        }
+    }
+
+    private func assertClaudeControllerQuietCompletion(
+        _ wire: [String],
+        quiet: Bool,
+        expectedTexts: [String],
+        finalText: String? = "[ack]",
+        expectsUncertainty: Bool = false,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        let (h, s, owner, runID) = fixture()
+        XCTAssertNotNil(s.quietLedger.candidateStartKey(owner: owner), file: file, line: line)
+        let controller = ClaudeNativeProcessSessionController(
+            runID: runID, tabID: s.tabID, windowID: -1, workspacePath: nil,
+            config: .agentMode(commandName: "/usr/bin/false")
+        )
+        await controller.test_installConfigurationTransport(write: { _ in })
+        let stream = await controller.events
+        let turnID = await controller.test_beginTurnTracking()
+        s.claudeExpectedTurnIDs.insert(turnID)
+        let result = finalText.map { #"{"type":"result","subtype":"success","result":"\#($0)"}"# }
+            ?? #"{"type":"result","subtype":"success"}"#
+        for payload in [#"{"type":"system","subtype":"session_state_changed","session_state":"running"}"#]
+            + wire + [result, #"{"type":"system","subtype":"session_state_changed","session_state":"idle"}"#]
+        {
+            await controller.test_receiveConfigurationResponseLine(Data(payload.utf8))
+        }
+        // A genuine result + idle completion must arrive before shutdown can recover anything.
+        var iterator = stream.makeAsyncIterator()
+        var events: [NativeAgentRuntimeEvent] = []
+        while let event = await iterator.next() {
+            events.append(event)
+            if case .turnCompleted = event { break }
+        }
+        await controller.shutdown()
+        while let event = await iterator.next() {
+            events.append(event)
+        }
+        let completedTurnIDs = events.compactMap { event -> UUID? in
+            if case let .turnCompleted(id, status) = event {
+                XCTAssertEqual(status, .completed, file: file, line: line)
+                return id
+            }
+            return nil
+        }
+        XCTAssertEqual(completedTurnIDs, [turnID], file: file, line: line)
+        let streams = events.compactMap { event -> AIStreamResult? in
+            if case let .stream(result) = event { return result }
+            return nil
+        }
+        XCTAssertEqual(streams.filter { $0.type == "session_state_changed" }.compactMap(\.text), ["running", "idle"], file: file, line: line)
+        XCTAssertFalse(streams.contains { $0.text == "Provider completion recovery" }, file: file, line: line)
+        let uncertaintyIndex = streams.firstIndex { $0.type == "event" }
+        XCTAssertEqual(uncertaintyIndex != nil, expectsUncertainty, "\(wire)", file: file, line: line)
+        if let uncertaintyIndex, let finalIndex = streams.firstIndex(where: { $0.type == "final_content" }) {
+            XCTAssertLessThan(uncertaintyIndex, finalIndex, file: file, line: line)
+        }
+        let runner = ClaudeIntegratedAgentModeRunner(claudeCoordinator: h.host.claudeCoordinator, hooks: h.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier())
+        let completed = await runner.testConsumeQuietEvents(events, session: s, runID: runID, owner: owner)
+        XCTAssertTrue(completed, file: file, line: line)
+        XCTAssertEqual(s.items.filter { $0.kind == .assistant }.map(\.text), expectedTexts, file: file, line: line)
+        var notified = 0
+        h.onTurnComplete = { notified += 1 }
+        let revision = await commit(h, s, owner)
+        XCTAssertNotNil(revision, file: file, line: line)
+        XCTAssertEqual(notified, 1, file: file, line: line)
+        XCTAssertNil(s.activeRunOwnership, file: file, line: line)
+        h.host.refreshDerivedTranscriptState(for: s, publishActivePresentation: false)
+        let projection = s.workingTranscriptProjection
+        let presentation = AgentTranscriptPresentationSnapshot(
+            revision: 1, visibleBlocks: projection.workingBlocks, workingBlocks: projection.workingBlocks,
+            visibleRows: projection.workingRows, workingRows: projection.workingRows,
+            rowAnchorIndex: projection.rowAnchorIndex, anchorBlockIndex: projection.anchorBlockIndex
+        )
+        let display = AgentTranscriptProjectionBuilder.maskForLocalDisplay(presentation, archivedBlocks: s.archivedTranscriptSnapshot.blocks, hiddenSourceIDs: s.quietLedger.hiddenSourceIDs)
+        XCTAssertEqual(s.quietLedger.facts, AgentRunQuietFacts(settledThrough: 1, ordinaryThrough: quiet ? 0 : 1), "\(wire)", file: file, line: line)
+        XCTAssertEqual(display.presentation.visibleRows.map(\.text), quiet ? [] : expectedTexts, "\(wire)", file: file, line: line)
+        XCTAssertEqual(s.quietLedger.hiddenSourceIDs.isEmpty, !quiet, file: file, line: line)
+    }
+
     func testSemanticIngressBeforeSuppressionAndStaleCallbackCannotPoisonCurrentOwner() async {
         for type in ["tool_call", "tool_result", "tool_progress", "auth_status", "task_progress", "error", "system", "unclassified"] {
             let (h, s, owner, runID) = fixture()
