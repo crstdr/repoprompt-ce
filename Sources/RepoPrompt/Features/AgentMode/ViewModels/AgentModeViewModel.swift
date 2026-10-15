@@ -14607,6 +14607,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             sourceItems: workingItemsSnapshot,
             reconcilesQuietSourceRetirement: pendingMutationSummary?.containsStructuralMutation != false
                 || fullDetailTurnEnvelopeChanged || builtPresentation.sanitizedActivityCount > 0,
+            isLiveRefresh: reason == .liveMutation,
             to: session
         )
         let hasCompactedTranscriptPrefix = builtPresentation.transcript.turns.contains { $0.retentionTier != .full }
@@ -14994,6 +14995,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             projection: session.transcriptProjection,
             turnProjectionCaches: session.turnProjectionCaches,
             archivedSnapshot: session.archivedTranscriptSnapshot,
+            reusesPreviousArchive: false,
             projectionProtection: session.transcriptProjectionProtection,
             canonicalVisibleRowCount: session.transcriptCanonicalVisibleRowCount,
             projectionCounts: session.transcriptProjectionCounts,
@@ -15192,6 +15194,19 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
         let workingProjection = AgentTranscriptProjectionBuilder.workingProjection(from: fullProjection)
         let archivedSnapshot = AgentTranscriptProjectionBuilder.archivedSnapshot(from: fullProjection)
+        // The sanitizer already validated the equal prefix. With the same turn envelope and
+        // protection, a changed final full-detail turn cannot change any archived projection.
+        // Forward that existing proof; do not compare/scan the archive a second time here.
+        let reusesPreviousArchive = !isColdLoad
+            && trustedIncrementalFinalTurnStartSequenceIndex != nil
+            && previousBaseProjection != nil
+            && projectionProtection == previousProjectionProtection
+            && sanitizeMetrics.reusedTurnCount > 0
+            && sanitizeMetrics.reusedTurnCount == sanitizedTranscript.turns.count - 1
+            && previousSanitizedTranscript?.turns.count == sanitizedTranscript.turns.count
+            && previousSanitizedTranscript?.turns.last?.id == sanitizedTranscript.turns.last?.id
+            && previousSanitizedTranscript?.turns.last?.retentionTier == .full
+            && sanitizedTranscript.turns.last?.retentionTier == .full
         let projection = isCompressedHistoryRevealed ? fullProjection : workingProjection
         let projectionCounts = AgentTranscriptProjectionBuilder.projectionCounts(for: baseProjection)
         let canonicalVisibleRowCount = projectionCounts.canonicalVisibleRowCount
@@ -15294,6 +15309,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             projection: projection,
             turnProjectionCaches: updatedTurnProjectionCaches,
             archivedSnapshot: archivedSnapshot,
+            reusesPreviousArchive: reusesPreviousArchive,
             projectionProtection: projectionProtection,
             canonicalVisibleRowCount: canonicalVisibleRowCount,
             projectionCounts: projectionCounts,
@@ -15421,6 +15437,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         _ presentation: BuiltTranscriptPresentation,
         sourceItems: [AgentChatItem]? = nil,
         reconcilesQuietSourceRetirement: Bool = true,
+        isLiveRefresh: Bool = false,
         to session: TabSession
     ) {
         if let sourceItems, sourceItems != session.items {
@@ -15436,7 +15453,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session.fullTranscriptProjection = presentation.fullProjection
         session.workingTranscriptProjection = presentation.workingProjection
         session.turnProjectionCaches = presentation.turnProjectionCaches
-        session.archivedTranscriptSnapshot = presentation.archivedSnapshot
+        // Only this synchronous live-refresh path may retain an installed archive. Explicit
+        // apply/hydration (including same-revision A3), replacement and reset remain writers.
+        if !isLiveRefresh || !presentation.reusesPreviousArchive {
+            session.archivedTranscriptSnapshot = presentation.archivedSnapshot
+        }
         session.transcriptProjection = materializedTranscriptProjection(for: session)
         if reconcilesQuietSourceRetirement { session.reconcileQuietSourceIDs(previousAnchors: previousQuietSourceAnchors) }
         session.transcriptProjectionProtection = presentation.projectionProtection

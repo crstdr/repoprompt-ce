@@ -718,6 +718,152 @@ final class AgentQuietCheckInDisplayMaskTests: XCTestCase {
         XCTAssertEqual(session.quietTranscriptDisplayCache?.result.presentation, h.host.activeTranscriptPresentation)
     }
 
+    func testSourceDrivenLiveRefreshReusesQuietArchiveForUnmaterializedWake() throws {
+        try assertSourceDrivenLiveRefreshReusesQuietArchive(archivedQuietSource: false)
+    }
+
+    func testSourceDrivenLiveRefreshReusesQuietArchiveForArchivedSyntheticAlias() throws {
+        try assertSourceDrivenLiveRefreshReusesQuietArchive(archivedQuietSource: true)
+    }
+
+    private func assertSourceDrivenLiveRefreshReusesQuietArchive(archivedQuietSource: Bool) throws {
+        let (h, manager, session) = try liveFixture()
+        defer { withExtendedLifetime(manager) {} }
+        let wake = UUID()
+        let quiet = AgentChatItem.assistant("[ack]", sequenceIndex: 0)
+        let owner = session.beginRunAttempt(source: "quiet-source-archive")
+        session.quietLedger.markRoutineWake(owner: owner, wakeID: wake)
+        if archivedQuietSource { session.appendItem(quiet) }
+        session.sealQuietCheckIn(owner: owner, terminalState: .completed, normal: true, hasSuccessor: false)
+        XCTAssertTrue(session.endRunAttempt(ifCurrent: owner, source: "quiet-source-archive"))
+        session.runState = .running
+        let request = AgentChatItem.user("ordinary live request", sequenceIndex: 10000)
+        let stream = AgentChatItem.assistant("ordinary live stream", sequenceIndex: 10001)
+        let live = AgentTranscriptIO.buildTranscript(from: [request, stream], terminalState: .running, compact: false)
+        let history = (0 ..< 2000).map { index in
+            let text = archivedQuietSource && index == 0 ? "[ack]" : "ordinary history \(index)"
+            return AgentTranscriptTurn(
+                conclusionActivityID: archivedQuietSource && index == 0 ? quiet.id : UUID(), retentionTier: .archived,
+                summary: .init(requestText: nil, conclusionText: text, compactConclusionText: text, middleSummaryText: nil, toolCount: 0, notableToolNames: [], keyPaths: [], compactedActivityCount: 0, hadWarning: false, hadError: false),
+                terminalState: .completed, startedAt: date, completedAt: date
+            )
+        }
+        let transcript = AgentTranscriptCompactor.compact(AgentTranscript(turns: history + live.turns))
+        h.host.applyTranscriptPresentation(transcript, to: session)
+        // Retention movement preserves the archived source's proof; source mutations below use
+        // the ordinary session callback, not direct base/projection assignment.
+        session.setItemsSilently([request, stream], reason: .retentionCompaction)
+        _ = h.host.test_publishTranscriptPresentation(tabID: session.tabID, forceRevision: true)
+        h.host.syncTranscriptUIState()
+        let initial = try XCTUnwrap(session.quietTranscriptDisplayCache)
+        let installedArchive = session.archivedTranscriptSnapshot
+        XCTAssertEqual(installedArchive.rows.count, 2000)
+        XCTAssertEqual(initial.result.archiveBlockVisits, 2000)
+        XCTAssertEqual(initial.result.archiveRowVisits, 2000)
+        XCTAssertTrue(session.quietLedger.hiddenSourceIDs.contains(archivedQuietSource ? quiet.id : wake))
+        let alias = try XCTUnwrap(installedArchive.rows.first)
+        if archivedQuietSource {
+            XCTAssertNotEqual(alias.id, quiet.id)
+            XCTAssertTrue(session.quietTranscriptArchiveDisplayCache?.region.removedRowIDs.contains(alias.id) == true)
+            XCTAssertFalse(initial.result.archivedBlocks.contains { $0.rows.contains { $0.id == alias.id } })
+        }
+        let expectedArchiveCount = archivedQuietSource ? 1999 : 2000
+        XCTAssertEqual(initial.result.archivedBlocks.count, expectedArchiveCount)
+        h.host.test_setAllowsScheduledDerivedTranscriptRefreshWithoutPromptManager(true)
+        defer { h.host.test_setAllowsScheduledDerivedTranscriptRefreshWithoutPromptManager(false) }
+        var quietMS: [Double] = [], builderMS: [Double] = [], refreshMS: [Double] = [], inclusiveMS: [Double] = [], archiveSnapshotMS: [Double] = []
+        var quietArchiveBlocks: [Int] = [], quietArchiveRows: [Int] = []
+        func ms(_ from: ContinuousClock.Instant, _ to: ContinuousClock.Instant) -> Double {
+            let elapsed = from.duration(to: to)
+            return Double(elapsed.components.seconds) * 1000 + Double(elapsed.components.attoseconds) / 1e15
+        }
+        for index in 0 ..< 100 {
+            let oldSourceRevision = session.sourceItemsRevision
+            let oldBuildCount = session.transcriptPerformanceSnapshot.projectionBuildCount
+            let oldPresentationRevision = h.host.activeTranscriptPresentation.revision
+            let start = ContinuousClock.now
+            session.mutateItem(at: 1) { $0.text = "ordinary streamed text \(index)"
+                $0.isStreaming = true
+            }
+            // Drain the real scheduled source refresh synchronously, separating existing builder
+            // cost from publication + didSet-owned quiet display preparation. No projection helper.
+            h.host.refreshDerivedTranscriptState(for: session, reason: .liveMutation, publishActivePresentation: false)
+            let refreshed = ContinuousClock.now
+            let publishStart = ContinuousClock.now
+            _ = h.host.test_publishTranscriptPresentation(tabID: session.tabID, forceRevision: true)
+            h.host.syncTranscriptUIState()
+            let end = ContinuousClock.now
+            quietMS.append(ms(publishStart, end))
+            refreshMS.append(ms(start, refreshed))
+            inclusiveMS.append(ms(start, end))
+            try builderMS.append(XCTUnwrap(session.transcriptPerformanceSnapshot.lastProjectionBuildDurationMS))
+            let cache = try XCTUnwrap(session.quietTranscriptDisplayCache)
+            let base = h.host.activeTranscriptPresentation
+            XCTAssertGreaterThan(session.sourceItemsRevision, oldSourceRevision)
+            XCTAssertEqual(session.transcriptPerformanceSnapshot.projectionBuildCount, oldBuildCount + 1)
+            XCTAssertGreaterThan(base.revision, oldPresentationRevision)
+            XCTAssertEqual(session.transcriptPerformanceSnapshot.lastSanitizeReusedTurnCount, 2000)
+            XCTAssertTrue(cache.result.presentation.visibleRows.contains { $0.id == stream.id && $0.text == "ordinary streamed text \(index)" })
+            XCTAssertEqual(cache.result.presentation.visibleRows, base.visibleRows)
+            XCTAssertEqual(cache.result.presentation.workingRows, base.workingRows)
+            XCTAssertEqual(cache.result.presentation.visibleBlocks, base.visibleBlocks)
+            XCTAssertEqual(cache.result.presentation.workingBlocks, base.workingBlocks)
+            XCTAssertEqual(cache.result.presentation.metadata, base.metadata)
+            XCTAssertEqual(cache.result.presentation.rowAnchorIndex, base.rowAnchorIndex)
+            XCTAssertEqual(cache.result.presentation.anchorBlockIndex, base.anchorBlockIndex)
+            XCTAssertEqual(cache.result.presentation.archivedHistoryState, .init(hasArchivedHistory: true, presentedRowCount: expectedArchiveCount, blockCount: expectedArchiveCount))
+            XCTAssertEqual(cache.result.archiveBlockVisits, 0, "No repeated QUIET MASK archive traversal; existing builder work is separate")
+            XCTAssertEqual(cache.result.archiveRowVisits, 0)
+            XCTAssertEqual(cache.result.archivedBlocks.count, expectedArchiveCount)
+            quietArchiveBlocks.append(cache.result.archiveBlockVisits)
+            quietArchiveRows.append(cache.result.archiveRowVisits)
+            initial.result.archivedBlocks.withUnsafeBufferPointer { old in
+                cache.result.archivedBlocks.withUnsafeBufferPointer { current in XCTAssertEqual(old.baseAddress, current.baseAddress, "Masked archive storage survives the BUILT installation") }
+            }
+            installedArchive.blocks.withUnsafeBufferPointer { old in
+                session.archivedTranscriptSnapshot.blocks.withUnsafeBufferPointer { current in XCTAssertEqual(old.baseAddress, current.baseAddress, "Unchanged archive is not reinstalled") }
+            }
+            // Diagnostic-only repetition of the unchanged production archive snapshot/count/index
+            // routine on this SAME fixture, outside both timed real paths. This is a subcost,
+            // not the entire builder cost, and is not additional production quiet-mask work.
+            let archiveStart = ContinuousClock.now
+            let measuredArchive = AgentTranscriptProjectionBuilder.archivedSnapshot(from: session.fullTranscriptProjection)
+            archiveSnapshotMS.append(ms(archiveStart, .now))
+            XCTAssertEqual(measuredArchive.rows.count, 2000)
+        }
+        func measurements(_ samples: [Double]) -> [String: Any] {
+            ["samplesMS": samples, "p99MS": samples.sorted()[Int(ceil(0.99 * Double(samples.count))) - 1], "maxMS": samples.max()!]
+        }
+        let measurements: [String: Any] = [
+            "scenario": archivedQuietSource ? "archived-synthetic-alias" : "unmaterialized-wake", "n": 100,
+            "quantile": "sort(samples)[ceil(0.99*N)-1]", "archiveRows": 2000,
+            "quietPublicationAndOwnerSync": measurements(quietMS), "existingBuilderTotal": measurements(builderMS),
+            "sourceAndDerivedRefresh": measurements(refreshMS), "inclusiveSourceThroughUISync": measurements(inclusiveMS),
+            "separateArchiveSnapshotSubcost": measurements(archiveSnapshotMS),
+            "quietArchiveBlockVisits": quietArchiveBlocks, "quietArchiveRowVisits": quietArchiveRows,
+            "builderStatus": "pre-existing, unchanged; current measurement, not a pristine-baseline measurement"
+        ]
+        try print("QUIET_F2_SOURCE_STREAM " + String(decoding: JSONSerialization.data(withJSONObject: measurements, options: [.sortedKeys]), as: UTF8.self))
+        // A real archive replacement runs through the built installer and MUST retire both caches.
+        var changed = session.transcript
+        changed.turns[10].conclusionActivityID = UUID()
+        changed.turns[10].summary?.conclusionText = "changed archived conclusion"
+        changed.turns[10].summary?.compactConclusionText = "changed archived conclusion"
+        h.host.applyTranscriptPresentation(changed, to: session)
+        XCTAssertNil(session.quietTranscriptArchiveDisplayCache)
+        XCTAssertNil(session.quietTranscriptDisplayCache)
+        _ = h.host.test_publishTranscriptPresentation(tabID: session.tabID, forceRevision: true)
+        h.host.syncTranscriptUIState()
+        let replaced = try XCTUnwrap(session.quietTranscriptDisplayCache)
+        XCTAssertEqual(replaced.result.archiveBlockVisits, 2000)
+        XCTAssertEqual(replaced.result.archiveRowVisits, 2000)
+        XCTAssertTrue(replaced.result.archivedBlocks.contains { $0.rows.contains { $0.text == "changed archived conclusion" } })
+        XCTAssertEqual(replaced.result.archivedBlocks.count, expectedArchiveCount)
+        // Explicit same-content apply/hydration remains an invalidating writer, never a live reuse.
+        h.host.applyTranscriptPresentation(session.transcript, to: session)
+        XCTAssertNil(session.quietTranscriptArchiveDisplayCache)
+    }
+
     func testReusedArchiveRetainsSyntheticAliasContributionAcrossWindowedBaseAssignments() throws {
         let (h, manager, session) = try liveFixture()
         defer { withExtendedLifetime(manager) {} }
