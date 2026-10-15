@@ -6044,6 +6044,104 @@ extension AgentSessionLinkAutoWakeTests {
 }
 
 extension AgentSessionLinkAutoWakeTests {
+    func testQuietBatchReorderingKeepsFailureSuppressedWithoutBlockingFreshAdmissionBases() throws {
+        typealias Notices = AgentSessionLinkPassiveStatusNotices
+        for freshBasis in ["ordinary", "status", "attention", "overflow", "manual"] {
+            let fixture = try makeFixture(fenceProviderLaunch: true)
+            try publishInventory(fixture, revision: 1)
+            fixture.session.oversight.autoWakeOnUpdates = true
+            let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+            var reducer = Notices(observerEndpoint: endpoint, queueEpoch: Self.laneQueueEpoch)
+            func sample(_ index: Int, _ settled: UInt64, _ ordinary: UInt64, status: Notices.Status = .idle) -> Notices.Sample {
+                .init(
+                    reference: Self.laneReference(index), targetEndpoint: Self.laneTargetEndpoint(index),
+                    targetSessionID: Self.targetID(index), displayName: "Lane \(index)", status: status,
+                    idleForSend: status == .idle, runFacts: .init(settledThrough: settled, ordinaryThrough: ordinary)
+                )
+            }
+            func publish(_ snapshot: Notices.Snapshot) {
+                fixture.viewModel.agentSessionLinkPublishPassiveStatusNotices(snapshot, to: endpoint)
+            }
+            reducer.enable(samples: [sample(0, 8, 8), sample(1, 8, 8)], linkSetRevision: 1)
+            reducer.setAutoWakeLanes((0 ..< 2).map { .init(
+                reference: Self.laneReference($0), targetEndpoint: Self.laneTargetEndpoint($0),
+                targetSessionID: Self.targetID($0), isEffectivelySelected: true
+            ) })
+            reducer.reconcile(samples: [sample(0, 9, 9), sample(1, 9, 9)], linkSetRevision: 1, deliverable: true)
+            let original = reducer.snapshot
+            XCTAssertEqual(original.entries.map(\.reference), [Self.laneReference(0), Self.laneReference(1)])
+            publish(original)
+            let first = try reserveQuietWake(fixture)
+            let frozen = try XCTUnwrap(first.passive?.receipt)
+            XCTAssertTrue(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(for: fixture.session, dispatchID: first.dispatchID))
+            fixture.viewModel.agentSessionLinkRecordPhysicalDispatchFailure(for: fixture.session, dispatchID: first.dispatchID)
+            let failed = try XCTUnwrap(fixture.session.oversight.suppressedWakeFingerprint)
+            XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+
+            // Only A's quiet cutoff/metadata advances: display order becomes B,A, not a new failure.
+            reducer.reconcile(samples: [sample(0, 10, 9), sample(1, 9, 9)], linkSetRevision: 1, deliverable: true)
+            let quiet = reducer.snapshot
+            XCTAssertEqual(quiet.entries.map(\.reference), [Self.laneReference(1), Self.laneReference(0)])
+            XCTAssertEqual(quiet.entries.last?.edgeSequence, original.entries.first?.edgeSequence)
+            XCTAssertEqual(quiet.entries.last?.ordinaryThrough, 9)
+            XCTAssertEqual(quiet.entries.last?.receiptSettledThrough, 10)
+            XCTAssertGreaterThan(try XCTUnwrap(quiet.entries.last?.changeSequence), try XCTUnwrap(original.entries.first?.changeSequence))
+            XCTAssertEqual(frozen.deliveredStatuses.map(\.reference), [Self.laneReference(0), Self.laneReference(1)])
+            XCTAssertEqual(frozen.deliveredStatuses.map(\.settledThrough), [9, 9])
+            for _ in 0 ..< 3 {
+                publish(quiet)
+            }
+            XCTAssertNil(fixture.session.oversight.pendingAutoWake, "\(freshBasis): quiet-only reordering must not rearm the failed batch")
+            guard fixture.session.oversight.pendingAutoWake == nil else {
+                fixture.session.oversight.pendingAutoWake?.task?.cancel()
+                continue
+            }
+            XCTAssertEqual(fixture.session.oversight.suppressedWakeFingerprint, failed)
+
+            switch freshBasis {
+            case "ordinary":
+                reducer.reconcile(samples: [sample(0, 11, 11), sample(1, 9, 9)], linkSetRevision: 1, deliverable: true)
+            case "status":
+                reducer.reconcile(samples: [sample(0, 10, 9, status: .waiting), sample(1, 9, 9)], linkSetRevision: 1, deliverable: true)
+            case "attention":
+                XCTAssertEqual(reducer.requestAttention(
+                    reference: Self.laneReference(1), targetEndpoint: Self.laneTargetEndpoint(1),
+                    targetSessionID: Self.targetID(1), linkSetRevision: 1
+                ), .accepted)
+            case "overflow", "manual": break
+            default: return XCTFail("Unknown admission control")
+            }
+            var successor = reducer.snapshot
+            if freshBasis == "overflow" {
+                // Existing anonymous overflow producer shape; retain the reducer's exact row order.
+                successor = .init(
+                    observerEndpoint: successor.observerEndpoint, queueEpoch: successor.queueEpoch,
+                    queueRevision: successor.queueRevision + 1, linkSetRevision: successor.linkSetRevision,
+                    isEnabled: successor.isEnabled, isDeliverable: successor.isDeliverable,
+                    entries: successor.entries, attentionRequests: successor.attentionRequests,
+                    unacknowledgedOverflowCount: 1, overflowProduced: successor.overflowProduced + 1,
+                    autoWakeLanes: successor.autoWakeLanes
+                )
+            }
+            publish(successor)
+            if freshBasis == "manual" {
+                XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+                XCTAssertEqual(fixture.viewModel.agentSessionLinkRequestManualWakeNow(for: endpoint), .scheduled)
+            }
+            let next = try reserveQuietWake(fixture)
+            XCTAssertEqual(next.passive?.receipt.deliveredStatuses.map(\.reference), successor.entries.map(\.reference))
+            XCTAssertEqual(next.passive?.receipt.deliveredStatuses.map(\.settledThrough), successor.entries.map(\.receiptSettledThrough))
+            XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.isManual, freshBasis == "manual")
+            XCTAssertTrue(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(for: fixture.session, dispatchID: next.dispatchID), freshBasis)
+            fixture.viewModel.agentSessionLinkRecordPhysicalDispatchFailure(for: fixture.session, dispatchID: next.dispatchID)
+            XCTAssertEqual(fixture.session.oversight.suppressedWakeFingerprint, freshBasis == "manual" ? failed : successor.wakeEligibilityFingerprint)
+            for _ in 0 ..< 3 {
+                publish(successor)
+            }
+            XCTAssertNil(fixture.session.oversight.pendingAutoWake, "\(freshBasis): one attempt, not a retry loop")
+        }
+    }
+
     func testF3QuietLaneNewOrdinaryCoverageRearmsFailureBeforeClaimAndWhenBudgetOmitted() throws {
         for omitted in [false, true] {
             let fixture = try makeFixture(fenceProviderLaunch: true)

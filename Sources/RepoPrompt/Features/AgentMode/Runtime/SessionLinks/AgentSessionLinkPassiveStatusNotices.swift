@@ -367,7 +367,12 @@ struct AgentSessionLinkPassiveStatusNotices {
             overflowProduced: UInt64
         ) {
             self.queueEpoch = queueEpoch
-            self.edges = edges
+            // One occurrence per exact reference; display metadata order is not failure identity.
+            // Canonicalize only this fingerprint, never the rendered rows or receipt subset.
+            self.edges = edges.sorted {
+                ($0.reference.linkID.uuidString, $0.reference.generation)
+                    < ($1.reference.linkID.uuidString, $1.reference.generation)
+            }
             self.attentionOccurrences = attentionOccurrences
             self.overflowProduced = overflowProduced
         }
