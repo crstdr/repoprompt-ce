@@ -37,6 +37,7 @@ final class AgentSessionLinkRunnerHarness {
     /// that suspension.
     var onAttachmentsConsumed: (@MainActor () -> Void)?
     var nativeTranscriptHost: AgentModeViewModel?
+    var onTerminalPublication: (@MainActor (AgentRunTerminalCommitRevision, AgentTabSession) -> Void)?
     var onNativeStreamResult: (@MainActor (AIStreamResult, AgentTabSession, UUID, UUID) async -> Void)?
 
     /// Runs while the message is being built, i.e. the last synchronous MainActor point before the
@@ -267,7 +268,10 @@ final class AgentSessionLinkRunnerHarness {
             terminalSettlement: .init(
                 prepareTerminalPublication: { _ in },
                 makeTerminalPublicationEnvelope: { _, _, _, _, _ in nil },
-                publishTerminalCommit: { _, _, _ in .accepted(successorEpoch: nil) }
+                publishTerminalCommit: { session, revision, _ in
+                    harnessBox?.onTerminalPublication?(revision, session)
+                    return .accepted(successorEpoch: nil)
+                }
             ),
             continuation: .init(
                 startFollowUpRun: { _, _ in },
