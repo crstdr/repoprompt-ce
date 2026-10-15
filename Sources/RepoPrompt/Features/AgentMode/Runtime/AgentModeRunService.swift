@@ -1041,6 +1041,10 @@ final class AgentModeRunService {
             guard let self, let session else { return }
             defer {
                 session.claudeSteeringFlushTask = nil
+                // Reevaluate retained terminal obligations only after dequeued work releases.
+                if session.claudeSteeringAbandonment?.attemptID == runAttemptID {
+                    session.claudeSteeringAbandonment?.notify([])
+                }
                 if session.runState == .running,
                    session.selectedAgent.usesClaudeNativeRuntime,
                    !session.pendingClaudeSteeringInstructions.isEmpty
@@ -1171,11 +1175,14 @@ final class AgentModeRunService {
                     }
                     restoreAllQueuedClaudeSteeringDrafts(tabID: tabID, session: session, strategy: .prependAlways, definitiveNoWrite: !providerWriteAttempted)
                     return
+                case .supersededAfterWriteAttempt:
+                    // The provider may own this turn even though local currency was lost.
+                    // Do not restore it or publish a no-write abandonment.
+                    return
                 case .superseded:
-                    // A same-owner refusal on the same controller cannot be a post-write return:
-                    // those returns fail the coordinator's intent/controller fence.
                     guard !Task.isCancelled,
                           isCurrentClaudeSteeringAttempt(session: session, runID: runID, runAttemptID: runAttemptID),
+                          dependencies.claudeCoordinator.runAttemptIsCurrent(ownership, runID: runID, for: session),
                           let sendingController,
                           session.claudeController.map(ObjectIdentifier.init) == ObjectIdentifier(sendingController)
                     else { return }

@@ -254,7 +254,7 @@ final class ClaudeIntegratedAgentModeRunner {
                         "ready"
                     case .failed:
                         Task.isCancelled ? "cancelled" : "failed"
-                    case .superseded:
+                    case .superseded, .supersededAfterWriteAttempt:
                         "superseded"
                     }
                     await lease.providerInitializationCompleted(
@@ -269,7 +269,7 @@ final class ClaudeIntegratedAgentModeRunner {
                     case .failed:
                         nativeFailureMetadata = (errorText: nil, shouldShutdownSession: false)
                         throw NativeTerminalFailure()
-                    case .superseded:
+                    case .superseded, .supersededAfterWriteAttempt:
                         return .superseded
                     }
 
@@ -393,8 +393,10 @@ final class ClaudeIntegratedAgentModeRunner {
         // Keep consuming provider events while a promised successor is waiting for MCP idle.
         // The local settlement signal wakes this loop even when the provider stream stays open.
         let inbox = AsyncStream<RunnerEvent>.makeStream()
+        var queuedNativeEvents = 0
         let forwarding = Task {
             for await event in events {
+                queuedNativeEvents += 1
                 inbox.continuation.yield(.native(event))
             }
             inbox.continuation.finish()
@@ -416,6 +418,7 @@ final class ClaudeIntegratedAgentModeRunner {
             }
         }
         var protectedTerminal: (turnID: UUID, status: NativeAgentRuntimeTurnStatus)?
+        var abandonedProtectedTurns: Set<UUID> = []
         eventLoop: for await input in inbox.stream {
             guard session.runID == runID,
                   session.activeRunAttemptID == runAttemptID
@@ -427,6 +430,7 @@ final class ClaudeIntegratedAgentModeRunner {
             let event: NativeAgentRuntimeEvent
             switch input {
             case let .native(native):
+                queuedNativeEvents -= 1
                 event = native
             case .staleActiveProbe:
                 probePending = false
@@ -437,6 +441,12 @@ final class ClaudeIntegratedAgentModeRunner {
                 else { continue eventLoop }
                 let active = await controller.hasActiveSession
                 let busy = await controller.hasTurnInFlight
+                // Reads suspend this consumer. Native output already forwarded behind the
+                // probe must be applied before any out-of-band terminal decision.
+                if queuedNativeEvents > 0 {
+                    session.claudeSteeringAbandonment?.probe()
+                    continue eventLoop
+                }
                 guard active, !busy, !Task.isCancelled,
                       session.claudeController.map(ObjectIdentifier.init) == ObjectIdentifier(controller),
                       Self.staleActiveRecoveryFencesAreClear(session: session, coordinator: claudeCoordinator, ownership: ownership, runID: runID)
@@ -445,7 +455,16 @@ final class ClaudeIntegratedAgentModeRunner {
                 NSLog("[ClaudeRunRecovery] reason=idle_provider_no_expected_completion")
                 return .failed(errorText: "Claude Code stopped reporting this run's outcome, so RepoPrompt closed it as failed. The conversation is intact; send a message to continue.", shouldShutdownSession: false)
             case let .steeringAbandoned(ids):
-                if let terminal = protectedTerminal, ids.contains(terminal.turnID),
+                // A delayed refusal cannot retire a later dequeued/preparing successor.
+                // Keep the obligation until the flush publishes its quiescent boundary.
+                abandonedProtectedTurns.formUnion(ids)
+                if let terminal = protectedTerminal, abandonedProtectedTurns.contains(terminal.turnID),
+                   !Task.isCancelled,
+                   let ownership = session.activeRunOwnership,
+                   claudeCoordinator.runAttemptIsCurrent(ownership, runID: runID, for: session),
+                   session.claudeController.map(ObjectIdentifier.init) == subscribedController.map(ObjectIdentifier.init),
+                   session.claudeSteeringFlushTask == nil,
+                   !claudeCoordinator.hasNativeSendOrToolWork(session: session, runID: runID),
                    session.claudeExpectedTurnIDs.isEmpty,
                    !session.pendingClaudeSteeringInstructions.contains(where: { $0.targetRunID == runID && $0.targetRunAttemptID == runAttemptID })
                 {
