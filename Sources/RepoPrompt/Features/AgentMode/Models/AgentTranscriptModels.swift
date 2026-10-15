@@ -325,15 +325,14 @@ public struct AgentTranscriptRecoveryDiagnostic: Codable, Sendable, Equatable {
     /// identifiers and share the identifier budget; the longest token a producer
     /// emits today is `repeatedResumeTimeout` (21 characters).
     public static let maximumTokenLength = maximumIdentifierLength
-    /// Upper bound for diagnostics carried by a single turn summary. A turn
-    /// emits at most one record per reconnect fallback, and each new fallback
-    /// requires the current thread to accumulate
-    /// `repeatedResumeTimeoutFallbackThreshold` (2) consecutive resume timeouts
-    /// first — four records already mean ≥8 timed-out attempts and five thread
-    /// bindings inside one turn. The bound keeps the list a small slice of the
-    /// per-turn entry budgets consumers apply (`get_session` renders ≤20
-    /// entries per turn) and guards malformed persisted values, not real storms.
-    public static let maximumPerTurn = 4
+    /// Upper bound for diagnostics carried by a single turn summary. This is a
+    /// malformed-payload guard, not a producer bound: a turn emits one record
+    /// per reconnect fallback with no limit (`resumeFrameTooLarge` falls back on
+    /// the first oversized-resume failure). The value mirrors the per-turn entry
+    /// budget the consumers enforce — `get_session` renders ≤20 entries per
+    /// turn — so a corrupt persisted list can displace at most one turn's
+    /// rendered entries, and read-time dedupe keeps distinct records intact.
+    public static let maximumPerTurn = 20
 
     /// Stable outcome token for "the previous thread could not be resumed and a fresh
     /// thread was started in its place".
@@ -390,10 +389,10 @@ public struct AgentTranscriptRecoveryDiagnostic: Codable, Sendable, Equatable {
         self.sequenceIndex = sequenceIndex
     }
 
-    /// Dedupes by row identity and applies the per-turn cap. Used by every consumer of a
-    /// summary's diagnostic list so a malformed or over-cap persisted value self-heals at
-    /// read time. Identity (not content) is the dedupe key: two distinct rows may share
-    /// identical fields, and each row ID must stay resolvable for cutoff anchors.
+    /// Dedupes by row identity and applies the per-turn bound. Used by every consumer of a
+    /// summary's diagnostic list so a malformed persisted value self-heals at read time.
+    /// Identity (not content) is the dedupe key: two distinct rows may share identical
+    /// fields, and each row ID must stay resolvable for cutoff anchors.
     static func normalizedList(
         _ diagnostics: [AgentTranscriptRecoveryDiagnostic]?
     ) -> [AgentTranscriptRecoveryDiagnostic] {
