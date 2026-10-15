@@ -1579,6 +1579,7 @@ final class ClaudeAgentModeCoordinator {
                 // A lane-update dispatch has no base user instruction. If its required batch was
                 // revoked, acknowledged, revision-fenced, or omitted by the shared budget, stop before
                 // `sendUserMessage`; `.superseded` is the quiet no-provider-call outcome.
+                defer { withExtendedLifetime(monitoring.quietMarkerProducerLifetime) {} }
                 guard !monitoring.mustAbortDispatch else {
                     hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
                     return .superseded

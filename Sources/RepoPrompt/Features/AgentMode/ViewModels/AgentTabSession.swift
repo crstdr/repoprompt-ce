@@ -27,8 +27,10 @@ final class AgentTabSession: ObservableObject {
         didSet {
             guard !suppressSourceItemsChanged else { return }
             if let owner = activeRunOwnership { quietLedger.invalidateRange(owner: owner) }
+            let previousIDs = liveItemIDs
             repairStoredSourceItemsIfNeeded(diagnosticContext: "items.didSet")
             rebuildSourceItemDerivedState()
+            reconcileQuietSourceIDs(previousLiveIDs: previousIDs)
             onSourceItemsChanged?(self, .structural)
         }
     }
@@ -1610,6 +1612,7 @@ final class AgentTabSession: ObservableObject {
     func beginPersistentBindingTransition() -> UInt64 {
         // The existing full endpoint is retired by this generation change. No saved verdicts.
         quietLedger = AgentRunQuietLedger()
+        oversight.clearWakeSuppression()
         oversight.overseerActivation = nil
         // Clear the outgoing proof before the generation moves so it cannot be observed under the
         // incoming incarnation.
@@ -1629,6 +1632,7 @@ final class AgentTabSession: ObservableObject {
         precondition(binding == nil || binding?.tabID == tabID)
         if persistentSessionBindingIdentity != binding {
             oversight.overseerActivation = nil
+            oversight.clearWakeSuppression()
             quietLedger = AgentRunQuietLedger()
         }
         persistentSessionBindingIdentity = binding
@@ -2023,6 +2027,41 @@ final class AgentTabSession: ObservableObject {
         return quietLedger.sourceFacts(owner: activeRunOwnership, capturedState: capturedState)
     }
 
+    /// Share the same lifetime with every actual old-marker producer, including ordinary new-owner
+    /// native reentry. Claim-cache entries and acknowledged auth replay do not retain it.
+    func retainQuietMarkerProducer(for claim: AgentSessionLinkOutboundPromptClaim?) -> AgentQuietMarkerProducerLifetime? {
+        guard let claim, claim.routineQuietCheckIn, let wakeID = claim.dispatchID.autoWakeID,
+              let binding = currentRestorationBindingToken,
+              var attempt = oversight.pendingAutoWake, attempt.wakeID == wakeID,
+              let endpoint = claim.passive?.observerEndpoint, attempt.observerEndpoint == endpoint,
+              endpoint.tabID == tabID, endpoint.sessionID == activeAgentSessionID,
+              endpoint.persistentBindingGeneration == persistentSessionBindingIdentity?.generation,
+              endpoint.bindingTransitionGeneration == bindingTransitionGeneration
+        else { return nil }
+        if let lifetime = attempt.quietMarkerProducerLifetime { return lifetime }
+        let lifetime = AgentQuietMarkerProducerLifetime(wakeID: wakeID, binding: binding, session: self)
+        attempt.quietMarkerProducerLifetime = lifetime
+        oversight.pendingAutoWake = attempt
+        return lifetime
+    }
+
+    /// Existing source/projection mutation owners supply their indexed proof. No new address list,
+    /// pending map, baseline snapshot, or per-item history traversal is created.
+    func reconcileQuietSourceIDs(previousLiveIDs: Set<UUID> = [], previousAnchors: [UUID: AgentTranscriptAnchor] = [:]) {
+        let currentIDs = liveItemIDs
+        let currentAnchors = fullTranscriptProjection.rowAnchorIndex
+        quietLedger.reconcileSourceIDs(
+            wasMaterialized: { previousLiveIDs.contains($0) || previousAnchors[$0] != nil },
+            isRetained: { currentIDs.contains($0) || currentAnchors[$0] != nil }
+        )
+    }
+
+    private func discardMaterializedQuietSourceProof() {
+        let ids = liveItemIDs
+        let anchors = fullTranscriptProjection.rowAnchorIndex
+        quietLedger.discardSourceProof(isMaterialized: { ids.contains($0) || anchors[$0] != nil })
+    }
+
     private func quietSourceSuffix(in rows: [AgentChatItem], startKey: Int) -> ArraySlice<AgentChatItem> {
         var lower = rows.startIndex
         var upper = rows.endIndex
@@ -2255,11 +2294,13 @@ final class AgentTabSession: ObservableObject {
         preservesQuietRange: Bool = false
     ) {
         if !preservesQuietRange, let owner = activeRunOwnership { quietLedger.invalidateRange(owner: owner) }
+        let previousIDs = liveItemIDs
         let repairedItems = repairedSourceItems(newItems, diagnosticContext: diagnosticContext)
         suppressSourceItemsChanged = true
         items = repairedItems
         suppressSourceItemsChanged = false
         rebuildSourceItemDerivedState(payloadUpdate: payloadUpdate)
+        if !preservesQuietRange { reconcileQuietSourceIDs(previousLiveIDs: previousIDs) }
         sourceItemsRevision &+= 1
         derivedTranscriptSyncState = nil
         if case let .notify(mutation) = dispatch {
@@ -2469,6 +2510,9 @@ final class AgentTabSession: ObservableObject {
     ) {
         if let previousItem, previousItem.id != updatedItem?.id {
             liveItemIDs.remove(previousItem.id)
+            if fullTranscriptProjection.rowAnchorIndex[previousItem.id] == nil {
+                quietLedger.retireSourceIDs([previousItem.id])
+            }
             setEphemeralToolResultPayload(nil, for: previousItem.id)
         }
         guard let updatedItem else { return }
@@ -2617,7 +2661,7 @@ final class AgentTabSession: ObservableObject {
         payloadUpdate: SourceItemPayloadUpdate
     ) {
         if reason == .persistedSessionHydration || reason == .routeActivation || reason == .clearedChat || reason == .stressHarnessReset {
-            quietLedger.discardSourceProof()
+            discardMaterializedQuietSourceProof()
         }
         #if DEBUG
             if AgentTranscriptDebugInstrumentation.isEnabled {
@@ -2760,6 +2804,7 @@ final class AgentTabSession: ObservableObject {
     }
 
     func clearDerivedTranscriptCaches() {
+        let previousAnchors = fullTranscriptProjection.rowAnchorIndex
         transcript = .empty
         baseTranscriptProjection = .empty
         fullTranscriptProjection = .empty
@@ -2775,6 +2820,7 @@ final class AgentTabSession: ObservableObject {
         transcriptPerformanceSnapshot = .empty
         rawToolResultPayloadRenderRevisionByItemID = [:]
         derivedTranscriptSyncState = nil
+        reconcileQuietSourceIDs(previousAnchors: previousAnchors)
     }
 
     func replaceItems(_ items: [AgentChatItem]) {
@@ -2843,7 +2889,8 @@ final class AgentTabSession: ObservableObject {
         reconcileIncrementalEphemeralPayload(previousItem: previousItem, updatedItem: updatedItem)
         updateToolCorrelationIndexes(previousItem: previousItem, updatedItem: updatedItem, at: index)
         finishIncrementalSourceItemsMutation(
-            .replace(index: index, previousKind: previousItem.kind, currentKind: updatedItem.kind)
+            previousItem.id == updatedItem.id
+                ? .replace(index: index, previousKind: previousItem.kind, currentKind: updatedItem.kind) : .structural
         )
         lastActivityAt = Date()
         isDirty = true
@@ -2875,7 +2922,10 @@ final class AgentTabSession: ObservableObject {
         nextSequenceIndex = max(nextSequenceIndex, updatedItem.sequenceIndex + 1)
         reconcileIncrementalEphemeralPayload(previousItem: previousItem, updatedItem: updatedItem)
         updateToolCorrelationIndexes(previousItem: previousItem, updatedItem: updatedItem, at: index)
-        finishIncrementalSourceItemsMutation(.mutate(index: index, itemKind: updatedItem.kind))
+        finishIncrementalSourceItemsMutation(
+            previousItem.id == updatedItem.id
+                ? .mutate(index: index, itemKind: updatedItem.kind) : .structural
+        )
         lastActivityAt = Date()
         isDirty = true
     }
@@ -2929,7 +2979,8 @@ final class AgentTabSession: ObservableObject {
         reconcileIncrementalEphemeralPayload(previousItem: previousItem, updatedItem: updatedItem)
         updateToolCorrelationIndexes(previousItem: previousItem, updatedItem: updatedItem, at: index)
         finishIncrementalSourceItemsMutation(
-            .replace(index: index, previousKind: previousItem.kind, currentKind: updatedItem.kind)
+            previousItem.id == updatedItem.id
+                ? .replace(index: index, previousKind: previousItem.kind, currentKind: updatedItem.kind) : .structural
         )
         lastActivityAt = Date()
         isDirty = true

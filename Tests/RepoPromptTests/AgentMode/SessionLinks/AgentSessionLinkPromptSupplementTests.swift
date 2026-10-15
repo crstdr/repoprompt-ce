@@ -4578,3 +4578,64 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
         XCTAssertNotNil(reissued.claim)
     }
 }
+
+extension AgentSessionLinkPromptClaimStoreTests {
+    func testRoutineBooleanIsDefaultFalseAndPartOfRenderClaimAndReuseIdentityWithoutCopy() throws {
+        let live = inventory(revision: 1, targetCount: 1)
+        let batch = passiveSnapshot(linkSetRevision: 1, targetIDs: [grantedTargetID(0)])
+        for provider in [AgentSessionLinkPromptProviderContext.codexExec, .claudeCode, .devin, .unselected] {
+            let store = AgentSessionLinkOutboundPromptClaimStore()
+            let epoch = AgentSessionLinkPromptEpoch(endpoint: endpoint, allowsSupplement: true, providerContext: provider)
+            let dispatch = AgentSessionLinkPromptDispatchID.autoWake(wakeID: UUID())
+            var renderedBits: [Bool] = []
+            let render: (AgentSessionLinkPromptRenderRequest) -> AgentSessionLinkPromptRenderResult = {
+                renderedBits.append($0.routineQuietCheckIn)
+                return self.render($0)
+            }
+            let ordinary = try XCTUnwrap(store.claim(dispatchID: dispatch, epoch: epoch, inventory: live, passiveNotices: batch, render: render))
+            XCTAssertFalse(ordinary.routineQuietCheckIn)
+            let routine = try XCTUnwrap(store.claim(dispatchID: dispatch, epoch: epoch, inventory: live, passiveNotices: batch, routineQuietCheckIn: true, render: render))
+            let supports = provider == .codexExec || provider == .claudeCode
+            XCTAssertEqual(routine.routineQuietCheckIn, supports)
+            XCTAssertEqual(routine.fragment, ordinary.fragment, "sentence emission remains off in C3")
+            XCTAssertEqual(renderedBits, supports ? [false, true] : [false])
+            XCTAssertEqual(Set([ordinary, routine]).count, supports ? 2 : 1)
+            let retry = store.claim(dispatchID: dispatch, epoch: epoch, inventory: live, passiveNotices: batch, routineQuietCheckIn: true, render: render)
+            XCTAssertEqual(retry, routine)
+            XCTAssertEqual(renderedBits.count, supports ? 2 : 1)
+            let natural = try XCTUnwrap(store.claim(dispatchID: .codexNativeSend(UUID()), epoch: epoch, inventory: live, passiveNotices: batch, routineQuietCheckIn: true, render: render))
+            XCTAssertFalse(natural.routineQuietCheckIn, "ordinary dispatch family cannot qualify")
+        }
+    }
+
+    func testActuallyRenderedAttentionDisqualifiesWhileOmittedAttentionDoesNot() throws {
+        let live = inventory(revision: 1, targetCount: 1)
+        let queueEpoch = UUID()
+        let attention = attentionRequest(targetSessionID: grantedTargetID(0), reference: grantedReference(0), queueEpoch: queueEpoch)
+        let batch = passiveSnapshot(linkSetRevision: 1, queueEpoch: queueEpoch, targetIDs: [grantedTargetID(0)], attentionRequests: [attention])
+        let epoch = AgentSessionLinkPromptEpoch(endpoint: endpoint, allowsSupplement: true, providerContext: .claudeCode)
+        for includesAttention in [true, false] {
+            let store = AgentSessionLinkOutboundPromptClaimStore()
+            let claim = try XCTUnwrap(store.claim(dispatchID: .autoWake(wakeID: UUID()), epoch: epoch, inventory: live, passiveNotices: batch, routineQuietCheckIn: true) { request in
+                guard !includesAttention, let offered = request.passiveNotices else { return self.render(request) }
+                // Simulate a renderer choosing only the status subset. Render those actual bytes,
+                // rather than falsely removing attention from the receipt while leaving it in copy.
+                let subset = AgentSessionLinkPassiveStatusNotices.Snapshot(
+                    observerEndpoint: offered.observerEndpoint, queueEpoch: offered.queueEpoch,
+                    queueRevision: offered.queueRevision, linkSetRevision: offered.linkSetRevision,
+                    isEnabled: offered.isEnabled, isDeliverable: offered.isDeliverable,
+                    entries: offered.entries, attentionRequests: [],
+                    unacknowledgedOverflowCount: offered.unacknowledgedOverflowCount,
+                    overflowProduced: offered.overflowProduced
+                )
+                return self.render(.init(
+                    membershipKind: request.membershipKind, inventory: request.inventory,
+                    passiveNotices: subset, toolReference: request.toolReference,
+                    laneGuidanceMode: request.laneGuidanceMode, routineQuietCheckIn: request.routineQuietCheckIn
+                ))
+            })
+            XCTAssertEqual(claim.routineQuietCheckIn, !includesAttention)
+            XCTAssertEqual(claim.passive?.receipt.deliveredAttentionOccurrences.isEmpty, !includesAttention)
+        }
+    }
+}

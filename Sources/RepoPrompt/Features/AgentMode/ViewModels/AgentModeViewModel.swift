@@ -14591,9 +14591,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             isColdLoad: reason == .coldLoad,
             trustedIncrementalFinalTurnStartSequenceIndex: trustedIncrementalFinalTurnStartSequenceIndex
         )
+        let fullDetailTurnEnvelopeChanged = AgentTranscriptIO.fullDetailTurnEnvelopeChanged(
+            from: existingTranscript,
+            to: builtPresentation.transcript
+        )
         applyBuiltTranscriptPresentation(
             builtPresentation,
             sourceItems: workingItemsSnapshot,
+            reconcilesQuietSourceRetirement: pendingMutationSummary?.containsStructuralMutation != false
+                || fullDetailTurnEnvelopeChanged || builtPresentation.sanitizedActivityCount > 0,
             to: session
         )
         let hasCompactedTranscriptPrefix = builtPresentation.transcript.turns.contains { $0.retentionTier != .full }
@@ -14602,10 +14608,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let containsExcludedLegacyItems = AgentTranscriptIO.containsExcludedLegacyItems(
             workingItemsSnapshot,
             policy: importPolicy
-        )
-        let fullDetailTurnEnvelopeChanged = AgentTranscriptIO.fullDetailTurnEnvelopeChanged(
-            from: existingTranscript,
-            to: builtPresentation.transcript
         )
         let shouldReconcileWorkingItems: Bool = {
             guard session.items == workingItemsSnapshot,
@@ -15411,6 +15413,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private func applyBuiltTranscriptPresentation(
         _ presentation: BuiltTranscriptPresentation,
         sourceItems: [AgentChatItem]? = nil,
+        reconcilesQuietSourceRetirement: Bool = true,
         to session: TabSession
     ) {
         if let sourceItems, sourceItems != session.items {
@@ -15420,6 +15423,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             session.compactSummaryOnlyToolResultsAndAlignEphemeralPayloadMap()
             return
         }
+        let previousQuietSourceAnchors = reconcilesQuietSourceRetirement ? session.fullTranscriptProjection.rowAnchorIndex : [:]
         session.transcript = presentation.transcript
         session.baseTranscriptProjection = presentation.baseProjection
         session.fullTranscriptProjection = presentation.fullProjection
@@ -15427,6 +15431,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session.turnProjectionCaches = presentation.turnProjectionCaches
         session.archivedTranscriptSnapshot = presentation.archivedSnapshot
         session.transcriptProjection = materializedTranscriptProjection(for: session)
+        if reconcilesQuietSourceRetirement { session.reconcileQuietSourceIDs(previousAnchors: previousQuietSourceAnchors) }
         session.transcriptProjectionProtection = presentation.projectionProtection
         session.transcriptCanonicalVisibleRowCount = presentation.canonicalVisibleRowCount
         session.transcriptProjectionCounts = presentation.projectionCounts

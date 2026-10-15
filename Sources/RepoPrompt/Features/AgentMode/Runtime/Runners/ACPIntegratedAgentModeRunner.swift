@@ -692,6 +692,7 @@ final class ACPIntegratedAgentModeRunner {
         // render whatever membership is current when it dispatches.
         let oversightDispatch = AgentSessionLinkPromptDispatchID.acpActiveSteering(runAttemptID: runAttemptID)
         var monitoring: AgentModeRunService.AgentSessionLinkDecoratedAgentMessage?
+        defer { withExtendedLifetime(monitoring?.quietMarkerProducerLifetime) {} }
         let promptMessage: AgentMessage
         if carry.exactNote {
             promptMessage = agentMessage
@@ -1179,6 +1180,7 @@ final class ACPIntegratedAgentModeRunner {
         // refresh system text.
         let oversightDispatch = AgentSessionLinkPromptDispatchID.acpPromptTurn(runAttemptID: runAttemptID)
         var monitoring: AgentModeRunService.AgentSessionLinkDecoratedAgentMessage?
+        defer { withExtendedLifetime(monitoring?.quietMarkerProducerLifetime) {} }
         let promptMessage: AgentMessage
         if carry.exactNote {
             // The framed note is the whole provider input. Decoration would change those bytes.

@@ -187,7 +187,7 @@ final class AgentRunQuietLedgerTests: XCTestCase {
         XCTAssertTrue(fixture.ledger.end(owner: successor, authoritativeOwner: successor))
         let untracked = AgentRunOwnership(binding: fixture.owner.binding)
         XCTAssertTrue(fixture.ledger.end(owner: untracked, authoritativeOwner: untracked))
-        fixture.ledger.discardSourceProof()
+        fixture.ledger.discardSourceProof(isMaterialized: { _ in false })
         XCTAssertNil(fixture.ledger.facts)
     }
 
@@ -221,22 +221,57 @@ final class AgentRunQuietLedgerTests: XCTestCase {
     func testReloadLosesHidingButKeepsMonotonicFactsAndInvalidatesOpenRange() {
         var fixture = AgentQuietCheckInFixture()
         fixture.begin()
-        _ = fixture.seal(fixture.rows(["[ack]"]))
+        let rows = fixture.rows(["[ack]"])
+        _ = fixture.seal(rows)
         let settled = fixture.ledger.facts
-        fixture.ledger.discardSourceProof()
-        XCTAssertTrue(fixture.ledger.hiddenSourceIDs.isEmpty)
+        let materializedIDs = Set(rows.map(\.id))
+        fixture.ledger.discardSourceProof(isMaterialized: materializedIDs.contains)
+        XCTAssertEqual(fixture.ledger.hiddenSourceIDs, [fixture.wakeID])
         XCTAssertEqual(fixture.ledger.facts, settled)
         XCTAssertEqual(fixture.seal()?.facts, settled)
-        XCTAssertTrue(fixture.ledger.hiddenSourceIDs.isEmpty)
+        XCTAssertEqual(fixture.ledger.hiddenSourceIDs, [fixture.wakeID])
         let successor = AgentRunOwnership(binding: fixture.owner.binding)
         fixture.ledger.begin(owner: successor, startKey: 20, provider: .codexExec)
         fixture.ledger.markRoutineWake(owner: successor, wakeID: UUID())
-        fixture.ledger.discardSourceProof()
+        fixture.ledger.discardSourceProof(isMaterialized: { _ in false })
         let result = fixture.ledger.settle(
             owner: successor, terminalState: .completed, classifiesQuietCheckIn: true,
             endKey: 19, rangeIsComplete: true, rows: [AgentChatItem]()
         )
         XCTAssertEqual(result?.facts, AgentRunQuietFacts(settledThrough: 2, ordinaryThrough: 2))
         XCTAssertEqual(result?.isQuiet, false)
+    }
+}
+
+extension AgentRunQuietLedgerTests {
+    @MainActor
+    func testProducerCompletionBeforeAndAfterSealRetiresOnlyUnmaterializedMarker() {
+        for beforeSeal in [false, true] {
+            var fixture = AgentQuietCheckInFixture()
+            fixture.begin()
+            let rows = fixture.rows(["[ack]"])
+            if beforeSeal { fixture.ledger.retireUnmaterializedWake(fixture.wakeID) }
+            XCTAssertTrue(fixture.seal(rows)?.isQuiet == true)
+            if !beforeSeal { fixture.ledger.retireUnmaterializedWake(fixture.wakeID) }
+            XCTAssertEqual(fixture.ledger.hiddenSourceIDs, Set(rows.map(\.id)))
+        }
+        var materialized = AgentQuietCheckInFixture()
+        materialized.begin()
+        let marker = AgentChatItem.laneUpdateAutoWake(wakeID: materialized.wakeID, acceptedAt: Date(), sequenceIndex: 10)
+        XCTAssertTrue(materialized.ledger.registerHostMarker(marker))
+        XCTAssertTrue(materialized.seal([marker])?.isQuiet == true)
+        materialized.ledger.retireUnmaterializedWake(materialized.wakeID)
+        XCTAssertTrue(materialized.ledger.hiddenSourceIDs.contains(marker.id))
+    }
+
+    @MainActor
+    func testPriorOrdinaryPhysicalDispatchAndDistinctWakeCannotGainRoutineOrigin() {
+        for ordinary in [true, false] {
+            var fixture = AgentQuietCheckInFixture()
+            fixture.begin(routine: false)
+            fixture.ledger.recordPhysicalDispatch(owner: fixture.owner, wakeID: UUID(), routineQuietCheckIn: !ordinary, alreadyAcquired: false)
+            fixture.ledger.recordPhysicalDispatch(owner: fixture.owner, wakeID: fixture.wakeID, routineQuietCheckIn: true, alreadyAcquired: false)
+            XCTAssertFalse(fixture.seal()?.isQuiet == true)
+        }
     }
 }

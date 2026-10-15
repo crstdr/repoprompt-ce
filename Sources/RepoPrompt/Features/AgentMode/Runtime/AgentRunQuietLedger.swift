@@ -14,6 +14,29 @@ struct AgentRunQuietFacts: Equatable, Hashable {
     static let zero = AgentRunQuietFacts(settledThrough: 0, ordinaryThrough: 0)!
 }
 
+/// Shared only by the existing wake attempt and callback-capable producer wrappers. No claim/cache
+/// identity or dispatch authority: final ARC release merely schedules exact-source cleanup.
+/// The immutable payload and Swift's weak-reference storage can be released from any executor.
+final class AgentQuietMarkerProducerLifetime: @unchecked Sendable {
+    private let wakeID: UUID
+    private let binding: AgentSessionRestorationBindingToken
+    private weak var session: AgentTabSession?
+
+    @MainActor
+    init(wakeID: UUID, binding: AgentSessionRestorationBindingToken, session: AgentTabSession) {
+        self.wakeID = wakeID
+        self.binding = binding
+        self.session = session
+    }
+
+    deinit {
+        Task { @MainActor [weak session, binding, wakeID] in
+            guard let session, session.currentRestorationBindingToken == binding else { return }
+            session.quietLedger.retireUnmaterializedWake(wakeID)
+        }
+    }
+}
+
 /// Owned by one live source binding. The existing lifecycle facade remains the attempt authority;
 /// this value never looks up a session, repairs history, publishes, persists, or starts work.
 @MainActor
@@ -31,6 +54,7 @@ struct AgentRunQuietLedger {
         let provider: AgentSessionLinkPromptProviderContext
         let openingFacts: AgentRunQuietFacts?
         var routineWakeID: UUID?
+        var markerProducerFinished = false
         var hasOccurrence = false
         var rangeIsComplete = true
         var seal: Seal?
@@ -111,6 +135,20 @@ struct AgentRunQuietLedger {
         }
     }
 
+    /// The existing winning transport fence is the authority; no dispatch/owner journal is kept.
+    mutating func recordPhysicalDispatch(owner: AgentRunOwnership, wakeID: UUID, routineQuietCheckIn: Bool, alreadyAcquired: Bool) {
+        guard let current = attempt, current.owner == owner, current.seal == nil else { return }
+        if alreadyAcquired {
+            // Same-owner/same-wake reentry is idempotent. An acquired replay onto any other owner
+            // cannot borrow the prior owner's origin, even when its frozen claim still qualifies.
+            if current.routineWakeID != wakeID { noteOccurrence(owner: owner) }
+        } else if routineQuietCheckIn, AgentQuietCheckInClassifier.supports(current.provider) {
+            markRoutineWake(owner: owner, wakeID: wakeID)
+        } else {
+            noteOccurrence(owner: owner)
+        }
+    }
+
     mutating func noteOccurrence(owner: AgentRunOwnership) {
         guard isOpen(owner: owner) else { return }
         attempt?.hasOccurrence = true
@@ -152,6 +190,9 @@ struct AgentRunQuietLedger {
         {
             quiet = true
             hiddenSourceIDs.formUnion(hiddenIDs)
+            if current.markerProducerFinished, !hostMarkerIDs.contains(wakeID) {
+                hiddenSourceIDs.remove(wakeID)
+            }
         }
         advance(quiet: quiet)
         let seal = Seal(ownership: owner, isQuiet: quiet, facts: facts)
@@ -202,13 +243,25 @@ struct AgentRunQuietLedger {
 
     /// Producer settlement proves no admissible callback (including queued MainActor work) remains.
     mutating func retireUnmaterializedWake(_ wakeID: UUID) {
+        if attempt?.routineWakeID == wakeID { attempt?.markerProducerFinished = true }
         guard !hostMarkerIDs.contains(wakeID) else { return }
         hiddenSourceIDs.remove(wakeID)
     }
 
-    /// Reload lost verdict proof: rows reappear. A surviving binding must NOT reset its counters.
-    mutating func discardSourceProof() {
-        hiddenSourceIDs.removeAll()
+    /// Existing mutation owners supply indexed materialization/retention proof, not a history scan.
+    /// Never infer retirement for an unmaterialized wake from its absence in a source projection.
+    mutating func reconcileSourceIDs(wasMaterialized: (UUID) -> Bool, isRetained: (UUID) -> Bool) {
+        guard !hiddenSourceIDs.isEmpty || !hostMarkerIDs.isEmpty else { return }
+        hiddenSourceIDs = hiddenSourceIDs.filter { !wasMaterialized($0) || isRetained($0) }
+        hostMarkerIDs = hostMarkerIDs.filter { !wasMaterialized($0) || isRetained($0) }
+    }
+
+    /// Reload loses MATERIALIZED verdict proof; rows reappear. Still-admissible unmaterialized
+    /// marker exclusions remain in this same projection until their producer or binding retires.
+    /// A surviving binding must NOT reset its aggregate facts.
+    mutating func discardSourceProof(isMaterialized: (UUID) -> Bool) {
+        let registered = hostMarkerIDs
+        hiddenSourceIDs = hiddenSourceIDs.filter { !registered.contains($0) && !isMaterialized($0) }
         hostMarkerIDs.removeAll()
         if attempt?.seal == nil { attempt?.rangeIsComplete = false }
     }

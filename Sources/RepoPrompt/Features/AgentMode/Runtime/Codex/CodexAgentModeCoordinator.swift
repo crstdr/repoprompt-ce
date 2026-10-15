@@ -3625,6 +3625,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             session: session,
             dispatchID: promptDispatchID
         )
+        defer { withExtendedLifetime(monitoring?.quietMarkerProducerLifetime) {} }
         let requiredLaneUnavailable = monitoring?.mustAbortDispatch == true
             || (monitoring == nil && AgentModeViewModel.dispatchRequiresLaneBatch(session, promptDispatchID))
         guard !requiredLaneUnavailable else {
@@ -8138,6 +8139,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         // prepares only after that gate settles; steering prepares immediately. Both the initial
         // steer and its bounded expected-turn retry send the same rendered string.
         var monitoring: AgentSessionLinkDecoratedProviderText?
+        // All bounded retries retain the shared lifetime through their last possible acceptance.
+        // Auth replay only reattaches an acknowledged auto-wake claim; it never accepts it again.
+        defer { withExtendedLifetime(monitoring?.quietMarkerProducerLifetime) {} }
         var acquiredAgentSessionLinkPhysicalDispatch = false
         let prepareAgentSessionLinkPhysicalDispatch: () async -> NativeSendOutcome? = {
             if isSelfNote {
