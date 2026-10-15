@@ -107,6 +107,10 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
     /// carrying it here does not put it on the wire.
     public var laneUpdateDisplayAttribution: AgentLaneUpdateDisplayAttribution?
 
+    /// Typed recovery record for a `.system` notice row. Same retention rationale as the
+    /// fields above: the summary extraction reads it before the activity is trimmed.
+    public var recoveryDiagnostic: AgentTranscriptRecoveryDiagnostic?
+
     public init(
         id: UUID,
         timestamp: Date,
@@ -125,7 +129,8 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
         isSubstantiveAssistant: Bool = false,
         sealsAssistantBoundary: Bool = false,
         crossSessionAttribution: AgentCrossSessionAttribution? = nil,
-        laneUpdateDisplayAttribution: AgentLaneUpdateDisplayAttribution? = nil
+        laneUpdateDisplayAttribution: AgentLaneUpdateDisplayAttribution? = nil,
+        recoveryDiagnostic: AgentTranscriptRecoveryDiagnostic? = nil
     ) {
         self.id = id
         self.timestamp = timestamp
@@ -145,6 +150,7 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
         self.sealsAssistantBoundary = sealsAssistantBoundary
         self.crossSessionAttribution = crossSessionAttribution
         self.laneUpdateDisplayAttribution = laneUpdateDisplayAttribution?.validated
+        self.recoveryDiagnostic = recoveryDiagnostic
     }
 
     public init(from item: AgentChatItem, toolExecution: AgentTranscriptToolExecution? = nil, role: AgentTranscriptActivityRole? = nil, sealsAssistantBoundary: Bool = false) {
@@ -166,6 +172,10 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
         self.sealsAssistantBoundary = sealsAssistantBoundary
         crossSessionAttribution = item.crossSessionAttribution
         laneUpdateDisplayAttribution = item.laneUpdateDisplayAttribution?.validated
+        recoveryDiagnostic = item.recoveryDiagnostic
+        // The activity is the authoritative carrier once inside a turn: re-key the record
+        // to this activity so sequence rewrites at append time cannot desync it.
+        recoveryDiagnostic?.align(to: id, timestamp: timestamp, sequenceIndex: sequenceIndex)
     }
 
     public func toItem(text overrideText: String? = nil, isStreaming overrideStreaming: Bool? = nil) -> AgentChatItem {
@@ -190,7 +200,8 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
             crossSessionAttribution: crossSessionAttribution,
             // Synthesized decoding cannot reject a malformed nested value without failing the whole
             // activity, so the drop happens here instead.
-            laneUpdateDisplayAttribution: laneUpdateDisplayAttribution?.validated
+            laneUpdateDisplayAttribution: laneUpdateDisplayAttribution?.validated,
+            recoveryDiagnostic: recoveryDiagnostic
         )
     }
 
@@ -292,6 +303,115 @@ public struct AgentTranscriptRequestAnchor: Codable, Identifiable, Sendable, Equ
     }
 }
 
+/// A bounded, typed record of an automatic provider-thread recovery transition — e.g. Codex
+/// could not resume the previous thread and a fresh thread was started in its place.
+///
+/// Ordinary `.system` rows are dropped by retention demotion and cannot be rebuilt by
+/// compacted projections, so a recovery notice stored only as row text is non-durable.
+/// Carrying a payload-free diagnostic through the turn summary keeps the transition
+/// inspectable — in compacted projections, `get_log`, and history — after the row is gone.
+public struct AgentTranscriptRecoveryDiagnostic: Codable, Sendable, Equatable {
+    /// Upper bound for the retained display text. The live notice is a single sentence.
+    public static let maximumTextLength = 500
+    /// Upper bound for the machine-stable reason/outcome tokens.
+    public static let maximumTokenLength = 120
+    /// Upper bound for retained provider conversation identifiers.
+    public static let maximumIdentifierLength = 200
+    /// Upper bound for diagnostics carried by a single turn summary.
+    public static let maximumPerTurn = 4
+
+    /// Stable outcome token for "the previous thread could not be resumed and a fresh
+    /// thread was started in its place".
+    public static let freshThreadStartedOutcome = "freshThreadStarted"
+
+    /// Identity of the originating `.system` row. Compacted projections reuse it as the
+    /// rebuilt row's ID so dedup and `up_to_item_id` cutoff handling stay stable.
+    public var id: UUID
+    /// When the transition was recorded (mirrors the originating row).
+    public var timestamp: Date
+    /// Ordering of the originating row, so compacted projections re-seat the notice at
+    /// its original position.
+    public var sequenceIndex: Int
+    /// Machine-stable reason token (e.g. `resumeFrameTooLarge`), never a rendered sentence.
+    public var reason: String
+    /// Machine-stable outcome token (e.g. `freshThreadStarted`).
+    public var outcome: String
+    /// Provider conversation bound before the transition, if any.
+    public var previousConversationID: String?
+    /// Provider conversation bound after the transition, if any.
+    public var replacementConversationID: String?
+    /// The bounded display line the live row showed, retained verbatim.
+    public var text: String
+
+    public init(
+        id: UUID = UUID(),
+        timestamp: Date = Date(),
+        sequenceIndex: Int = 0,
+        reason: String,
+        outcome: String,
+        previousConversationID: String? = nil,
+        replacementConversationID: String? = nil,
+        text: String
+    ) {
+        self.id = id
+        self.timestamp = timestamp
+        self.sequenceIndex = sequenceIndex
+        self.reason = Self.clamped(reason, limit: Self.maximumTokenLength)
+        self.outcome = Self.clamped(outcome, limit: Self.maximumTokenLength)
+        self.previousConversationID = previousConversationID.map {
+            Self.clamped($0, limit: Self.maximumIdentifierLength)
+        }
+        self.replacementConversationID = replacementConversationID.map {
+            Self.clamped($0, limit: Self.maximumIdentifierLength)
+        }
+        self.text = Self.clamped(text, limit: Self.maximumTextLength)
+    }
+
+    /// Re-keys the record to the row that carries it. Every carrier boundary (item,
+    /// activity, compacted row) is authoritative for identity and ordering.
+    mutating func align(to rowID: UUID, timestamp: Date, sequenceIndex: Int) {
+        id = rowID
+        self.timestamp = timestamp
+        self.sequenceIndex = sequenceIndex
+    }
+
+    /// Dedupes by row identity and applies the per-turn cap. Used by every consumer of a
+    /// summary's diagnostic list so a malformed or over-cap persisted value self-heals at
+    /// read time. Identity (not content) is the dedupe key: two distinct rows may share
+    /// identical fields, and each row ID must stay resolvable for cutoff anchors.
+    static func normalizedList(
+        _ diagnostics: [AgentTranscriptRecoveryDiagnostic]?
+    ) -> [AgentTranscriptRecoveryDiagnostic] {
+        guard let diagnostics else { return [] }
+        var seenRowIDs = Set<UUID>()
+        var result: [AgentTranscriptRecoveryDiagnostic] = []
+        for diagnostic in diagnostics where seenRowIDs.insert(diagnostic.id).inserted {
+            result.append(diagnostic)
+            if result.count >= maximumPerTurn { break }
+        }
+        return result
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(
+            id: c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID(),
+            timestamp: c.decodeIfPresent(Date.self, forKey: .timestamp) ?? Date(),
+            sequenceIndex: c.decodeIfPresent(Int.self, forKey: .sequenceIndex) ?? 0,
+            reason: c.decodeIfPresent(String.self, forKey: .reason) ?? "",
+            outcome: c.decodeIfPresent(String.self, forKey: .outcome) ?? "",
+            previousConversationID: c.decodeIfPresent(String.self, forKey: .previousConversationID),
+            replacementConversationID: c.decodeIfPresent(String.self, forKey: .replacementConversationID),
+            text: c.decodeIfPresent(String.self, forKey: .text) ?? ""
+        )
+    }
+
+    private static func clamped(_ value: String, limit: Int) -> String {
+        guard value.count > limit else { return value }
+        return String(value.prefix(limit))
+    }
+}
+
 public struct AgentTranscriptTurnSummary: Codable, Sendable, Equatable {
     public var middleSummaryItemID: UUID
     public var requestText: String?
@@ -305,6 +425,10 @@ public struct AgentTranscriptTurnSummary: Codable, Sendable, Equatable {
     public var hadWarning: Bool
     public var hadError: Bool
     public var lastUserInteractionAt: Date?
+    /// Typed recovery transitions that occurred inside this turn, captured from the
+    /// activities before retention trimming so the notice remains renderable after the
+    /// `.system` row itself is gone.
+    public var recoveryDiagnostics: [AgentTranscriptRecoveryDiagnostic]?
 
     public init(
         middleSummaryItemID: UUID = UUID(),
@@ -318,7 +442,8 @@ public struct AgentTranscriptTurnSummary: Codable, Sendable, Equatable {
         compactedActivityCount: Int,
         hadWarning: Bool,
         hadError: Bool,
-        lastUserInteractionAt: Date? = nil
+        lastUserInteractionAt: Date? = nil,
+        recoveryDiagnostics: [AgentTranscriptRecoveryDiagnostic]? = nil
     ) {
         self.middleSummaryItemID = middleSummaryItemID
         self.requestText = requestText
@@ -332,6 +457,13 @@ public struct AgentTranscriptTurnSummary: Codable, Sendable, Equatable {
         self.hadWarning = hadWarning
         self.hadError = hadError
         self.lastUserInteractionAt = lastUserInteractionAt
+        self.recoveryDiagnostics = recoveryDiagnostics
+    }
+
+    /// Deduped (by row identity) and capped view of `recoveryDiagnostics`. Consumers use
+    /// this so a malformed or over-cap persisted summary self-heals at read time.
+    public var normalizedRecoveryDiagnostics: [AgentTranscriptRecoveryDiagnostic] {
+        AgentTranscriptRecoveryDiagnostic.normalizedList(recoveryDiagnostics)
     }
 }
 
