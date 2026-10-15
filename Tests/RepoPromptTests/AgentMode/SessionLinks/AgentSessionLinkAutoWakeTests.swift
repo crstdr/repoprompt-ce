@@ -5630,6 +5630,10 @@ extension AgentSessionLinkAutoWakeTests {
         XCTAssertTrue(fixture.session.endRunAttempt(ifCurrent: owner, source: "test.claude.sealed"))
         fixture.session.runState = .completed
         fixture.viewModel.clearChat(tabID: fixture.tabID)
+        weak var cohort = fixture.session.oversight.pendingAutoWake?.quietMarkerProducerLifetime
+        fixture.viewModel.agentSessionLinkRecordPhysicalDispatchFailure(for: fixture.session, dispatchID: claim.dispatchID)
+        XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+        XCTAssertNotNil(cohort, "only the suspended native local, not the retired reservation, owns this lifetime")
         let successor = fixture.session.beginRunAttempt(source: "test.claude.successor")
         XCTAssertTrue(fixture.session.quietLedger.hiddenSourceIDs.contains(wakeID))
         await gate.open()
@@ -5637,5 +5641,59 @@ extension AgentSessionLinkAutoWakeTests {
         XCTAssertTrue(fixture.session.liveItemIDs.contains(wakeID))
         XCTAssertTrue(fixture.session.quietLedger.hiddenSourceIDs.contains(wakeID))
         XCTAssertEqual(fixture.session.activeRunOwnership, successor)
+    }
+}
+
+extension AgentSessionLinkAutoWakeTests {
+    func testAnchoredQuietRowsRetireAtProjectionInstallAndCannotBecomePendingOnReload() throws {
+        let fixture = try makeFixture(fenceProviderLaunch: true)
+        fixture.session.selectedAgent = .codexExec
+        try publishInventory(fixture, revision: 1)
+        fixture.session.oversight.autoWakeOnUpdates = true
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+        let claim = try reserveQuietWake(fixture)
+        let owner = try beginAndAcquireQuietWake(fixture, claim: claim)
+        let producer = try XCTUnwrap(fixture.session.retainQuietMarkerProducer(for: claim))
+        defer { withExtendedLifetime(producer) {} }
+        let thinking = AgentChatItem.thinking("private reasoning", sequenceIndex: fixture.session.nextSequenceIndex)
+        fixture.session.appendItem(thinking)
+        let assistant = AgentChatItem.assistant("[ack]", sequenceIndex: fixture.session.nextSequenceIndex)
+        fixture.session.appendItem(assistant)
+        fixture.session.sealQuietCheckIn(owner: owner, terminalState: .completed, normal: true, hasSuccessor: false)
+        XCTAssertTrue(fixture.session.endRunAttempt(ifCurrent: owner, source: "test.rows.sealed"))
+        fixture.session.runState = .completed
+        let wakeID = try XCTUnwrap(claim.dispatchID.autoWakeID)
+        let rows = [thinking, assistant]
+        fixture.viewModel.refreshDerivedTranscriptState(for: fixture.session, publishActivePresentation: false)
+        for row in rows {
+            XCTAssertTrue(fixture.session.quietLedger.hiddenSourceIDs.contains(row.id))
+            XCTAssertNotNil(fixture.session.fullTranscriptProjection.rowAnchorIndex[row.id])
+        }
+        _ = fixture.session.removeItem(at: 1)
+        _ = fixture.session.removeItem(at: 0)
+        fixture.viewModel.refreshDerivedTranscriptState(for: fixture.session, publishActivePresentation: false)
+        for row in rows {
+            XCTAssertEqual(
+                fixture.session.quietLedger.hiddenSourceIDs.contains(row.id),
+                fixture.session.fullTranscriptProjection.rowAnchorIndex[row.id] != nil,
+                "incremental removal may still retain a canonical prefix anchor; only actual retirement prunes it"
+            )
+        }
+        // Retire any canonical prefix anchors through their actual cache owner, then install the
+        // empty presentation before hydration. Neither retired assistant nor thinking may become pending.
+        fixture.session.clearDerivedTranscriptCaches()
+        fixture.viewModel.refreshDerivedTranscriptState(for: fixture.session, publishActivePresentation: false)
+        for row in rows {
+            XCTAssertNil(fixture.session.fullTranscriptProjection.rowAnchorIndex[row.id])
+            XCTAssertFalse(fixture.session.quietLedger.hiddenSourceIDs.contains(row.id))
+        }
+        XCTAssertTrue(fixture.session.quietLedger.hiddenSourceIDs.contains(wakeID))
+        fixture.session.setItemsSilently(rows, reason: .persistedSessionHydration)
+        fixture.viewModel.refreshDerivedTranscriptState(for: fixture.session, publishActivePresentation: false)
+        for row in rows {
+            XCTAssertFalse(fixture.session.quietLedger.hiddenSourceIDs.contains(row.id), "rehydrated assistant/thinking cannot masquerade as pending markers")
+        }
+        XCTAssertTrue(fixture.session.quietLedger.hiddenSourceIDs.contains(wakeID), "a genuinely capable unmaterialized marker stays pending")
+        XCTAssertEqual(fixture.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: 0))
     }
 }

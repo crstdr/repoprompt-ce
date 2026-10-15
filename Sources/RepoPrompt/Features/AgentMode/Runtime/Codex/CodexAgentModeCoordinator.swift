@@ -6034,6 +6034,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     replayTurn.text
                 }
             }
+            // Ordinary auth replay may compose against an existing dispatching wake. Its local
+            // wrapper must retain that cohort through acceptance just like the native send path.
+            defer { withExtendedLifetime(monitoring?.quietMarkerProducerLifetime) {} }
             let acquiredPhysicalDispatch = viewModel?.agentSessionLinkAcquirePhysicalDispatch(
                 for: session,
                 dispatchID: replayDispatchID

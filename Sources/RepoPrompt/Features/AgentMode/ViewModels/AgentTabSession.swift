@@ -2030,7 +2030,7 @@ final class AgentTabSession: ObservableObject {
     /// Share the same lifetime with every actual old-marker producer, including ordinary new-owner
     /// native reentry. Claim-cache entries and acknowledged auth replay do not retain it.
     func retainQuietMarkerProducer(for claim: AgentSessionLinkOutboundPromptClaim?) -> AgentQuietMarkerProducerLifetime? {
-        guard let claim, claim.routineQuietCheckIn, let wakeID = claim.dispatchID.autoWakeID,
+        guard let claim, let wakeID = claim.dispatchID.autoWakeID,
               let binding = currentRestorationBindingToken,
               var attempt = oversight.pendingAutoWake, attempt.wakeID == wakeID,
               let endpoint = claim.passive?.observerEndpoint, attempt.observerEndpoint == endpoint,
@@ -2038,7 +2038,11 @@ final class AgentTabSession: ObservableObject {
               endpoint.persistentBindingGeneration == persistentSessionBindingIdentity?.generation,
               endpoint.bindingTransitionGeneration == bindingTransitionGeneration
         else { return nil }
+        // Callback membership belongs to the already-quiet wake, not a later claim's qualification.
+        // Attention or claim-cache loss may make this producer ordinary while it can still accept
+        // the old wake's marker. Only creating a new cohort requires routine qualification.
         if let lifetime = attempt.quietMarkerProducerLifetime { return lifetime }
+        guard claim.routineQuietCheckIn else { return nil }
         let lifetime = AgentQuietMarkerProducerLifetime(wakeID: wakeID, binding: binding, session: self)
         attempt.quietMarkerProducerLifetime = lifetime
         oversight.pendingAutoWake = attempt
