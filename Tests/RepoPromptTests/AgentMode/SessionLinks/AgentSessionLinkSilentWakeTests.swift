@@ -48,7 +48,11 @@ extension AgentSessionLinkRuntimeBridgeTests {
         try await assertDelayedClaudeAbandonment(successorRefuses: false, nonFlushSend: true)
     }
 
-    private func assertDelayedClaudeAbandonment(successorRefuses: Bool, successorUncertain: Bool = false, nonFlushSend: Bool = false) async throws {
+    func testNativeClaudeLaterAcceptedCompletionOutlivesEarlierUncertainty() async throws {
+        try await assertDelayedClaudeAbandonment(successorRefuses: false, successorUncertain: true, laterAcceptedCompletion: true)
+    }
+
+    private func assertDelayedClaudeAbandonment(successorRefuses: Bool, successorUncertain: Bool = false, nonFlushSend: Bool = false, laterAcceptedCompletion: Bool = false) async throws {
         let fixture = try await makeNativeWakeFixture(agent: .claudeCode)
         let session = fixture.session
         let runnerGate = TestReleaseFence(name: "runner held before abandonment")
@@ -121,6 +125,25 @@ extension AgentSessionLinkRuntimeBridgeTests {
             try await AsyncTestWait.waitUntil("quiescent notification consumed") { sentinel || !session.runState.isActive }
             XCTAssertEqual(session.runState, .running, "An older no-write cannot prove a later send was unwritten")
             XCTAssertNil(session.lastTerminalCommitRevision)
+            if laterAcceptedCompletion {
+                await fixture.claude.setFailSendAfterRecord(false)
+                XCTAssertEqual(fixture.vm.submitUserTurn(text: "Later accepted turn", tabID: fixture.tabID), .submitted)
+                try await AsyncTestWait.waitUntil("later turn accepted") { !session.claudeExpectedTurnIDs.isEmpty && session.claudeSteeringFlushTask == nil }
+                let laterTurn = try XCTUnwrap(session.claudeExpectedTurnIDs.first)
+                let refused = TestReleaseFence(name: "later definitive refusal")
+                defer { refused.release() }
+                await fixture.claude.setSteeringConfigurationGate(refused, fail: true)
+                XCTAssertEqual(fixture.vm.submitUserTurn(text: "Later refused steer", tabID: fixture.tabID), .submitted)
+                let entered = await refused.waitUntilEntered(timeout: 3)
+                XCTAssertTrue(entered)
+                await fixture.claude.emit(.turnCompleted(turnID: laterTurn, status: .completed))
+                try await AsyncTestWait.waitUntil("later authoritative terminal consumed") { session.claudeExpectedTurnIDs.isEmpty }
+                refused.release()
+                do {
+                    try await AsyncTestWait.waitUntil("later known completion commits", timeout: 2) { !session.runState.isActive }
+                } catch { XCTFail("Earlier uncertainty stranded a later authoritative completion") }
+                XCTAssertEqual(session.lastTerminalCommitRevision?.terminalState, .completed)
+            }
             return
         }
         if successorRefuses {
@@ -212,6 +235,52 @@ extension AgentSessionLinkRuntimeBridgeTests {
             XCTAssertEqual(count, 1)
             await fixture.vm.test_claudeCoordinator.shutdownClaudeSession(session)
         }
+    }
+
+    func testNativeClaudeCancelledOldMCPWaitCannotRestoreReplacementQueue() async throws {
+        var releaseOld: CheckedContinuation<Void, Never>?
+        let newWait = TestReleaseFence(name: "replacement MCP wait")
+        var calls = 0
+        let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() }, awaitNoActiveMCPTools: { _ in
+            calls += 1
+            if calls == 1 {
+                // Model an asynchronous dependency that acknowledges cancellation late.
+                await withCheckedContinuation { releaseOld = $0 }
+            } else { await newWait.enterAndWait() }
+            throw CancellationError()
+        })
+        let session = harness.host.session(for: UUID())
+        session.selectedAgent = .claudeCode
+        session.hasLoadedPersistedState = true
+        session.installRunID(UUID())
+        session.runState = .running
+        let oldOwner = session.beginRunAttempt(source: "test.old-flush")
+        func instruction(_ text: String, owner: AgentRunOwnership) -> AgentTabSession.ClaudeSteeringInstruction {
+            .init(id: UUID(), targetRunID: session.runID, targetRunAttemptID: owner.attemptID, providerText: text, attachments: [], taggedFileAttachments: [], draftText: text, optimisticUserItemID: nil, createdAt: Date())
+        }
+        defer { releaseOld?.resume()
+            newWait.release()
+            session.claudeSteeringFlushTask?.cancel()
+        }
+        session.pendingClaudeSteeringInstructions = [instruction("Old unsent", owner: oldOwner)]
+        _ = await harness.service.submitQueuedClaudeSteeringIfSupported(session: session)
+        try await AsyncTestWait.waitUntil("old MCP wait entered") { releaseOld != nil }
+        let oldTask = try XCTUnwrap(session.claudeSteeringFlushTask)
+        harness.service.withdrawQueuedWorkForManagedStop(tabID: session.tabID, session: session)
+        _ = session.endRunAttempt(ifCurrent: oldOwner, source: "test.replaced")
+        let newOwner = session.beginRunAttempt(source: "test.new-flush")
+        let replacement = instruction("Replacement unsent", owner: newOwner)
+        session.pendingClaudeSteeringInstructions = [replacement]
+        _ = await harness.service.submitQueuedClaudeSteeringIfSupported(session: session)
+        let newEntered = await newWait.waitUntilEntered(timeout: 3)
+        XCTAssertTrue(newEntered)
+        let newFlush = try XCTUnwrap(session.claudeSteeringFlushID)
+        releaseOld?.resume()
+        releaseOld = nil
+        await oldTask.value
+        XCTAssertEqual(session.pendingClaudeSteeringInstructions.map(\.id), [replacement.id], "Old cancelled wait cannot remove a replacement attempt's draft")
+        XCTAssertEqual(session.claudeSteeringFlushID, newFlush)
+        XCTAssertNotNil(session.claudeSteeringFlushTask)
     }
 
     func testNativeClaudeFailedUnsentSteerSettlesConsumedCompletionAndAdmitsWake() async throws {

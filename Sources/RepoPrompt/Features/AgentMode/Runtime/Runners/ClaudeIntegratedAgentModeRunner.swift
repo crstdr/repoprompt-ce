@@ -403,7 +403,8 @@ final class ClaudeIntegratedAgentModeRunner {
         }
         let subscribedController = session.claudeController
         var probePending = false
-        var uncertainSuccessorWrite = false
+        var uncertainTerminalIDs: Set<UUID> = []
+        var protectedTerminal: (turnID: UUID, status: NativeAgentRuntimeTurnStatus)?
         var settlementRecheck: Task<Void, Never>?
         session.claudeSteeringAbandonment = (runAttemptID, { ids in
             inbox.continuation.yield(.steeringAbandoned(ids))
@@ -412,7 +413,10 @@ final class ClaudeIntegratedAgentModeRunner {
             probePending = true
             inbox.continuation.yield(.staleActiveProbe)
         }, {
-            uncertainSuccessorWrite = true
+            // Only outcomes already outstanding at this write boundary are superseded.
+            // A later accepted turn can establish its own authoritative completion.
+            uncertainTerminalIDs.formUnion(session.claudeExpectedTurnIDs)
+            if let terminal = protectedTerminal { uncertainTerminalIDs.insert(terminal.turnID) }
         })
         defer {
             forwarding.cancel()
@@ -422,7 +426,6 @@ final class ClaudeIntegratedAgentModeRunner {
                 session.claudeSteeringAbandonment = nil
             }
         }
-        var protectedTerminal: (turnID: UUID, status: NativeAgentRuntimeTurnStatus)?
         var abandonedProtectedTurns: Set<UUID> = []
         eventLoop: for await input in inbox.stream {
             guard session.runID == runID,
@@ -456,7 +459,7 @@ final class ClaudeIntegratedAgentModeRunner {
                       session.claudeController.map(ObjectIdentifier.init) == ObjectIdentifier(controller),
                       Self.staleActiveRecoveryFencesAreClear(session: session, coordinator: claudeCoordinator, ownership: ownership, runID: runID)
                 else { continue eventLoop }
-                if !uncertainSuccessorWrite, let terminal = protectedTerminal,
+                if let terminal = protectedTerminal, !uncertainTerminalIDs.contains(terminal.turnID),
                    abandonedProtectedTurns.contains(terminal.turnID)
                 {
                     return Self.terminalOutcome(terminal.status)
@@ -470,7 +473,7 @@ final class ClaudeIntegratedAgentModeRunner {
                 if let terminal = protectedTerminal, ids.contains(terminal.turnID) {
                     abandonedProtectedTurns.insert(terminal.turnID)
                 }
-                if !uncertainSuccessorWrite, let terminal = protectedTerminal,
+                if let terminal = protectedTerminal, !uncertainTerminalIDs.contains(terminal.turnID),
                    abandonedProtectedTurns.contains(terminal.turnID), settlementRecheck == nil,
                    claudeCoordinator.hasNativeSendOrToolWork(session: session, runID: runID)
                 {
@@ -487,7 +490,7 @@ final class ClaudeIntegratedAgentModeRunner {
                         inbox.continuation.yield(.steeringAbandoned([]))
                     }
                 }
-                if !uncertainSuccessorWrite, let terminal = protectedTerminal, abandonedProtectedTurns.contains(terminal.turnID),
+                if let terminal = protectedTerminal, !uncertainTerminalIDs.contains(terminal.turnID), abandonedProtectedTurns.contains(terminal.turnID),
                    !Task.isCancelled,
                    let ownership = session.activeRunOwnership,
                    claudeCoordinator.runAttemptIsCurrent(ownership, runID: runID, for: session),

@@ -1100,8 +1100,16 @@ final class AgentModeRunService {
                     steeringDebugLog("[AgentRunSteeringWake] Claude flush MCP idle returned tab=\(tabID) runID=\(runID) attempt=\(runAttemptID) queue=\(session.pendingClaudeSteeringInstructions.count)")
                 } catch {
                     steeringDebugLog("[AgentRunSteeringWake] Claude flush MCP idle cancelled tab=\(tabID) runID=\(runID) attempt=\(runAttemptID) error=\(error)")
-                    // Task cancelled (user cancelled the run) — restore all remaining drafts.
-                    restoreAllQueuedClaudeSteeringDrafts(tabID: tabID, session: session, strategy: .prependAlways)
+                    // Stop withdraws the old queue synchronously; a late cancelled waiter
+                    // must not restore or remove a replacement flush's instructions.
+                    guard session.claudeSteeringFlushID == flushID,
+                          isCurrentClaudeSteeringAttempt(session: session, runID: runID, runAttemptID: runAttemptID)
+                    else { return }
+                    restoreQueuedClaudeSteeringDrafts(
+                        tabID: tabID, session: session, strategy: .prependAlways,
+                        definitiveNoWrite: !Task.isCancelled,
+                        matching: { $0.targetRunID == runID && $0.targetRunAttemptID == runAttemptID }
+                    )
                     return
                 }
 
