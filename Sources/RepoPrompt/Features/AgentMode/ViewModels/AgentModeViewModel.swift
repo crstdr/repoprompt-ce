@@ -95,6 +95,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     @Published private(set) var activeTranscriptPresentation: AgentTranscriptPresentationSnapshot = .empty {
         didSet {
+            // Hydration/performance can change without a revision, including during batched sync.
+            if let tabID = activeTranscriptPresentation.tabID {
+                sessions[tabID]?.quietTranscriptDisplayCache = nil
+            }
             guard !isActiveUISyncSuppressed else { return }
             syncTranscriptUIState()
         }

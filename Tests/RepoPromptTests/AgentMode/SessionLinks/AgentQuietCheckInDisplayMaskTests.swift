@@ -245,6 +245,112 @@ final class AgentQuietCheckInDisplayMaskTests: XCTestCase {
         return (harness, manager, session)
     }
 
+    func testSameRevisionHydrationRefreshesMaskedAndEmptyDisplayAndRestoreSignalWithoutGetterWork() async throws {
+        for hasMask in [false, true] {
+            let (h, manager, session) = try liveFixture()
+            defer { withExtendedLifetime(manager) {} }
+            let ordinary = AgentChatItem.assistant("ordinary context")
+            session.appendItem(ordinary)
+            var quietRowID: UUID?
+            if hasMask {
+                session.runState = .running
+                let owner = session.beginRunAttempt(source: "quiet-display-hydration")
+                session.quietLedger.markRoutineWake(owner: owner, wakeID: UUID())
+                let ack = AgentChatItem.assistant("[ack]")
+                quietRowID = ack.id
+                session.appendItem(ack)
+                let revision = await AgentRunTerminalCommitBarrier().commit(.init(
+                    binding: h.hooks.bindTerminalSession(session), ownership: owner, expectedRunID: session.runID,
+                    terminalState: .completed, source: "quiet-display-hydration", attachmentDisposition: .deleteFiles,
+                    finalizeNonCodexUsage: false, supportsFollowUp: false, notifyTurnComplete: false, classifiesQuietCheckIn: true
+                ))
+                XCTAssertNotNil(revision)
+                XCTAssertTrue(session.quietLedger.hiddenSourceIDs.contains(ack.id))
+            }
+            session.clearCurrentBindingHydration()
+            h.host.refreshDerivedTranscriptState(for: session, publishActivePresentation: false)
+            _ = h.host.test_publishTranscriptPresentation(tabID: session.tabID)
+            h.host.syncTranscriptUIState()
+            let before = h.host.ui.transcript.snapshot
+            let warm = try XCTUnwrap(session.quietTranscriptDisplayCache)
+            XCTAssertFalse(before.isHydrated)
+            XCTAssertFalse(warm.result.presentation.bindingsHydrated)
+            XCTAssertNil(warm.result.presentation.hydratedPersistentBinding)
+            XCTAssertNil(warm.result.presentation.hydratedBindingTransitionGeneration)
+            let hidden = session.quietLedger.hiddenSourceIDs
+            XCTAssertEqual(hidden.isEmpty, !hasMask)
+            let baseRevision = h.host.activeTranscriptPresentation.revision
+            let maskRevision = session.quietLedger.displayMaskRevision
+
+            // The only transition is the existing hydration setter: no presentation republish.
+            h.host.test_setActiveSessionBindingsAreHydrated(true)
+            let after = h.host.ui.transcript.snapshot
+            XCTAssertTrue(after.isHydrated)
+            XCTAssertEqual(after.presentationRevision, baseRevision)
+            XCTAssertEqual(after.displayMaskRevision, maskRevision)
+            XCTAssertTrue(after.presentation.bindingsHydrated, "mask=\(hasMask): cache must expose hydration at the same revision")
+            XCTAssertEqual(after.presentation.hydratedPersistentBinding, session.authoritativeHydratedBinding)
+            XCTAssertEqual(after.presentation.hydratedBindingTransitionGeneration, session.authoritativeHydratedBindingTransitionGeneration)
+            XCTAssertEqual(session.quietLedger.hiddenSourceIDs, hidden)
+            XCTAssertTrue(after.presentation.visibleRows.contains(where: { $0.id == ordinary.id }))
+            if let quietRowID {
+                XCTAssertFalse(after.presentation.visibleRows.contains(where: { $0.id == quietRowID }))
+                XCTAssertTrue(session.items.contains(where: { $0.id == quietRowID }))
+            }
+            func restoreSignal(_ snapshot: AgentTranscriptUISnapshot) -> AgentTranscriptRestoreSignal {
+                .init(
+                    tabID: snapshot.presentation.tabID,
+                    bindingsHydrated: snapshot.presentation.bindingsHydrated,
+                    presentationRevision: snapshot.presentation.revision
+                )
+            }
+            XCTAssertEqual(AgentTranscriptActivationRepaintRemountPolicy.remountKey(
+                oldSignal: restoreSignal(before), newSignal: restoreSignal(after), currentTabID: session.tabID,
+                rehydratePhase: .awaitingHydration(tabID: session.tabID, target: .liveBottom),
+                lastRemountKey: nil, remountCount: 0, layoutPassToken: 42
+            ), .init(tabID: session.tabID, presentationRevision: baseRevision, layoutPassToken: 42))
+            let hydrated = try XCTUnwrap(session.quietTranscriptDisplayCache)
+            XCTAssertEqual(hydrated.key, warm.key, "no new key state/revision is needed")
+            var publications = 0
+            let updates = h.host.ui.transcript.$snapshot.dropFirst().sink { _ in publications += 1 }
+            for _ in 0 ..< 100 {
+                _ = h.host.makeTranscriptUISnapshot()
+                h.host.syncTranscriptUIState()
+                hydrated.result.presentation.visibleBlocks.withUnsafeBufferPointer { old in
+                    session.quietTranscriptDisplayCache?.result.presentation.visibleBlocks.withUnsafeBufferPointer { current in
+                        XCTAssertEqual(old.baseAddress, current.baseAddress)
+                    }
+                }
+            }
+            XCTAssertEqual(publications, 0, "unchanged sync/getters reuse without publication")
+            updates.cancel()
+
+            // Real binding application suppresses intermediate UI sync. Its performance-only
+            // assignment keeps the same revision, but must invalidate BEFORE the suppression guard.
+            session.transcriptPerformanceSnapshot.projectionPublishCount += 1
+            session.transcriptAutoFollowArmingState = h.host.activeTranscriptFollowBindingState.armingState == .armed
+                ? .disarmedAfterManualDetach : .armed
+            var observedSuppressedPublication = false
+            let follow = h.host.$activeTranscriptFollowBindingState.dropFirst().sink { _ in
+                observedSuppressedPublication = true
+                XCTAssertTrue(h.host.isRestoringState, "observation is inside real suppressed binding application")
+                XCTAssertNil(session.quietTranscriptDisplayCache, "presentation assignment invalidates even while UI sync is suppressed")
+            }
+            h.host.applySessionToBindings(session)
+            follow.cancel()
+            XCTAssertTrue(observedSuppressedPublication)
+            XCTAssertEqual(h.host.activeTranscriptPresentation.revision, baseRevision)
+            XCTAssertEqual(session.quietLedger.displayMaskRevision, maskRevision)
+            let final = try XCTUnwrap(session.quietTranscriptDisplayCache)
+            XCTAssertEqual(final.key, hydrated.key)
+            XCTAssertEqual(final.result.presentation.performanceSnapshot, h.host.activeTranscriptPresentation.performanceSnapshot)
+            XCTAssertTrue(final.result.presentation.bindingsHydrated)
+            XCTAssertEqual(session.quietLedger.hiddenSourceIDs, hidden)
+            if let quietRowID { XCTAssertFalse(final.result.presentation.visibleRows.contains(where: { $0.id == quietRowID })) }
+            print("QUIET_A3_HYDRATION mask=\(hasMask) sameBaseRevision=true sameMaskRevision=true getterSyncIterations=100 unchangedPublications=\(publications) suppressedPublicationObserved=\(observedSuppressedPublication) blockVisits=\(final.result.blockVisits) rowVisits=\(final.result.rowVisits) anchorVisits=\(final.result.anchorVisits)")
+        }
+    }
+
     func testRealBarrierDefersDisplayBuildThenPublishesMaskRevisionAndReusesCacheWithoutGetterWork() async throws {
         let (h, manager, session) = try liveFixture()
         defer { withExtendedLifetime(manager) {} }
@@ -451,6 +557,9 @@ final class AgentQuietCheckInDisplayMaskTests: XCTestCase {
         _ = h.host.test_publishTranscriptPresentation(tabID: session.tabID)
         h.host.syncTranscriptUIState()
         var sealMS: [Double] = [], ownerMS: [Double] = [], hitMS: [Double] = []
+        var measuredCacheBuilds = 0
+        var workTotals = (blocks: 0, rows: 0, anchors: 0)
+        var workMax = (blocks: 0, rows: 0, anchors: 0)
         func ms(_ duration: Duration) -> Double {
             Double(duration.components.seconds) * 1000 + Double(duration.components.attoseconds) / 1e15
         }
@@ -468,6 +577,13 @@ final class AgentQuietCheckInDisplayMaskTests: XCTestCase {
             ownerMS.append(ms(syncStart.duration(to: .now)))
             let cache = try XCTUnwrap(session.quietTranscriptDisplayCache)
             XCTAssertFalse(cache.result.archivedBlocks.isEmpty, "Separate archived materialization is part of the owning UI measurement")
+            measuredCacheBuilds += 1
+            workTotals.blocks += cache.result.blockVisits
+            workTotals.rows += cache.result.rowVisits
+            workTotals.anchors += cache.result.anchorVisits
+            workMax.blocks = max(workMax.blocks, cache.result.blockVisits)
+            workMax.rows = max(workMax.rows, cache.result.rowVisits)
+            workMax.anchors = max(workMax.anchors, cache.result.anchorVisits)
             let hitStart = ContinuousClock.now
             for _ in 0 ..< 10 {
                 _ = h.host.makeTranscriptUISnapshot()
@@ -484,6 +600,7 @@ final class AgentQuietCheckInDisplayMaskTests: XCTestCase {
             samples.sorted()[Int(Double(samples.count - 1) * 0.99)]
         }
         print("QUIET_C5_UI_HARDWARE samples=100 getters=1000 positivelyRoutineRowsPerSeal=1 sealP99MS=\(p99(sealMS)) ownerSyncP99MS=\(p99(ownerMS)) ownerSyncMaxMS=\(ownerMS.max()!) getterP99MS=\(p99(hitMS)) archiveBlocks=\(session.archivedTranscriptSnapshot.blocks.count) frozenCacheInputBufferMatches=\(sharedInputBuffers) observedNewHelperBuffersOnReuse=0 helperRowStride=\(MemoryLayout<AgentTranscriptDisplaySummaryInput.Row>.stride) helperInputStride=\(MemoryLayout<AgentTranscriptDisplaySummaryInput>.stride)")
+        print("QUIET_A3_DISPLAY_WORK measuredCacheBuilds=\(measuredCacheBuilds) blocksTotal=\(workTotals.blocks) rowsTotal=\(workTotals.rows) anchorsTotal=\(workTotals.anchors) blocksMax=\(workMax.blocks) rowsMax=\(workMax.rows) anchorsMax=\(workMax.anchors)")
     }
 
     func testEmptyLocalMaskRetiresOnlyDisplayMetadataNotHydrationOrCanonicalFollowScope() {
