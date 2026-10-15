@@ -64,7 +64,7 @@ final class ClaudeAgentModeCoordinator {
 
     enum NativeSendOutcome: Equatable {
         case sent
-        case failed(message: String)
+        case failed(message: String, providerWriteAttempted: Bool = false)
         case superseded
     }
 
@@ -1212,7 +1212,13 @@ final class ClaudeAgentModeCoordinator {
             // stream *after* this method returns (send → release lease → events(for:)),
             // so events that arrive in between must be buffered in a live stream.
             // ensureEventsStreamReady is idempotent — it only recreates if nil.
-            await controller.ensureEventsStreamReady()
+            if allowsCatalogRouteControllerRecovery {
+                // A new attempt owns a fresh subscription, even when retaining the process.
+                // The previous iterator may have ended by cancellation on local settlement.
+                await controller.resetEventsStreamForNewRun()
+            } else {
+                await controller.ensureEventsStreamReady()
+            }
             guard intentIsCurrent(intent, for: session),
                   sessionOwnsClaudeController(controller, for: session)
             else {
@@ -1497,7 +1503,8 @@ final class ClaudeAgentModeCoordinator {
                     return recordSendFailure(
                         "Claude native command failed: \(error.localizedDescription)",
                         session: session,
-                        intent: intent
+                        intent: intent,
+                        providerWriteAttempted: true
                     )
                 }
             }
@@ -1540,7 +1547,8 @@ final class ClaudeAgentModeCoordinator {
                     return recordSendFailure(
                         "Claude continuation note delivery is uncertain: \(error.localizedDescription)",
                         session: session,
-                        intent: intent
+                        intent: intent,
+                        providerWriteAttempted: true
                     )
                 }
             }
@@ -1689,7 +1697,8 @@ final class ClaudeAgentModeCoordinator {
                 return recordSendFailure(
                     "Claude native send failed: \(error.localizedDescription)",
                     session: session,
-                    intent: intent
+                    intent: intent,
+                    providerWriteAttempted: true
                 )
             }
         }
@@ -1728,7 +1737,8 @@ final class ClaudeAgentModeCoordinator {
     private func recordSendFailure(
         _ message: String,
         session: AgentTabSession,
-        intent: NativeSessionIntent
+        intent: NativeSessionIntent,
+        providerWriteAttempted: Bool = false
     ) -> NativeSendOutcome {
         guard intentIsCurrent(intent, for: session) else { return .superseded }
         if session.items.last?.kind != .error || session.items.last?.text != message {
@@ -1742,7 +1752,7 @@ final class ClaudeAgentModeCoordinator {
         session.isDirty = true
         hostCapabilities.requestUIRefresh(session, true)
         hostCapabilities.scheduleSave(session)
-        return .failed(message: message)
+        return .failed(message: message, providerWriteAttempted: providerWriteAttempted)
     }
 
     private func interruptClaudeTurnIfNeeded(

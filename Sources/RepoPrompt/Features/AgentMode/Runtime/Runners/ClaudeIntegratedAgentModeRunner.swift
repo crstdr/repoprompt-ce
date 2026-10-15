@@ -6,6 +6,11 @@ import RepoPromptSettingsCore
 
 @MainActor
 final class ClaudeIntegratedAgentModeRunner {
+    private enum RunnerEvent {
+        case native(NativeAgentRuntimeEvent)
+        case steeringAbandoned(Set<UUID>)
+    }
+
     private enum ConsumeEventsOutcome {
         case completed
         case cancelled
@@ -353,7 +358,27 @@ final class ClaudeIntegratedAgentModeRunner {
             }
         }
 
-        eventLoop: for await event in events {
+        // Keep consuming provider events while a promised successor is waiting for MCP idle.
+        // The local settlement signal wakes this loop even when the provider stream stays open.
+        let inbox = AsyncStream<RunnerEvent>.makeStream()
+        let forwarding = Task {
+            for await event in events {
+                inbox.continuation.yield(.native(event))
+            }
+            inbox.continuation.finish()
+        }
+        session.claudeSteeringAbandonment = (runAttemptID, { ids in
+            inbox.continuation.yield(.steeringAbandoned(ids))
+        })
+        defer {
+            forwarding.cancel()
+            inbox.continuation.finish()
+            if session.claudeSteeringAbandonment?.attemptID == runAttemptID {
+                session.claudeSteeringAbandonment = nil
+            }
+        }
+        var protectedTerminal: (turnID: UUID, status: NativeAgentRuntimeTurnStatus)?
+        eventLoop: for await input in inbox.stream {
             guard session.runID == runID,
                   session.activeRunAttemptID == runAttemptID
             else {
@@ -361,6 +386,19 @@ final class ClaudeIntegratedAgentModeRunner {
                 break eventLoop
             }
 
+            let event: NativeAgentRuntimeEvent
+            switch input {
+            case let .native(native):
+                event = native
+            case let .steeringAbandoned(ids):
+                if let terminal = protectedTerminal, ids.contains(terminal.turnID),
+                   session.claudeExpectedTurnIDs.isEmpty,
+                   !session.pendingClaudeSteeringInstructions.contains(where: { $0.targetRunID == runID && $0.targetRunAttemptID == runAttemptID })
+                {
+                    return Self.terminalOutcome(terminal.status)
+                }
+                continue eventLoop
+            }
             if let ownership = session.activeRunOwnership, ownership.attemptID == runAttemptID {
                 session.recordRunProgress(ownership: ownership, kind: .providerEvent, stage: .running)
             }
@@ -436,6 +474,7 @@ final class ClaudeIntegratedAgentModeRunner {
                 let hasLegacyUnscopedProtection = session.claudeSupersedingProtectedTurnIDs.isEmpty
                     && session.pendingSupersedingTurnCompletions > 0
                 if wasProtectedClaudeTurn || hasLegacyUnscopedProtection {
+                    if wasProtectedClaudeTurn { protectedTerminal = (turnID, turnStatus) }
                     session.pendingSupersedingTurnCompletions = max(0, session.pendingSupersedingTurnCompletions - 1)
                     // Keep run alive for the next (superseding) turn regardless of the
                     // stale turn's reported terminal status. Old interrupted turns can land
@@ -451,14 +490,7 @@ final class ClaudeIntegratedAgentModeRunner {
                 // No superseding turn expected — terminal for this run.
                 session.pendingSupersedingTurnCompletions = 0
                 session.claudeSupersedingProtectedTurnIDs.removeAll()
-                switch turnStatus {
-                case .completed:
-                    return .completed
-                case .cancelled:
-                    return .cancelled
-                case .failed:
-                    return .failed(errorText: nil, shouldShutdownSession: false)
-                }
+                return Self.terminalOutcome(turnStatus)
             case let .error(message):
                 session.notePassiveWakeActivity()
                 session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
@@ -491,6 +523,14 @@ final class ClaudeIntegratedAgentModeRunner {
             errorText: "Claude events stream ended unexpectedly. The run may need to be restarted.",
             shouldShutdownSession: false
         )
+    }
+
+    private static func terminalOutcome(_ status: NativeAgentRuntimeTurnStatus) -> ConsumeEventsOutcome {
+        switch status {
+        case .completed: .completed
+        case .cancelled: .cancelled
+        case .failed: .failed(errorText: nil, shouldShutdownSession: false)
+        }
     }
 
     private func handleAcquireFailure(

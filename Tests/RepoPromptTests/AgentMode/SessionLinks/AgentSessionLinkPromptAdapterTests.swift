@@ -2891,7 +2891,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         let shutdownCount = await controller.shutdownCount
         let sentCount = await controller.sentCount
 
-        guard case let .failed(message) = outcome else {
+        guard case let .failed(message, _) = outcome else {
             return XCTFail("expected route loss to fail closed, got \(outcome)")
         }
         XCTAssertTrue(message.contains("could not verify the exact RepoPrompt MCP route"))
@@ -3577,6 +3577,13 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
     private var turnInFlight = false
     private var failSendAfterRecord = false
     private var finishEventsAfterSend = false
+    private var steeringConfigurationGate: TestReleaseFence?
+    private var failSteeringConfiguration = false
+
+    func setSteeringConfigurationGate(_ gate: TestReleaseFence, fail: Bool) {
+        steeringConfigurationGate = gate
+        failSteeringConfiguration = fail
+    }
 
     func setFinishEventsAfterSend(_ value: Bool) {
         finishEventsAfterSend = value
@@ -3626,7 +3633,12 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
     }
 
     func ensureEventsStreamReady() async {}
-    func resetEventsStreamForNewRun() async {}
+    func resetEventsStreamForNewRun() async {
+        continuation?.finish()
+        continuation = nil
+        stream = nil
+        _ = events
+    }
 
     func startOrResume(
         existingSessionID: String?,
@@ -3659,6 +3671,12 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
     func applyModelAndEffortWithProof(model _: String?, effortLevel _: NativeAgentRuntimeEffortLevel?) async throws -> NativeAgentRuntimeConfigurationApplication {
         if let configurationGate {
             _ = await configurationGate.requirement()
+        }
+        if let steeringConfigurationGate {
+            await steeringConfigurationGate.enterAndWait()
+            if failSteeringConfiguration {
+                throw NativeAgentRuntimeControllerError.processNotRunning
+            }
         }
         return configuration.apply()
     }

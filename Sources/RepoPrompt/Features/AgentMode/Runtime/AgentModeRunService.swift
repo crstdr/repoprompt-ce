@@ -1151,16 +1151,16 @@ final class AgentModeRunService {
                 case .sent:
                     hooks.providerInput.recordPendingHandoffSendOutcome(session, true)
                     await hooks.continuation.signalMCPInstructionDelivered(session)
-                case .failed:
+                case let .failed(_, providerWriteAttempted):
                     hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
                     // Re-insert the failed instruction so it's included in the restore.
-                    // The coordinator deliberately leaves the live run state and
-                    // ownership untouched; the owner event loop settles later.
+                    // Only a definitive no-write may settle a previously consumed terminal.
+                    // Transport failures remain uncertain; the owner stream still owns them.
                     session.pendingClaudeSteeringInstructions.insert(steering, at: 0)
                     if let dequeuedUserInputTokens {
                         session.pendingNonCodexUserInputTokenQueue.insert(dequeuedUserInputTokens, at: 0)
                     }
-                    restoreAllQueuedClaudeSteeringDrafts(tabID: tabID, session: session, strategy: .prependAlways)
+                    restoreAllQueuedClaudeSteeringDrafts(tabID: tabID, session: session, strategy: .prependAlways, definitiveNoWrite: !providerWriteAttempted)
                     return
                 case .superseded:
                     return
@@ -1187,6 +1187,7 @@ final class AgentModeRunService {
         tabID: UUID,
         session: AgentTabSession,
         strategy: DraftRestorationStrategy,
+        definitiveNoWrite: Bool = true,
         matching shouldRestore: (AgentTabSession.ClaudeSteeringInstruction) -> Bool
     ) {
         let instructions = session.pendingClaudeSteeringInstructions.filter(shouldRestore)
@@ -1197,6 +1198,10 @@ final class AgentModeRunService {
         releaseUnconsumedClaudeSupersedingProtection(for: instructions, session: session)
         session.pendingClaudeSteeringInstructions.removeAll(where: shouldRestore)
         restoreClaudeSteeringDrafts(drafts, tabID: tabID, strategy: strategy)
+        if definitiveNoWrite, let abandonment = session.claudeSteeringAbandonment {
+            let current = instructions.filter { $0.targetRunID == session.runID && $0.targetRunAttemptID == abandonment.attemptID }
+            abandonment.notify(Set(current.flatMap(\.supersedingProtectedTurnIDs)))
+        }
     }
 
     /// Restores only the leading stale instructions so newer queued work remains eligible for a new flush task.
@@ -1247,12 +1252,14 @@ final class AgentModeRunService {
     private func restoreAllQueuedClaudeSteeringDrafts(
         tabID: UUID,
         session: AgentTabSession,
-        strategy: DraftRestorationStrategy
+        strategy: DraftRestorationStrategy,
+        definitiveNoWrite: Bool = true
     ) {
         restoreQueuedClaudeSteeringDrafts(
             tabID: tabID,
             session: session,
             strategy: strategy,
+            definitiveNoWrite: definitiveNoWrite,
             matching: { _ in true }
         )
     }
