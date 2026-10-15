@@ -5536,23 +5536,42 @@ enum AgentTranscriptProjectionBuilder {
         let blockVisits: Int
         let rowVisits: Int
         let anchorVisits: Int
+        var archiveBlockVisits = 0
+        var archiveRowVisits = 0
     }
 
-    /// Pure local-UI transform. Never installed in a canonical/session projection or used by Read.
-    static func maskForLocalDisplay(
-        _ base: AgentTranscriptPresentationSnapshot,
-        archivedBlocks: [AgentTranscriptRenderBlock],
-        hiddenSourceIDs: Set<UUID>
-    ) -> DisplayMaskResult {
-        guard !hiddenSourceIDs.isEmpty else {
-            return .init(presentation: base, archivedBlocks: archivedBlocks, blockVisits: 0, rowVisits: 0, anchorVisits: 0)
-        }
+    /// The existing transform's temporary identity/count contribution, retained only with the
+    /// derived display cache. No independently maintained source index or history revision.
+    struct DisplayMaskRegion {
+        let blocks: [AgentTranscriptRenderBlock]
+        let removedRowIDs: Set<UUID>
+        let blockIDs: Set<String>
+        let originalTurnIDs: Set<UUID>
+        let retainedTurnIDs: Set<UUID>
+        let changed: Bool
+        let presentedRowCount: Int
+        let blockVisits: Int
+        let rowVisits: Int
+    }
+
+    static func maskArchiveForLocalDisplay(
+        _ archive: AgentArchivedTranscriptSnapshot, hiddenSourceIDs: Set<UUID>
+    ) -> DisplayMaskRegion {
+        maskDisplayRegion(archive.blocks, rowAnchorIndex: archive.rowAnchorIndex, hiddenSourceIDs: hiddenSourceIDs)
+    }
+
+    private static func maskDisplayRegion(
+        _ blocks: [AgentTranscriptRenderBlock], rowAnchorIndex: [UUID: AgentTranscriptAnchor], hiddenSourceIDs: Set<UUID>
+    ) -> DisplayMaskRegion {
         let context = AgentTranscriptProjectionBuildContext()
         var blockVisits = 0
         var rowVisits = 0
-        var anchorVisits = 0
         var removedRowIDs = Set<UUID>()
         var mutations = 0
+        var blockIDs = Set<String>()
+        var originalTurnIDs = Set<UUID>()
+        var retainedTurnIDs = Set<UUID>()
+        var presentedRowCount = 0
         func hiddenAnchor(_ anchor: AgentTranscriptAnchor?) -> Bool {
             switch anchor {
             case let .activity(_, _, id), let .conclusion(_, id): hiddenSourceIDs.contains(id)
@@ -5560,13 +5579,14 @@ enum AgentTranscriptProjectionBuilder {
             }
         }
         func hideRow(_ row: AgentChatItem) -> Bool {
-            hiddenSourceIDs.contains(row.id) || hiddenAnchor(base.rowAnchorIndex[row.id])
+            hiddenSourceIDs.contains(row.id) || hiddenAnchor(rowAnchorIndex[row.id])
         }
-        func masked(_ blocks: [AgentTranscriptRenderBlock]) -> [AgentTranscriptRenderBlock] {
+        func masked(_ blocks: [AgentTranscriptRenderBlock], topLevel: Bool = false) -> [AgentTranscriptRenderBlock] {
             let initialMutations = mutations
             let result = blocks.compactMap { block -> AgentTranscriptRenderBlock? in
                 let before = mutations
                 blockVisits += 1
+                originalTurnIDs.insert(block.turnID)
                 let rows = block.rows.filter { row in
                     rowVisits += 1
                     let hidden = hideRow(row) || (block.kind == .conclusion && hiddenAnchor(block.primaryAnchor))
@@ -5584,7 +5604,12 @@ enum AgentTranscriptProjectionBuilder {
                         let children = masked(history.sections.flatMap(\.childBlocks))
                         let childrenChanged = mutations != childStart
                         let priorInputCount = inputs.count
-                        inputs = inputs.filter { input in !input.rows.contains { hiddenSourceIDs.contains($0.id) } }
+                        inputs = inputs.filter { input in
+                            !input.rows.contains { row in
+                                rowVisits += 1
+                                return hiddenSourceIDs.contains(row.id)
+                            }
+                        }
                         let prefixChanged = inputs.count != priorInputCount
                         if prefixChanged { mutations += 1 }
                         if childrenChanged || prefixChanged {
@@ -5625,12 +5650,21 @@ enum AgentTranscriptProjectionBuilder {
                 }
                 let ids = block.activityIDs.filter { !hiddenSourceIDs.contains($0) }
                 if ids.count != block.activityIDs.count { mutations += 1 }
-                guard mutations != before else { return block }
+                func retain(_ result: AgentTranscriptRenderBlock) -> AgentTranscriptRenderBlock {
+                    retainedTurnIDs.insert(result.turnID)
+                    if topLevel {
+                        blockIDs.insert(result.id)
+                        // presentedItemCount reads only the already visited block and rows.count.
+                        presentedRowCount += presentedItemCount(for: result)
+                    }
+                    return result
+                }
+                guard mutations != before else { return retain(block) }
                 if block.groupedHistory == nil, block.collapsedHistoryRange == nil, rows.isEmpty { return nil }
                 // A hidden first anchor cannot hide visible siblings. Prefer a surviving source row.
                 let anchorID = block.anchorActivityID.flatMap { hiddenSourceIDs.contains($0) ? nil : $0 } ?? ids.first
                 let primary = hiddenAnchor(block.primaryAnchor)
-                    ? anchorID.flatMap { base.rowAnchorIndex[$0] } ?? rows.first.flatMap { base.rowAnchorIndex[$0.id] }
+                    ? anchorID.flatMap { rowAnchorIndex[$0] } ?? rows.first.flatMap { rowAnchorIndex[$0.id] }
                     : block.primaryAnchor
                 let summary = block.clusterSummary == nil ? nil : clusterSummary(for: rows, context: context)
                 var result = AgentTranscriptRenderBlock(
@@ -5641,46 +5675,108 @@ enum AgentTranscriptProjectionBuilder {
                     defaultPresentation: block.defaultPresentation
                 )
                 result.displaySummaryInputs = inputs
-                return result
+                return retain(result)
             }
             return mutations == initialMutations ? blocks : result
         }
-        let visible = masked(base.visibleBlocks)
-        let working = masked(base.workingBlocks)
-        let archive = masked(archivedBlocks)
-        let visibleRows = base.visibleRows.filter { !hideRow($0) && !removedRowIDs.contains($0.id) }
-        let workingRows = base.workingRows.filter { !hideRow($0) && !removedRowIDs.contains($0.id) }
-        let blockIDs = Set((visible + working + archive).map(\.id))
+        let result = masked(blocks, topLevel: true)
+        return .init(
+            blocks: result, removedRowIDs: removedRowIDs, blockIDs: blockIDs,
+            originalTurnIDs: originalTurnIDs, retainedTurnIDs: retainedTurnIDs, changed: mutations != 0,
+            presentedRowCount: presentedRowCount, blockVisits: blockVisits, rowVisits: rowVisits
+        )
+    }
+
+    /// Pure local-UI transform. Never installed in a canonical/session projection or used by Read.
+    static func maskForLocalDisplay(
+        _ base: AgentTranscriptPresentationSnapshot,
+        archivedBlocks: [AgentTranscriptRenderBlock],
+        hiddenSourceIDs: Set<UUID>,
+        reusableArchive: DisplayMaskRegion? = nil
+    ) -> DisplayMaskResult {
+        guard !hiddenSourceIDs.isEmpty else {
+            return .init(presentation: base, archivedBlocks: archivedBlocks, blockVisits: 0, rowVisits: 0, anchorVisits: 0)
+        }
+        let visible = maskDisplayRegion(base.visibleBlocks, rowAnchorIndex: base.rowAnchorIndex, hiddenSourceIDs: hiddenSourceIDs)
+        let working = maskDisplayRegion(base.workingBlocks, rowAnchorIndex: base.rowAnchorIndex, hiddenSourceIDs: hiddenSourceIDs)
+        let archive = reusableArchive ?? maskDisplayRegion(archivedBlocks, rowAnchorIndex: base.rowAnchorIndex, hiddenSourceIDs: hiddenSourceIDs)
+        let archiveBlocksVisited = reusableArchive == nil ? archive.blockVisits : 0
+        let archiveRowsVisited = reusableArchive == nil ? archive.rowVisits : 0
+        var rowVisits = visible.rowVisits + working.rowVisits + archiveRowsVisited
+        var anchorVisits = 0
+        func hiddenAnchor(_ anchor: AgentTranscriptAnchor?) -> Bool {
+            switch anchor {
+            case let .activity(_, _, id), let .conclusion(_, id): hiddenSourceIDs.contains(id)
+            default: false
+            }
+        }
+        func removed(_ id: UUID) -> Bool {
+            hiddenSourceIDs.contains(id) || visible.removedRowIDs.contains(id)
+                || working.removedRowIDs.contains(id) || archive.removedRowIDs.contains(id)
+        }
+        func rows(_ input: [AgentChatItem]) -> [AgentChatItem] {
+            var changed = false
+            let result = input.filter { row in
+                rowVisits += 1
+                let hide = removed(row.id) || hiddenAnchor(base.rowAnchorIndex[row.id])
+                changed = changed || hide
+                return !hide
+            }
+            return changed ? result : input
+        }
+        let visibleRows = rows(base.visibleRows)
+        let workingRows = rows(base.workingRows)
+        let blockVisits = visible.blockVisits + working.blockVisits + archiveBlocksVisited
+        guard visible.changed || working.changed || archive.changed
+            || visibleRows.count != base.visibleRows.count || workingRows.count != base.workingRows.count
+        else {
+            return .init(
+                presentation: base, archivedBlocks: archive.blocks, blockVisits: blockVisits, rowVisits: rowVisits, anchorVisits: 0,
+                archiveBlockVisits: archiveBlocksVisited, archiveRowVisits: archiveRowsVisited
+            )
+        }
         let rowAnchors = base.rowAnchorIndex.filter { id, anchor in
             anchorVisits += 1
-            return !hiddenSourceIDs.contains(id) && !removedRowIDs.contains(id) && !hiddenAnchor(anchor)
+            return !removed(id) && !hiddenAnchor(anchor)
         }
         let blockAnchors = base.anchorBlockIndex.filter { anchor, block in
             anchorVisits += 1
-            return blockIDs.contains(block) && !hiddenAnchor(anchor)
+            // Reuse the archive's already-computed contribution: no archive-containing union/map.
+            return (visible.blockIDs.contains(block) || working.blockIDs.contains(block) || archive.blockIDs.contains(block)) && !hiddenAnchor(anchor)
         }
         let old = base.metadata
         func retained(_ id: UUID?) -> UUID? {
-            id.flatMap { hiddenSourceIDs.contains($0) || removedRowIDs.contains($0) ? nil : $0 }
+            id.flatMap { removed($0) ? nil : $0 }
+        }
+        func lostTurn(_ target: UUID) -> Bool {
+            let wasMaterialized = visible.originalTurnIDs.contains(target) || working.originalTurnIDs.contains(target) || archive.originalTurnIDs.contains(target)
+            let survives = visible.retainedTurnIDs.contains(target) || working.retainedTurnIDs.contains(target) || archive.retainedTurnIDs.contains(target)
+            return wasMaterialized && !survives
         }
         let metadata = AgentTranscriptPresentationMetadata(
-            latestUserMessageID: retained(old.latestUserMessageID), latestTurnID: visible.last?.turnID,
-            dynamicSummaryLockTargetTurnID: old.dynamicSummaryLockTargetTurnID.flatMap { target in visible.contains(where: { $0.turnID == target }) ? target : nil },
-            recentAssistantItemIDs: old.recentAssistantItemIDs.filter { !hiddenSourceIDs.contains($0) && !removedRowIDs.contains($0) },
+            latestUserMessageID: retained(old.latestUserMessageID),
+            latestTurnID: old.latestTurnID.flatMap { lostTurn($0) ? visible.blocks.last?.turnID : $0 },
+            dynamicSummaryLockTargetTurnID: old.dynamicSummaryLockTargetTurnID.flatMap { lostTurn($0) ? nil : $0 },
+            recentAssistantItemIDs: old.recentAssistantItemIDs.filter { !removed($0) },
             activeContextBuilderCallItemID: retained(old.activeContextBuilderCallItemID),
             activeContextBuilderResultItemID: retained(old.activeContextBuilderResultItemID), mostRecentEditItemID: retained(old.mostRecentEditItemID)
         )
         let presentation = AgentTranscriptPresentationSnapshot(
-            tabID: base.tabID, revision: base.revision, visibleBlocks: visible, workingBlocks: working,
+            tabID: base.tabID, revision: base.revision, visibleBlocks: visible.blocks, workingBlocks: working.blocks,
             visibleRows: visibleRows, workingRows: workingRows, rowAnchorIndex: rowAnchors, anchorBlockIndex: blockAnchors,
-            archivedHistoryState: .init(hasArchivedHistory: !archive.isEmpty, presentedRowCount: presentedItemCount(for: archive), blockCount: archive.count),
+            archivedHistoryState: archive.changed
+                ? .init(hasArchivedHistory: !archive.blocks.isEmpty, presentedRowCount: archive.presentedRowCount, blockCount: archive.blocks.count)
+                : base.archivedHistoryState,
             isCompressedHistoryRevealed: base.isCompressedHistoryRevealed, isTranscriptWindowExpanded: base.isTranscriptWindowExpanded,
             isWindowCappedWhileActive: base.isWindowCappedWhileActive, bindingsHydrated: base.bindingsHydrated,
             hydratedPersistentBinding: base.hydratedPersistentBinding, hydratedBindingTransitionGeneration: base.hydratedBindingTransitionGeneration,
             performanceSnapshot: base.performanceSnapshot, metadata: metadata,
             rawToolResultPayloadRenderRevisionByItemID: base.rawToolResultPayloadRenderRevisionByItemID
         )
-        return .init(presentation: presentation, archivedBlocks: archive, blockVisits: blockVisits, rowVisits: rowVisits, anchorVisits: anchorVisits)
+        return .init(
+            presentation: presentation, archivedBlocks: archive.blocks, blockVisits: blockVisits, rowVisits: rowVisits, anchorVisits: anchorVisits,
+            archiveBlockVisits: archiveBlocksVisited, archiveRowVisits: archiveRowsVisited
+        )
     }
 
     private static func displaySummary(

@@ -9,6 +9,16 @@ struct AgentQuietTranscriptDisplayCache {
         let maskRevision: UInt64
     }
 
+    struct Archive {
+        let key: Key
+        let region: AgentTranscriptProjectionBuilder.DisplayMaskRegion
+
+        func matches(_ candidate: Key) -> Bool {
+            key.session == candidate.session && key.binding == candidate.binding
+                && key.tabID == candidate.tabID && key.maskRevision == candidate.maskRevision
+        }
+    }
+
     let key: Key
     let result: AgentTranscriptProjectionBuilder.DisplayMaskResult
 }
@@ -38,14 +48,31 @@ extension AgentModeViewModel {
             session.quietTranscriptDisplayCache = nil
             return false
         }
-        let result = AgentTranscriptProjectionBuilder.maskForLocalDisplay(
-            base, archivedBlocks: session.archivedTranscriptSnapshot.blocks, hiddenSourceIDs: session.quietLedger.hiddenSourceIDs
+        let hidden = session.quietLedger.hiddenSourceIDs
+        let reusable = session.quietTranscriptArchiveDisplayCache.flatMap { $0.matches(key) ? $0.region : nil }
+        // Archive replacement/reset and mask/binding retirement clear this part in AgentTabSession.
+        // Base assignment clears only the presentation part, including same-revision hydration (A3).
+        let archive = hidden.isEmpty ? nil : reusable ?? AgentTranscriptProjectionBuilder.maskArchiveForLocalDisplay(
+            session.archivedTranscriptSnapshot, hiddenSourceIDs: hidden
         )
+        session.quietTranscriptArchiveDisplayCache = archive.map { .init(key: key, region: $0) }
+        var result = AgentTranscriptProjectionBuilder.maskForLocalDisplay(
+            base, archivedBlocks: session.archivedTranscriptSnapshot.blocks, hiddenSourceIDs: hidden, reusableArchive: archive
+        )
+        if reusable == nil, let archive {
+            // Charge the initial archive traversal to this owner sync, not just the helper call.
+            result = .init(
+                presentation: result.presentation, archivedBlocks: result.archivedBlocks,
+                blockVisits: result.blockVisits + archive.blockVisits, rowVisits: result.rowVisits + archive.rowVisits,
+                anchorVisits: result.anchorVisits, archiveBlockVisits: archive.blockVisits, archiveRowVisits: archive.rowVisits
+            )
+        }
         session.quietTranscriptDisplayCache = .init(key: key, result: result)
         #if DEBUG
             perfRecorder.increment("quiet.display.cache.build", tabID: session.tabID)
             perfRecorder.event("quiet.display.work", tabID: session.tabID, fields: [
-                "blocks": String(result.blockVisits), "rows": String(result.rowVisits), "anchors": String(result.anchorVisits)
+                "blocks": String(result.blockVisits), "rows": String(result.rowVisits), "anchors": String(result.anchorVisits),
+                "archiveBlocks": String(result.archiveBlockVisits), "archiveRows": String(result.archiveRowVisits)
             ])
         #endif
         return true

@@ -42,10 +42,14 @@ final class AgentTabSession: ObservableObject {
     var transcriptProjection: AgentTranscriptProjection = .empty
     var turnProjectionCaches: [UUID: AgentTranscriptTurnProjectionCache] = [:]
     var archivedTranscriptSnapshot: AgentArchivedTranscriptSnapshot = .empty {
-        didSet { quietTranscriptDisplayCache = nil }
+        didSet {
+            quietTranscriptDisplayCache = nil
+            quietTranscriptArchiveDisplayCache = nil
+        }
     }
 
     var quietTranscriptDisplayCache: AgentQuietTranscriptDisplayCache?
+    var quietTranscriptArchiveDisplayCache: AgentQuietTranscriptDisplayCache.Archive?
     var onQuietDisplayMaskChanged: ((AgentTabSession) -> Void)?
     var isCompressedHistoryRevealed: Bool = false
     var isTranscriptWindowExpanded: Bool = false
@@ -2091,12 +2095,14 @@ final class AgentTabSession: ObservableObject {
         let hadMask = !quietLedger.hiddenSourceIDs.isEmpty
         quietLedger = AgentRunQuietLedger()
         quietTranscriptDisplayCache = nil
+        quietTranscriptArchiveDisplayCache = nil
         if hadMask { onQuietDisplayMaskChanged?(self) }
     }
 
     private func quietDisplayMaskDidChange(since revision: UInt64) {
         guard quietLedger.displayMaskRevision != revision else { return }
         quietTranscriptDisplayCache = nil
+        quietTranscriptArchiveDisplayCache = nil
         onQuietDisplayMaskChanged?(self)
     }
 
