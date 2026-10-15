@@ -1866,6 +1866,26 @@ final class WedgeFakeCodexController: CodexSessionControllerPassiveStubDefaults,
     private var interrupts: [String] = []
     private var shutdowns = 0
     private var qaResponses = 0
+    private var recoverySnapshot: CodexNativeSessionController.ThreadSnapshot?
+    private var recoverySnapshotGate: TestReleaseFence?
+
+    func setRecoverySnapshot(_ snapshot: CodexNativeSessionController.ThreadSnapshot, gate: TestReleaseFence? = nil) {
+        lock.withLock {
+            recoverySnapshot = snapshot
+            recoverySnapshotGate = gate
+            active = true
+        }
+    }
+
+    func readThreadSnapshot(includeTurns _: Bool, timeout _: TimeInterval?) async throws -> CodexNativeSessionController.ThreadSnapshot {
+        let (snapshot, gate) = lock.withLock { (recoverySnapshot, recoverySnapshotGate) }
+        if let gate { await gate.enterAndWait() }
+        return snapshot ?? .init(
+            conversationID: "fake", rolloutPath: nil, model: nil, reasoningEffort: nil,
+            runtimeStatus: .idle, currentTurnID: nil, activeTurnIDs: [], latestTurnStatus: nil
+        )
+    }
+
     var qaResponseCount: Int {
         lock.withLock { qaResponses }
     }
@@ -2082,6 +2102,154 @@ final class WedgeFakeCodexController: CodexSessionControllerPassiveStubDefaults,
 }
 
 extension CodexResumeWedgeCommitTests {
+    func testAdmittedActiveReattachCannotQuietNormallyCompletedSilenceOrAckIncludingBufferedStartup() async throws {
+        for buffered in [false, true] {
+            for ack in [false, true] {
+                let startup = TestReleaseFence(name: "quiet recovery startup")
+                let f = makeFixture([[.suspendedSuccess(Self.oldThreadID, startup)]], freshSession: true, shouldManageCodexTooling: false)
+                _ = try installRestoredBinding(f)
+                f.viewModel.test_initializeRunService()
+                let runID = UUID()
+                f.session.installRunID(runID)
+                f.session.codexConversationID = Self.oldThreadID
+                f.session.codexRolloutPath = Self.oldRolloutPath
+                let old = WedgeFakeCodexController(runID: runID, responses: [])
+                let snapshot = CodexNativeSessionController.ThreadSnapshot(
+                    conversationID: Self.oldThreadID, rolloutPath: Self.oldRolloutPath, model: nil, reasoningEffort: nil,
+                    runtimeStatus: .active(activeFlags: []), currentTurnID: "quiet-recovery", activeTurnIDs: ["quiet-recovery"], latestTurnStatus: nil
+                )
+                old.setRecoverySnapshot(snapshot)
+                f.session.codexController = old
+                f.session.runState = .running
+                f.session.beginRunAttempt(source: "quiet-active-recovery")
+                await f.coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "quiet-recovery"), session: f.session, sourceController: old)
+                let owner = try XCTUnwrap(f.session.activeRunOwnership)
+                f.session.quietLedger.recordPhysicalDispatch(owner: owner, wakeID: UUID(), routineQuietCheckIn: true, alreadyAcquired: false)
+                if ack { await f.coordinator.test_handleCodexNativeEvent(.assistantDelta("[ack]"), session: f.session, sourceController: old) }
+                XCTAssertNotNil(f.session.quietLedger.candidateStartKey(owner: owner))
+                // First unchanged active probe is benign. Only the second admits reattachment.
+                let firstFailed = await f.coordinator.test_attemptCodexStallRecovery(session: f.session)
+                XCTAssertFalse(firstFailed)
+                XCTAssertTrue(f.factory.controllers.isEmpty)
+                XCTAssertNotNil(f.session.quietLedger.candidateStartKey(owner: owner), "a skipped probe is not recovery")
+                let recovery = Task { await f.coordinator.test_attemptCodexStallRecovery(session: f.session) }
+                addTeardownBlock { @MainActor in
+                    startup.release()
+                    recovery.cancel()
+                    _ = await recovery.value
+                    await f.coordinator.shutdownCodexSession(f.session)
+                    f.session.saveDebounceTask?.cancel()
+                }
+                guard await startup.waitUntilEntered(timeout: 4) else { continue }
+                let replacement = try XCTUnwrap(f.factory.controllers.last)
+                replacement.setRecoverySnapshot(snapshot)
+                XCTAssertEqual(f.factory.controllers.count, 1)
+                XCTAssertEqual(old.shutdownCount, 1)
+                XCTAssertEqual(f.session.activeRunOwnership, owner)
+                XCTAssertEqual(f.session.runID, runID)
+                XCTAssertTrue(f.coordinator.test_codexReattachReconciliationIsPending(session: f.session))
+                if buffered {
+                    await f.coordinator.test_handleCodexNativeEvent(.turnCompleted(turnID: "quiet-recovery", status: .completed), session: f.session, sourceController: replacement)
+                    XCTAssertTrue(f.session.runState.isActive, "startup completion is buffered, not a fabricated terminal state")
+                    XCTAssertEqual(f.session.quietLedger.facts, .zero)
+                }
+                startup.release()
+                let failed = await recovery.value
+                XCTAssertFalse(failed)
+                if !buffered {
+                    XCTAssertEqual(f.session.activeRunOwnership, owner)
+                    XCTAssertEqual(f.session.runState, .running)
+                    await f.coordinator.test_handleCodexNativeEvent(.turnCompleted(turnID: "quiet-recovery", status: .completed), session: f.session, sourceController: replacement)
+                }
+                XCTAssertEqual(f.session.runState, .completed)
+                XCTAssertEqual(f.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: 1), "buffered=\(buffered) ack=\(ack): admitted recovery is ordinary even at normal completion")
+                XCTAssertTrue(f.session.quietLedger.hiddenSourceIDs.isEmpty, "buffered=\(buffered) ack=\(ack): recovery cannot hide rows or its routine marker")
+                XCTAssertFalse(f.coordinator.test_codexReattachReconciliationIsPending(session: f.session))
+                await f.coordinator.shutdownCodexSession(f.session)
+                f.session.saveDebounceTask?.cancel()
+            }
+        }
+    }
+
+    func testSkippedQuietRecoveryProbesDoNotLatchRetryOrTouchSuccessorOwnerBindingOrController() async throws {
+        for variant in ["first", "changed", "waiting", "owner", "binding", "controller", "cancelled"] {
+            let f = makeFixture([], freshSession: true, shouldManageCodexTooling: false)
+            _ = try installRestoredBinding(f)
+            f.viewModel.test_initializeRunService()
+            let runID = UUID()
+            f.session.installRunID(runID)
+            f.session.codexConversationID = Self.oldThreadID
+            let old = WedgeFakeCodexController(runID: runID, responses: [])
+            func snapshot(_ turn: String = "quiet-negative", flags: [String] = []) -> CodexNativeSessionController.ThreadSnapshot {
+                .init(
+                    conversationID: Self.oldThreadID,
+                    rolloutPath: nil,
+                    model: nil,
+                    reasoningEffort: nil,
+                    runtimeStatus: .active(activeFlags: flags),
+                    currentTurnID: turn,
+                    activeTurnIDs: [turn],
+                    latestTurnStatus: nil
+                )
+            }
+            old.setRecoverySnapshot(snapshot())
+            f.session.codexController = old
+            f.session.runState = .running
+            let owner = f.session.beginRunAttempt(source: "quiet-negative-recovery")
+            await f.coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "quiet-negative"), session: f.session, sourceController: old)
+            f.session.quietLedger.recordPhysicalDispatch(owner: owner, wakeID: UUID(), routineQuietCheckIn: true, alreadyAcquired: false)
+            addTeardownBlock { @MainActor in
+                await f.coordinator.shutdownCodexSession(f.session)
+                f.session.saveDebounceTask?.cancel()
+            }
+            let first = await f.coordinator.test_attemptCodexStallRecovery(session: f.session)
+            XCTAssertFalse(first)
+            XCTAssertNotNil(f.session.quietLedger.candidateStartKey(owner: owner))
+            if variant == "first" {
+                XCTAssertTrue(f.factory.controllers.isEmpty)
+                XCTAssertEqual(f.session.runLifecycle.liveness?.retryIntent, AgentRunRetryIntent.none)
+                continue
+            }
+            let gate = TestReleaseFence(name: "quiet recovery probe \(variant)")
+            let probe = variant == "changed" ? snapshot("progressed-turn")
+                : variant == "waiting" ? snapshot(flags: ["waiting_on_approval"]) : snapshot()
+            old.setRecoverySnapshot(probe, gate: gate)
+            let recovery = Task { await f.coordinator.test_attemptCodexStallRecovery(session: f.session) }
+            addTeardownBlock { @MainActor in gate.release()
+                recovery.cancel()
+                _ = await recovery.value
+            }
+            guard await gate.waitUntilEntered(timeout: 4) else { continue }
+            var currentOwner = owner
+            var currentController = old
+            if variant == "owner" {
+                currentOwner = f.session.beginRunAttempt(source: "quiet-recovery-successor")
+                f.session.quietLedger.recordPhysicalDispatch(owner: currentOwner, wakeID: UUID(), routineQuietCheckIn: true, alreadyAcquired: false)
+            } else if variant == "binding" {
+                f.session.beginPersistentBindingTransition()
+            } else if variant == "controller" {
+                currentController = WedgeFakeCodexController(runID: runID, responses: [])
+                currentController.setRecoverySnapshot(snapshot())
+                f.session.codexController = currentController
+            } else if variant == "cancelled" {
+                recovery.cancel()
+            }
+            let factsBeforeRelease = f.session.quietLedger.facts
+            gate.release()
+            let failed = await recovery.value
+            XCTAssertFalse(failed, variant)
+            XCTAssertTrue(f.factory.controllers.isEmpty, "\(variant): no recovery startup admitted")
+            XCTAssertEqual(old.shutdownCount, 0, "\(variant): skipped probe cannot retire a controller")
+            XCTAssertTrue(f.session.codexController === currentController)
+            XCTAssertEqual(f.session.activeRunOwnership, currentOwner)
+            XCTAssertEqual(f.session.quietLedger.facts, factsBeforeRelease)
+            XCTAssertEqual(f.session.runLifecycle.liveness?.retryIntent, AgentRunRetryIntent.none)
+            if variant != "binding" {
+                XCTAssertNotNil(f.session.quietLedger.candidateStartKey(owner: currentOwner), "\(variant): no retry occurrence may contaminate the surviving quiet owner")
+            }
+        }
+    }
+
     func testQuietNormalNativeCompletionVersusMissedCompletionWatchdogAndHiddenTool() async throws {
         for variant in 0 ..< 5 {
             let f = makeFixture([])

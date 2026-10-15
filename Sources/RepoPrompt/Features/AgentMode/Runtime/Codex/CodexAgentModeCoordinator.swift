@@ -5337,6 +5337,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         guard session.selectedAgent == .codexExec,
               session.runState.isActive,
               session.activeRunAttemptID == expectedRunAttemptID,
+              let recoveryOwnership = session.activeRunOwnership,
               !hasCodexStartupClaim(for: session)
         else {
             return .skipped
@@ -5569,6 +5570,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 )
             }
         }
+        guard !Task.isCancelled,
+              session.selectedAgent == .codexExec,
+              session.runState.isActive,
+              session.isCurrentRunAttemptForCurrentBinding(recoveryOwnership, expectedRunID: expectedRunID),
+              !hasCodexStartupClaim(for: session)
+        else { return .skipped }
         if let sourceController {
             guard let activeController = session.codexController,
                   Self.sameCodexControllerInstance(activeController, sourceController)
@@ -5601,6 +5608,15 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             guard codexRecoveryAttemptKeys.insert(recoveryAttemptKey).inserted else {
                 return .unrecoverable(recoveryFailureMessage(for: trigger, recoveryAlreadyAttempted: true))
             }
+        }
+
+        // Only admitted recovery of this still-owned running attempt is retry activity. Keep
+        // skipped probes and waiting dispositions neutral; latch before any startup callback.
+        if session.runState == .running, !hasPendingCodexInteraction(for: session) {
+            session.recordRunProgress(
+                ownership: recoveryOwnership, kind: .stageTransition,
+                stage: .retrying, retryIntent: .applicationManaged
+            )
         }
 
         let reattachReconciliationToken: UUID? = if trigger == .stallWatchdog,
