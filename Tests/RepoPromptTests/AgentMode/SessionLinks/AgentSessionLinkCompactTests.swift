@@ -1317,7 +1317,7 @@ final class AgentSessionLinkCompactClaudeDispatchTests: XCTestCase {
             )
         )
 
-        guard case let .failed(message) = outcome else {
+        guard case let .failed(message, _) = outcome else {
             return XCTFail("Expected a fail-closed refusal, got \(outcome)")
         }
         XCTAssertTrue(message.contains("still in flight"), message)

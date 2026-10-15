@@ -787,6 +787,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private let usesProductionAgentDefaultsAndModelPolling: Bool
     let clearConsumedAttachmentsAfterProviderConsumption: Bool
     let applyEditsApprovalStore: ApplyEditsApprovalStore
+    func requestClaudeStaleActiveProbe(for session: TabSession) {
+        runService.requestClaudeStaleActiveProbe(session: session)
+    }
+
     private lazy var runService: AgentModeRunService = makeRunService()
 
     /// Materializes the lazy run service so its terminal-commit barrier is installed before a
