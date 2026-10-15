@@ -973,7 +973,7 @@ extension AgentModeViewModel {
                 $0.reference == delivered.reference
                     && $0.toStatus == delivered.toStatus
             }),
-                currentAdmission.routineLaneAdmits(entry.reference)
+                currentAdmission.routineLaneAdmits(entry.reference), attempt.isManual || entry.isRoutineWakeEligible
             else {
                 return false
             }
@@ -2215,7 +2215,7 @@ extension AgentModeViewModel {
         return AgentSessionLinkAutoWakeAdmission(
             routineLanesBeforeInterval: routineLanes,
             hasConcreteEntryBeforeInterval: snapshot.entries.contains {
-                routineLanes[$0.reference] != nil
+                routineLanes[$0.reference] != nil && (isManual || $0.isRoutineWakeEligible)
             },
             overflowAloneMayWakeBeforeInterval: agentSessionLinkOverflowAloneMayWake(
                 snapshot,

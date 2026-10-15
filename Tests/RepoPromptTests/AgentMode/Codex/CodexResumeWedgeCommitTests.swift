@@ -2120,6 +2120,29 @@ extension CodexResumeWedgeCommitTests {
             }
             XCTAssertEqual(f.session.quietLedger.facts, AgentRunQuietFacts(settledThrough: 1, ordinaryThrough: variant == 0 || variant == 3 ? 0 : 1))
             XCTAssertEqual(f.session.runState, .completed)
+            let target = DomainAgentSessionLinkEndpointIdentity(
+                windowID: 2, workspaceID: UUID(), tabID: f.session.tabID, sessionID: UUID(),
+                persistentBindingGeneration: UUID(), bindingTransitionGeneration: 1
+            )
+            let reference = DomainAgentSessionLinkReference(linkID: UUID(), generation: 1)
+            var notices = AgentSessionLinkPassiveStatusNotices(observerEndpoint: target)
+            func sample(_ facts: AgentRunQuietFacts?) -> AgentSessionLinkPassiveStatusNotices.Sample {
+                .init(
+                    reference: reference,
+                    targetEndpoint: target,
+                    targetSessionID: target.sessionID,
+                    displayName: "Codex target",
+                    status: .idle,
+                    runFacts: facts
+                )
+            }
+            notices.enable(samples: [sample(.zero)], linkSetRevision: 1)
+            notices.reconcile(samples: [sample(f.session.quietLedger.facts)], linkSetRevision: 1, deliverable: true)
+            XCTAssertEqual(
+                notices.snapshot.entries.first?.isRoutineWakeEligible ?? false,
+                variant != 0 && variant != 3,
+                "F4: actual watchdog completion remains ordinary and downstream eligible even with every intermediate sample dropped"
+            )
             await f.coordinator.shutdownCodexSession(f.session)
             f.session.saveDebounceTask?.cancel()
         }

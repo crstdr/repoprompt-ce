@@ -549,6 +549,7 @@ struct AgentSessionLinkPromptRenderRequest {
     let laneGuidanceMode: AgentSessionLinkPrompts.LaneGuidanceMode
     /// Initial idle-follow-up routine qualification, never a copy-emission switch on its own.
     let routineQuietCheckIn: Bool
+    let providerContext: AgentSessionLinkPromptProviderContext
 
     init(
         membershipKind: AgentSessionLinkPromptSupplementKind?,
@@ -556,7 +557,8 @@ struct AgentSessionLinkPromptRenderRequest {
         passiveNotices: AgentSessionLinkPassiveStatusNotices.Snapshot?,
         toolReference: String = MCPWindowToolName.agentSessionLink,
         laneGuidanceMode: AgentSessionLinkPrompts.LaneGuidanceMode = .full,
-        routineQuietCheckIn: Bool = false
+        routineQuietCheckIn: Bool = false,
+        providerContext: AgentSessionLinkPromptProviderContext = .unselected
     ) {
         self.membershipKind = membershipKind
         self.inventory = inventory
@@ -564,6 +566,7 @@ struct AgentSessionLinkPromptRenderRequest {
         self.toolReference = toolReference
         self.laneGuidanceMode = laneGuidanceMode
         self.routineQuietCheckIn = routineQuietCheckIn
+        self.providerContext = providerContext
     }
 }
 
@@ -1208,7 +1211,8 @@ final class AgentSessionLinkOutboundPromptClaimStore {
                 passiveNotices: passiveBatch,
                 toolReference: epoch.toolReference,
                 laneGuidanceMode: laneGuidanceMode ?? .full,
-                routineQuietCheckIn: routineQuietCheckIn
+                routineQuietCheckIn: routineQuietCheckIn,
+                providerContext: epoch.providerContext
             ))
             state.renderedFingerprint = fingerprint
             state.renderedResult = rendered

@@ -379,6 +379,11 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         }
 
         var snapshotOverrides: [UUID: DomainAgentSessionObservationSnapshot] = [:]
+        var runFacts: [UUID: AgentRunQuietFacts] = [:]
+        func agentSessionLinkRunFacts(for candidate: AgentSessionLinkEndpointCandidate, capturedStatus _: DomainAgentSessionLinkStatus) -> AgentRunQuietFacts? {
+            runFacts[candidate.sessionID]
+        }
+
         var installCountsBySession: [UUID: Int] = [:]
         var liveObservations: [UUID: () -> Void] = [:]
         var waitingOnByEndpoint: [DomainAgentSessionLinkEndpointIdentity: DomainAgentSessionWaitingOn] = [:]
@@ -9122,5 +9127,102 @@ private extension Result {
     var success: Success? {
         guard case let .success(value) = self else { return nil }
         return value
+    }
+}
+
+extension AgentSessionLinkRuntimeBridgeTests {
+    func testFactsOnlyPublicationPairsWithoutPublicSequenceOrReadinessActivityAndDeduplicates() async throws {
+        let fixture = makeFixture()
+        fixture.host.runFacts[fixture.target.sessionID] = .init(settledThrough: 8, ordinaryThrough: 8)
+        guard case .added = await addLink(fixture) else { return XCTFail("add failed") }
+        fixture.host.fireObservation(for: fixture.target.sessionID)
+        await fixture.bridge.test_settleTargetPublications()
+        let seedValue = await pollState(fixture)
+        let seed = try XCTUnwrap(seedValue)
+        let reads = fixture.host.observationSnapshotCalls[fixture.target.sessionID, default: 0]
+        let discoveries = fixture.host.candidateReadCount
+        fixture.host.runFacts[fixture.target.sessionID] = .init(settledThrough: 9, ordinaryThrough: 8)
+        fixture.host.fireObservation(for: fixture.target.sessionID)
+        await fixture.bridge.test_settleTargetPublications()
+        let quietValue = await pollState(fixture)
+        let quiet = try XCTUnwrap(quietValue)
+        XCTAssertEqual(quiet.changeSequence, seed.changeSequence, "private facts never forge public activity")
+        XCTAssertEqual(fixture.host.observationSnapshotCalls[fixture.target.sessionID, default: 0], reads + 1)
+        XCTAssertEqual(fixture.host.candidateReadCount, discoveries, "facts fanout uses existing inbound index, not discovery")
+        XCTAssertTrue(try XCTUnwrap(fixture.host.publishedPassiveNoticesByEndpoint[fixture.observer.domainEndpoint]).entries.isEmpty)
+        fixture.host.runFacts[fixture.target.sessionID] = .init(settledThrough: 10, ordinaryThrough: 10)
+        fixture.host.fireObservation(for: fixture.target.sessionID)
+        await fixture.bridge.test_settleTargetPublications()
+        let snapshot = try XCTUnwrap(fixture.host.publishedPassiveNoticesByEndpoint[fixture.observer.domainEndpoint])
+        let entry = try XCTUnwrap(snapshot.entries.first)
+        XCTAssertEqual(entry.fromStatus, .idle)
+        XCTAssertEqual(entry.toStatus, .idle)
+        XCTAssertEqual(entry.runFacts, .init(settledThrough: 10, ordinaryThrough: 10))
+        let sequence = fixture.bridge.test_sourcePublicationSequence(for: fixture.target.sessionID)
+        fixture.host.fireObservation(for: fixture.target.sessionID)
+        await fixture.bridge.test_settleTargetPublications()
+        XCTAssertEqual(fixture.bridge.test_sourcePublicationSequence(for: fixture.target.sessionID), sequence)
+        XCTAssertEqual(fixture.host.publishedPassiveNoticesByEndpoint[fixture.observer.domainEndpoint], snapshot)
+    }
+
+    func testAuthorityAwaitNeverAttachesNewerOrSupersededFactsToCapturedStatusInEitherOrdering() async throws {
+        for afterAuthorityRead in [false, true] {
+            let fixture = makeFixture()
+            fixture.host.runFacts[fixture.target.sessionID] = .init(settledThrough: 8, ordinaryThrough: 8)
+            guard case .added = await addLink(fixture) else { return XCTFail("add failed") }
+            fixture.host.fireObservation(for: fixture.target.sessionID)
+            await fixture.bridge.test_settleTargetPublications()
+            // Establish an actionable pending row so the sampled frame's proof can be inspected.
+            fixture.host.snapshotOverrides[fixture.target.sessionID] = quietSnapshot(fixture, status: .running)
+            fixture.host.fireObservation(for: fixture.target.sessionID)
+            await fixture.bridge.test_settleTargetPublications()
+            fixture.host.snapshotOverrides[fixture.target.sessionID] = quietSnapshot(fixture, status: .awaitingUser)
+            fixture.host.fireObservation(for: fixture.target.sessionID)
+            await fixture.bridge.test_settleTargetPublications()
+            var fired = false
+            var capturedMixed: AgentSessionLinkPassiveStatusNotices.Sample?
+            fixture.bridge.test_onPassiveSample = { sample in
+                if fired, sample.status == .waiting, sample.runFacts == nil { capturedMixed = sample }
+            }
+            let replacement = try XCTUnwrap(AgentRunQuietFacts(settledThrough: 9, ordinaryThrough: 9))
+            let interleave: @MainActor (DomainAgentSessionLinkEndpointIdentity) async -> Void = { endpoint in
+                guard endpoint == fixture.target.domainEndpoint, !fired else { return }
+                fired = true
+                fixture.host.runFacts[fixture.target.sessionID] = replacement
+                fixture.host.snapshotOverrides[fixture.target.sessionID] = self.quietSnapshot(fixture, status: .idle)
+                fixture.host.fireObservation(for: fixture.target.sessionID)
+                try? await AsyncTestWait.waitUntil("new pair crosses authority await", timeout: 4) {
+                    fixture.bridge.test_pairedRunFacts(for: fixture.target.domainEndpoint) == replacement
+                }
+            }
+            if afterAuthorityRead { fixture.bridge.test_afterPassiveObservationSnapshot = interleave }
+            else { fixture.bridge.test_beforePassiveObservationSnapshot = interleave }
+            await fixture.bridge.test_refreshStatus(sessionIDs: [fixture.observer.sessionID])
+            fixture.bridge.test_beforePassiveObservationSnapshot = nil
+            fixture.bridge.test_afterPassiveObservationSnapshot = nil
+            await fixture.bridge.test_settleTargetPublications()
+            XCTAssertTrue(fired)
+            // The hook captures the ACTUAL mixed sample, before a later valid pass repairs it.
+            let mixed = try XCTUnwrap(capturedMixed)
+            XCTAssertEqual(mixed.targetEndpoint, fixture.target.domainEndpoint)
+            XCTAssertEqual(mixed.status, .waiting)
+            XCTAssertNil(mixed.runFacts)
+            fixture.bridge.test_onPassiveSample = nil
+        }
+    }
+
+    private func quietSnapshot(_ fixture: Fixture, status: DomainAgentSessionLinkStatus) -> DomainAgentSessionObservationSnapshot {
+        .init(
+            sessionID: fixture.target.sessionID,
+            displayName: "Build API",
+            providerDisplayName: "Codex CLI",
+            status: status,
+            board: .empty,
+            idleForSend: status == .idle,
+            pendingInteractionKind: nil,
+            latestVisibleAssistantPreview: "unchanged",
+            visibleRowCount: 2,
+            lastActivityAt: Date(timeIntervalSince1970: 100)
+        )
     }
 }

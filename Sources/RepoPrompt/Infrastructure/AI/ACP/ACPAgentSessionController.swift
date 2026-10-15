@@ -2032,8 +2032,6 @@ actor ACPAgentSessionController {
     }
 
     private func handleNotification(method: String, params: [String: Any], inboundSequence: UInt64) {
-        if provider.providerID == .devin,
-           let incomingSession = params["sessionId"] as? String, incomingSession != sessionID { return }
         guard method == "session/update" else {
             emitDevinQuietUncertaintyIfCurrent(params: params)
             return
@@ -2076,6 +2074,11 @@ actor ACPAgentSessionController {
             )
             return
         }
+
+        // Administrative metadata has its own session/retirement fences and may arrive while
+        // bootstrap has not installed sessionID yet. Quiet semantic ingress must not discard it.
+        if provider.providerID == .devin,
+           let incomingSession = params["sessionId"] as? String, incomingSession != self.sessionID { return }
 
         if shouldSuppressSessionLoadReplayUpdate(update) {
             #if DEBUG

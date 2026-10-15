@@ -489,6 +489,8 @@ enum AgentSessionLinkACPServerScript {
     /// traffic exists yet, so these are live-unverified):
     /// - `ACP_ADVERTISE_COMMANDS` (comma list): an `available_commands_update` right after
     ///   `session/new`; `__malformed__` sends a non-list `availableCommands`.
+    /// - `ACP_ADVERTISE_BEFORE_NEW_RESPONSE` (`1`): delivers the bootstrap advertisement before
+    ///   the `session/new` response, while the controller's session identity is still unopened.
     /// - `ACP_ADVERTISE_AFTER_PROMPT` (comma list, may be empty): a replacement list during each prompt.
     /// - `ACP_PROMPT_LOG` (path): each `session/prompt` `prompt` array, one JSON line per prompt.
     /// - `ACP_RPC_LOG` (path): actual JSON-RPC requests and successful responses.
@@ -610,11 +612,14 @@ enum AgentSessionLinkACPServerScript {
                 if os.environ.get("ACP_ADVERTISE_COMMANDS") is not None:
                     advertise(params.get("sessionId"), os.environ["ACP_ADVERTISE_COMMANDS"])
             elif method == "session/new":
+                advertises_before = os.environ.get("ACP_ADVERTISE_BEFORE_NEW_RESPONSE") == "1"
+                if advertises_before and os.environ.get("ACP_ADVERTISE_COMMANDS") is not None:
+                    advertise("monitor-acp-session", os.environ["ACP_ADVERTISE_COMMANDS"])
                 respond(request.get("id"), {
                     "sessionId": "monitor-acp-session",
                     "configOptions": config_options()
                 })
-                if os.environ.get("ACP_ADVERTISE_COMMANDS") is not None:
+                if not advertises_before and os.environ.get("ACP_ADVERTISE_COMMANDS") is not None:
                     advertise("monitor-acp-session", os.environ["ACP_ADVERTISE_COMMANDS"])
             elif method == "session/cancel" and os.environ.get("ACP_ADVERTISE_ON_CANCEL") is not None:
                 advertise(params.get("sessionId"), os.environ["ACP_ADVERTISE_ON_CANCEL"])
