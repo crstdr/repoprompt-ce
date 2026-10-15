@@ -2535,3 +2535,221 @@ extension CodexResumeWedgeCommitTests {
         }
     }
 }
+
+/// Source-derived v0.160.1 wire shapes; this is static replay, not a live emission capture.
+private func quietPlainCodexNotifications(reasoning: Bool, ack: Bool, replacement: Bool) -> [(String, [String: CodexJSONValue])] {
+    let thread = CodexJSONValue.string("old-committed-thread")
+    let turn = CodexJSONValue.string("plain-turn")
+    func scoped(_ payload: [String: CodexJSONValue]) -> [String: CodexJSONValue] {
+        payload.merging(["threadId": thread, "turnId": turn]) { _, scope in scope }
+    }
+    func lifecycle(_ method: String, _ item: [String: CodexJSONValue]) -> (String, [String: CodexJSONValue]) {
+        (method, scoped(["item": .object(item)]))
+    }
+    let user: [String: CodexJSONValue] = [
+        "id": .string("canonical-user-uuid"),
+        "type": .string("userMessage"),
+        "clientId": .null,
+        "content": .array([.object(["type": .string("text"), "text": .string("Same text")])])
+    ]
+    var events: [(String, [String: CodexJSONValue])] = [
+        ("turn/started", scoped(["turn": .object(["id": turn, "status": .string("inProgress"), "items": .array([])])])),
+        ("thread/status/changed", ["threadId": thread, "status": .object(["type": .string("active"), "activeFlags": .array([])])]),
+        ("rawResponseItem/completed", scoped(["item": .object([
+            "id": .string("msg_raw_prompt"), "type": .string("message"), "role": .string("user"),
+            "content": .array([.object(["type": .string("input_text"), "text": .string("Same text")])]),
+            "internal_chat_message_metadata_passthrough": .object(["turn_id": turn, "content_item_kinds": .array([.string("user.text")])])
+        ])])),
+        lifecycle("item/started", user), lifecycle("item/completed", user)
+    ]
+    if reasoning {
+        events += [
+            lifecycle("item/started", ["id": .string("thought"), "type": .string("reasoning"), "summary": .array([]), "content": .array([])]),
+            ("item/reasoning/summaryPartAdded", scoped(["itemId": .string("thought"), "summaryIndex": .number(0)])),
+            ("item/reasoning/summaryTextDelta", scoped(["itemId": .string("thought"), "summaryIndex": .number(0), "delta": .string("Thinking")])),
+            ("item/reasoning/textDelta", scoped(["itemId": .string("thought"), "contentIndex": .number(0), "delta": .string("Thinking")])),
+            lifecycle("item/completed", ["id": .string("thought"), "type": .string("reasoning"), "summary": .array([.string("Thinking")]), "content": .array([.string("Thinking")])]),
+            lifecycle("rawResponseItem/completed", [
+                "id": .string("thought"),
+                "type": .string("reasoning"),
+                "summary": .array([.object(["type": .string("summary_text"), "text": .string("Thinking")])]),
+                "content": .array([.object(["type": .string("reasoning_text"), "text": .string("Thinking")])]),
+                "encrypted_content": .null
+            ])
+        ]
+    }
+    if ack {
+        events += [
+            lifecycle("item/started", ["id": .string("answer"), "type": .string("agentMessage"), "text": .string("")]),
+            ("item/agentMessage/delta", scoped(["itemId": .string("answer"), "delta": .string(replacement ? "discarded streaming prose" : "[ack]")])),
+            lifecycle("item/completed", ["id": .string("answer"), "type": .string("agentMessage"), "text": .string("[ack]")]),
+            lifecycle("rawResponseItem/completed", [
+                "id": .string("answer"),
+                "type": .string("message"),
+                "role": .string("assistant"),
+                "content": .array([.object(["type": .string("output_text"), "text": .string("[ack]")])]),
+                "phase": .string("final_answer")
+            ])
+        ]
+    }
+    let usage = CodexJSONValue.object([
+        "totalTokens": .number(3),
+        "inputTokens": .number(1),
+        "cachedInputTokens": .number(0),
+        "cacheWriteInputTokens": .number(0),
+        "outputTokens": .number(2),
+        "reasoningOutputTokens": .number(1)
+    ])
+    events += [
+        ("rawResponse/completed", scoped(["responseId": .string("response-1"), "usage": usage, "usageMetadata": .null])),
+        ("thread/tokenUsage/updated", scoped(["tokenUsage": .object(["total": usage, "last": usage, "modelContextWindow": .number(1000)])])),
+        ("account/rateLimits/updated", ["rateLimits": .object([
+            "limitId": .null,
+            "limitName": .null,
+            "normalModelSlug": .null,
+            "primary": .null,
+            "secondary": .null,
+            "credits": .null,
+            "individualLimit": .null,
+            "spendControlReached": .null,
+            "planType": .null,
+            "rateLimitReachedType": .null
+        ])]),
+        ("account/updated", ["authMode": .null, "planType": .null]),
+        ("turn/completed", scoped(["turn": .object(["id": turn, "status": .string("completed"), "items": .array([])])])),
+        ("thread/status/changed", ["threadId": thread, "status": .object(["type": .string("idle")])])
+    ]
+    return events
+}
+
+extension CodexResumeWedgeCommitTests {
+    func testQuietCodex01601PlainStreamsAndBoundedRawAnnotations() async throws {
+        let scenarios = [
+            "plain",
+            "replacement",
+            "image",
+            "audio",
+            "command",
+            "raw-tool",
+            "unknown",
+            "malformed-raw",
+            "context",
+            "goal",
+            "hook",
+            "missing",
+            "empty",
+            "unknown-kind",
+            "count-mismatch",
+            "mixed-context",
+            "mixed-plain",
+            "unpinned-case",
+            "echo-then-context",
+            "unrepresented-assistant",
+            "unrepresented-reasoning",
+            "bad-raw-response",
+            "bad-summary-part",
+            "foreign-thread",
+            "foreign-turn",
+            "stale-controller",
+            "legacy-neutral",
+            "legacy-abort",
+            "legacy-no-id"
+        ]
+        for reasoning in [false, true] {
+            for ack in [false, true] {
+                for scenario in scenarios {
+                    let label = "\(scenario) reasoning=\(reasoning) ack=\(ack)"
+                    let f = makeFixture([])
+                    f.viewModel.test_initializeRunService()
+                    let runID = UUID()
+                    f.session.installRunID(runID)
+                    let current = CodexNativeSessionController(client: CodexAppServerClient(), runID: runID, tabID: f.session.tabID, windowID: -1, workspacePaths: .uniform(nil))
+                    f.session.codexController = current
+                    f.session.codexConversationID = Self.oldThreadID
+                    let owner = try XCTUnwrap(f.session.activeRunOwnership)
+                    let wakeID = UUID()
+                    f.session.quietLedger.markRoutineWake(owner: owner, wakeID: wakeID)
+                    await current.test_installThreadState(threadID: Self.oldThreadID, authoritativeTurnID: "plain-turn", routingTurnID: "plain-turn")
+                    var events = quietPlainCodexNotifications(reasoning: reasoning, ack: ack, replacement: scenario == "replacement")
+                    guard case let .object(originalRaw)? = events[2].1["item"] else { return XCTFail("Missing raw input fixture") }
+                    var raw = originalRaw
+                    func annotate(_ kinds: [String]?) {
+                        raw["internal_chat_message_metadata_passthrough"] = .object(kinds.map {
+                            ["turn_id": .string("plain-turn"), "content_item_kinds": .array($0.map(CodexJSONValue.string))]
+                        } ?? ["turn_id": .string("plain-turn")])
+                    }
+                    var extra: (String, [String: CodexJSONValue])?
+                    switch scenario {
+                    case "image":
+                        annotate(["user.image"])
+                        raw["content"] = .array([.object(["type": .string("input_image"), "image_url": .string("data:image/png;base64,AA==")])])
+                    case "audio":
+                        annotate(["user.audio"])
+                        raw["content"] = .array([.object(["type": .string("input_audio"), "audio_url": .string("data:audio/wav;base64,AA==")])])
+                    case "context": annotate(["agents_md.instructions"])
+                    case "goal": annotate(["user.goal"])
+                    case "hook": annotate(["hooks.additional_context"])
+                    case "missing": annotate(nil)
+                    case "empty": annotate([])
+                    case "unknown-kind": annotate(["user.future"])
+                    case "count-mismatch": annotate(["user.text", "user.text"])
+                    case "mixed-context", "mixed-plain":
+                        annotate(["user.text", scenario == "mixed-context" ? "agents_md.instructions" : "user.image"])
+                        raw["content"] = .array([
+                            .object(["type": .string("input_text"), "text": .string("Same text")]),
+                            .object(["type": .string("input_text"), "text": .string("Same text")])
+                        ])
+                    case "unpinned-case": annotate(["User.Text"])
+                    case "malformed-raw": raw["content"] = .string("Same text")
+                    case "echo-then-context":
+                        var context = raw
+                        context["id"] = .string("msg_context")
+                        context["internal_chat_message_metadata_passthrough"] = .object(["turn_id": .string("plain-turn"), "content_item_kinds": .array([.string("agents_md.instructions")])])
+                        extra = ("rawResponseItem/completed", ["item": .object(context)])
+                    case "command": extra = ("item/started", ["item": .object(["id": .string("command"), "type": .string("commandExecution"), "command": .string("echo test"), "cwd": .string("/tmp"), "processId": .string("1"), "status": .string("inProgress"), "commandActions": .array([]), "aggregatedOutput": .null, "exitCode": .null, "durationMs": .null])])
+                    case "raw-tool": extra = ("rawResponseItem/completed", ["item": .object(["id": .string("fc_tool"), "type": .string("function_call"), "name": .string("shell"), "arguments": .string("{}"), "call_id": .string("call-1")])])
+                    case "unrepresented-assistant": extra = ("rawResponseItem/completed", ["item": .object(["id": .string("unrepresented"), "type": .string("message"), "role": .string("assistant"), "content": .array([.object(["type": .string("output_text"), "text": .string("Same text")])])])])
+                    case "unrepresented-reasoning": extra = ("rawResponseItem/completed", ["item": .object(["id": .string("unrepresented"), "type": .string("reasoning"), "summary": .array([]), "encrypted_content": .null])])
+                    case "bad-raw-response": extra = ("rawResponse/completed", ["responseId": .string("response-bad"), "usage": .string("invalid"), "usageMetadata": .null])
+                    case "bad-summary-part": extra = ("item/reasoning/summaryPartAdded", ["summaryIndex": .number(0)])
+                    case "legacy-neutral": extra = ("codex/event/task_complete", [:])
+                    case "legacy-abort": extra = ("codex/event/turn_aborted", [:])
+                    case "legacy-no-id": extra = ("codex/event/agent_message", ["msg": .object(["type": .string("agent_message"), "message": .string("[ack]")])])
+                    case "unknown", "foreign-thread", "foreign-turn", "stale-controller": extra = ("future/activity", [:])
+                    default: break
+                    }
+                    events[2].1["item"] = .object(raw)
+                    if var extra {
+                        extra.1["threadId"] = .string(scenario == "foreign-thread" ? "other-thread" : Self.oldThreadID)
+                        extra.1["turnId"] = .string(scenario == "foreign-turn" ? "other-turn" : "plain-turn")
+                        if scenario == "stale-controller" {
+                            let stale = CodexNativeSessionController(client: CodexAppServerClient(), runID: runID, tabID: f.session.tabID, windowID: -1, workspacePaths: .uniform(nil))
+                            await stale.test_installThreadState(threadID: Self.oldThreadID, authoritativeTurnID: "plain-turn", routingTurnID: "plain-turn")
+                            await stale.test_handleNotification(method: extra.0, params: extra.1)
+                            await stale.shutdown()
+                            for await event in stale.events {
+                                await f.coordinator.test_handleCodexNativeEvent(event, session: f.session, sourceController: stale)
+                            }
+                        } else { events.insert(extra, at: events.count - 2) }
+                    }
+                    for (method, params) in events {
+                        await current.test_handleNotification(method: method, params: params)
+                    }
+                    await current.shutdown()
+                    var warnings: [String] = []
+                    for await event in current.events {
+                        if case let .livenessActivity(activity) = event, activity.kind == .warning { warnings.append(activity.method) }
+                        await f.coordinator.test_handleCodexNativeEvent(event, session: f.session, sourceController: current)
+                    }
+                    let quiet = ["plain", "replacement", "image", "audio", "foreign-thread", "foreign-turn", "stale-controller", "legacy-neutral"].contains(scenario)
+                    XCTAssertEqual(f.session.runState, .completed, label)
+                    XCTAssertEqual(f.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: quiet ? 0 : 1), label)
+                    XCTAssertEqual(f.session.quietLedger.hiddenSourceIDs.contains(wakeID), quiet, "\(label): silence must retain the exact wake mask too")
+                    if !quiet { XCTAssertTrue(f.session.quietLedger.hiddenSourceIDs.isEmpty, label) }
+                    if scenario == "plain" || scenario == "replacement" { XCTAssertTrue(warnings.isEmpty, "\(label): \(warnings)") }
+                    f.session.saveDebounceTask?.cancel()
+                }
+            }
+        }
+    }
+}

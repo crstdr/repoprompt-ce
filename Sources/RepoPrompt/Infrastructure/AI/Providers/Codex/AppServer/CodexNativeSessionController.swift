@@ -4038,7 +4038,12 @@ final class CodexNativeSessionController {
             guard let item = Self.canonicalItem(from: params),
                   Self.canonicalItemScope(from: params, item: item) != nil
             else { return true }
-            return !["agentmessage", "agent_message", "reasoning"].contains(normalizedTypeString(from: item))
+            let type = normalizedTypeString(from: item)
+            if type == "usermessage" || type == "user_message" {
+                // Canonical prompt echo; accepted task input is latched by the host before send.
+                return !(item["content"] is [Any])
+            }
+            return !["agentmessage", "agent_message", "reasoning"].contains(type)
         }
         switch method {
         case "turn/completed", "codex/event/turn_completed":
@@ -4046,17 +4051,91 @@ final class CodexNativeSessionController {
             return turn?["status"] as? String != "completed"
         case "codex/event/agent_message":
             return Self.notificationItemID(from: params, includeTopLevelIDFallback: false) == nil
+        case "rawResponseItem/completed":
+            return hasUnrepresentedRawResponseItem(params)
+        case "rawResponse/completed":
+            guard Self.turnScope(threadID: Self.notificationThreadID(from: params), turnID: Self.notificationTurnID(from: params)) != nil,
+                  Self.firstString(in: params, keys: ["responseId"]) != nil,
+                  params["usageMetadata"] is NSNull || params["usageMetadata"] is [String: Any]
+            else { return true }
+            if params["usage"] is NSNull { return false }
+            guard let usage = params["usage"] as? [String: Any] else { return true }
+            return Self.parseTokenUsagePayload(from: ["tokenUsage": ["last": usage]]) == nil
+        case "item/reasoning/summaryPartAdded":
+            return Self.canonicalItemScope(from: params) == nil || (intValue(params["summaryIndex"]) ?? -1) < 0
+        case "thread/tokenUsage/updated":
+            return Self.turnScope(threadID: Self.notificationThreadID(from: params), turnID: Self.notificationTurnID(from: params)) == nil
+                || Self.parseTokenUsagePayload(from: params) == nil
+        case "account/rateLimits/updated":
+            return !(params["rateLimits"] is [String: Any])
+        case "account/updated":
+            return !(params["authMode"] is NSNull || params["authMode"] is String)
+                || !(params["planType"] is NSNull || params["planType"] is String)
         case "codex/event/mcp_tool_call_begin", "codex/event/mcp_tool_call_end":
             // A valid tool event already reaches typed activity before UI suppression. Only a
             // malformed envelope needs the uncertainty fallback; preserve the existing first event.
             return parseRawMCPToolLifecycleEvent(method: method, params: params) == nil
         case "turn/started", "codex/event/turn_started",
              "codex/event/task_complete", "item/agentMessage/delta",
-             "item/reasoning/summaryTextDelta", "item/reasoning/textDelta", "thread/tokenUsage/updated",
+             "item/reasoning/summaryTextDelta", "item/reasoning/textDelta",
              "thread/status/changed", "deprecationNotice":
             return false
         default:
             return true
+        }
+    }
+
+    private func hasUnrepresentedRawResponseItem(_ params: [String: Any]) -> Bool {
+        guard let item = Self.canonicalItem(from: params),
+              let scope = Self.canonicalItemScope(from: params, item: item),
+              Self.turnScope(threadID: Self.notificationThreadID(from: params), turnID: scope.turnID) != nil
+        else { return true }
+        switch item["type"] as? String {
+        case "message":
+            guard let content = item["content"] as? [[String: Any]] else { return true }
+            switch item["role"] as? String {
+            case "user":
+                // Harness-owned v0.160.1 wire annotation (outside exported schema), not text or
+                // version inference. Missing/new/mixed/misaligned kinds stay ordinary and visible.
+                guard let metadata = item["internal_chat_message_metadata_passthrough"] as? [String: Any],
+                      let kinds = metadata["content_item_kinds"] as? [String],
+                      let kind = kinds.first, kinds.count == content.count,
+                      ["user.text", "user.image", "user.audio"].contains(kind),
+                      kinds.allSatisfy({ $0 == kind })
+                else { return true }
+                return !content.allSatisfy { part in
+                    switch (kind, part["type"] as? String) {
+                    case ("user.text", "input_text"), ("user.text", "output_text"):
+                        part["text"] is String
+                    case ("user.image", "input_image"):
+                        Self.nonEmptyString(part["image_url"] as? String) != nil
+                            || Self.nonEmptyString(part["file_id"] as? String) != nil
+                    case ("user.audio", "input_audio"):
+                        Self.nonEmptyString(part["audio_url"] as? String) != nil
+                    default: false
+                    }
+                }
+            case "assistant":
+                // Core emits canonical completion before recording this raw model-output mirror.
+                // Its exact existing scope, not its text, proves the final replacement is represented.
+                return !completedCanonicalItemScopes.contains(scope) || !content.allSatisfy {
+                    ["input_text", "output_text"].contains($0["type"] as? String ?? "") && $0["text"] is String
+                }
+            default: return true
+            }
+        case "reasoning":
+            guard completedCanonicalItemScopes.contains(scope),
+                  let summary = item["summary"] as? [[String: Any]],
+                  summary.allSatisfy({ $0["type"] as? String == "summary_text" && $0["text"] is String })
+            else { return true }
+            if let content = item["content"], !(content is NSNull) {
+                guard let parts = content as? [[String: Any]], parts.allSatisfy({
+                    ["reasoning_text", "text"].contains($0["type"] as? String ?? "") && $0["text"] is String
+                }) else { return true }
+            }
+            if let encrypted = item["encrypted_content"], !(encrypted is NSNull), !(encrypted is String) { return true }
+            return false
+        default: return true
         }
     }
 
