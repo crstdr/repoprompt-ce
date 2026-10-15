@@ -311,13 +311,28 @@ public struct AgentTranscriptRequestAnchor: Codable, Identifiable, Sendable, Equ
 /// Carrying a payload-free diagnostic through the turn summary keeps the transition
 /// inspectable — in compacted projections, `get_log`, and history — after the row is gone.
 public struct AgentTranscriptRecoveryDiagnostic: Codable, Sendable, Equatable {
-    /// Upper bound for the retained display text. The live notice is a single sentence.
+    /// Upper bound for the retained display text. Reuses the smallest per-entry
+    /// budget `get_session` applies to comparable single-line entries (tool
+    /// summaries and error rows clip at this bound); the longest notice the
+    /// coordinator can emit today is 109 characters.
     public static let maximumTextLength = 500
-    /// Upper bound for the machine-stable reason/outcome tokens.
-    public static let maximumTokenLength = 120
-    /// Upper bound for retained provider conversation identifiers.
-    public static let maximumIdentifierLength = 200
-    /// Upper bound for diagnostics carried by a single turn summary.
+    /// Upper bound for retained provider conversation identifiers. Codex thread
+    /// IDs (`thread.id` on the app-server wire) are UUID strings (36 characters);
+    /// the bound covers a UUID plus a short provider prefix — anything longer is
+    /// a payload, not an identifier.
+    public static let maximumIdentifierLength = 64
+    /// Upper bound for the machine-stable reason/outcome tokens. Tokens are wire
+    /// identifiers and share the identifier budget; the longest token a producer
+    /// emits today is `repeatedResumeTimeout` (21 characters).
+    public static let maximumTokenLength = maximumIdentifierLength
+    /// Upper bound for diagnostics carried by a single turn summary. A turn
+    /// emits at most one record per reconnect fallback, and each new fallback
+    /// requires the current thread to accumulate
+    /// `repeatedResumeTimeoutFallbackThreshold` (2) consecutive resume timeouts
+    /// first — four records already mean ≥8 timed-out attempts and five thread
+    /// bindings inside one turn. The bound keeps the list a small slice of the
+    /// per-turn entry budgets consumers apply (`get_session` renders ≤20
+    /// entries per turn) and guards malformed persisted values, not real storms.
     public static let maximumPerTurn = 4
 
     /// Stable outcome token for "the previous thread could not be resumed and a fresh
