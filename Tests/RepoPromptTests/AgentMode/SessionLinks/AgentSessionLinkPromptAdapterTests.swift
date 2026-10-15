@@ -3577,6 +3577,12 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
     private var turnInFlight = false
     private var failSendAfterRecord = false
     private var finishEventsAfterSend = false
+    private var startupEvent: NativeAgentRuntimeEvent?
+
+    func setStartupEvent(_ event: NativeAgentRuntimeEvent) {
+        startupEvent = event
+    }
+
     private var steeringConfigurationGate: TestReleaseFence?
     private var failSteeringConfiguration = false
 
@@ -3647,6 +3653,7 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
         systemPromptOverride _: String?
     ) async throws -> NativeAgentRuntimeSessionRef {
         configuration.replaceProcess()
+        if let startupEvent { emit(startupEvent) }
         startOrResumeExistingSessionIDs.append(existingSessionID)
         if rejectResume, existingSessionID != nil {
             throw NativeAgentRuntimeControllerError.processNotRunning

@@ -999,6 +999,14 @@ final class AgentModeRunService {
         return true
     }
 
+    func requestClaudeStaleActiveProbe(session: AgentTabSession) {
+        guard let ownership = session.activeRunOwnership, let runID = session.runID,
+              let sink = session.claudeSteeringAbandonment, sink.attemptID == ownership.attemptID,
+              ClaudeIntegratedAgentModeRunner.staleActiveRecoveryFencesAreClear(session: session, coordinator: dependencies.claudeCoordinator, ownership: ownership, runID: runID)
+        else { return }
+        sink.probe()
+    }
+
     @discardableResult
     func submitQueuedClaudeSteeringIfSupported(session: AgentTabSession) async -> Bool {
         guard session.selectedAgent.usesClaudeNativeRuntime,
@@ -1137,6 +1145,7 @@ final class AgentModeRunService {
                     session
                 )
                 steeringDebugLog("[AgentRunSteeringWake] Claude flush sending native interrupt id=\(steering.id) tab=\(tabID) runID=\(runID) attempt=\(runAttemptID)")
+                let sendingController = session.claudeController
                 let sendOutcome = await dependencies.claudeCoordinator.sendClaudeNativeMessage(
                     session: session,
                     text: augmentedSteeringText,
@@ -1163,6 +1172,18 @@ final class AgentModeRunService {
                     restoreAllQueuedClaudeSteeringDrafts(tabID: tabID, session: session, strategy: .prependAlways, definitiveNoWrite: !providerWriteAttempted)
                     return
                 case .superseded:
+                    // A same-owner refusal on the same controller cannot be a post-write return:
+                    // those returns fail the coordinator's intent/controller fence.
+                    guard !Task.isCancelled,
+                          isCurrentClaudeSteeringAttempt(session: session, runID: runID, runAttemptID: runAttemptID),
+                          let sendingController,
+                          session.claudeController.map(ObjectIdentifier.init) == ObjectIdentifier(sendingController)
+                    else { return }
+                    session.pendingClaudeSteeringInstructions.insert(steering, at: 0)
+                    if let dequeuedUserInputTokens {
+                        session.pendingNonCodexUserInputTokenQueue.insert(dequeuedUserInputTokens, at: 0)
+                    }
+                    restoreAllQueuedClaudeSteeringDrafts(tabID: tabID, session: session, strategy: .prependAlways)
                     return
                 }
             }
@@ -1290,7 +1311,7 @@ final class AgentModeRunService {
         session.acpSteeringFlushTask?.cancel()
         session.acpSteeringFlushTask = nil
         session.acpSteeringFlushID = nil
-        restoreAllQueuedClaudeSteeringDrafts(tabID: tabID, session: session, strategy: .prependAlways)
+        restoreAllQueuedClaudeSteeringDrafts(tabID: tabID, session: session, strategy: .prependAlways, definitiveNoWrite: false)
         session.pendingClaudeSteeringInstructions.removeAll()
         restoreLocalACPSteeringDrafts(session.pendingACPSteeringInstructions, tabID: tabID)
         if let scheduled = session.scheduledACPFollowUp {
@@ -1391,7 +1412,7 @@ final class AgentModeRunService {
         // already-delivered active prompt.
         switch intent {
         case .userStop:
-            restoreAllQueuedClaudeSteeringDrafts(tabID: tabID, session: session, strategy: .prependAlways)
+            restoreAllQueuedClaudeSteeringDrafts(tabID: tabID, session: session, strategy: .prependAlways, definitiveNoWrite: false)
         case .executionLocationChange:
             restoreAllQueuedDraftsForExecutionLocationChange(tabID: tabID, session: session, strategy: .prependAlways)
         case .runtimeShutdown:

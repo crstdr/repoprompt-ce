@@ -564,7 +564,7 @@ final class AgentTabSession: ObservableObject {
     /// Task that drains `pendingClaudeSteeringInstructions` one-by-one, waiting for MCP tool idle between each.
     var claudeSteeringFlushTask: Task<Void, Never>?
     /// Runner-owned, attempt-scoped notification; never a synthetic provider terminal.
-    var claudeSteeringAbandonment: (attemptID: UUID, notify: (Set<UUID>) -> Void)?
+    var claudeSteeringAbandonment: (attemptID: UUID, notify: (Set<UUID>) -> Void, probe: () -> Void)?
 
     /// ACP steering queue — carries text accepted for serialized live steering.
     struct ACPSteeringManagedContext {
