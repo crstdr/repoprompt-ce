@@ -174,7 +174,10 @@ extension AgentSessionLinkRuntimeBridgeTests {
         XCTAssertEqual(session.lastTerminalCommitRevision?.ownership, ownership)
         XCTAssertEqual(session.lastTerminalCommitRevision?.terminalState, uncertainWrite ? .failed : .completed)
         XCTAssertNil(session.activeRunOwnership)
-        if !uncertainWrite { publishClaudeSuccessorWake(fixture) }
+        if !uncertainWrite {
+            publishClaudeSuccessorWake(fixture)
+            XCTAssertNotNil(session.oversight.pendingAutoWake, "Queued oversight content can reserve after settlement without Stop")
+        }
         session.oversight.pendingAutoWake?.task?.cancel()
         let shutdowns = await fixture.claude.shutdownCount
         XCTAssertEqual(shutdowns, 0, "Settlement must preserve the retained controller")
