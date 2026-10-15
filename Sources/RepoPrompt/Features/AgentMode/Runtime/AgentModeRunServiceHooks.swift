@@ -260,6 +260,9 @@ extension AgentModeRunService.Hooks {
             tabID: tabID,
             lifecycle: session.runLifecycle,
             hooks: .init(
+                sealQuietCheckIn: { owner, state, normal, successor in
+                    session.sealQuietCheckIn(owner: owner, terminalState: state, normal: normal, hasSuccessor: successor)
+                },
                 flushPendingAssistantDelta: {
                     transcript.flushPendingAssistantDelta(session)
                 },

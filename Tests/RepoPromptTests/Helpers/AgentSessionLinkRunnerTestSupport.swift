@@ -35,6 +35,7 @@ final class AgentSessionLinkRunnerHarness {
     /// Runs immediately before `prepareForNextTurn()` on the ACP path, inside the window the old
     /// (buggy) composition point sat in. A test uses it to prove composition reads membership *after*
     /// that suspension.
+    var onTurnComplete: (() -> Void)?
     var onAttachmentsConsumed: (@MainActor () -> Void)?
 
     /// Runs while the message is being built, i.e. the last synchronous MainActor point before the
@@ -79,7 +80,8 @@ final class AgentSessionLinkRunnerHarness {
         headlessProviderFactory: @escaping AgentModeViewModel.HeadlessProviderFactory,
         acpProviderFactory: @escaping AgentModeViewModel.ACPProviderFactory = { _, _ in nil },
         workspacePath: String = FileManager.default.currentDirectoryPath,
-        sessionLinkHost: AgentModeViewModel? = nil
+        sessionLinkHost: AgentModeViewModel? = nil,
+        replayTranscript: Bool = false
     ) {
         self.stubSystemPrompt = stubSystemPrompt
         self.headlessProviderFactory = headlessProviderFactory
@@ -155,7 +157,7 @@ final class AgentSessionLinkRunnerHarness {
             presentation: .init(
                 setAgentRunActive: { _, _ in },
                 requestUIRefresh: { _, _ in },
-                notifyAgentTurnComplete: { _ in }
+                notifyAgentTurnComplete: { _ in harnessBox?.onTurnComplete?() }
             ),
             bindingObservation: .init(
                 updateBindings: { _ in }
@@ -167,11 +169,13 @@ final class AgentSessionLinkRunnerHarness {
                 scheduleSave: { _ in }
             ),
             transcript: .init(
-                handleHeadlessStreamResult: { _, _, _, _ in },
-                finalizeStreamingItems: { _ in },
+                handleHeadlessStreamResult: { result, session, runID, attemptID in
+                    if replayTranscript { await harnessBox?.host.test_handleStreamResult(result, session: session, runID: runID, runAttemptID: attemptID) }
+                },
+                finalizeStreamingItems: { session in if replayTranscript { harnessBox?.host.finalizeStreamingItems(in: session) } },
                 finalizePendingToolCalls: { _, _ in },
                 finalizePendingToolCallsWithUpperBound: { _, _, _ in },
-                flushPendingAssistantDelta: { _ in },
+                flushPendingAssistantDelta: { session in if replayTranscript { harnessBox?.host.flushPendingAssistantDelta(session) } },
                 clearPendingAssistantDelta: { _ in }
             ),
             providerInput: .init(

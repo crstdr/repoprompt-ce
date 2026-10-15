@@ -11,8 +11,9 @@ enum AgentQuietCheckInClassifier {
     /// enablement: the normal terminal path must first qualify its accepted ingress coverage.
     static func supports(_ provider: AgentSessionLinkPromptProviderContext) -> Bool {
         switch provider {
-        case .codexExec, .claudeCode, .devin: true
-        case .unselected, .claudeCodeGLM, .kimiCode, .customClaudeCompatible,
+        case .codexExec, .claudeCode: true
+        // Devin stays disabled for BOTH classification and future copy until exact own-echo U4 proof exists.
+        case .devin, .unselected, .claudeCodeGLM, .kimiCode, .customClaudeCompatible,
              .openCode, .cursor, .grokBuild, .antigravity: false
         }
     }

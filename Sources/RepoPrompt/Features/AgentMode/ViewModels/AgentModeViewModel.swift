@@ -18754,6 +18754,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         selectedWorkflowMutationGeneration: UInt64?,
         managedTurn: AgentNoncomposerTurn? = nil
     ) {
+        let expectedOwnership = session.activeRunOwnership
         let expectedWaitID = session.instructionWaitID
         let expectedControllerID = session.codexController.map(ObjectIdentifier.init)
         let dispatchID = AgentSessionLinkPromptDispatchID.waitingContinuation(
@@ -18778,6 +18779,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
             let stillOwnsContinuation = {
                 self.sessions[tabID] === session
+                    && expectedOwnership.map { session.isCurrentRunAttemptForCurrentBinding($0) && session.quietLedger.isOpen(owner: $0) } == true
                     && session.instructionContinuation != nil
                     && session.instructionWaitID == expectedWaitID
                     && session.codexController.map(ObjectIdentifier.init) == expectedControllerID
@@ -18898,7 +18900,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 )
                 return
             }
-            guard resumeWaitingInstructionContinuation(
+            guard stillOwnsContinuation(), resumeWaitingInstructionContinuation(
                 session: session,
                 providerText: monitoring.text,
                 claim: monitoring.claim,
@@ -19187,6 +19189,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         // An accepted local or managed steer owns the boundary before its user row is published.
         agentSelfCompactCancelForAcceptedLocalInput(session)
+        session.noteAcceptedTaskInput()
         let userItem = AgentChatItem.user(
             bubbleText,
             attachments: attachmentsToSend,
@@ -19791,6 +19794,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         workflow: AgentWorkflowDefinition?
     ) {
         guard case let .setObjective(objective) = action else { return }
+        session.noteAcceptedTaskInput()
         let userItem = AgentChatItem.user(
             objective,
             sequenceIndex: session.nextSequenceIndex,
@@ -21339,7 +21343,19 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         await MainActor.run {
             guard session.runID == runID,
-                  session.activeRunAttemptID == runAttemptID else { return }
+                  session.activeRunAttemptID == runAttemptID,
+                  let owner = session.activeRunOwnership,
+                  session.isCurrentRunAttemptForCurrentBinding(owner) else { return }
+            session.noteAcceptedStream(result, owner: owner)
+            let usesMessageIdentity = session.quietLedger.usesQuietMessageBoundaries(owner: owner)
+            let startsNewMessage = usesMessageIdentity && result.contentMessageID != nil && result.contentMessageID != session.nonCodexContentMessageID
+            if usesMessageIdentity, result.type == "content" || result.type == "final_content",
+               let messageID = result.contentMessageID, messageID != session.nonCodexContentMessageID
+            {
+                flushPendingAssistantDelta(session)
+                endActiveAssistantSegment(session)
+                session.nonCodexContentMessageID = messageID
+            }
             var shouldUpdateBindings = false
             switch result.type {
             case "content":
@@ -21361,6 +21377,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 // interleaved, which can prematurely finalize the streaming segment.
                 // Walk past system items but stop at tool calls, user messages, etc.
                 let tailAssistantIndex: Int? = {
+                    guard !startsNewMessage else { return nil }
                     if let streamingAssistantIndex = self.resumableStreamingAssistantIndexAcrossTrailingUserInterjections(in: session) {
                         return streamingAssistantIndex
                     }
@@ -21688,7 +21705,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     func finalizeStreamingItems(in session: TabSession) {
-        session.mutateItemsBatch(touchActivity: false) { items in
+        // This owner changes streaming flags only, never membership, keys or completed text.
+        session.mutateItemsBatch(touchActivity: false, preservesQuietRange: true) { items in
             for index in items.indices where items[index].isStreaming {
                 items[index].isStreaming = false
             }
@@ -22543,6 +22561,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         origin: UserInstructionResponse.Origin
     ) -> Bool {
         guard let continuation = session.instructionContinuation else { return false }
+        session.noteAcceptedTaskInput() // User and lane-update continuations reuse, never reset, the attempt.
         switch origin {
         case .user:
             // Estimated from the decorated text, not the augmented text: this is what the provider is

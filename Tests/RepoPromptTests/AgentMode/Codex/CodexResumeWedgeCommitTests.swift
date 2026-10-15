@@ -2080,3 +2080,105 @@ final class WedgeFakeCodexController: CodexSessionControllerPassiveStubDefaults,
         continuation.finish()
     }
 }
+
+extension CodexResumeWedgeCommitTests {
+    func testQuietNormalNativeCompletionVersusMissedCompletionWatchdogAndHiddenTool() async throws {
+        for variant in 0 ..< 5 {
+            let f = makeFixture([])
+            f.viewModel.test_initializeRunService()
+            let runID = UUID()
+            f.session.runLifecycle.installRunID(runID)
+            let controller = WedgeFakeCodexController(runID: runID, responses: [])
+            f.session.codexController = controller
+            f.session.codexConversationID = Self.oldThreadID
+            await f.coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "quiet-normal"), session: f.session, sourceController: controller)
+            let owner = try XCTUnwrap(f.session.activeRunOwnership)
+            f.session.quietLedger.markRoutineWake(owner: owner, wakeID: UUID())
+            if let activity = CodexNativeSessionController.test_parseLivenessActivity(
+                method: "thread/status/changed", params: ["threadId": Self.oldThreadID, "status": ["type": "active"]]
+            ) {
+                await f.coordinator.test_handleCodexNativeEvent(.livenessActivity(activity), session: f.session, sourceController: controller)
+            } else { XCTFail("Expected real neutral Codex lifecycle translation") }
+            if variant == 3 {
+                await f.coordinator.test_handleCodexNativeEvent(.assistantDelta("[ack]"), session: f.session, sourceController: controller)
+            }
+            if variant == 4, let activity = CodexNativeSessionController.test_parseLivenessActivity(method: "turn/plan/updated", params: ["threadId": Self.oldThreadID]) {
+                await f.coordinator.test_handleCodexNativeEvent(.livenessActivity(activity), session: f.session, sourceController: controller)
+            }
+            if variant == 2 {
+                await f.coordinator.test_handleCodexNativeEvent(.toolCall(name: "get_file_tree", invocationID: UUID(), argsJSON: "{}"), session: f.session, sourceController: controller)
+                XCTAssertNil(f.session.quietLedger.candidateStartKey(owner: owner), "Accepted native tools latch before transcript hiding")
+            }
+            if variant == 1 {
+                await f.coordinator.test_settleQuietIdleRecovery(session: f.session, snapshot: .init(
+                    conversationID: Self.oldThreadID, rolloutPath: nil, model: nil, reasoningEffort: nil,
+                    runtimeStatus: .idle, currentTurnID: nil, activeTurnIDs: [], latestTurnStatus: .completed
+                ))
+                XCTAssertTrue(f.session.items.contains { $0.kind == .system && $0.text == "Repo Prompt reconnected after a quiet period and confirmed that Codex completed the turn." })
+            } else {
+                await f.coordinator.test_handleCodexNativeEvent(.turnCompleted(turnID: "quiet-normal", status: .completed), session: f.session, sourceController: controller)
+            }
+            XCTAssertEqual(f.session.quietLedger.facts, AgentRunQuietFacts(settledThrough: 1, ordinaryThrough: variant == 0 || variant == 3 ? 0 : 1))
+            XCTAssertEqual(f.session.runState, .completed)
+            await f.coordinator.shutdownCodexSession(f.session)
+            f.session.saveDebounceTask?.cancel()
+        }
+    }
+}
+
+extension CodexResumeWedgeCommitTests {
+    func testQuietRawNativeIngressCurrentForeignUnknownAndFinishedAck() async throws {
+        for variant in 0 ..< 9 {
+            let f = makeFixture([])
+            f.viewModel.test_initializeRunService()
+            let runID = UUID()
+            f.session.installRunID(runID)
+            let controller = CodexNativeSessionController(
+                client: CodexAppServerClient(), runID: runID, tabID: f.session.tabID,
+                windowID: -1, workspacePaths: .uniform(nil)
+            )
+            f.session.codexController = controller
+            f.session.codexConversationID = Self.oldThreadID
+            let owner = try XCTUnwrap(f.session.activeRunOwnership)
+            f.session.quietLedger.markRoutineWake(owner: owner, wakeID: UUID())
+            await controller.test_installThreadState(threadID: Self.oldThreadID, authoritativeTurnID: "raw-turn", routingTurnID: "raw-turn")
+            let stream = controller.events
+            let thread = variant == 2 ? "foreign-thread" : Self.oldThreadID
+            if [1, 2, 3, 4, 6].contains(variant) {
+                let method = variant == 3 ? "item/started" : variant == 4 ? "turn/plan/updated" : "future/activity"
+                await controller.test_handleNotification(method: method, params: ["threadId": .string(thread), "turnId": .string(variant == 6 ? "foreign-turn" : "raw-turn")])
+            }
+            if variant == 0 {
+                await controller.test_handleNotification(method: "item/agentMessage/delta", params: [
+                    "threadId": .string(Self.oldThreadID), "turnId": .string("raw-turn"),
+                    "itemId": .string("answer"), "delta": .string("discarded streaming prose")
+                ])
+            }
+            if variant == 8 {
+                await controller.test_handleNotification(method: "item/completed", params: [
+                    "threadId": .string(Self.oldThreadID), "turnId": .string("raw-turn"),
+                    "item": .object(["id": .string("earlier"), "type": .string("agentMessage"), "text": .string("separate completed prose")])
+                ])
+            }
+            if variant != 7 { // Actual raw native silence has no assistant row at all.
+                await controller.test_handleNotification(method: "item/completed", params: [
+                    "threadId": .string(Self.oldThreadID), "turnId": .string("raw-turn"),
+                    "item": .object(["id": .string("answer"), "type": .string("agentMessage"), "text": .string("[ack]")])
+                ])
+            }
+            await controller.test_handleNotification(method: "turn/completed", params: [
+                "threadId": .string(Self.oldThreadID), "turn": .object(variant == 5 ? ["id": .string("raw-turn")] : ["id": .string("raw-turn"), "status": .string("completed")])
+            ])
+            await controller.shutdown()
+            // Route the actual translated stream through the production current-controller gate.
+            // Start is coordinator-owned separately so the routine mark precedes all tested ingress.
+            await f.coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "raw-turn"), session: f.session, sourceController: controller)
+            for await event in stream {
+                await f.coordinator.test_handleCodexNativeEvent(event, session: f.session, sourceController: controller)
+            }
+            XCTAssertEqual(f.session.quietLedger.facts?.ordinaryThrough, variant == 0 || variant == 2 || variant == 6 || variant == 7 ? 0 : 1, "variant \(variant)")
+            XCTAssertEqual(f.session.quietLedger.facts?.settledThrough, 1)
+            f.session.saveDebounceTask?.cancel()
+        }
+    }
+}

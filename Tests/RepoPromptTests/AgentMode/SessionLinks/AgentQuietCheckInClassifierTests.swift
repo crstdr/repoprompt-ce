@@ -57,7 +57,7 @@ final class AgentQuietCheckInClassifierTests: XCTestCase {
                 var fixture = AgentQuietCheckInFixture()
                 fixture.begin(provider: provider)
                 let row = fixture.rows([kind == .thinking ? "private reasoning" : "[ack]"], kind: kind)
-                let supported = [.codexExec, .claudeCode, .devin].contains(provider)
+                let supported = [.codexExec, .claudeCode].contains(provider)
                 XCTAssertEqual(fixture.seal(row)?.isQuiet, supported, provider.rawValue)
                 var silent = AgentQuietCheckInFixture()
                 silent.begin(provider: provider)

@@ -790,6 +790,11 @@ final class ClaudeAgentModeCoordinator {
                 throw error
             }
 
+            if case let .runAttempt(owner, runID) = intent,
+               session.isCurrentRunAttemptForCurrentBinding(owner, expectedRunID: runID)
+            {
+                session.recordRunProgress(ownership: owner, kind: .stageTransition, stage: .retrying, retryIntent: .applicationManaged)
+            }
             await hostCapabilities.stageClaudeResumeRecoveryHandoff(session)
             guard intentIsCurrent(intent, for: session),
                   let detached = detachClaudeController(
@@ -1710,6 +1715,9 @@ final class ClaudeAgentModeCoordinator {
             removeToolTracking: true
         ) else {
             return false
+        }
+        if let owner = session.activeRunOwnership, session.isCurrentRunAttemptForCurrentBinding(owner) {
+            session.recordRunProgress(ownership: owner, kind: .stageTransition, stage: .retrying, retryIntent: .applicationManaged)
         }
         _ = await retireClaudeController(
             detached,

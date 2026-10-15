@@ -15,6 +15,8 @@ import RepoPromptSettingsCore
 @MainActor
 final class AgentTabSession: ObservableObject {
     let tabID: UUID
+    var quietLedger = AgentRunQuietLedger()
+    var nonCodexContentMessageID: String?
     let perfRecorder: any AgentModePerfRecording
     private var suppressSourceItemsChanged = false
 
@@ -24,6 +26,7 @@ final class AgentTabSession: ObservableObject {
     @Published var items: [AgentChatItem] = [] {
         didSet {
             guard !suppressSourceItemsChanged else { return }
+            if let owner = activeRunOwnership { quietLedger.invalidateRange(owner: owner) }
             repairStoredSourceItemsIfNeeded(diagnosticContext: "items.didSet")
             rebuildSourceItemDerivedState()
             onSourceItemsChanged?(self, .structural)
@@ -67,6 +70,9 @@ final class AgentTabSession: ObservableObject {
     @Published var runState: AgentSessionRunState = .idle {
         didSet {
             guard runState != oldValue else { return }
+            if runState == .waitingForApproval || runState == .waitingForQuestion {
+                noteAcceptedTaskInput()
+            }
             noteMonitorObservationInputsChanged()
             onRunStateChanged?(self)
         }
@@ -1602,6 +1608,8 @@ final class AgentTabSession: ObservableObject {
 
     @discardableResult
     func beginPersistentBindingTransition() -> UInt64 {
+        // The existing full endpoint is retired by this generation change. No saved verdicts.
+        quietLedger = AgentRunQuietLedger()
         oversight.overseerActivation = nil
         // Clear the outgoing proof before the generation moves so it cannot be observed under the
         // incoming incarnation.
@@ -1619,7 +1627,10 @@ final class AgentTabSession: ObservableObject {
 
     func installPersistentSessionBinding(_ binding: AgentPersistentSessionBindingIdentity?) {
         precondition(binding == nil || binding?.tabID == tabID)
-        if persistentSessionBindingIdentity != binding { oversight.overseerActivation = nil }
+        if persistentSessionBindingIdentity != binding {
+            oversight.overseerActivation = nil
+            quietLedger = AgentRunQuietLedger()
+        }
         persistentSessionBindingIdentity = binding
         persistentSessionBindingDidChange?()
         bindingTransitionInProgress = false
@@ -1872,6 +1883,10 @@ final class AgentTabSession: ObservableObject {
             ),
             attemptID: attemptID
         )
+        nonCodexContentMessageID = nil
+        let previousFacts = quietLedger.facts
+        quietLedger.begin(owner: ownership, startKey: nextSequenceIndex, provider: .init(agentKind: selectedAgent))
+        if previousFacts != quietLedger.facts { noteMonitorObservationInputsChanged() }
         #if DEBUG
             perfRecorder.increment("run.lifecycle.attempt.started")
             perfRecorder.increment("run.lifecycle.attempt.started.source.\(source)")
@@ -1922,6 +1937,7 @@ final class AgentTabSession: ObservableObject {
             retryIntent: retryIntent,
             timestampUptimeNanoseconds: timestampUptimeNanoseconds
         )
+        noteQuietProgress(result, kind: kind, stage: stage, retryIntent: retryIntent)
         recordRunProgressDiagnostic(result, kind: kind, stage: stage)
         return result
     }
@@ -1929,13 +1945,17 @@ final class AgentTabSession: ObservableObject {
     @discardableResult
     func acceptRunProgress(_ signal: AgentRunProgressSignal) -> AgentRunProgressAcceptance {
         let result = runLifecycle.acceptProgress(signal)
+        noteQuietProgress(result, kind: signal.kind, stage: signal.stage, retryIntent: signal.retryIntent)
         recordRunProgressDiagnostic(result, kind: signal.kind, stage: signal.stage)
         return result
     }
 
     @discardableResult
     func endRunAttempt(ifCurrent ownership: AgentRunOwnership, source: String) -> Bool {
+        let ownsQuietSource = isCurrentRunAttemptForCurrentBinding(ownership)
         guard runLifecycle.endAttempt(ifCurrent: ownership) else { return false }
+        if ownsQuietSource { _ = quietLedger.end(owner: ownership, authoritativeOwner: ownership) }
+        noteMonitorObservationInputsChanged()
         recordRunAttemptEnded(ownership, source: source)
         return true
     }
@@ -1943,7 +1963,10 @@ final class AgentTabSession: ObservableObject {
     @discardableResult
     func endCurrentRunAttempt(source: String) -> Bool {
         guard let ownership = activeRunOwnership else { return false }
+        let ownsQuietSource = isCurrentRunAttemptForCurrentBinding(ownership)
         guard runLifecycle.endAttempt(ifCurrent: ownership) else { return false }
+        if ownsQuietSource { _ = quietLedger.end(owner: ownership, authoritativeOwner: ownership) }
+        noteMonitorObservationInputsChanged()
         recordRunAttemptEnded(ownership, source: source)
         return true
     }
@@ -1952,6 +1975,62 @@ final class AgentTabSession: ObservableObject {
     func endRunAttempt(ifCurrentAttemptID attemptID: UUID, source: String) -> Bool {
         guard let ownership = activeRunOwnership, ownership.attemptID == attemptID else { return false }
         return endRunAttempt(ifCurrent: ownership, source: source)
+    }
+
+    private func noteQuietProgress(
+        _ acceptance: AgentRunProgressAcceptance,
+        kind: AgentRunLivenessSignalKind,
+        stage: AgentRunLifecycleStage,
+        retryIntent: AgentRunRetryIntent
+    ) {
+        guard case let .accepted(snapshot) = acceptance,
+              isCurrentRunAttemptForCurrentBinding(snapshot.ownership)
+        else { return }
+        if kind == .toolActivity || kind == .interaction || stage == .waitingForInteraction
+            || stage == .retrying || stage == .cancelling || retryIntent != .none
+        {
+            quietLedger.noteOccurrence(owner: snapshot.ownership)
+        }
+    }
+
+    /// Accepted synchronous task boundary only, never called by an unqualified provider callback.
+    func noteAcceptedTaskInput() {
+        guard let owner = activeRunOwnership, isCurrentRunAttemptForCurrentBinding(owner) else { return }
+        quietLedger.noteOccurrence(owner: owner)
+    }
+
+    func noteAcceptedStream(_ result: AIStreamResult, owner: AgentRunOwnership) {
+        guard isCurrentRunAttemptForCurrentBinding(owner) else { return }
+        quietLedger.noteAcceptedStream(result, owner: owner)
+    }
+
+    func sealQuietCheckIn(owner: AgentRunOwnership, terminalState: AgentSessionRunState, normal: Bool, hasSuccessor: Bool) {
+        guard isCurrentRunAttemptForCurrentBinding(owner) else { return }
+        // Only positively routine candidates need a range. No history materialization or stored
+        // array offset: binary-search the already ordered live suffix. Missing retained rows fail open.
+        let start = normal && terminalState == .completed && !hasSuccessor ? quietLedger.candidateStartKey(owner: owner) : nil
+        let rows = start.map { quietSourceSuffix(in: items, startKey: $0) } ?? items[items.endIndex...]
+        quietLedger.settle(
+            owner: owner, terminalState: terminalState, classifiesQuietCheckIn: normal,
+            hasSuccessor: hasSuccessor, endKey: nextSequenceIndex - 1,
+            rangeIsComplete: start != nil, rows: rows
+        )
+    }
+
+    func quietRunFacts(capturedState: AgentSessionRunState) -> AgentRunQuietFacts? {
+        guard !bindingTransitionInProgress else { return nil }
+        if let owner = activeRunOwnership, !isCurrentRunAttemptForCurrentBinding(owner) { return nil }
+        return quietLedger.sourceFacts(owner: activeRunOwnership, capturedState: capturedState)
+    }
+
+    private func quietSourceSuffix(in rows: [AgentChatItem], startKey: Int) -> ArraySlice<AgentChatItem> {
+        var lower = rows.startIndex
+        var upper = rows.endIndex
+        while lower < upper {
+            let middle = lower + (upper - lower) / 2
+            if rows[middle].sequenceIndex < startKey { lower = middle + 1 } else { upper = middle }
+        }
+        return rows[lower...]
     }
 
     private func recordRunAttemptEnded(_ ownership: AgentRunOwnership, source: String) {
@@ -2172,8 +2251,10 @@ final class AgentTabSession: ObservableObject {
         _ newItems: [AgentChatItem],
         dispatch: SourceItemsDispatch,
         payloadUpdate: SourceItemPayloadUpdate = .rebuildFromSource,
-        diagnosticContext: String
+        diagnosticContext: String,
+        preservesQuietRange: Bool = false
     ) {
+        if !preservesQuietRange, let owner = activeRunOwnership { quietLedger.invalidateRange(owner: owner) }
         let repairedItems = repairedSourceItems(newItems, diagnosticContext: diagnosticContext)
         suppressSourceItemsChanged = true
         items = repairedItems
@@ -2192,6 +2273,7 @@ final class AgentTabSession: ObservableObject {
     ) -> [AgentChatItem] {
         let repair = AgentSourceItemIDRepair.repairDuplicateIDs(in: candidateItems)
         if repair.didRepair {
+            if let owner = activeRunOwnership { quietLedger.invalidateRange(owner: owner) }
             AgentSourceItemIDRepair.logDiagnostics(
                 repair.diagnostics,
                 context: "tab_session tab_id=\(tabID.uuidString) \(diagnosticContext)"
@@ -2217,6 +2299,7 @@ final class AgentTabSession: ObservableObject {
     ) -> Bool {
         let repair = AgentSourceItemIDRepair.repairDuplicateIDs(in: candidateItems)
         guard repair.didRepair else { return false }
+        if let owner = activeRunOwnership { quietLedger.invalidateRange(owner: owner) }
         AgentSourceItemIDRepair.logDiagnostics(
             repair.diagnostics,
             context: "tab_session tab_id=\(tabID.uuidString) \(diagnosticContext)"
@@ -2486,6 +2569,7 @@ final class AgentTabSession: ObservableObject {
     func mutateItemsBatch(
         mutation: AgentModeViewModel.SourceItemsMutation = .structural,
         touchActivity: Bool = true,
+        preservesQuietRange: Bool = false,
         _ body: (inout [AgentChatItem]) -> Void
     ) -> Bool {
         let previousItems = items
@@ -2495,7 +2579,8 @@ final class AgentTabSession: ObservableObject {
         commitSourceItems(
             updatedItems,
             dispatch: .notify(mutation),
-            diagnosticContext: "mutateItemsBatch"
+            diagnosticContext: "mutateItemsBatch",
+            preservesQuietRange: preservesQuietRange
         )
         if touchActivity {
             lastActivityAt = Date()
@@ -2531,6 +2616,9 @@ final class AgentTabSession: ObservableObject {
         reason: SilentItemReplacementReason,
         payloadUpdate: SourceItemPayloadUpdate
     ) {
+        if reason == .persistedSessionHydration || reason == .routeActivation || reason == .clearedChat || reason == .stressHarnessReset {
+            quietLedger.discardSourceProof()
+        }
         #if DEBUG
             if AgentTranscriptDebugInstrumentation.isEnabled {
                 AgentTranscriptDebugInstrumentation.emitSessionItemsReplacement(.init(
@@ -2571,6 +2659,13 @@ final class AgentTabSession: ObservableObject {
             return false
         }
 
+        if let owner = activeRunOwnership, let start = quietLedger.startKey(owner: owner),
+           previousItem.sequenceIndex >= start || compactedItem.sequenceIndex >= start,
+           previousItem.id != compactedItem.id || previousItem.sequenceIndex != compactedItem.sequenceIndex
+           || (previousItem.kind != compactedItem.kind && !(previousItem.kind == .toolCall && compactedItem.kind == .toolResult))
+        {
+            quietLedger.invalidateRange(owner: owner)
+        }
         suppressSourceItemsChanged = true
         items[index] = compactedItem
         suppressSourceItemsChanged = false
@@ -2694,6 +2789,7 @@ final class AgentTabSession: ObservableObject {
     }
 
     func appendItem(_ item: AgentChatItem) {
+        if item.kind == .user { noteAcceptedTaskInput() }
         var newItem = item
         newItem.sequenceIndex = nextSequenceIndex
         nextSequenceIndex += 1
@@ -2733,6 +2829,13 @@ final class AgentTabSession: ObservableObject {
             isDirty = true
             return
         }
+        if let owner = activeRunOwnership, let start = quietLedger.startKey(owner: owner),
+           previousItem.sequenceIndex >= start || updatedItem.sequenceIndex >= start,
+           previousItem.id != updatedItem.id || previousItem.sequenceIndex != updatedItem.sequenceIndex
+           || (previousItem.kind != updatedItem.kind && !(previousItem.kind == .toolCall && updatedItem.kind == .toolResult))
+        {
+            quietLedger.invalidateRange(owner: owner)
+        }
         suppressSourceItemsChanged = true
         items[index] = updatedItem
         suppressSourceItemsChanged = false
@@ -2759,6 +2862,13 @@ final class AgentTabSession: ObservableObject {
             isDirty = true
             return
         }
+        if let owner = activeRunOwnership, let start = quietLedger.startKey(owner: owner),
+           previousItem.sequenceIndex >= start || updatedItem.sequenceIndex >= start,
+           previousItem.id != updatedItem.id || previousItem.sequenceIndex != updatedItem.sequenceIndex
+           || (previousItem.kind != updatedItem.kind && !(previousItem.kind == .toolCall && updatedItem.kind == .toolResult))
+        {
+            quietLedger.invalidateRange(owner: owner)
+        }
         suppressSourceItemsChanged = true
         items[index] = updatedItem
         suppressSourceItemsChanged = false
@@ -2774,6 +2884,9 @@ final class AgentTabSession: ObservableObject {
     func removeItem(at index: Int) -> AgentChatItem? {
         guard items.indices.contains(index) else { return nil }
         let removed = items[index]
+        if let owner = activeRunOwnership, let start = quietLedger.startKey(owner: owner), removed.sequenceIndex >= start {
+            quietLedger.invalidateRange(owner: owner)
+        }
         suppressSourceItemsChanged = true
         items.remove(at: index)
         suppressSourceItemsChanged = false
@@ -2801,6 +2914,13 @@ final class AgentTabSession: ObservableObject {
             lastActivityAt = Date()
             isDirty = true
             return
+        }
+        if let owner = activeRunOwnership, let start = quietLedger.startKey(owner: owner),
+           previousItem.sequenceIndex >= start || updatedItem.sequenceIndex >= start,
+           previousItem.id != updatedItem.id || previousItem.sequenceIndex != updatedItem.sequenceIndex
+           || (previousItem.kind != updatedItem.kind && !(previousItem.kind == .toolCall && updatedItem.kind == .toolResult))
+        {
+            quietLedger.invalidateRange(owner: owner)
         }
         suppressSourceItemsChanged = true
         items[index] = updatedItem

@@ -3554,6 +3554,16 @@ final class CodexNativeSessionController {
         {
             markTurnActivity(notifiedTurnID, makeCurrent: true)
         }
+        // Preserve semantic/unknown activity before item/tool deduplication or malformed-payload
+        // early returns. Reuse the existing scoped non-rendering liveness channel; no history or
+        // extra event registry. The coordinator applies its current controller/turn acceptance.
+        if hasUnrepresentedQuietActivity(method: notification.method, params: params) {
+            await emit(.livenessActivity(.init(
+                kind: .warning, method: notification.method,
+                threadID: Self.notificationThreadID(from: params), turnID: notifiedTurnID,
+                itemID: Self.notificationItemID(from: params), activeFlags: [], message: nil
+            )))
+        }
         switch notification.method {
         case "turn/started", "codex/event/turn_started":
             emittedToolEventDedupKeys.removeAll(keepingCapacity: true)
@@ -4017,6 +4027,31 @@ final class CodexNativeSessionController {
             if let activity = Self.parseLivenessActivity(method: notification.method, params: params) {
                 await emit(.livenessActivity(activity))
             }
+        }
+    }
+
+    private func hasUnrepresentedQuietActivity(method: String, params: [String: Any]) -> Bool {
+        if Self.isItemLifecycleNotificationMethod(method) {
+            guard let item = Self.canonicalItem(from: params) else { return true }
+            return !["agentmessage", "agent_message", "reasoning"].contains(normalizedTypeString(from: item))
+        }
+        switch method {
+        case "turn/completed", "codex/event/turn_completed":
+            let turn = params["turn"] as? [String: Any]
+            return turn?["status"] as? String != "completed"
+        case "codex/event/agent_message":
+            return Self.notificationItemID(from: params, includeTopLevelIDFallback: false) == nil
+        case "codex/event/mcp_tool_call_begin", "codex/event/mcp_tool_call_end":
+            // A valid tool event already reaches typed activity before UI suppression. Only a
+            // malformed envelope needs the uncertainty fallback; preserve the existing first event.
+            return parseRawMCPToolLifecycleEvent(method: method, params: params) == nil
+        case "turn/started", "codex/event/turn_started",
+             "codex/event/task_complete", "item/agentMessage/delta",
+             "item/reasoning/summaryTextDelta", "item/reasoning/textDelta", "thread/tokenUsage/updated",
+             "thread/status/changed", "deprecationNotice":
+            return false
+        default:
+            return true
         }
     }
 

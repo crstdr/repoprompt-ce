@@ -47,6 +47,43 @@ struct AgentRunQuietLedger {
         facts = initialFacts
     }
 
+    func usesQuietMessageBoundaries(owner: AgentRunOwnership) -> Bool {
+        candidateStartKey(owner: owner) != nil && attempt?.provider == .claudeCode
+    }
+
+    func candidateStartKey(owner: AgentRunOwnership) -> Int? {
+        guard let current = attempt, current.owner == owner, current.seal == nil,
+              current.routineWakeID != nil, !current.hasOccurrence, current.rangeIsComplete,
+              facts != nil, AgentQuietCheckInClassifier.supports(current.provider)
+        else { return nil }
+        return current.startKey
+    }
+
+    func startKey(owner: AgentRunOwnership) -> Int? {
+        attempt?.owner == owner && attempt?.seal == nil ? attempt?.startKey : nil
+    }
+
+    mutating func noteAcceptedStream(_ result: AIStreamResult, owner: AgentRunOwnership) {
+        guard let current = attempt, current.owner == owner, current.seal == nil else { return }
+        let neutral: Bool = switch result.type {
+        case "content", "final_content", "reasoning", "usage", "message_stop", "transport_activity":
+            true
+        case "lifecycle":
+            ["initialized", "completed"].contains(result.text ?? "")
+        case "session_state_changed":
+            ["running", "idle"].contains(result.text?.lowercased() ?? "")
+        case "system":
+            ["Agent initialized", "Agent completed", "Agent cancelled"].contains(result.text ?? "")
+        case "event":
+            false // Unknown activity is never evidence of silence, even without text.
+        case "status":
+            current.provider == .claudeCode && result.text?.hasPrefix("Permission mode:") == true
+        default:
+            false
+        }
+        if !neutral { noteOccurrence(owner: owner) }
+    }
+
     func isOpen(owner: AgentRunOwnership) -> Bool {
         attempt?.owner == owner && attempt?.seal == nil
     }
