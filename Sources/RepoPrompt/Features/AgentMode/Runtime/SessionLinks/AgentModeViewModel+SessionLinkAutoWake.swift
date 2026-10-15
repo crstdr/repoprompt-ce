@@ -1856,7 +1856,7 @@ extension AgentModeViewModel {
         if let predicate = agentSessionLinkAutoWakeRouteRefusal(session) {
             if let refusalPhase {
                 // Closed predicate vocabulary and the existing phase only: no endpoint or content.
-                AgentSessionLinkAutoWakeDiagnostics.routeRefused(predicate: predicate, phase: refusalPhase)
+                AgentSessionLinkAutoWakeDiagnostics.routeRefused(observer: session.oversight.wakeDiagnosticObserver, predicate: predicate, phase: refusalPhase)
                 if predicate == .runStateIsActive {
                     requestClaudeStaleActiveProbe(for: session)
                 }
