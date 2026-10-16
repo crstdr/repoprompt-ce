@@ -5003,16 +5003,20 @@ final class AgentSessionLinkRuntimeBridge {
                 #if DEBUG
                     await test_afterPassiveObservationSnapshot?(targetEndpoint)
                 #endif
-                let facts: AgentRunQuietFacts? = if let capturedChain, let capturedFrame, let observation,
-                                                    chains[targetEndpoint.sessionID] === capturedChain,
-                                                    capturedChain.endpoint == targetEndpoint, capturedFrame.endpoint == targetEndpoint,
-                                                    capturedChain.scheduledFrame?.sourceSequence == capturedFrame.sourceSequence,
-                                                    capturedChain.pairedFrame?.sourceSequence == capturedFrame.sourceSequence,
-                                                    capturedFrame.status == AgentSessionLinkPassiveStatusNotices.Status(presentation.status),
-                                                    capturedFrame.matchesCanonical(observation)
-                {
-                    capturedFrame.runFacts
-                } else { nil }
+                let pairing: AgentSessionLinkAutoWakeDiagnostics.PairingOutcome = if capturedChain == nil { .missingChain }
+                else if capturedFrame == nil { .missingFrame }
+                else if observation == nil { .missingObservation }
+                else if let capturedChain, chains[targetEndpoint.sessionID] !== capturedChain { .chainReplaced }
+                else if capturedChain?.endpoint != targetEndpoint || capturedFrame?.endpoint != targetEndpoint { .endpointMismatch }
+                else if capturedChain?.scheduledFrame?.sourceSequence != capturedFrame?.sourceSequence { .scheduledFrameChanged }
+                else if capturedChain?.pairedFrame?.sourceSequence != capturedFrame?.sourceSequence { .pairedFrameChanged }
+                else if capturedFrame?.status != AgentSessionLinkPassiveStatusNotices.Status(presentation.status) { .statusMismatch }
+                else if let capturedFrame, let observation, !capturedFrame.matchesCanonical(observation) { .observationMismatch }
+                else { .paired }
+                let facts = pairing == .paired ? capturedFrame?.runFacts : nil
+                AgentSessionLinkAutoWakeDiagnostics.record(.pairing(
+                    observer: endpoint.sessionID, source: targetEndpoint.sessionID, outcome: pairing, facts: facts
+                ))
 
                 statusSamples.append(AgentSessionLinkPassiveStatusNotices.Sample(
                     reference: reference,

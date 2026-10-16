@@ -9873,3 +9873,24 @@ extension AgentSessionLinkRuntimeBridgeTests {
         withExtendedLifetime(dormantOldCache) {}
     }
 }
+
+extension AgentSessionLinkRuntimeBridgeTests {
+    func testFactsPairingDiagnosticsReplayAuthorityAwaitMismatchAndPairedProof() async throws {
+        let recorder = QuietCheckInDiagnosticRecorder()
+        try await AgentSessionLinkAutoWakeDiagnostics.$testObserver.withValue({ recorder.record($0) }) {
+            try await testAuthorityAwaitNeverAttachesNewerOrSupersededFactsToCapturedStatusInEitherOrdering()
+        }
+        XCTAssertTrue(recorder.events.contains {
+            if case let .pairing(_, _, outcome, facts) = $0 {
+                return outcome == .paired && facts != nil
+            }
+            return false
+        })
+        XCTAssertTrue(recorder.events.contains {
+            if case let .pairing(_, _, outcome, facts) = $0 {
+                return outcome == .scheduledFrameChanged && facts == nil
+            }
+            return false
+        }, "the real authority-await interleaving must identify the freshness gate, not just unknown proof")
+    }
+}

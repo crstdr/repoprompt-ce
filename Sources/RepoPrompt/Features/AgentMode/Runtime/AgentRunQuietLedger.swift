@@ -93,7 +93,10 @@ struct AgentRunQuietLedger {
     /// Only the authoritative begin funnel calls this. Re-entry cannot clear accepted occurrences.
     mutating func begin(owner: AgentRunOwnership, startKey: Int, provider: AgentSessionLinkPromptProviderContext) {
         guard attempt?.owner != owner, lastEndedOwner != owner else { return }
-        if let previous = attempt, previous.seal == nil { advance(quiet: false) }
+        if let previous = attempt, previous.seal == nil {
+            advance(quiet: false)
+            recordSeal(previous, outcome: .supersededUnsealedAttempt)
+        }
         let serial = facts.flatMap { value -> UInt64? in
             let (next, overflow) = value.settledThrough.addingReportingOverflow(1)
             return overflow ? nil : next
@@ -152,20 +155,26 @@ struct AgentRunQuietLedger {
         guard let current = attempt, current.owner == owner else { return nil }
         if let seal = current.seal { return seal }
         var quiet = false
-        if facts != nil, current.serial != nil,
-           classifiesQuietCheckIn, terminalState == .completed, !hasSuccessor,
-           !current.hasOccurrence, current.rangeIsComplete,
-           AgentSessionLinkPrompts.supportsQuietCheckIn(current.provider),
-           let wakeID = current.routineWakeID,
-           case let .quiet(hiddenIDs) = AgentQuietCheckInClassifier.classify(
-               rows: rows,
-               startKey: current.startKey,
-               endKey: endKey,
-               rangeIsComplete: rangeIsComplete,
-               routineWakeID: wakeID,
-               hostMarkerIDs: hostMarkerIDs
-           )
+        let outcome: AgentSessionLinkAutoWakeDiagnostics.SealOutcome
+        if facts == nil || current.serial == nil { outcome = .unknownFacts }
+        else if !classifiesQuietCheckIn { outcome = .unqualified }
+        else if terminalState != .completed { outcome = .terminalNotCompleted }
+        else if hasSuccessor { outcome = .successor }
+        else if current.hasOccurrence { outcome = .occurrence }
+        else if !current.rangeIsComplete { outcome = .invalidatedRange }
+        else if !AgentSessionLinkPrompts.supportsQuietCheckIn(current.provider) { outcome = .unsupportedProvider }
+        else if current.routineWakeID == nil { outcome = .nonRoutineWake }
+        else if let wakeID = current.routineWakeID,
+                case let .quiet(hiddenIDs) = AgentQuietCheckInClassifier.classify(
+                    rows: rows,
+                    startKey: current.startKey,
+                    endKey: endKey,
+                    rangeIsComplete: rangeIsComplete,
+                    routineWakeID: wakeID,
+                    hostMarkerIDs: hostMarkerIDs
+                )
         {
+            outcome = .quiet
             quiet = true
             var changed = false
             for id in hiddenIDs {
@@ -173,10 +182,11 @@ struct AgentRunQuietLedger {
                 changed = hiddenSourceIDs.insert(id).inserted || changed
             }
             if changed { displayMaskRevision &+= 1 }
-        }
+        } else { outcome = .sourceRangeOrReply }
         advance(quiet: quiet)
         let seal = Seal(ownership: owner, isQuiet: quiet, facts: facts)
         attempt?.seal = seal
+        recordSeal(current, outcome: outcome)
         return seal
     }
 
@@ -188,7 +198,10 @@ struct AgentRunQuietLedger {
         guard authoritativeOwner == owner, lastEndedOwner != owner else { return false }
         if let current = attempt {
             guard current.owner == owner else { return false }
-            if current.seal == nil { advance(quiet: false) }
+            if current.seal == nil {
+                advance(quiet: false)
+                recordSeal(current, outcome: .unsealedEnd)
+            }
         } else {
             advance(quiet: false)
         }
@@ -250,6 +263,13 @@ struct AgentRunQuietLedger {
         hostMarkerIDs.removeAll()
         if hiddenSourceIDs.count != count { displayMaskRevision &+= 1 }
         if attempt?.seal == nil { attempt?.rangeIsComplete = false }
+    }
+
+    private func recordSeal(_ current: Attempt, outcome: AgentSessionLinkAutoWakeDiagnostics.SealOutcome) {
+        AgentSessionLinkAutoWakeDiagnostics.record(.seal(
+            source: current.owner.binding.persistentSessionID ?? current.owner.binding.tabID,
+            attempt: current.owner.attemptID, outcome: outcome, facts: facts, occurrence: current.hasOccurrence
+        ))
     }
 
     private mutating func advance(quiet: Bool) {
