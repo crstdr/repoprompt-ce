@@ -1707,7 +1707,12 @@ final actor ClaudeNativeProcessSessionController {
             if content is String { return false }
             guard let blocks = content as? [[String: Any]] else { return true }
             return blocks.contains { block in
-                !["text", "thinking", "tool_use", "tool_result"].contains(block["type"] as? String ?? "")
+                switch block["type"] as? String {
+                case "text": !(block["text"] is String)
+                case "thinking": !(block["thinking"] is String)
+                case "tool_use", "tool_result": false // Translator emits activity even with fallback fields.
+                default: true
+                }
             }
         case "stream_event":
             guard let event = payload["event"] as? [String: Any] else { return true }
@@ -1719,11 +1724,22 @@ final actor ClaudeNativeProcessSessionController {
                 return false
             case "message_delta", "message_stop", "content_block_stop": return false
             case "content_block_start":
-                let block = event["content_block"] as? [String: Any]
-                return !["text", "thinking"].contains(block?["type"] as? String ?? "")
+                guard let block = event["content_block"] as? [String: Any] else { return true }
+                switch block["type"] as? String {
+                case "text": return !(block["text"] is String)
+                case "thinking": return !(block["thinking"] is String)
+                default: return true
+                }
             case "content_block_delta":
-                let delta = event["delta"] as? [String: Any]
-                return !["text_delta", "thinking_delta", "signature_delta"].contains(delta?["type"] as? String ?? "")
+                guard let delta = event["delta"] as? [String: Any] else { return true }
+                // Empty Strings are legitimate framing. Missing/malformed payloads are not
+                // neutral merely because their type name is recognized by the translator.
+                switch delta["type"] as? String {
+                case "text_delta": return !(delta["text"] is String)
+                case "thinking_delta": return !(delta["thinking"] is String)
+                case "signature_delta": return !(delta["signature"] is String)
+                default: return true
+                }
             default: return true
             }
         case "system":

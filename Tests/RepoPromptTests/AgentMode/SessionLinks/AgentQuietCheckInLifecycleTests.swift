@@ -287,6 +287,197 @@ final class AgentQuietCheckInLifecycleTests: XCTestCase {
         }
     }
 
+    func testClaudeControllerMalformedAssistantTextValuesRemainOrdinaryBeforeAuthoritativeAck() async {
+        for type in ["assistant", "message"] {
+            for field in ["", #", "text":null"#, #", "text":42"#] {
+                // Interpolate raw JSON fields without coercing invalid values into Strings.
+                let block = #"{"type":"text"\#(field)}"#
+                await assertClaudeControllerQuietCompletion([
+                    #"{"type":"\#(type)","message":{"id":"m","content":[\#(block)]}}"#
+                ], quiet: false, expectedTexts: ["[ack]"], expectsUncertainty: true)
+            }
+        }
+    }
+
+    func testClaudeControllerMalformedKnownDeltaPayloadsRemainOrdinary() async {
+        let start = #"{"type":"stream_event","event":{"type":"message_start","message":{"id":"m","content":[]}}}"#
+        for (type, field) in [("text_delta", "text"), ("thinking_delta", "thinking"), ("signature_delta", "signature")] {
+            for value in [nil, "null", "42"] as [String?] {
+                let data = value.map { #", "\#(field)":\#($0)"# } ?? ""
+                await assertClaudeControllerQuietCompletion([
+                    start, #"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"\#(type)"\#(data)}}}"#
+                ], quiet: false, expectedTexts: ["[ack]"], expectsUncertainty: true)
+            }
+        }
+    }
+
+    func testClaudeControllerMalformedKnownBlockPayloadsRemainOrdinary() async {
+        let start = #"{"type":"stream_event","event":{"type":"message_start","message":{"id":"m","content":[]}}}"#
+        for (type, field) in [("text", "text"), ("thinking", "thinking")] {
+            for value in [nil, "null", "42"] as [String?] {
+                let data = value.map { #", "\#(field)":\#($0)"# } ?? ""
+                let block = #"{"type":"\#(type)"\#(data)}"#
+                await assertClaudeControllerQuietCompletion([
+                    start, #"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":\#(block)}}"#
+                ], quiet: false, expectedTexts: ["[ack]"], expectsUncertainty: true)
+                if type == "thinking" {
+                    await assertClaudeControllerQuietCompletion([
+                        #"{"type":"assistant","message":{"id":"m","content":[\#(block)]}}"#
+                    ], quiet: false, expectedTexts: ["[ack]"], expectsUncertainty: true)
+                }
+            }
+        }
+    }
+
+    func testClaudeControllerWellFormedEmptyReasoningAndSameItemReplacementRemainQuiet() async {
+        for content in [
+            #"[{"type":"text","text":""}]"#,
+            "[]",
+            "\"\"",
+            #""prose""#,
+            #"[{"type":"thinking","thinking":"reasoning"}]"#,
+            #"[{"type":"thinking","thinking":""}]"#
+        ] {
+            await assertClaudeControllerQuietCompletion([
+                #"{"type":"assistant","message":{"id":"m","content":\#(content)}}"#
+            ], quiet: true, expectedTexts: ["[ack]"])
+        }
+        let start = #"{"type":"stream_event","event":{"type":"message_start","message":{"id":"m","content":[]}}}"#
+        for (type, field) in [("text_delta", "text"), ("thinking_delta", "thinking"), ("signature_delta", "signature")] {
+            for value in ["", "ordinary streamed prefix"] {
+                await assertClaudeControllerQuietCompletion([
+                    start, #"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"\#(type)","\#(field)":"\#(value)"}}}"#
+                ], quiet: true, expectedTexts: ["[ack]"])
+            }
+        }
+        for (type, field) in [("text", "text"), ("thinking", "thinking")] {
+            await assertClaudeControllerQuietCompletion([
+                start, #"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"\#(type)","\#(field)":""}}}"#
+            ], quiet: true, expectedTexts: ["[ack]"])
+        }
+    }
+
+    func testClaudeConsumerBindingReplacementRejectsStaleSemanticAndTerminalWhileSameIDRemainsOrdinary() async throws {
+        try await assertConsumerBindingReplacementSafety(claude: true)
+    }
+
+    func testACPConsumerBindingReplacementRejectsStaleSemanticAndTerminalWhileSameIDRemainsOrdinary() async throws {
+        try await assertConsumerBindingReplacementSafety(claude: false)
+    }
+
+    private func assertConsumerBindingReplacementSafety(claude: Bool) async throws {
+        for replacesBinding in [false, true] {
+            let h = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() }, replayTranscript: true)
+            // ACP's consumer is provider-neutral; use the same supported quiet-ledger fixture as
+            // the existing ACP approval test. This does not enable shipped Devin quiet behavior.
+            let s = h.makeSession(agent: claude ? .claudeCode : .codexExec)
+            h.host.test_installLiveSession(s)
+            let sessionID = UUID()
+            let installed = try XCTUnwrap(h.host.test_installPersistentSessionBinding(sessionID: sessionID, on: s))
+            let runID = UUID()
+            s.installRunID(runID)
+            s.runState = .running
+            let owner = s.beginRunAttempt(source: "binding-consumer-control")
+            s.quietLedger.markRoutineWake(owner: owner, wakeID: UUID())
+            XCTAssertNotNil(s.quietLedger.candidateStartKey(owner: owner))
+            let gate = QuietIngressGate()
+            let base = try XCTUnwrap(h.hooks)
+            var semanticIngressCount = 0
+            let hooks = AgentModeRunService.Hooks(
+                usage: base.usage, attachments: base.attachments, presentation: base.presentation,
+                bindingObservation: base.bindingObservation, queuedWorkRecovery: base.queuedWorkRecovery,
+                persistence: base.persistence,
+                transcript: .init(
+                    handleHeadlessStreamResult: { result, session, runID, attemptID in
+                        if result.type == "usage" { await gate.pass() }
+                        if result.type == "event" { semanticIngressCount += 1 }
+                        await base.transcript.handleHeadlessStreamResult(result, session, runID, attemptID)
+                    },
+                    finalizeStreamingItems: base.transcript.finalizeStreamingItems,
+                    finalizePendingToolCalls: base.transcript.finalizePendingToolCalls,
+                    finalizePendingToolCallsWithUpperBound: base.transcript.finalizePendingToolCallsWithUpperBound,
+                    flushPendingAssistantDelta: base.transcript.flushPendingAssistantDelta,
+                    clearPendingAssistantDelta: base.transcript.clearPendingAssistantDelta
+                ),
+                providerInput: base.providerInput, interactions: base.interactions,
+                terminalSettlement: base.terminalSettlement, continuation: base.continuation
+            )
+            let turnID = UUID()
+            s.claudeExpectedTurnIDs.insert(turnID)
+            let results = [AIStreamResult(type: "usage", text: nil), .init(type: "event", text: "semantic activity"), .init(type: "final_content", text: "[ack]", contentMessageID: "m")]
+            let task = Task { @MainActor in
+                if claude {
+                    let runner = ClaudeIntegratedAgentModeRunner(claudeCoordinator: h.host.claudeCoordinator, hooks: hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier())
+                    return await runner.testConsumeQuietEvents(results.map(NativeAgentRuntimeEvent.stream) + [.turnCompleted(turnID: turnID, status: .completed)], session: s, runID: runID, owner: owner)
+                }
+                let runner = ACPIntegratedAgentModeRunner(
+                    hooks: hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier(), toolTrackingHooks: .noOp,
+                    providerFactory: { _, _ in nil }, controllerFactory: { provider, request in try ACPAgentSessionController(provider: provider, runRequest: request) }
+                )
+                await runner.testConsumeQuietEvents(results.map(NormalizedAgentRuntimeEvent.stream) + [.terminal(state: .completed, errorText: nil)], session: s, runID: runID, owner: owner)
+                return false // ACP's existing test seam intentionally discards its outcome.
+            }
+            defer { gate.open()
+                task.cancel()
+            }
+            await gate.waitUntilEntered()
+            XCTAssertTrue(s.isCurrentRunAttemptForCurrentBinding(owner))
+            XCTAssertNotNil(s.quietLedger.candidateStartKey(owner: owner), "Paused before semantic ingress")
+            let replacement = try XCTUnwrap(h.host.test_installPersistentSessionBinding(sessionID: replacesBinding ? UUID() : sessionID, on: s))
+            XCTAssertEqual(replacement == installed, !replacesBinding)
+            XCTAssertEqual(s.isCurrentRunAttemptForCurrentBinding(owner), !replacesBinding)
+            let replacementFacts = s.quietLedger.facts
+            let replacementSequence = s.runLifecycle.liveness?.lastAcceptedSequence
+            if replacesBinding { XCTAssertNil(s.quietRunFacts(capturedState: .running), "Retired owner is unknown, not freshly ordinary") }
+            gate.open()
+            let consumedNormalTerminal = await task.value
+            if claude { XCTAssertEqual(consumedNormalTerminal, !replacesBinding) }
+            XCTAssertEqual(semanticIngressCount, replacesBinding ? 0 : 1, "The real consumer rejects stale events before the semantic VM hook")
+            XCTAssertEqual(s.items.filter { $0.kind == .assistant }.map(\.text), replacesBinding ? [] : ["[ack]"])
+            if replacesBinding {
+                XCTAssertEqual(s.runLifecycle.liveness?.lastAcceptedSequence, replacementSequence)
+                let revision = await commit(h, s, owner)
+                XCTAssertNil(revision, "Normal old terminal cannot seal under the replacement binding")
+                XCTAssertEqual(s.quietLedger.facts, replacementFacts)
+                XCTAssertTrue(s.quietLedger.hiddenSourceIDs.isEmpty)
+                XCTAssertNil(s.quietRunFacts(capturedState: .running))
+                XCTAssertTrue(s.endRunAttempt(ifCurrent: owner, source: "retired-binding-consumer-control"))
+                XCTAssertEqual(s.quietLedger.facts, replacementFacts, "Old central end cannot advance replacement facts")
+                XCTAssertTrue(s.quietLedger.hiddenSourceIDs.isEmpty)
+            } else {
+                XCTAssertNil(s.quietLedger.candidateStartKey(owner: owner), "Accepted semantic activity made the still-current owner ordinary")
+                let revision = await commit(h, s, owner)
+                XCTAssertNotNil(revision)
+                XCTAssertEqual(s.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: 1))
+                XCTAssertTrue(s.quietLedger.hiddenSourceIDs.isEmpty)
+            }
+        }
+    }
+
+    @MainActor
+    private final class QuietIngressGate {
+        private var entered = false
+        private var opened = false
+        private var entryWaiter: CheckedContinuation<Void, Never>?
+        private var releaseWaiter: CheckedContinuation<Void, Never>?
+        func pass() async {
+            entered = true
+            entryWaiter?.resume()
+            entryWaiter = nil
+            if !opened { await withCheckedContinuation { releaseWaiter = $0 } }
+        }
+
+        func waitUntilEntered() async {
+            if !entered { await withCheckedContinuation { entryWaiter = $0 } }
+        }
+
+        func open() {
+            opened = true
+            releaseWaiter?.resume()
+            releaseWaiter = nil
+        }
+    }
+
     private func assertClaudeControllerQuietCompletion(
         _ wire: [String],
         quiet: Bool,
