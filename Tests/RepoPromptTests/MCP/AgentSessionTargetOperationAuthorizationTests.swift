@@ -130,6 +130,36 @@ final class AgentSessionTargetOperationAuthorizationTests: XCTestCase {
         }
     }
 
+    func testGlobalOverseerAutoApproveLetsAnAgentRunEveryTargetOperationOnAnySession() throws {
+        let previous = OverseerGlobalAutoApprove.isEnabled
+        defer { OverseerGlobalAutoApprove.isEnabled = previous }
+        let unrelated = DomainAgentSessionTargetProvenance.known(targetSessionID: UUID(), parentSessionID: nil)
+        let caller = DomainAgentSessionCallerIdentity.agentSession(callerSessionID)
+        let operations: [DomainAgentSessionTargetOperation] = [.runSteer, .runCancel, .runRespond, .manageStop, .manageCleanup]
+
+        OverseerGlobalAutoApprove.isEnabled = { false }
+        for operation in operations {
+            XCTAssertThrowsError(
+                try AgentSessionTargetOperationGuard.require(operation: operation, caller: caller, provenance: unrelated, reference: "x"),
+                "\(operation.rawValue): off keeps the direct-child and human-only rules"
+            )
+        }
+
+        OverseerGlobalAutoApprove.isEnabled = { true }
+        for operation in operations {
+            XCTAssertNoThrow(
+                try AgentSessionTargetOperationGuard.require(operation: operation, caller: caller, provenance: unrelated, reference: "x"),
+                "\(operation.rawValue): global on removes the barrier, including session deletion"
+            )
+        }
+        XCTAssertThrowsError(
+            try AgentSessionTargetOperationGuard.require(
+                operation: .runSteer, caller: .unresolvedAgentRun, provenance: unrelated, reference: "x"
+            ),
+            "unresolved routing is not a caller and still fails closed"
+        )
+    }
+
     func testAgentOriginCallerCannotTargetItsOwnSession() async throws {
         let window = try await makeWindow()
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
@@ -1655,7 +1685,7 @@ final class DelegationMembershipCensusTests: XCTestCase {
         XCTAssertEqual(DelegationSpawnAdmission.admit(
             creatorSessionID: creator, target: .newSession,
             scopes: fixture.scopes, administration: fixture.core, projector: projector
-        ), .denied(.usageProofMissing), "A missing safe placement is not evidence that this creator is unscoped")
+        ), .creatorPlacementUnresolved(projector.pointResolutionState(for: creator) == .replicated ? "creator_replicated" : "creator_ancestry_conflict"), "A missing safe placement is not evidence that this creator is unscoped")
         let after = fixture.scopes.usageIncludingReservations(emptyUsage)
         XCTAssertEqual(after.liveSessionCount, before.liveSessionCount)
         XCTAssertEqual(after.worktreeCount, before.worktreeCount)
@@ -1675,6 +1705,10 @@ final class DelegationMembershipCensusTests: XCTestCase {
         let source = OpenWindowsDelegationProvenanceSource(windows: { [window] })
         let projector = SpawnProvenanceDelegationMembershipProjector(source: source)
         let scopes = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
+        let unscopedCore = AgentSessionAdministrationCore(scopes: scopes, projector: projector)
+        XCTAssertEqual(DelegationSpawnAdmission.admit(
+            creatorSessionID: child, target: .newSession, scopes: scopes, administration: unscopedCore, projector: projector
+        ), .unscoped, "With no live delegation anywhere, scope provenance cannot revoke the creation surface's own authority")
         let pending = try scopes.requestScope(
             requesterSessionID: child, requesterTabID: nil, kind: .tree(rootSessionID: root),
             capabilities: [.observe, .spawn], guardrails: .init(maxLiveSessions: 10), reason: nil, idempotencyKey: nil
@@ -1687,7 +1721,10 @@ final class DelegationMembershipCensusTests: XCTestCase {
         let emptyUsage = DomainDelegationScopeUsage(scopeID: scope.id, liveSessionCount: 0, worktreeCount: 0)
         XCTAssertEqual(DelegationSpawnAdmission.admit(
             creatorSessionID: child, target: .newSession, scopes: scopes, administration: core, projector: projector
-        ), .denied(.usageProofMissing))
+        ), .creatorPlacementUnresolved("creator_ancestry_conflict"))
+        let diagnostic = String(describing: DelegationSpawnAdmission.error(for: .usageProofMissing, subreason: "creator_ancestry_conflict"))
+        XCTAssertTrue(diagnostic.contains("creator_ancestry_conflict"))
+        XCTAssertTrue(diagnostic.contains("scope_status"))
         XCTAssertEqual(scopes.usageIncludingReservations(emptyUsage), emptyUsage)
 
         // An actually unloaded root retains the existing ancestry contract; it is distinct from a

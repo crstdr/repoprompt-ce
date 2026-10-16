@@ -4,6 +4,7 @@ import Foundation
 /// request-local evidence, never a cache or authority retained across an await or mutation.
 @MainActor
 enum AgentSessionCarrierResolver {
+    weak static var preparedSessionRuntimes: (any PreparedAgentSessionRuntimeRegistry)?
     struct Observation {
         let window: WindowState
         let workspaceID: UUID
@@ -118,7 +119,9 @@ enum AgentSessionCarrierResolver {
 
     static func capture(windows: [WindowState], sessionIDs requestedIDs: Set<UUID>? = nil) -> Snapshot {
         var seenWindows: Set<ObjectIdentifier> = []
-        let windows = windows.filter { !$0.isClosing && seenWindows.insert(ObjectIdentifier($0)).inserted }
+        // Prepared runtimes borrow a saved carrier; they are not a second physical/UI claim.
+        // Their exact saved witness is joined below only after real carrier conflicts are checked.
+        let windows = windows.filter { !$0.isClosing && !$0.isPreparedSessionOwner && seenWindows.insert(ObjectIdentifier($0)).inserted }
         // A census intentionally enumerates owners. Point reads never enumerate dictionary keys,
         // unrelated workspaces, or unrelated live sessions to discover their candidate identities.
         let ids: Set<UUID>
@@ -296,6 +299,8 @@ enum AgentSessionCarrierResolver {
                 snapshot.replicatedSessionIDs.insert(row.sessionID)
             }
         }
-        return snapshot
+        return preparedSessionRuntimes?.addingPreparedRuntimeCarriers(
+            to: snapshot, sessionIDs: requestedIDs, windowIDs: Set(windows.map(\.windowID))
+        ) ?? snapshot
     }
 }

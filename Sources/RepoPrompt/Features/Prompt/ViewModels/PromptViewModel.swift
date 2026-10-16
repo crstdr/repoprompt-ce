@@ -2531,6 +2531,11 @@ class PromptViewModel: ObservableObject {
             .store(in: &cancellables)
 
         fileManager.$autoCodemapFiles
+            // Root/selection reconciliation can republish an unchanged list while a save is
+            // being prepared; only a real change may invalidate it. Dedupe before dropFirst
+            // so the initial value is the comparison baseline.
+            .map { $0.map(\.fullPath) }
+            .removeDuplicates()
             .dropFirst()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
@@ -2541,6 +2546,11 @@ class PromptViewModel: ObservableObject {
             .store(in: &cancellables)
 
         fileManager.$manualCodemapFiles
+            // Root/selection reconciliation can republish an unchanged list while a save is
+            // being prepared; only a real change may invalidate it. Dedupe before dropFirst
+            // so the initial value is the comparison baseline.
+            .map { $0.map(\.fullPath) }
+            .removeDuplicates()
             .dropFirst()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
@@ -5162,8 +5172,9 @@ class PromptViewModel: ObservableObject {
             dirtyTabIDs.insert(activeID)
             manager.markWorkspaceDirty()
         } else if !isDirty, wasDirty {
+            // Clearing a presentation-only dirty badge changes no workspace bytes.
+            // Bumping the save version here can exhaust an unrelated in-flight save.
             dirtyTabIDs.remove(activeID)
-            manager.markWorkspaceDirty()
         }
     }
 
