@@ -4064,6 +4064,19 @@ final class CodexNativeSessionController {
                 // Canonical prompt echo; accepted task input is latched by the host before send.
                 return !(item["content"] is [Any])
             }
+            if method == "item/completed" {
+                switch type {
+                case "agentmessage", "agent_message":
+                    // Required by the pinned schema; rendering fallbacks must not prove silence.
+                    return !(item["text"] is String)
+                case "reasoning":
+                    // Absent arrays default to empty; present arrays must contain only strings.
+                    return ["summary", "content"].contains { key in
+                        item[key] != nil && !(item[key] is [String])
+                    }
+                default: break
+                }
+            }
             return !["agentmessage", "agent_message", "reasoning"].contains(type)
         }
         switch method {

@@ -2862,6 +2862,125 @@ extension CodexResumeWedgeCommitTests {
         }
     }
 
+    func testMalformedNativeCompletionsRemainOrdinaryBeforeDeduplication() async throws {
+        let cases: [(String, [String: CodexJSONValue], Bool)] = [
+            ("missing-text", [:], true),
+            ("null-text", ["text": .null], true),
+            ("number-text", ["text": .number(7)], true),
+            ("object-text", ["text": .object([:])], true),
+            ("array-text", ["text": .array([])], true),
+            ("message-fallback", ["message": .string("[ack]")], true),
+            ("empty-text", ["text": .string("")], false),
+            ("ack-text", ["text": .string("[ack]")], false),
+            ("empty-text-fallback", ["text": .string(""), "message": .string("[ack]")], false),
+            ("reasoning-defaults", ["type": .string("reasoning")], false),
+            ("reasoning-empty", ["type": .string("reasoning"), "summary": .array([]), "content": .array([])], false),
+            ("reasoning-strings", ["type": .string("reasoning"), "summary": .array([.string("Thinking")]), "content": .array([.string("Thinking")])], false)
+        ] + ["summary", "content"].flatMap { field in
+            [
+                ("null-\(field)", ["type": .string("reasoning"), field: .null], true),
+                ("number-\(field)", ["type": .string("reasoning"), field: .number(7)], true),
+                ("object-\(field)", ["type": .string("reasoning"), field: .object([:])], true),
+                ("mixed-\(field)", ["type": .string("reasoning"), field: .array([.string(""), .number(7)])], true)
+            ]
+        }
+        for (name, payload, malformed) in cases {
+            for scope in ["current", "completed-item", "foreign-thread", "foreign-turn", "stale-controller"] {
+                let label = "\(name) scope=\(scope)"
+                let f = makeFixture([])
+                f.viewModel.test_initializeRunService()
+                let runID = UUID()
+                f.session.installRunID(runID)
+                let current = CodexNativeSessionController(client: CodexAppServerClient(), runID: runID, tabID: f.session.tabID, windowID: -1, workspacePaths: .uniform(nil))
+                f.session.codexController = current
+                f.session.codexConversationID = Self.oldThreadID
+                let owner = try XCTUnwrap(f.session.activeRunOwnership)
+                let wakeID = UUID()
+                f.session.quietLedger.markRoutineWake(owner: owner, wakeID: wakeID)
+                await current.test_installThreadState(threadID: Self.oldThreadID, authoritativeTurnID: "completion-turn", routingTurnID: "completion-turn")
+                let controller = scope == "stale-controller"
+                    ? CodexNativeSessionController(client: CodexAppServerClient(), runID: runID, tabID: f.session.tabID, windowID: -1, workspacePaths: .uniform(nil)) : current
+                if scope == "stale-controller" {
+                    await controller.test_installThreadState(threadID: Self.oldThreadID, authoritativeTurnID: "completion-turn", routingTurnID: "completion-turn")
+                }
+                var item = payload
+                item["id"] = .string("answer")
+                item["type"] = item["type"] ?? .string("agentMessage")
+                let thread = scope == "foreign-thread" ? "foreign-thread" : Self.oldThreadID
+                let turn = scope == "foreign-turn" ? "foreign-turn" : "completion-turn"
+                if scope == "completed-item" {
+                    var valid = item
+                    valid["text"] = .string("[ack]")
+                    valid["summary"] = .array([])
+                    valid["content"] = .array([])
+                    await controller.test_handleNotification(method: "item/completed", params: [
+                        "threadId": .string(thread), "turnId": .string(turn), "item": .object(valid)
+                    ])
+                } else if !malformed, item["type"] == .string("agentMessage"),
+                          item["text"] == .string("[ack]") || item["message"] == .string("[ack]")
+                {
+                    // Valid final replacement may discard prior streaming prose without uncertainty.
+                    await controller.test_handleNotification(method: "item/agentMessage/delta", params: [
+                        "threadId": .string(thread), "turnId": .string(turn), "itemId": .string("answer"), "delta": .string("discarded streaming prose")
+                    ])
+                }
+                await controller.test_handleNotification(method: "item/completed", params: [
+                    "threadId": .string(thread), "turnId": .string(turn), "item": .object(item)
+                ])
+                let terminal: [String: CodexJSONValue] = [
+                    "threadId": .string(Self.oldThreadID),
+                    "turn": .object(["id": .string("completion-turn"), "status": .string("completed")])
+                ]
+                if scope != "stale-controller" {
+                    await current.test_handleNotification(method: "turn/completed", params: terminal)
+                }
+                await controller.shutdown()
+                await f.coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "completion-turn"), session: f.session, sourceController: current)
+                var warnings = 0
+                var order: [String] = []
+                for await event in controller.events {
+                    switch event {
+                    case let .livenessActivity(activity) where activity.kind == .warning:
+                        warnings += 1
+                        XCTAssertEqual(activity.method, "item/completed", label)
+                        XCTAssertEqual(activity.threadID, thread, label)
+                        XCTAssertEqual(activity.turnID, turn, label)
+                        order.append("uncertainty")
+                    case .assistantCompleted, .reasoningCompleted: order.append("completed")
+                    default: break
+                    }
+                    await f.coordinator.test_handleCodexNativeEvent(event, session: f.session, sourceController: controller)
+                }
+                if scope == "stale-controller" {
+                    await current.test_handleNotification(method: "turn/completed", params: terminal)
+                    await current.shutdown()
+                    for await event in current.events {
+                        await f.coordinator.test_handleCodexNativeEvent(event, session: f.session, sourceController: current)
+                    }
+                }
+                let acceptedMalformed = malformed && ["current", "completed-item"].contains(scope)
+                // Foreign envelopes may be dropped by routing; stale controllers still translate but cannot latch.
+                let translated = scope != "foreign-thread"
+                XCTAssertEqual(warnings, malformed && translated ? 1 : 0, label)
+                if translated {
+                    XCTAssertEqual(
+                        order,
+                        scope == "completed-item"
+                            ? (malformed ? ["completed", "uncertainty"] : ["completed"])
+                            : (malformed ? ["uncertainty", "completed"] : ["completed"]),
+                        label
+                    )
+                }
+                XCTAssertEqual(f.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: acceptedMalformed ? 1 : 0), label)
+                XCTAssertEqual(f.session.quietLedger.hiddenSourceIDs.contains(wakeID), !acceptedMalformed, label)
+                if acceptedMalformed {
+                    XCTAssertTrue(f.session.quietLedger.hiddenSourceIDs.isEmpty, label)
+                }
+                f.session.saveDebounceTask?.cancel()
+            }
+        }
+    }
+
     private func makeQuietToolProgressFixture() async throws -> (Fixture, CodexNativeSessionController, AgentRunOwnership) {
         let f = makeFixture([])
         f.viewModel.test_initializeRunService()
