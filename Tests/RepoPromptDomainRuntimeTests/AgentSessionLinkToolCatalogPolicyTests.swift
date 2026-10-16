@@ -39,8 +39,8 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         func size(_ definition: MCPDomainToolDefinition) throws -> Int {
             try XCTUnwrap(String(data: encoder.encode(definition), encoding: .utf8)).unicodeScalars.count
         }
-        // The independent wait note occurs in both definitions; exclude it only from the frozen anchor.
-        XCTAssertEqual(try size(previous) - " Local input cancels older waits.".unicodeScalars.count, 10304, "Frozen c43f1bf6 full-entry baseline")
+        // Independent wait and row-budget guidance occurs in both definitions; exclude it only from the frozen anchor.
+        XCTAssertEqual(try size(previous) - " Local input cancels older waits.".unicodeScalars.count - 73, 10304, "Frozen c43f1bf6 full-entry baseline")
         XCTAssertLessThanOrEqual(try size(current) - size(previous), 160)
         let properties = try XCTUnwrap(current.inputSchema.objectValue?["properties"]?.objectValue)
         XCTAssertEqual(properties["model_id"], .object(["type": .string("string")]))
