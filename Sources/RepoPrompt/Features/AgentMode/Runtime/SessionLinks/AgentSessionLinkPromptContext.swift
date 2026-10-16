@@ -1183,7 +1183,7 @@ final class AgentSessionLinkOutboundPromptClaimStore {
                 .currentLaneGuidanceRevision ? .reminder : .full
         }
         let routineQuietCheckIn = routineQuietCheckIn && dispatchID.autoWakeID != nil
-            && AgentQuietCheckInClassifier.supports(epoch.providerContext)
+            && AgentSessionLinkPrompts.supportsQuietCheckIn(epoch.providerContext)
         let fingerprint = ClaimFingerprint(
             membershipKind: membershipKind,
             inventory: inventory,

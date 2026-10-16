@@ -4,6 +4,29 @@ import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 import RepoPromptSettingsCore
 
+/// Shared only by the existing wake attempt and callback-capable producer wrappers. No claim/cache
+/// identity or dispatch authority: final ARC release merely schedules exact-source cleanup.
+/// The immutable payload and Swift's weak-reference storage can be released from any executor.
+final class AgentQuietMarkerProducerLifetime: @unchecked Sendable {
+    private let wakeID: UUID
+    private let binding: AgentSessionRestorationBindingToken
+    private weak var session: AgentTabSession?
+
+    @MainActor
+    init(wakeID: UUID, binding: AgentSessionRestorationBindingToken, session: AgentTabSession) {
+        self.wakeID = wakeID
+        self.binding = binding
+        self.session = session
+    }
+
+    deinit {
+        Task { @MainActor [weak session, binding, wakeID] in
+            guard let session, session.currentRestorationBindingToken == binding else { return }
+            session.retireQuietUnmaterializedWake(wakeID)
+        }
+    }
+}
+
 // MARK: - Agent Tab Session
 
 /// Per-tab session state for agent mode.

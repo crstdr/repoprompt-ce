@@ -19,6 +19,17 @@ import RepoPromptDomainRuntime
 /// never builds a fragment of its own. `AgentSessionLinkMCPToolService.untrustedContentNotice`
 /// mirrors the autonomy clauses in compact form for the per-response notice.
 enum AgentSessionLinkPrompts {
+    /// Shared by classification and routine-dispatch copy. Calling this predicate is not provider
+    /// enablement: the normal terminal path must first qualify its accepted ingress coverage.
+    static func supportsQuietCheckIn(_ provider: AgentSessionLinkPromptProviderContext) -> Bool {
+        switch provider {
+        case .codexExec, .claudeCode: true
+        // Devin stays disabled for BOTH classification and future copy until exact own-echo U4 proof exists.
+        case .devin, .unselected, .claudeCodeGLM, .kimiCode, .customClaudeCompatible,
+             .openCode, .cursor, .grokBuild, .antigravity: false
+        }
+    }
+
     /// Hard cap on the rendered supplement. An inventory that cannot fit keeps a deterministic,
     /// order-preserving subset — each row is kept only if it still fits, so a single oversized row
     /// does not drop the rows after it and the retained set is not necessarily a prefix — reports
@@ -243,7 +254,7 @@ enum AgentSessionLinkPrompts {
         }
 
         let offersQuietReply = request.routineQuietCheckIn
-            && AgentQuietCheckInClassifier.supports(request.providerContext)
+            && AgentSessionLinkPrompts.supportsQuietCheckIn(request.providerContext)
             && request.providerContext != .codexExec
         let omitsDuplicateAutonomy = request.membershipKind == .inventory
             && request.laneGuidanceMode == .full

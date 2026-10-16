@@ -90,7 +90,7 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
         XCTAssertEqual(methods, ["initialize", resumeID == nil ? "session/new" : "session/load", "session/prompt"], "Fake emissions are gated by the real RPC exchange, not a timer")
         if resumeID != nil { XCTAssertEqual(recordedSessionLoadIDs(at: recordURL), ["bootstrap-session-id"]) }
         print("QUIET_F3_BOOTSTRAP mode=\(resumeID == nil ? "new" : "load") applied=\(content)")
-        XCTAssertFalse(AgentQuietCheckInClassifier.supports(.devin), "F3 does not qualify Devin quiet/copy")
+        XCTAssertFalse(AgentSessionLinkPrompts.supportsQuietCheckIn(.devin), "F3 does not qualify Devin quiet/copy")
     }
 
     func testCursorNewSessionPublishesRuntimeIDAsVerifiedLoadID() async throws {

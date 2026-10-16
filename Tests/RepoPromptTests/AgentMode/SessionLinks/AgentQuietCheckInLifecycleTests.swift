@@ -678,6 +678,6 @@ extension AgentQuietCheckInLifecycleTests {
                 }
             }
         }
-        XCTAssertFalse(AgentQuietCheckInClassifier.supports(.devin), "One shared predicate keeps future copy and classification disabled together")
+        XCTAssertFalse(AgentSessionLinkPrompts.supportsQuietCheckIn(.devin), "One shared predicate keeps future copy and classification disabled together")
     }
 }
