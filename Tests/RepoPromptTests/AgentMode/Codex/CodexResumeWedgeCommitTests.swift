@@ -2420,7 +2420,7 @@ extension CodexResumeWedgeCommitTests {
     func testQuietAutoapprovedNativeServerRequestsRemainOrdinaryAndScoped() async throws {
         for method in ["mcpServer/elicitation/request", "item/permissions/requestApproval"] {
             for ack in [false, true] {
-                for scope in ["current", "foreign-thread", "foreign-turn", "stale-controller", "no-request"] {
+                for scope in ["current", "absent-turn", "null-turn", "foreign-thread", "foreign-thread-no-turn", "foreign-turn", "stale-controller", "stale-controller-no-turn", "no-request"] {
                     let label = "\(method) ack=\(ack) scope=\(scope)"
                     let f = makeFixture([])
                     f.viewModel.test_initializeRunService()
@@ -2434,8 +2434,9 @@ extension CodexResumeWedgeCommitTests {
                             XCTAssertNotEqual(activity.kind, .serverRequestResolved, label)
                             if activity.method == method {
                                 XCTAssertEqual(activity.kind, .warning, label)
-                                XCTAssertEqual(activity.threadID, scope == "foreign-thread" ? "other-thread" : Self.oldThreadID, label)
-                                XCTAssertEqual(activity.turnID, scope == "foreign-turn" ? "other-turn" : "request-turn", label)
+                                XCTAssertEqual(activity.threadID, scope.hasPrefix("foreign-thread") ? "other-thread" : Self.oldThreadID, label)
+                                let lacksTurn = scope == "absent-turn" || scope == "null-turn" || scope.hasSuffix("no-turn")
+                                XCTAssertEqual(activity.turnID, lacksTurn ? nil : (scope == "foreign-turn" ? "other-turn" : "request-turn"), label)
                                 warningMethods.append(activity.method)
                             }
                         case .error, .serverRequestIssue, .approvalRequest, .permissionsRequest, .mcpElicitationRequest, .toolCall, .toolResult:
@@ -2454,7 +2455,7 @@ extension CodexResumeWedgeCommitTests {
                         )
                     }
                     let current = controller()
-                    let source = scope == "stale-controller" ? controller() : current
+                    let source = scope.hasPrefix("stale-controller") ? controller() : current
                     f.session.codexController = current
                     f.session.codexConversationID = Self.oldThreadID
                     let owner = try XCTUnwrap(f.session.activeRunOwnership)
@@ -2463,15 +2464,21 @@ extension CodexResumeWedgeCommitTests {
                     await source.test_installThreadState(threadID: Self.oldThreadID, authoritativeTurnID: "request-turn", routingTurnID: "request-turn")
                     await f.coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "request-turn"), session: f.session, sourceController: current)
                     if scope != "no-request" {
-                        await source.test_handleServerRequest(method: method, params: [
+                        var params: [String: CodexJSONValue] = [
                             "serverName": .string("RepoPromptCE"), "toolName": .string("apply_edits"),
-                            "threadId": .string(scope == "foreign-thread" ? "other-thread" : Self.oldThreadID),
+                            "threadId": .string(scope.hasPrefix("foreign-thread") ? "other-thread" : Self.oldThreadID),
                             "turnId": .string(scope == "foreign-turn" ? "other-turn" : "request-turn"),
                             "itemId": .string("permission-item"), "cwd": .string("/tmp"),
                             "message": .string("Approve app tool call?"),
                             "permissions": .object(["network": .object(["enabled": .bool(true)])]),
                             "requestedSchema": .object(["type": .string("object"), "properties": .object([:])])
-                        ])
+                        ]
+                        if scope == "absent-turn" || scope == "null-turn" || scope.hasSuffix("no-turn") {
+                            params["turnId"] = nil
+                            // Actual optional snake-case wire field, absent or explicitly null.
+                            params["turn_id"] = scope == "null-turn" ? .null : nil
+                        }
+                        await source.test_handleServerRequest(method: method, params: params)
                     }
                     if source !== current {
                         await source.shutdown()
@@ -2502,7 +2509,7 @@ extension CodexResumeWedgeCommitTests {
                         XCTAssertEqual(response["id"] as? Int, 42, label)
                         XCTAssertEqual((response["result"] as? [String: Any])?["action"] as? String, "accept", label)
                     }
-                    let ordinary = scope == "current"
+                    let ordinary = ["current", "absent-turn", "null-turn"].contains(scope)
                     XCTAssertEqual(f.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: ordinary ? 1 : 0), label)
                     XCTAssertEqual(f.session.runState, .completed, label)
                     if ordinary {
@@ -2982,6 +2989,79 @@ extension CodexResumeWedgeCommitTests {
                 if ordinary { XCTAssertTrue(f.session.quietLedger.hiddenSourceIDs.isEmpty, label) }
                 f.session.saveDebounceTask?.cancel()
                 await client.stop()
+            }
+        }
+    }
+}
+
+extension CodexResumeWedgeCommitTests {
+    func testUnscopedUnknownNativeNotificationIsOrdinaryOnlyForCurrentController() async throws {
+        for ack in [false, true] {
+            for scope in ["unscoped", "foreign-thread-no-turn", "foreign-turn", "stale-unscoped"] {
+                let label = "unknown notification ack=\(ack) scope=\(scope)"
+                let f = makeFixture([])
+                f.viewModel.test_initializeRunService()
+                let runID = UUID()
+                f.session.installRunID(runID)
+                func controller() -> CodexNativeSessionController {
+                    CodexNativeSessionController(client: CodexAppServerClient(), runID: runID, tabID: f.session.tabID, windowID: -1, workspacePaths: .uniform(nil))
+                }
+                let current = controller()
+                let source = scope == "stale-unscoped" ? controller() : current
+                f.session.codexController = current
+                f.session.codexConversationID = Self.oldThreadID
+                let owner = try XCTUnwrap(f.session.activeRunOwnership)
+                let wakeID = UUID()
+                f.session.quietLedger.markRoutineWake(owner: owner, wakeID: wakeID)
+                await current.test_installThreadState(threadID: Self.oldThreadID, authoritativeTurnID: "unknown-turn", routingTurnID: "unknown-turn")
+                await source.test_installThreadState(threadID: Self.oldThreadID, authoritativeTurnID: "unknown-turn", routingTurnID: "unknown-turn")
+                await f.coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "unknown-turn"), session: f.session, sourceController: current)
+                let params: [String: CodexJSONValue] = switch scope {
+                case "foreign-thread-no-turn": ["threadId": .string("other-thread")]
+                case "foreign-turn": ["threadId": .string(Self.oldThreadID), "turnId": .string("other-turn")]
+                default: [:]
+                }
+                await source.test_handleNotification(method: "future/activity", params: params)
+                var warnings = 0
+                func consume(_ controller: CodexNativeSessionController) async {
+                    for await event in controller.events {
+                        switch event {
+                        case let .livenessActivity(activity) where activity.method == "future/activity":
+                            warnings += 1
+                            XCTAssertEqual(activity.kind, .warning, label)
+                            XCTAssertEqual(activity.threadID, scope == "foreign-turn" ? Self.oldThreadID : nil, label)
+                            XCTAssertEqual(activity.turnID, scope == "foreign-turn" ? "other-turn" : nil, label)
+                            XCTAssertNil(activity.itemID, label)
+                        case .error, .serverRequestIssue, .errorNotification, .toolCall, .toolResult:
+                            XCTFail("No substitute error/tool activity: \(label)")
+                        default: break
+                        }
+                        await f.coordinator.test_handleCodexNativeEvent(event, session: f.session, sourceController: controller)
+                    }
+                }
+                if source !== current {
+                    await source.shutdown()
+                    await consume(source)
+                }
+                if ack {
+                    await current.test_handleNotification(method: "item/completed", params: [
+                        "threadId": .string(Self.oldThreadID), "turnId": .string("unknown-turn"),
+                        "item": .object(["id": .string("answer"), "type": .string("agentMessage"), "text": .string("[ack]")])
+                    ])
+                }
+                await current.test_handleNotification(method: "turn/completed", params: [
+                    "threadId": .string(Self.oldThreadID), "turn": .object(["id": .string("unknown-turn"), "status": .string("completed")])
+                ])
+                await current.shutdown()
+                await consume(current)
+                // Foreign thread is discarded by the controller; other scopes reach the coordinator.
+                XCTAssertEqual(warnings, scope == "foreign-thread-no-turn" ? 0 : 1, label)
+                let ordinary = scope == "unscoped"
+                XCTAssertEqual(f.session.runState, .completed, label)
+                XCTAssertEqual(f.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: ordinary ? 1 : 0), label)
+                XCTAssertEqual(f.session.quietLedger.hiddenSourceIDs.contains(wakeID), !ordinary, label)
+                if ordinary { XCTAssertTrue(f.session.quietLedger.hiddenSourceIDs.isEmpty, label) }
+                f.session.saveDebounceTask?.cancel()
             }
         }
     }
