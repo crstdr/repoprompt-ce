@@ -2869,7 +2869,10 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
         return created
     }
 
-    func ensureEventsStreamReady() async {}
+    func ensureEventsStreamReady() async {
+        _ = events
+    }
+
     func resetEventsStreamForNewRun() async {}
 
     func startOrResume(
