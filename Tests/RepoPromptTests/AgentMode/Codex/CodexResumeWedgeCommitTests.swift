@@ -3425,3 +3425,55 @@ extension CodexResumeWedgeCommitTests {
         }
     }
 }
+
+extension CodexResumeWedgeCommitTests {
+    func testQuietAckWithModerationMetadataBeforeCompletion() async throws {
+        // v0.160.1 defines metadata as arbitrary JSON, including scalar and null values.
+        for metadata: CodexJSONValue in [.object([:]), .array([]), .string("annotation"), .number(1), .bool(false), .null] {
+            try await replayQuietAckModerationMetadata([
+                "threadId": .string(Self.oldThreadID), "turnId": .string("plain-turn"), "metadata": metadata
+            ], malformed: false)
+        }
+    }
+
+    func testMalformedModerationMetadataKeepsAckOrdinary() async throws {
+        // Missing required metadata is malformed; a null value itself is valid JSON.
+        try await replayQuietAckModerationMetadata([
+            "threadId": .string(Self.oldThreadID), "turnId": .string("plain-turn")
+        ], malformed: true)
+    }
+
+    private func replayQuietAckModerationMetadata(_ payload: [String: CodexJSONValue], malformed: Bool) async throws {
+        let f = makeFixture([])
+        defer { f.session.saveDebounceTask?.cancel() }
+        f.viewModel.test_initializeRunService()
+        let runID = UUID()
+        f.session.installRunID(runID)
+        let controller = CodexNativeSessionController(client: CodexAppServerClient(), runID: runID, tabID: f.session.tabID, windowID: -1, workspacePaths: .uniform(nil))
+        f.session.codexController = controller
+        f.session.codexConversationID = Self.oldThreadID
+        let owner = try XCTUnwrap(f.session.activeRunOwnership)
+        let wakeID = UUID()
+        f.session.quietLedger.markRoutineWake(owner: owner, wakeID: wakeID)
+        await controller.test_installThreadState(threadID: Self.oldThreadID, authoritativeTurnID: "plain-turn", routingTurnID: "plain-turn")
+        var events = quietPlainCodexNotifications(reasoning: false, ack: true, replacement: false)
+        // Replay the live ordering: routine wake, [ack] agent message, moderation, completion.
+        let completionIndex = try XCTUnwrap(events.firstIndex { $0.0 == "turn/completed" })
+        events.insert(("turn/moderationMetadata", payload), at: completionIndex)
+        for (method, params) in events {
+            await controller.test_handleNotification(method: method, params: params)
+        }
+        await controller.shutdown()
+        var warnings: [String] = []
+        for await event in controller.events {
+            if case let .livenessActivity(activity) = event, activity.kind == .warning { warnings.append(activity.method) }
+            await f.coordinator.test_handleCodexNativeEvent(event, session: f.session, sourceController: controller)
+        }
+        XCTAssertEqual(warnings, malformed ? ["turn/moderationMetadata"] : [])
+        XCTAssertEqual(f.session.runState, .completed)
+        XCTAssertEqual(f.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: malformed ? 1 : 0))
+        XCTAssertEqual(f.session.quietLedger.hiddenSourceIDs.contains(wakeID), !malformed)
+        if malformed { XCTAssertTrue(f.session.quietLedger.hiddenSourceIDs.isEmpty) }
+        else { XCTAssertGreaterThan(f.session.quietLedger.hiddenSourceIDs.count, 1, "The ack row is hidden with the wake") }
+    }
+}

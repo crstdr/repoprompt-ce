@@ -4085,6 +4085,11 @@ final class CodexNativeSessionController {
             return turn?["status"] as? String != "completed"
         case "codex/event/agent_message":
             return Self.notificationItemID(from: params, includeTopLevelIDFallback: false) == nil
+        case "turn/moderationMetadata":
+            // v0.160.1 protocol metadata is arbitrary JSON, not semantic turn activity.
+            // Require the canonical envelope; malformed ingress must remain fail-visible.
+            return Self.turnScope(threadID: params["threadId"] as? String, turnID: params["turnId"] as? String) == nil
+                || params["metadata"] == nil
         case "rawResponseItem/completed":
             return hasUnrepresentedRawResponseItem(params)
         case "rawResponse/completed":
