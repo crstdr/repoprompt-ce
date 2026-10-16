@@ -752,7 +752,7 @@ extension AgentModeViewModel {
             } else {
                 attempt.admissionBasis == .routineStatusOrOverflow
                     && agentSessionLinkAutoWakeRoute(session) == .idleFollowUp
-                    && AgentQuietCheckInClassifier.supports(context.epoch.providerContext)
+                    && AgentSessionLinkPrompts.supportsQuietCheckIn(context.epoch.providerContext)
             }
         } else {
             false
