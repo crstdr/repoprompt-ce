@@ -7,191 +7,6 @@ final class AgentSessionLinkPassiveStatusNoticeTests: XCTestCase {
     private typealias Reducer = AgentSessionLinkPassiveStatusNotices
     private typealias Status = Reducer.Status
 
-    func testPassiveResolutionPreservesRowsSequencesAndFingerprint() {
-        let owner = passiveOwner(0)
-        var reducer = makeReducer()
-        reducer.enable(samples: [passiveSample(0, status: .running, evidence: .open(owner))], linkSetRevision: 1)
-        reducer.reconcile(samples: [passiveSample(0, status: .idle, evidence: .open(owner))], linkSetRevision: 1, deliverable: true)
-        let pending = reducer.snapshot
-        let target = sample(0, status: .idle)
-        XCTAssertEqual(pending.routineNonAdmittingReferences, [target.reference])
-        reducer.resolvePassiveWakeEvidence(reference: target.reference, targetEndpoint: target.targetEndpoint, evidence: .silent(owner))
-        XCTAssertEqual(reducer.snapshot.entries, pending.entries)
-        XCTAssertEqual(reducer.snapshot.queueRevision, pending.queueRevision)
-        XCTAssertEqual(reducer.snapshot.wakeEligibilityFingerprint, pending.wakeEligibilityFingerprint)
-        reducer.resolvePassiveWakeEvidence(reference: target.reference, targetEndpoint: target.targetEndpoint, evidence: .ordinary(owner))
-        XCTAssertTrue(reducer.snapshot.routineNonAdmittingReferences.isEmpty)
-        XCTAssertEqual(reducer.snapshot.entries, pending.entries)
-        XCTAssertEqual(reducer.snapshot.queueRevision, pending.queueRevision)
-    }
-
-    func testSameOwnerOrdinaryOrWaitingOpeningCannotProvePassiveClose() {
-        let owner = passiveOwner(0)
-        for opening in [
-            passiveSample(0, status: .running, evidence: .ordinary(owner)),
-            passiveSample(0, status: .waiting, evidence: .open(owner))
-        ] {
-            var reducer = makeReducer()
-            reducer.enable(samples: [opening], linkSetRevision: 1)
-            reducer.reconcile(samples: [passiveSample(0, status: .idle, evidence: .silent(owner))], linkSetRevision: 1, deliverable: true)
-            XCTAssertEqual(reducer.snapshot.entries.count, 1)
-            XCTAssertTrue(reducer.snapshot.routineNonAdmittingReferences.isEmpty)
-        }
-    }
-
-    func testNondeliverablePrivateOnlyRebaselineDoesNotAdvanceQueueRevision() {
-        let owner = passiveOwner(0)
-        var reducer = makeReducer()
-        reducer.enable(samples: [passiveSample(0, status: .running, evidence: .open(owner))], linkSetRevision: 1, deliverable: false)
-        let before = reducer.snapshot
-        reducer.reconcile(samples: [passiveSample(0, status: .running, evidence: .ordinary(owner))], linkSetRevision: 1, deliverable: false)
-        XCTAssertEqual(reducer.snapshot.queueRevision, before.queueRevision, "Private evidence is not public baseline content")
-        XCTAssertEqual(reducer.snapshot.entries, before.entries)
-    }
-
-    func testSampleCarriedPrivateResolutionDoesNotRefreshPublicMetadata() {
-        let owner = passiveOwner(0)
-        var reducer = makeReducer()
-        reducer.enable(samples: [passiveSample(0, status: .running, evidence: .open(owner))], linkSetRevision: 1)
-        reducer.reconcile(samples: [passiveSample(0, status: .idle, evidence: .open(owner))], linkSetRevision: 1, deliverable: true)
-        let before = reducer.snapshot
-        reducer.reconcile(samples: [passiveSample(0, status: .idle, evidence: .ordinary(owner))], linkSetRevision: 1, deliverable: true)
-        XCTAssertEqual(reducer.snapshot.entries, before.entries)
-        XCTAssertEqual(reducer.snapshot.queueRevision, before.queueRevision)
-        XCTAssertEqual(reducer.snapshot.wakeEligibilityFingerprint, before.wakeEligibilityFingerprint)
-        XCTAssertTrue(reducer.snapshot.routineNonAdmittingReferences.isEmpty)
-    }
-
-    func testUsefulPredecessorReceiptWhileSilentSuccessorRunsClearsDebtAcrossNetReversion() {
-        for receiptIncludesRow in [false, true] {
-            var reducer = makeReducer()
-            reducer.enable(samples: [sample(0, status: .running)], linkSetRevision: 1)
-            reducer.reconcile(samples: [sample(0, status: .idle, preview: "Useful")], linkSetRevision: 1, deliverable: true)
-            let useful = reducer.snapshot
-            let owner = passiveOwner(0)
-            reducer.reconcile(samples: [passiveSample(0, status: .running, evidence: .open(owner))], linkSetRevision: 1, deliverable: true)
-            XCTAssertTrue(reducer.snapshot.entries.isEmpty, "Baseline net reversion must still remove rendering")
-            reducer.apply(.init(snapshot: useful, deliveredEntries: receiptIncludesRow ? nil : []))
-            reducer.reconcile(samples: [passiveSample(0, status: .idle, evidence: .silent(owner), preview: "Useful")], linkSetRevision: 1, deliverable: true)
-            XCTAssertEqual(reducer.snapshot.entries.count, 1)
-            XCTAssertEqual(reducer.snapshot.routineNonAdmittingReferences.contains(sample(0, status: .idle).reference), receiptIncludesRow)
-        }
-    }
-
-    func testOmittedAndOlderReceiptsPayOnlyTheirOrdinaryWatermarkNotCurrentRow() {
-        var reducer = makeReducer()
-        reducer.enable(samples: [sample(0, status: .running)], linkSetRevision: 1)
-        reducer.reconcile(samples: [sample(0, status: .idle)], linkSetRevision: 1, deliverable: true)
-        let useful = reducer.snapshot
-        let owner = passiveOwner(0)
-        reducer.reconcile(samples: [passiveSample(0, status: .running, evidence: .open(owner))], linkSetRevision: 1, deliverable: true)
-        reducer.reconcile(samples: [passiveSample(0, status: .idle, evidence: .silent(owner))], linkSetRevision: 1, deliverable: true)
-        let successor = reducer.snapshot
-        reducer.apply(.init(snapshot: successor, deliveredEntries: []))
-        XCTAssertTrue(reducer.snapshot.routineNonAdmittingReferences.isEmpty, "An omitted row pays no debt")
-        let beforeOldReceipt = reducer.snapshot
-        reducer.apply(.init(snapshot: useful))
-        XCTAssertEqual(reducer.snapshot.entries, successor.entries, "The older receipt must not remove the newer silent row")
-        XCTAssertEqual(reducer.snapshot.queueRevision, beforeOldReceipt.queueRevision, "Private clearance alone cannot move public revision")
-        XCTAssertEqual(reducer.snapshot.routineNonAdmittingReferences.count, 1)
-        reducer.reconcile(samples: [sample(0, status: .running)], linkSetRevision: 1, deliverable: true)
-        reducer.reconcile(samples: [sample(0, status: .idle)], linkSetRevision: 1, deliverable: true)
-        reducer.apply(.init(snapshot: useful))
-        XCTAssertTrue(reducer.snapshot.routineNonAdmittingReferences.isEmpty, "Old coverage cannot pay newer ordinary work")
-        reducer.apply(.init(snapshot: reducer.snapshot))
-        XCTAssertTrue(reducer.snapshot.entries.isEmpty, "Merged current coverage settles its older debt too")
-    }
-
-    func testOrdinaryRefreshRatchetsButInheritedDebtDoesNotRatchetOnPassiveRefresh() {
-        var reducer = makeReducer()
-        reducer.enable(samples: [sample(0, status: .running)], linkSetRevision: 1)
-        reducer.reconcile(samples: [sample(0, status: .idle, preview: "First")], linkSetRevision: 1, deliverable: true)
-        let first = reducer.snapshot
-        reducer.reconcile(samples: [sample(0, status: .idle, preview: "Updated")], linkSetRevision: 1, deliverable: true)
-        let refreshed = reducer.snapshot
-        reducer.apply(.init(snapshot: first))
-        let owner = passiveOwner(0)
-        reducer.reconcile(samples: [passiveSample(0, status: .running, evidence: .open(owner))], linkSetRevision: 1, deliverable: true)
-        reducer.reconcile(samples: [passiveSample(0, status: .idle, evidence: .silent(owner), preview: "Updated")], linkSetRevision: 1, deliverable: true)
-        reducer.reconcile(samples: [passiveSample(0, status: .idle, evidence: .silent(owner), preview: "Updated", idleForSend: true)], linkSetRevision: 1, deliverable: true)
-        XCTAssertTrue(reducer.snapshot.routineNonAdmittingReferences.isEmpty)
-        reducer.apply(.init(snapshot: refreshed))
-        XCTAssertEqual(reducer.snapshot.entries.count, 1)
-        XCTAssertEqual(reducer.snapshot.routineNonAdmittingReferences.count, 1, "Only the ordinary refresh watermark was owed")
-    }
-
-    func testMissingOpenProofAndNewPublicOccurrenceFailOpenButSettledPrivateRetirementDoesNot() {
-        let owner = passiveOwner(0)
-        let target = sample(0, status: .idle)
-        for settled in [false, true] {
-            var reducer = makeReducer()
-            reducer.enable(samples: [passiveSample(0, status: .running, evidence: .open(owner))], linkSetRevision: 1)
-            reducer.reconcile(samples: [passiveSample(0, status: .idle, evidence: settled ? .silent(owner) : .open(owner))], linkSetRevision: 1, deliverable: true)
-            let original = reducer.snapshot
-            reducer.resolvePassiveWakeEvidence(reference: target.reference, targetEndpoint: target.targetEndpoint, evidence: .unknown)
-            XCTAssertEqual(reducer.snapshot.routineNonAdmittingReferences.isEmpty, !settled)
-            XCTAssertEqual(reducer.snapshot.entries, original.entries)
-            if settled {
-                reducer.resolvePassiveWakeEvidence(reference: target.reference, targetEndpoint: target.targetEndpoint, evidence: .ordinary(passiveOwner(0)), isNewOccurrence: true)
-                XCTAssertTrue(reducer.snapshot.routineNonAdmittingReferences.isEmpty)
-                XCTAssertEqual(reducer.snapshot.entries, original.entries, "Identical-scalar occurrence cannot invent a public edge")
-            }
-        }
-        var reducer = makeReducer()
-        reducer.enable(samples: [passiveSample(0, status: .running, evidence: .open(owner))], linkSetRevision: 1)
-        reducer.reconcile(samples: [passiveSample(0, status: .idle, evidence: .silent(owner))], linkSetRevision: 1, deliverable: true)
-        let edge = reducer.snapshot.entries.first?.edgeSequence
-        reducer.reconcile(samples: [sample(0, status: .idle, preview: "New ordinary result")], linkSetRevision: 1, deliverable: true)
-        XCTAssertTrue(reducer.snapshot.routineNonAdmittingReferences.isEmpty, "A missed next running sample cannot bless new output silent")
-        XCTAssertEqual(reducer.snapshot.entries.first?.edgeSequence, edge)
-    }
-
-    func testEndpointReplacementAndRebaselineCannotInheritPassiveProof() {
-        let owner = passiveOwner(0)
-        var reducer = makeReducer()
-        reducer.enable(samples: [passiveSample(0, status: .running, evidence: .open(owner))], linkSetRevision: 1)
-        reducer.reconcile(samples: [passiveSample(0, status: .idle, evidence: .silent(owner))], linkSetRevision: 1, deliverable: true)
-        reducer.reconcile(samples: [sample(0, status: .running, endpointGeneration: 2)], linkSetRevision: 2, deliverable: true)
-        reducer.reconcile(samples: [sample(0, status: .idle, endpointGeneration: 2)], linkSetRevision: 2, deliverable: true)
-        XCTAssertTrue(reducer.snapshot.routineNonAdmittingReferences.isEmpty)
-        reducer.disable(linkSetRevision: 3)
-        reducer.enable(samples: [sample(0, status: .running)], linkSetRevision: 4)
-        reducer.reconcile(samples: [sample(0, status: .idle)], linkSetRevision: 4, deliverable: true)
-        XCTAssertTrue(reducer.snapshot.routineNonAdmittingReferences.isEmpty)
-    }
-
-    func testMixedSilentOverflowAndPartialReceiptsKeepExistingCounters() {
-        var reducer = makeReducer()
-        let owners = (0 ..< 18).map(passiveOwner)
-        reducer.enable(samples: (0 ..< 18).map { passiveSample($0, status: .running, evidence: $0 == 0 ? .unknown : .open(owners[$0])) }, linkSetRevision: 1)
-        reducer.reconcile(samples: (0 ..< 18).map { passiveSample($0, status: .idle, evidence: $0 == 0 ? .unknown : .silent(owners[$0])) }, linkSetRevision: 1, deliverable: true)
-        let overflow = reducer.snapshot
-        XCTAssertEqual(overflow.entries.count, 16)
-        XCTAssertEqual(overflow.routineNonAdmittingReferences.count, 16)
-        XCTAssertEqual(overflow.unacknowledgedOverflowCount, 2)
-        reducer.apply(.init(snapshot: overflow, deliveredEntries: Array(overflow.entries.prefix(1)), overflowProducedThrough: 1))
-        XCTAssertEqual(reducer.snapshot.entries.count, 15)
-        XCTAssertEqual(reducer.snapshot.unacknowledgedOverflowCount, 1)
-        reducer.apply(.init(snapshot: overflow))
-        XCTAssertTrue(reducer.snapshot.entries.isEmpty)
-        XCTAssertEqual(reducer.snapshot.unacknowledgedOverflowCount, 1, "Same-revision receipts keep the existing overflow acknowledgement fence")
-        reducer.apply(.init(snapshot: reducer.snapshot))
-        XCTAssertEqual(reducer.snapshot.unacknowledgedOverflowCount, 0)
-        reducer.apply(.init(snapshot: overflow, deliveredEntries: [], overflowProducedThrough: 1))
-        XCTAssertEqual(reducer.snapshot.unacknowledgedOverflowCount, 0)
-    }
-
-    private func passiveOwner(_ index: Int) -> AgentRunOwnership {
-        let target = sample(index, status: .idle)
-        return .init(binding: .init(tabID: target.targetEndpoint.tabID, persistentSessionID: target.targetSessionID, persistentBindingGeneration: target.targetEndpoint.persistentBindingGeneration, bindingTransitionGeneration: target.targetEndpoint.bindingTransitionGeneration))
-    }
-
-    private func passiveSample(_ index: Int, status: Status, evidence: AgentSessionLinkPassiveWakeEvidence, preview: String? = nil, idleForSend: Bool = false) -> Reducer.Sample {
-        var target = sample(index, status: status, idleForSend: idleForSend, preview: preview)
-        target.passiveWakeEvidence = evidence
-        return target
-    }
-
     func testEveryLiveStatusEdgeHasTheSpecifiedDeterministicEffect() {
         struct Case {
             let from: Status
@@ -1002,7 +817,8 @@ final class AgentSessionLinkPassiveStatusNoticeTests: XCTestCase {
         endpointGeneration: UInt64 = 1,
         idleForSend: Bool = false,
         waitingOn: DomainAgentSessionWaitingOn? = nil,
-        preview: String? = nil
+        preview: String? = nil,
+        runFacts: AgentRunQuietFacts? = nil
     ) -> Reducer.Sample {
         let targetSessionID = sessionID(index)
         return Reducer.Sample(
@@ -1016,7 +832,8 @@ final class AgentSessionLinkPassiveStatusNoticeTests: XCTestCase {
             status: status,
             idleForSend: idleForSend,
             waitingOn: waitingOn,
-            latestVisibleAssistantPreview: preview
+            latestVisibleAssistantPreview: preview,
+            runFacts: runFacts
         )
     }
 
@@ -1056,5 +873,350 @@ final class AgentSessionLinkPassiveStatusNoticeTests: XCTestCase {
             fatalError("Expected non-nil value")
         }
         return value
+    }
+}
+
+extension AgentSessionLinkPassiveStatusNoticeTests {
+    private func facts(_ settled: UInt64, _ ordinary: UInt64) -> AgentRunQuietFacts {
+        AgentRunQuietFacts(settledThrough: settled, ordinaryThrough: ordinary)!
+    }
+
+    private func observe(_ reducer: inout Reducer, _ status: Status, _ proof: AgentRunQuietFacts?, index: Int = 0) {
+        reducer.reconcile(samples: [sample(index, status: status, runFacts: proof)], linkSetRevision: 1, deliverable: true)
+    }
+
+    func testF7r1DroppedOrdinaryThenQuietSamplesCreateTruthfulIdleCoverageOnce() throws {
+        var reducer = makeReducer()
+        reducer.enable(samples: [sample(0, status: .idle, runFacts: facts(8, 8))], linkSetRevision: 1)
+        observe(&reducer, .idle, facts(10, 9))
+        let entry = try XCTUnwrap(reducer.snapshot.entries.first)
+        XCTAssertEqual(transition(entry), "idle->idle")
+        XCTAssertTrue(entry.isRoutineWakeEligible)
+        XCTAssertEqual(entry.ordinaryThrough, 9)
+        XCTAssertEqual(reducer.deliveredRunThrough(for: entry.reference), 8)
+        let fingerprint = reducer.snapshot.wakeEligibilityFingerprint
+        observe(&reducer, .idle, facts(11, 9))
+        XCTAssertEqual(reducer.snapshot.wakeEligibilityFingerprint, fingerprint, "quiet settlement changes cutoff, not failed occurrence")
+        let receipt = Reducer.Receipt(snapshot: reducer.snapshot)
+        reducer.apply(receipt)
+        XCTAssertEqual(reducer.deliveredRunThrough(for: entry.reference), 11)
+        XCTAssertTrue(reducer.snapshot.entries.isEmpty)
+        observe(&reducer, .idle, facts(12, 9))
+        XCTAssertTrue(reducer.snapshot.entries.isEmpty)
+    }
+
+    func testF5ReceiptNinePaysBeforeRunningCleanupAndCannotPayOrdinaryTen() throws {
+        for ordinarySuccessor in [false, true] {
+            var reducer = makeReducer()
+            reducer.enable(samples: [sample(0, status: .idle, runFacts: facts(8, 8))], linkSetRevision: 1)
+            observe(&reducer, .idle, facts(9, 9))
+            let receipt = Reducer.Receipt(snapshot: reducer.snapshot)
+            let reference = try XCTUnwrap(reducer.snapshot.entries.first?.reference)
+            observe(&reducer, .running, facts(9, 9))
+            XCTAssertEqual(reducer.snapshot.entries.first?.toStatus, .running)
+            reducer.apply(receipt)
+            XCTAssertEqual(reducer.deliveredRunThrough(for: reference), 9)
+            XCTAssertTrue(reducer.snapshot.entries.isEmpty, "paid coverage-only running row retires independently of status guard")
+            observe(&reducer, .idle, facts(10, ordinarySuccessor ? 10 : 9))
+            XCTAssertEqual(reducer.snapshot.entries.count, ordinarySuccessor ? 1 : 0)
+            if ordinarySuccessor {
+                reducer.apply(receipt)
+                XCTAssertEqual(reducer.snapshot.entries.first?.ordinaryThrough, 10)
+                XCTAssertEqual(reducer.deliveredRunThrough(for: reference), 9)
+            }
+        }
+    }
+
+    func testQuietIntervalPreservesFailedIdentityButUnpairedCloseAdvancesItAcrossBothOrigins() throws {
+        for origin in [Status.idle, .running] {
+            for paired in [false, true] {
+                var reducer = makeReducer()
+                reducer.enable(samples: [sample(0, status: origin, runFacts: facts(8, 8))], linkSetRevision: 1)
+                observe(&reducer, .idle, facts(9, 9))
+                let fingerprint = reducer.snapshot.wakeEligibilityFingerprint
+                let oldEdge = try XCTUnwrap(reducer.snapshot.entries.first?.edgeSequence)
+                observe(&reducer, .running, facts(9, 9))
+                observe(&reducer, .idle, paired ? facts(10, 9) : nil)
+                let entry = try XCTUnwrap(reducer.snapshot.entries.first)
+                XCTAssertEqual(entry.fromStatus, origin)
+                XCTAssertEqual(entry.edgeSequence == oldEdge, paired)
+                XCTAssertEqual(reducer.snapshot.wakeEligibilityFingerprint == fingerprint, paired)
+                XCTAssertEqual(entry.isRoutineWakeEligible, paired || origin == .running)
+                if !paired {
+                    let unknownReceipt = Reducer.Receipt(snapshot: reducer.snapshot)
+                    reducer.apply(unknownReceipt)
+                    XCTAssertEqual(reducer.deliveredRunThrough(for: entry.reference), 8)
+                    XCTAssertFalse(try XCTUnwrap(reducer.snapshot.entries.first).isRoutineWakeEligible)
+                    for _ in 0 ..< 5 {
+                        observe(&reducer, .idle, nil)
+                    }
+                    XCTAssertFalse(try XCTUnwrap(reducer.snapshot.entries.first).isRoutineWakeEligible)
+                    observe(&reducer, .idle, facts(10, 9))
+                    XCTAssertTrue(try XCTUnwrap(reducer.snapshot.entries.first).isRoutineWakeEligible)
+                    reducer.apply(.init(snapshot: reducer.snapshot))
+                    XCTAssertEqual(reducer.deliveredRunThrough(for: entry.reference), 10)
+                    XCTAssertTrue(reducer.snapshot.entries.isEmpty)
+                }
+            }
+        }
+    }
+
+    func testUnavailableAndUnpairedRunningResumeRecoverFirstFreshIdleWithoutRebaseline() {
+        var reducer = makeReducer()
+        reducer.enable(samples: [sample(0, status: .idle, runFacts: facts(8, 8))], linkSetRevision: 1)
+        let reference = sample(0, status: .idle).reference
+        observe(&reducer, .idle, facts(9, 9))
+        observe(&reducer, .unavailable, nil)
+        XCTAssertTrue(reducer.snapshot.entries.isEmpty)
+        XCTAssertEqual(reducer.deliveredRunThrough(for: reference), 8)
+        observe(&reducer, .running, nil)
+        observe(&reducer, .idle, nil)
+        reducer.apply(.init(snapshot: reducer.snapshot))
+        observe(&reducer, .idle, facts(10, 9))
+        XCTAssertEqual(reducer.snapshot.entries.first?.ordinaryThrough, 9)
+        XCTAssertEqual(reducer.deliveredRunThrough(for: reference), 8)
+        reducer.apply(.init(snapshot: reducer.snapshot))
+        XCTAssertEqual(reducer.deliveredRunThrough(for: reference), 10)
+        for _ in 0 ..< 5 {
+            observe(&reducer, .idle, facts(10, 9))
+        }
+        XCTAssertTrue(reducer.snapshot.entries.isEmpty)
+    }
+
+    func testUnknownOnlyAcceptedStatusClearsWithoutInventingDeliveredPosition() throws {
+        var reducer = makeReducer()
+        reducer.enable(samples: [sample(0, status: .running)], linkSetRevision: 1)
+        observe(&reducer, .idle, nil)
+        let reference = try XCTUnwrap(reducer.snapshot.entries.first?.reference)
+        reducer.apply(.init(snapshot: reducer.snapshot))
+        XCTAssertTrue(reducer.snapshot.entries.isEmpty)
+        XCTAssertNil(reducer.deliveredRunThrough(for: reference))
+    }
+
+    func testUnpairedWaitingAcceptanceRetainsInertCoverageAndNextRealWaitingEdge() throws {
+        var reducer = makeReducer()
+        reducer.enable(samples: [sample(0, status: .idle, runFacts: facts(8, 8))], linkSetRevision: 1)
+        observe(&reducer, .idle, facts(9, 9))
+        observe(&reducer, .waiting, nil)
+        let receipt = Reducer.Receipt(snapshot: reducer.snapshot)
+        let reference = try XCTUnwrap(reducer.snapshot.entries.first?.reference)
+        reducer.apply(receipt)
+        let settled = try XCTUnwrap(reducer.snapshot.entries.first)
+        XCTAssertEqual(transition(settled), "waiting->waiting")
+        XCTAssertFalse(settled.isRoutineWakeEligible)
+        XCTAssertEqual(reducer.deliveredRunThrough(for: reference), 8)
+        for _ in 0 ..< 5 {
+            observe(&reducer, .waiting, facts(9, 9))
+        }
+        XCTAssertFalse(try XCTUnwrap(reducer.snapshot.entries.first).isRoutineWakeEligible)
+        let failed = reducer.snapshot.wakeEligibilityFingerprint
+        observe(&reducer, .running, facts(9, 9))
+        observe(&reducer, .waiting, facts(9, 9))
+        let fresh = try XCTUnwrap(reducer.snapshot.entries.first)
+        XCTAssertEqual(transition(fresh), "running->waiting")
+        XCTAssertTrue(fresh.isRoutineWakeEligible)
+        XCTAssertNotEqual(reducer.snapshot.wakeEligibilityFingerprint, failed)
+        reducer.apply(receipt)
+        XCTAssertEqual(reducer.snapshot.entries.first, fresh, "old receipt cannot demote the new actionable edge")
+        observe(&reducer, .idle, facts(10, 10))
+        reducer.apply(.init(snapshot: reducer.snapshot))
+        XCTAssertEqual(reducer.deliveredRunThrough(for: reference), 10)
+        XCTAssertTrue(reducer.snapshot.entries.isEmpty)
+    }
+
+    func testSameStatusUnpairedRefreshPaysOnlyItsFrozenOlderCutoff() throws {
+        var reducer = makeReducer()
+        reducer.enable(samples: [sample(0, status: .idle, runFacts: facts(8, 8))], linkSetRevision: 1)
+        observe(&reducer, .idle, facts(9, 9))
+        reducer.reconcile(samples: [sample(0, status: .idle, preview: "new metadata")], linkSetRevision: 1, deliverable: true)
+        let entry = try XCTUnwrap(reducer.snapshot.entries.first)
+        XCTAssertNil(entry.runFacts, "older cutoff is payment, never current fresh admission proof")
+        XCTAssertEqual(entry.receiptSettledThrough, 9)
+        XCTAssertFalse(entry.isRoutineWakeEligible)
+        reducer.apply(.init(snapshot: reducer.snapshot))
+        XCTAssertEqual(reducer.deliveredRunThrough(for: entry.reference), 9)
+        XCTAssertTrue(reducer.snapshot.entries.isEmpty)
+    }
+
+    func testRegressingPairCannotSupplyFreshProofOrReplaceCachedCoverage() throws {
+        var reducer = makeReducer()
+        reducer.enable(samples: [sample(0, status: .idle, runFacts: facts(8, 8))], linkSetRevision: 1)
+        observe(&reducer, .idle, facts(10, 9))
+        observe(&reducer, .running, nil)
+        observe(&reducer, .idle, facts(9, 8))
+        let entry = try XCTUnwrap(reducer.snapshot.entries.first)
+        XCTAssertNil(entry.runFacts)
+        XCTAssertEqual(entry.ordinaryThrough, 9)
+        XCTAssertFalse(entry.isRoutineWakeEligible)
+        observe(&reducer, .idle, facts(11, 10))
+        XCTAssertEqual(reducer.snapshot.entries.first?.ordinaryThrough, 10)
+        XCTAssertTrue(try XCTUnwrap(reducer.snapshot.entries.first).isRoutineWakeEligible)
+    }
+
+    func testEvictionDoesNotPayAndAnonymousOverflowCannotPayTargets() {
+        var reducer = makeReducer()
+        let baseline = (0 ..< 18).map { sample($0, status: .idle, runFacts: facts(8, 8)) }
+        reducer.enable(samples: baseline, linkSetRevision: 1)
+        reducer.reconcile(samples: [sample(0, status: .idle, runFacts: facts(9, 9))] + Array(baseline.dropFirst()), linkSetRevision: 1, deliverable: true)
+        let oldReceipt = Reducer.Receipt(snapshot: reducer.snapshot)
+        let newSamples = (0 ..< 18).map { sample($0, status: .idle, runFacts: facts(9, 9)) }
+        reducer.reconcile(samples: newSamples, linkSetRevision: 1, deliverable: true)
+        XCTAssertEqual(reducer.snapshot.entries.count, 16)
+        XCTAssertEqual(reducer.snapshot.overflowProduced, 2)
+        let reference = sample(0, status: .idle).reference
+        XCTAssertFalse(reducer.snapshot.entries.contains { $0.reference == reference })
+        let overflowReceipt = Reducer.Receipt(snapshot: reducer.snapshot, deliveredEntries: [])
+        reducer.apply(overflowReceipt)
+        XCTAssertEqual(reducer.deliveredRunThrough(for: reference), 8)
+        reducer.apply(oldReceipt)
+        XCTAssertEqual(reducer.deliveredRunThrough(for: reference), 9, "rendered payment precedes missing-row guard")
+        let produced = reducer.snapshot.overflowProduced
+        for _ in 0 ..< 5 {
+            reducer.reconcile(samples: newSamples, linkSetRevision: 1, deliverable: true)
+        }
+        XCTAssertEqual(reducer.snapshot.overflowProduced, produced)
+        var newer = newSamples
+        newer[0] = sample(0, status: .idle, runFacts: facts(10, 10))
+        reducer.reconcile(samples: newer, linkSetRevision: 1, deliverable: true)
+        XCTAssertEqual(reducer.snapshot.overflowProduced, produced + 1)
+        XCTAssertEqual(reducer.snapshot.entries.count, 16)
+    }
+
+    func testQuietSuccessorCloseRepresentsOrdinaryFirstSampledWhileRunningAndPaysFrozenReceipt() throws {
+        var reducer = makeReducer()
+        let reference = sample(0, status: .idle).reference
+        reducer.enable(samples: [sample(0, status: .idle, runFacts: facts(8, 8))], linkSetRevision: 1)
+        // The ordinary close at 9 was missed; its first sample is the successor's running frame.
+        observe(&reducer, .running, facts(9, 9))
+        XCTAssertTrue(reducer.snapshot.entries.isEmpty)
+        XCTAssertEqual(reducer.deliveredRunThrough(for: reference), 8)
+
+        // Quiet successor 10 cannot suppress the still-unrepresented ordinary settlement 9.
+        observe(&reducer, .idle, facts(10, 9))
+        XCTAssertEqual(reducer.snapshot.entries.count, 1, "unpaid ordinary 9 must be represented at the quiet close")
+        XCTAssertEqual(reducer.snapshot.entries.first?.toStatus, .idle)
+        XCTAssertEqual(reducer.snapshot.entries.first?.ordinaryThrough, 9)
+        XCTAssertEqual(reducer.snapshot.entries.first?.receiptSettledThrough, 10)
+        XCTAssertEqual(reducer.snapshot.entries.first?.isRoutineWakeEligible, true, "ordinary 9 must independently admit")
+        XCTAssertEqual(reducer.deliveredRunThrough(for: reference), 8, "representation is not payment")
+        let entry = try XCTUnwrap(reducer.snapshot.entries.first)
+        let receipt = Reducer.Receipt(snapshot: reducer.snapshot)
+
+        // Unchanged idle cannot churn the row; later quiet facts cannot enlarge this receipt.
+        observe(&reducer, .idle, facts(10, 9))
+        XCTAssertEqual(reducer.snapshot.entries.first, entry)
+        observe(&reducer, .idle, facts(11, 9))
+        reducer.apply(receipt)
+        XCTAssertEqual(reducer.deliveredRunThrough(for: reference), 10, "acceptance pays only frozen settled cutoff 10")
+        XCTAssertFalse(reducer.snapshot.entries.contains(where: \.isRoutineWakeEligible))
+        reducer.apply(.init(snapshot: reducer.snapshot))
+        XCTAssertEqual(reducer.deliveredRunThrough(for: reference), 11)
+        XCTAssertTrue(reducer.snapshot.entries.isEmpty)
+        observe(&reducer, .idle, facts(12, 9))
+        XCTAssertTrue(reducer.snapshot.entries.isEmpty, "paid ordinary coverage cannot echo on quiet settlement")
+    }
+
+    func testOrdinaryFirstSampledWhileRunningStillRepresentsAtIdle() throws {
+        var reducer = makeReducer()
+        reducer.enable(samples: [sample(0, status: .idle, runFacts: facts(8, 8))], linkSetRevision: 1)
+        observe(&reducer, .running, facts(9, 9))
+        XCTAssertTrue(reducer.snapshot.entries.isEmpty)
+        observe(&reducer, .idle, facts(9, 9))
+        XCTAssertEqual(reducer.snapshot.entries.first?.ordinaryThrough, 9)
+        XCTAssertTrue(try XCTUnwrap(reducer.snapshot.entries.first).isRoutineWakeEligible)
+    }
+}
+
+extension AgentSessionLinkPassiveStatusNoticeTests {
+    func testBothPristineWaitingCyclesStayDistinctWithAndWithoutRetainedCoverage() throws {
+        for coverage in [false, true] {
+            for intermediate in [Status.running, .idle] {
+                var reducer = makeReducer()
+                reducer.enable(samples: [sample(0, status: .waiting, runFacts: coverage ? facts(8, 8) : nil)], linkSetRevision: 1)
+                if coverage {
+                    observe(&reducer, .idle, facts(9, 9))
+                    observe(&reducer, .waiting, facts(9, 9))
+                    // This is pristine actionable waiting→idle→waiting net reversion, retaining
+                    // only unpaid coverage, not inventing a waiting edge.
+                    XCTAssertFalse(try XCTUnwrap(reducer.snapshot.entries.first).isStatusEdge)
+                }
+                observe(&reducer, intermediate, coverage ? facts(9, 9) : nil)
+                observe(&reducer, .waiting, coverage ? facts(9, 9) : nil)
+                if intermediate == .running {
+                    XCTAssertEqual(reducer.snapshot.entries.first.map(transition), "running->waiting")
+                    XCTAssertTrue(try XCTUnwrap(reducer.snapshot.entries.first).isStatusEdge)
+                } else if !coverage {
+                    XCTAssertTrue(reducer.snapshot.entries.isEmpty)
+                }
+            }
+        }
+    }
+
+    func testOlderPaymentPreservesNewerWaitingEdgeAndIndependentAttention() throws {
+        var reducer = makeReducer()
+        reducer.enable(samples: [sample(0, status: .idle, runFacts: facts(8, 8))], linkSetRevision: 1)
+        observe(&reducer, .idle, facts(9, 9))
+        let receipt = Reducer.Receipt(snapshot: reducer.snapshot)
+        observe(&reducer, .waiting, facts(9, 9))
+        XCTAssertEqual(requestAttention(0, reducer: &reducer), .accepted)
+        let waiting = try XCTUnwrap(reducer.snapshot.entries.first)
+        reducer.apply(receipt)
+        XCTAssertEqual(reducer.deliveredRunThrough(for: waiting.reference), 9)
+        let stillWaiting = try XCTUnwrap(reducer.snapshot.entries.first)
+        XCTAssertEqual(stillWaiting.fromStatus, waiting.fromStatus)
+        XCTAssertEqual(stillWaiting.toStatus, waiting.toStatus)
+        XCTAssertEqual(stillWaiting.edgeSequence, waiting.edgeSequence)
+        XCTAssertEqual(stillWaiting.changeSequence, waiting.changeSequence)
+        XCTAssertEqual(reducer.snapshot.attentionRequests.count, 1)
+    }
+}
+
+extension AgentSessionLinkPassiveStatusNoticeTests {
+    func testF5ReceiptArrivingAfterQuietClosePaysOldDebtWithoutReawakeningRetainedActionableShape() throws {
+        var reducer = makeReducer()
+        reducer.enable(samples: [sample(0, status: .running, runFacts: facts(8, 8))], linkSetRevision: 1)
+        observe(&reducer, .idle, facts(9, 9))
+        let receipt = Reducer.Receipt(snapshot: reducer.snapshot)
+        let opening = reducer.snapshot.entries.first?.openingSettledThrough
+        observe(&reducer, .running, facts(9, 9))
+        observe(&reducer, .idle, facts(10, 9))
+        XCTAssertEqual(
+            reducer.snapshot.entries.first?.openingSettledThrough,
+            opening,
+            "proven quiet refresh preserves the pending occurrence boundary"
+        )
+        XCTAssertTrue(try XCTUnwrap(reducer.snapshot.entries.first).isRoutineWakeEligible)
+        reducer.apply(receipt)
+        let retained = try XCTUnwrap(reducer.snapshot.entries.first)
+        XCTAssertEqual(reducer.deliveredRunThrough(for: retained.reference), 9)
+        XCTAssertTrue(retained.isStatusEdge, "newer status metadata was not acknowledged by the older receipt")
+        XCTAssertFalse(retained.isRoutineWakeEligible, "the live paid position must reach admission without inventing payment for cutoff 10")
+        observe(&reducer, .running, facts(10, 9))
+        observe(&reducer, .idle, facts(10, 9))
+        XCTAssertTrue(
+            try XCTUnwrap(reducer.snapshot.entries.first).isRoutineWakeEligible,
+            "unexplained close cannot inherit the previous quiet interval"
+        )
+    }
+}
+
+extension AgentSessionLinkPassiveStatusNoticeTests {
+    func testUnavailableCacheRejectsRegressingFirstReturnBeforeFreshIdleRecovery() throws {
+        var reducer = makeReducer()
+        reducer.enable(samples: [sample(0, status: .idle, runFacts: facts(8, 8))], linkSetRevision: 1)
+        observe(&reducer, .idle, facts(9, 9))
+        let reference = try XCTUnwrap(reducer.snapshot.entries.first?.reference)
+        observe(&reducer, .unavailable, nil)
+        observe(&reducer, .idle, facts(10, 8))
+        XCTAssertTrue(reducer.snapshot.entries.isEmpty, "a regressing return is not fresh proof")
+        XCTAssertEqual(reducer.deliveredRunThrough(for: reference), 8)
+        observe(&reducer, .idle, facts(10, 9))
+        let restored = try XCTUnwrap(reducer.snapshot.entries.first)
+        XCTAssertEqual(transition(restored), "idle->idle")
+        XCTAssertEqual(restored.ordinaryThrough, 9)
+        XCTAssertTrue(restored.isRoutineWakeEligible)
+        reducer.apply(.init(snapshot: reducer.snapshot))
+        XCTAssertEqual(reducer.deliveredRunThrough(for: reference), 10)
+        XCTAssertTrue(reducer.snapshot.entries.isEmpty)
     }
 }

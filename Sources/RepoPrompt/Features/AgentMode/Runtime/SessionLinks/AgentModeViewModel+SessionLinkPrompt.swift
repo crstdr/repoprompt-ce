@@ -709,21 +709,6 @@ extension AgentModeViewModel {
         let periodicAttempt = session.oversight.pendingAutoWake.flatMap { attempt in
             attempt.isPeriodic && attempt.wakeID == effectiveID.autoWakeID ? attempt : nil
         }
-        // The quiet-reply line belongs only to a routine status/overflow wake's own dispatch —
-        // never to a periodic, manual, or attention turn, nor to a piggybacked batch on an
-        // ordinary one. Any live phase qualifies: a claim may be minted while the attempt is
-        // still scheduled and must fingerprint identically at physical acquisition. The phase
-        // list is positive on purpose — a future dead phase must default to not teaching.
-        // Providers without passive-wake evidence can never finish quietly, so they are not
-        // taught the token at all.
-        let routineStatusWake = session.supportsPassiveWakeEvidence && (session.oversight.pendingAutoWake.map { attempt in
-            guard attempt.wakeID == effectiveID.autoWakeID,
-                  attempt.admissionBasis == .routineStatusOrOverflow else { return false }
-            switch attempt.phase {
-            case .scheduled, .awaitingSettlement, .preparingDispatch, .dispatching: return true
-            case .cancelledBeforeDispatch: return false
-            }
-        } ?? false)
         if let periodicAttempt {
             guard periodicAttempt.phase != .cancelledBeforeDispatch,
                   agentSessionLinkPeriodicWakeIsEligible(session, endpoint: periodicAttempt.observerEndpoint)
@@ -757,6 +742,21 @@ extension AgentModeViewModel {
                 locationLabelsByReference[reference] = locationLabel
             }
         }
+        // The first reservation knows the route before begin makes the run active. Later adapters
+        // retain that frozen qualification, not a route re-derived from the now-running session.
+        let routineQuietCheckIn: Bool = if let attempt = session.oversight.pendingAutoWake, attempt.wakeID == effectiveID.autoWakeID {
+            if attempt.phase.ownsTransportBoundary,
+               let reserved = agentSessionLinkPromptClaimStore.pendingClaim(dispatchID: effectiveID, observerSessionID: context.epoch.endpoint.sessionID)
+            {
+                reserved.routineQuietCheckIn
+            } else {
+                attempt.admissionBasis == .routineStatusOrOverflow
+                    && agentSessionLinkAutoWakeRoute(session) == .idleFollowUp
+                    && AgentQuietCheckInClassifier.supports(context.epoch.providerContext)
+            }
+        } else {
+            false
+        }
         return agentSessionLinkPromptClaimStore.claimOutcome(
             dispatchID: effectiveID,
             epoch: context.epoch,
@@ -772,7 +772,7 @@ extension AgentModeViewModel {
                     observer: context.epoch.endpoint, inventory: context.inventory, baseline: baseline
                 )
             },
-            routineStatusWake: routineStatusWake,
+            routineQuietCheckIn: routineQuietCheckIn,
             render: AgentSessionLinkPrompts.rendered
         )
     }
@@ -870,6 +870,7 @@ extension AgentModeViewModel {
             )
         }
         return AgentSessionLinkDecoratedProviderText(
+            quietMarkerProducerLifetime: session.retainQuietMarkerProducer(for: claim),
             dispatchContext: captured,
             text: AgentSessionLinkPromptComposer.decorated(providerText, with: claim),
             claim: claim,

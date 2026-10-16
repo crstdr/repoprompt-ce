@@ -529,19 +529,59 @@ final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
 }
 
 final class AgentToolResultPayloadRetentionTests: XCTestCase {
-    /// Passive-wake evidence counts only what the transcript renders: update kinds that normalize
-    /// to no stream events must keep producing nothing for Devin. `user_message_chunk` in
-    /// particular only echoes a client-issued prompt — the input veto already fired on the send
-    /// path — so it stays invisible rather than becoming reply text. If a future kind starts
-    /// producing events here, the evidence layer needs a matching visible-text or veto decision.
-    func testDevinInvisibleUpdateKindsNormalizeToNoEvents() {
+    /// Non-rendering ingress is not silence: Devin remains ineligible for quiet classification.
+    @MainActor
+    func testDevinInvisibleUpdateKindsRecordActivityWithoutTranscriptRows() async {
+        let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() }, replayTranscript: true)
+        var deliveredEvents = 0
+        harness.onNativeStreamResult = { _, _, _, _ in deliveredEvents += 1 }
+        let session = harness.makeSession(agent: .devin)
+        let runID = UUID()
+        session.installRunID(runID)
+        session.runState = .running
+        let owner = session.beginRunAttempt(source: "test.devin.invisible-updates")
+        defer { _ = session.endRunAttempt(ifCurrent: owner, source: "test.devin.invisible-updates.end") }
+        let runner = ACPIntegratedAgentModeRunner(
+            hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier(), toolTrackingHooks: .noOp,
+            providerFactory: { _, _ in nil },
+            controllerFactory: { provider, request in try ACPAgentSessionController(provider: provider, runRequest: request) }
+        )
+        harness.host.refreshDerivedTranscriptState(for: session)
+        let items = session.items
+        let revision = session.sourceItemsRevision
+        let preview = AgentModeViewModel.latestVisibleAssistantPreview(for: session)
+        let visibleRows = session.transcriptCanonicalVisibleRowCount
         for kind in ["user_message_chunk", "plan", "available_commands_update", "unrecognized_future_kind"] {
             let events = ACPDefaultSessionUpdateNormalizer.normalize(
-                ["sessionUpdate": kind, "content": ["type": "text", "text": "visible words"]],
-                providerID: .devin
+                ["sessionUpdate": kind, "content": ["type": "text", "text": "visible words"]], providerID: .devin
             )
-            XCTAssertTrue(events.isEmpty, "\(kind) must stay invisible to transcript and evidence")
+            XCTAssertEqual(events.count, kind == "available_commands_update" ? 0 : 1, kind)
+            for event in events {
+                guard case let .stream(result) = event else { return XCTFail("Expected non-rendering activity for \(kind)") }
+                XCTAssertEqual(result.type, "event", kind)
+                XCTAssertNil(result.text, kind)
+            }
+            let deliveredBefore = deliveredEvents
+            await runner.testConsumeQuietEvents(events, session: session, runID: runID, owner: owner)
+            harness.host.flushPendingAssistantDelta(session)
+            harness.host.refreshDerivedTranscriptState(for: session)
+            XCTAssertEqual(deliveredEvents - deliveredBefore, events.count, "\(kind) must reach the stream handler")
+            XCTAssertEqual(session.items, items, kind)
+            XCTAssertEqual(session.sourceItemsRevision, revision, kind)
+            XCTAssertEqual(AgentModeViewModel.latestVisibleAssistantPreview(for: session), preview, kind)
+            XCTAssertEqual(session.transcriptCanonicalVisibleRowCount, visibleRows, kind)
         }
+        let control = "Retained assistant control"
+        let visibleEvents = ACPDefaultSessionUpdateNormalizer.normalize(
+            ["sessionUpdate": "agent_message_chunk", "content": ["type": "text", "text": control]], providerID: .devin
+        )
+        await runner.testConsumeQuietEvents(visibleEvents, session: session, runID: runID, owner: owner)
+        harness.host.flushPendingAssistantDelta(session)
+        harness.host.finalizeStreamingItems(in: session)
+        harness.host.refreshDerivedTranscriptState(for: session)
+        XCTAssertTrue(session.items.contains { $0.kind == .assistant && $0.text == control }, "The same owner and real VM path must render visible input")
+        XCTAssertGreaterThan(session.sourceItemsRevision, revision)
+        XCTAssertGreaterThan(session.transcriptCanonicalVisibleRowCount, visibleRows)
     }
 
     func testNormalizedEmptyTerminalUpdatesFinishStreamedLifecycleWithoutErasingContent() throws {
