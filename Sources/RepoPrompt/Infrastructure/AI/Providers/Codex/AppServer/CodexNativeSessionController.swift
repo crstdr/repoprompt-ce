@@ -5140,6 +5140,7 @@ final class CodexNativeSessionController {
             )
             return
         }
+        await emitAutoApprovedServerRequestActivity(method: method, params: params)
         do {
             try await client.respondToServerRequest(id: requestID, result: response.payload)
         } catch {

@@ -2882,3 +2882,107 @@ extension CodexResumeWedgeCommitTests {
         }
     }
 }
+
+private final class QuietAuthRefreshWireRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var frames: [Data] = []
+
+    func record(_ frame: Data) {
+        lock.withLock { frames.append(frame) }
+    }
+
+    func recorded() -> [Data] {
+        lock.withLock { frames }
+    }
+}
+
+extension CodexResumeWedgeCommitTests {
+    func testSuccessfulDormantAuthRefreshIsOrdinaryOnlyForCurrentScope() async throws {
+        let method = "account/chatgptAuthTokens/refresh"
+        for ack in [false, true] {
+            for scope in ["current", "foreign-thread", "foreign-turn", "stale-controller", "no-request"] {
+                let label = "auth refresh ack=\(ack) scope=\(scope)"
+                let f = makeFixture([])
+                f.viewModel.test_initializeRunService()
+                let runID = UUID()
+                f.session.installRunID(runID)
+                let responses = QuietAuthRefreshWireRecorder()
+                let client = CodexAppServerClient(writeFrameHandler: { _, frame in responses.record(frame) })
+                // In-memory transport only: no process launch and a successful real client write.
+                await client.debugInstallTestTransport()
+                var options = CodexNativeSessionController.Options.agentModeDefault()
+                options.authTokensRefreshHandler = { _ in
+                    .init(accessToken: "fixture-refreshed-token", chatgptAccountID: "fixture-account", chatgptPlanType: "fixture-plan")
+                }
+                func controller() -> CodexNativeSessionController {
+                    CodexNativeSessionController(client: client, runID: runID, tabID: f.session.tabID, windowID: -1, workspacePaths: .uniform(nil), options: options)
+                }
+                let current = controller()
+                let source = scope == "stale-controller" ? controller() : current
+                f.session.codexController = current
+                f.session.codexConversationID = Self.oldThreadID
+                let owner = try XCTUnwrap(f.session.activeRunOwnership)
+                let wakeID = UUID()
+                f.session.quietLedger.markRoutineWake(owner: owner, wakeID: wakeID)
+                await current.test_installThreadState(threadID: Self.oldThreadID, authoritativeTurnID: "refresh-turn", routingTurnID: "refresh-turn")
+                await source.test_installThreadState(threadID: Self.oldThreadID, authoritativeTurnID: "refresh-turn", routingTurnID: "refresh-turn")
+                await f.coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "refresh-turn"), session: f.session, sourceController: current)
+                if scope != "no-request" {
+                    await source.test_handleServerRequest(method: method, params: [
+                        "reason": .string("unauthorized"), "previousAccountId": .string("fixture-account"),
+                        "threadId": .string(scope == "foreign-thread" ? "other-thread" : Self.oldThreadID),
+                        "turnId": .string(scope == "foreign-turn" ? "other-turn" : "refresh-turn")
+                    ])
+                }
+                var warningCount = 0
+                func consume(_ controller: CodexNativeSessionController) async {
+                    for await event in controller.events {
+                        switch event {
+                        case let .livenessActivity(activity) where activity.method == method:
+                            warningCount += 1
+                            XCTAssertEqual(activity.kind, .warning, label)
+                            XCTAssertEqual(activity.threadID, scope == "foreign-thread" ? "other-thread" : Self.oldThreadID, label)
+                            XCTAssertEqual(activity.turnID, scope == "foreign-turn" ? "other-turn" : "refresh-turn", label)
+                        case .error, .serverRequestIssue, .errorNotification, .approvalRequest, .permissionsRequest, .mcpElicitationRequest, .toolCall, .toolResult:
+                            XCTFail("Refresh must succeed without substitute error or interaction evidence: \(label)")
+                        default: break
+                        }
+                        await f.coordinator.test_handleCodexNativeEvent(event, session: f.session, sourceController: controller)
+                    }
+                }
+                if source !== current {
+                    await source.shutdown()
+                    await consume(source)
+                }
+                if ack {
+                    await current.test_handleNotification(method: "item/completed", params: [
+                        "threadId": .string(Self.oldThreadID), "turnId": .string("refresh-turn"),
+                        "item": .object(["id": .string("answer"), "type": .string("agentMessage"), "text": .string("[ack]")])
+                    ])
+                }
+                await current.test_handleNotification(method: "turn/completed", params: [
+                    "threadId": .string(Self.oldThreadID), "turn": .object(["id": .string("refresh-turn"), "status": .string("completed")])
+                ])
+                await current.shutdown()
+                await consume(current)
+                let frames = responses.recorded()
+                XCTAssertEqual(frames.count, scope == "no-request" ? 0 : 1, label)
+                for frame in frames {
+                    let response = try XCTUnwrap(JSONSerialization.jsonObject(with: frame) as? [String: Any])
+                    XCTAssertEqual(response["id"] as? Int, 42, label)
+                    XCTAssertNil(response["error"], label)
+                    let payload = try XCTUnwrap(response["result"] as? [String: String])
+                    XCTAssertEqual(payload, ["accessToken": "fixture-refreshed-token", "chatgptAccountId": "fixture-account", "chatgptPlanType": "fixture-plan"], label)
+                }
+                XCTAssertEqual(warningCount, scope == "no-request" ? 0 : 1, label)
+                let ordinary = scope == "current"
+                XCTAssertEqual(f.session.runState, .completed, label)
+                XCTAssertEqual(f.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: ordinary ? 1 : 0), label)
+                XCTAssertEqual(f.session.quietLedger.hiddenSourceIDs.contains(wakeID), !ordinary, label)
+                if ordinary { XCTAssertTrue(f.session.quietLedger.hiddenSourceIDs.isEmpty, label) }
+                f.session.saveDebounceTask?.cancel()
+                await client.stop()
+            }
+        }
+    }
+}
