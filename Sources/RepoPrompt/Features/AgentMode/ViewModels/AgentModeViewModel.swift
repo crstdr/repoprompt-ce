@@ -1046,7 +1046,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             TabSession
         ) async -> AgentRunTerminalPublicationResult)?
     #endif
+    weak var preparedSessionRuntimes: (any PreparedAgentSessionRuntimeRegistry)?
     private var hasPreparedForWindowClose = false
+    private var windowClosePreparationTask: Task<Void, Never>?
     private static let uiRefreshCoalesceDelayNanos: UInt64 = 75_000_000
     /// The restore service has already loaded and projected all metadata before
     /// it begins yielding preferred rows. Publishing those rows in fixed-size
@@ -4676,8 +4678,20 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     func prepareForWindowClose() async {
+        if let task = windowClosePreparationTask { await task.value
+            return
+        }
         guard !hasPreparedForWindowClose else { return }
         hasPreparedForWindowClose = true
+        let task = Task<Void, Never> { @MainActor [weak self] in
+            guard let self else { return }
+            await performWindowClosePreparation()
+        }
+        windowClosePreparationTask = task
+        await task.value
+    }
+
+    private func performWindowClosePreparation() async {
         queuedWorkspaceSwitchOwner = nil
         unregisterObserverRegistrations()
         stopOpenCodeModelsSubscription()
@@ -4797,6 +4811,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     // MARK: - Tab Management
 
     private func onTabChanged(_ tabID: UUID?, allowDuringWorkspaceSwitch: Bool = false) {
+        // A prepared runtime has no UI selection. Only explicit, consent-fenced preparation may
+        // hydrate it; a projected tab publication must never reconnect its provider.
+        guard workspaceManager?.isSessionRuntimeProjection != true else { return }
         // An actual duplicate of the complete target with live work joins it; it never advances the
         // generation and abandons that work's continuation (§4.5).
         if let tabID, isDuplicateActivationOfLiveTarget(tabID) {
@@ -5557,6 +5574,89 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     }
 
+    /// An explicitly authorized, targeted load for oversight. Unlike sidebar presentation, this
+    /// may materialize just this saved session, but never selects a tab or reconnects a provider.
+    func finishPreparedOversightRuntime() async -> Bool {
+        guard workspaceManager?.isSessionRuntimeProjection == true else { return false }
+        for session in sessions.values {
+            session.saveDebounceTask?.cancel()
+            session.saveDebounceTask = nil
+            flushPendingAssistantDelta(session)
+        }
+        await prepareForWindowClose()
+        var saved = true
+        for session in sessions.values {
+            if let id = session.activeAgentSessionID, AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: id) { continue }
+            switch await saveSession(for: session.tabID) {
+            case .saved, .notRequired: saved = saved && !session.isDirty
+            case .deferred, .failed: saved = false
+            }
+        }
+        return saved
+    }
+
+    /// Transfer only a settled idle runtime. A failed save keeps the original in-memory owner;
+    /// visiting a tab must never discard a managed response that has not reached disk.
+    func settlePreparedOversightHandoff() async -> Bool {
+        guard workspaceManager?.isSessionRuntimeProjection == true else { return false }
+        for session in sessions.values {
+            guard !session.runState.isActive, session.permitsBoundOperationAndSave else { return false }
+            flushPendingAssistantDelta(session)
+            switch await saveSession(for: session.tabID) {
+            case .saved, .notRequired:
+                guard !session.isDirty, !session.runState.isActive else { return false }
+            case .deferred, .failed: return false
+            }
+        }
+        return true
+    }
+
+    func prepareSavedOversightSession(
+        tabID: UUID, sessionID: UUID, workspaceID: UUID,
+        isStillAuthorized: @MainActor () -> Bool
+    ) async -> Bool {
+        guard !Task.isCancelled, isStillAuthorized(), let workspaceManager,
+              workspaceManager.activeWorkspaceID == workspaceID,
+              let tab = workspaceManager.modelRoutingTab(workspaceID: workspaceID, tabID: tabID),
+              tab.activeAgentSessionID == nil || tab.activeAgentSessionID == sessionID,
+              !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: sessionID),
+              !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: sessionID)
+        else { return false }
+        if tab.activeAgentSessionID == nil {
+            guard let entry = ownerValidatedSessionIndex[sessionID], entry.tabID == tabID,
+                  preferredActiveSidebarEntry(for: tabID, tabName: tab.name, workspaceID: workspaceID)?.id == sessionID,
+                  sessions[tabID].map({
+                      $0.activeAgentSessionID == nil && !$0.isDirty && $0.items.isEmpty
+                          && !$0.runState.isActive && !$0.bindingTransitionInProgress
+                          && !bindingHasSynchronousOwnership($0)
+                  }) ?? true,
+                  isStillAuthorized(),
+                  workspaceManager.compareAndSetActiveAgentSessionID(
+                      expected: nil, replacement: sessionID, forTabID: tabID, inWorkspaceID: workspaceID
+                  )
+            else { return false }
+        }
+        let session = session(for: tabID)
+        if session.activeAgentSessionID == nil {
+            guard !session.isDirty, session.items.isEmpty, !session.runState.isActive,
+                  !session.bindingTransitionInProgress, !bindingHasSynchronousOwnership(session),
+                  isStillAuthorized(), installPersistentSessionBinding(
+                      sessionID: sessionID, on: session, mutationTarget: .runtimeOnly, invalidateAsyncWork: false
+                  ) != nil
+            else { return false }
+            // The previous unbound/empty payload was not a load of this saved identity.
+            session.hasLoadedPersistedState = false
+        }
+        guard session.activeAgentSessionID == sessionID else { return false }
+        _ = await ensureSessionReady(tabID: tabID, reconnectActiveProviders: false)
+        return !Task.isCancelled && isStillAuthorized() && sessions[tabID] === session
+            && workspaceManager.activeWorkspaceID == workspaceID
+            && workspaceManager.activeAgentSessionID(forTabID: tabID, inWorkspaceID: workspaceID) == sessionID
+            && session.activeAgentSessionID == sessionID && session.permitsBoundOperationAndSave
+            && !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: sessionID)
+            && !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: sessionID)
+    }
+
     private enum PersistentSessionBindingMutationTarget {
         case runtimeOnly
         case compareAndSet(workspaceID: UUID)
@@ -5573,6 +5673,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         invalidateAsyncWork: Bool,
         freshCreation: AgentSessionCreationClaim? = nil
     ) -> AgentPersistentSessionBindingIdentity? {
+        if let sessionID, workspaceManager?.isSessionRuntimeProjection != true,
+           preparedSessionRuntimes?.hasPreparedRuntime(sessionID) == true { return nil }
         if session.activeAgentSessionID == sessionID {
             return session.persistentSessionBindingIdentity
         }
@@ -6039,6 +6141,23 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         expectedTransition: PersistentBindingTransitionToken? = nil,
         requiresHydration: Bool = false
     ) async throws -> AgentPersistentSessionBindingIdentity {
+        if workspaceManager?.isSessionRuntimeProjection != true,
+           let owners = preparedSessionRuntimes,
+           await !(owners.releasePreparedOversightOwnerForVisit(sessionID: requestedSessionID, preparingReplacement: false))
+        {
+            if let workspace = workspaceManager?.activeWorkspace {
+                let tabID = targetSession.tabID
+                let expectedVisibleID = workspaceManager?.activeAgentSessionID(forTabID: tabID)
+                owners.queuePreparedRuntimeVisit(requestedSessionID) { [weak self, weak targetSession] in
+                    guard let self, let targetSession, !self.hasPreparedForWindowClose,
+                          sessions[tabID] === targetSession,
+                          workspaceManager?.activeWorkspaceID == workspace.id,
+                          workspaceManager?.activeAgentSessionID(forTabID: tabID) == expectedVisibleID else { return }
+                    _ = await activateRoutedAgentSession(tabID: tabID, sessionID: requestedSessionID, workspace: workspace)
+                }
+            }
+            throw PersistentBindingMutationError.blockedByOwnership
+        }
         if targetSession.activeAgentSessionID == requestedSessionID,
            let binding = targetSession.persistentSessionBindingIdentity
         {
@@ -7267,6 +7386,32 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// Ensures a session exists for the given tab ID and loads any persisted state.
     /// Used by MCP tool handlers to ensure session is ready before accessing it.
     func ensureSessionReady(tabID: UUID, reconnectActiveProviders: Bool = false) async -> TabSession {
+        let owners = preparedSessionRuntimes
+        let visibleSessionID = workspaceManager?.activeAgentSessionID(forTabID: tabID)
+        let preparedVisitID = workspaceManager?.isSessionRuntimeProjection != true
+            ? visibleSessionID.flatMap { owners?.hasPreparedRuntime($0) == true ? $0 : nil } : nil
+        if let preparedVisitID, owners?.claimPreparedRuntimeVisit(preparedVisitID) != true { return session(for: tabID) }
+        defer {
+            if let preparedVisitID {
+                owners?.finishPreparedRuntimeVisit(preparedVisitID)
+            }
+        }
+        if workspaceManager?.isSessionRuntimeProjection != true,
+           let id = workspaceManager?.activeAgentSessionID(forTabID: tabID),
+           let owners,
+           await !(owners.releasePreparedOversightOwnerForVisit(sessionID: id, preparingReplacement: false))
+        {
+            // Keep one writer while the run settles; the user's visit is resumed by the
+            // owner's existing run-state observation, without a second click or polling timer.
+            let workspaceID = workspaceManager?.activeWorkspaceID
+            owners.queuePreparedRuntimeVisit(id) { [weak self] in
+                guard let self, !self.hasPreparedForWindowClose,
+                      workspaceManager?.activeWorkspaceID == workspaceID,
+                      workspaceManager?.activeAgentSessionID(forTabID: tabID) == id else { return }
+                _ = await ensureSessionReady(tabID: tabID, reconnectActiveProviders: reconnectActiveProviders)
+            }
+            return session(for: tabID)
+        }
         let session = session(for: tabID)
 
         // Load persisted session if we haven't already.
@@ -7298,6 +7443,27 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         sessionID: UUID?,
         workspace: WorkspaceModel
     ) async -> AgentRouteSessionActivationResult {
+        let owners = preparedSessionRuntimes
+        let preparedVisitID = workspaceManager?.isSessionRuntimeProjection != true
+            ? sessionID.flatMap { owners?.hasPreparedRuntime($0) == true ? $0 : nil } : nil
+        if let preparedVisitID, owners?.claimPreparedRuntimeVisit(preparedVisitID) != true { return .blockedByActiveDifferentSession }
+        defer {
+            if let preparedVisitID {
+                owners?.finishPreparedRuntimeVisit(preparedVisitID)
+            }
+        }
+        if let preparedVisitID, let owners,
+           await !(owners.releasePreparedOversightOwnerForVisit(sessionID: preparedVisitID, preparingReplacement: false))
+        {
+            let expectedVisibleID = workspaceManager?.activeAgentSessionID(forTabID: tabID)
+            owners.queuePreparedRuntimeVisit(preparedVisitID) { [weak self] in
+                guard let self, !self.hasPreparedForWindowClose,
+                      workspaceManager?.activeWorkspaceID == workspace.id,
+                      workspaceManager?.activeAgentSessionID(forTabID: tabID) == expectedVisibleID else { return }
+                _ = await activateRoutedAgentSession(tabID: tabID, sessionID: sessionID, workspace: workspace)
+            }
+            return .blockedByActiveDifferentSession
+        }
         guard let sessionID else {
             let session = await ensureSessionReady(tabID: tabID, reconnectActiveProviders: true)
             return sessions[tabID] === session && session.operationAdmissionFailureMessage == nil
@@ -10564,7 +10730,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 reason: reason.rawValue
             ))
             throw MCPError.internalError(
-                "The Agent session could not be started because its workspace binding was not durably accepted. No provider was started; resolve workspace persistence and retry."
+                "The Agent session could not be started because its workspace binding was not durably accepted (reason=\(reason.rawValue), save=\(receipt.outcome.diagnosticCategory), category=\(receipt.outcome.normalizedFailureCategory?.rawValue ?? "none")). No provider was started; inspect manage_workspaces {action:\"list\"}, resolve the reported workspace admission failure, and retry only after it changes."
             )
         }
     }
@@ -17140,6 +17306,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             #endif
             return .notRequired
         }
+        if workspaceManager?.isSessionRuntimeProjection == true,
+           let id = session.activeAgentSessionID, AgentSessionDeletionRegistry.shared.blocksNewOversight(sessionID: id)
+        {
+            return .deferred("The saved target is being deleted or has been deleted; its retired runtime cannot write it back.")
+        }
         var effectiveCreationSave = creationSave
         if let handle = creationSave?.handle {
             guard handle.session === session, freshSessionCreationIsCurrent(handle),
@@ -18994,6 +19165,94 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             tabID: tabID, session: session, displayText: displayText,
             turn: AgentNoncomposerTurn(managed: turn), route: route
         )
+    }
+
+    /// App-authored scope decisions use ordinary noncomposer submission, never the user's draft,
+    /// attachments, workflow, or interview preference. Busy sessions retain the notice at its owner.
+    func submitDelegationDecision(
+        _ text: String, tabID: UUID, expectedSessionID: UUID, stopFence: AgentRunStartStopFence,
+        resuming persisted: AgentSessionLinkSendDelivery? = nil
+    ) async -> DelegationDecisionDeliveryOutcome {
+        let deletion = AgentSessionDeletionRegistry.shared
+        guard !WindowStatesManager.shared.isTerminating,
+              !deletion.isPermanentlyDeleted(sessionID: expectedSessionID),
+              !deletion.isDeletionInProgress(sessionID: expectedSessionID) else { return .retry }
+        guard let session = sessions[tabID], session.activeAgentSessionID == expectedSessionID,
+              stopFence.permitsQueuedDelivery(to: session),
+              let endpoint = agentSessionLinkObserverEndpoint(tabID: tabID) else { return .retry }
+        var readiness = Self.agentSessionLinkDeliveryReadinessSnapshot(
+            session: session, endpointMatchesGrant: true, isClosing: false
+        )
+        if session.runState == .waitingForUser, session.instructionContinuation != nil {
+            readiness.runStateIsActive = false
+            readiness.hasWaitingPrompt = false
+        }
+        guard AgentSessionLinkDeliveryReadiness.evaluate(snapshot: readiness).isReady else { return .retry }
+        if persisted != nil, session.runState.isActive { return .retry }
+        if let persisted, !session.items.contains(where: { $0.id == persisted.targetItemID && $0.kind == .user && $0.text == text }) {
+            return .indeterminate // Never recreate an accepted row whose identity can no longer be proved.
+        }
+        // An app-authored decision resumes an idle requester; it is not an active managed steer.
+        // The steer path deliberately withdraws idle input, so use the existing claimed, durable
+        // noncomposer start instead. No draft, workflow, provider permission or link is borrowed.
+        if !session.runState.isActive {
+            guard let target = makeComposerSubmitTarget(tabID: tabID, session: session),
+                  target.route == .existingAgentSession, target.expectedSourceAgentSessionID == expectedSessionID
+            else { return .retry }
+            let attempt = AgentComposerSubmitAttempt(
+                id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: ""
+            )
+            guard case let .claimed(claim) = claimComposerSubmitAttempt(attempt, requireActiveTabOwnership: false) else { return .retry }
+            let isCurrent: @MainActor () -> Bool = {
+                !WindowStatesManager.shared.isTerminating
+                    && WindowStatesManager.shared.allWindows.contains { $0.windowID == endpoint.windowID && !$0.isClosing && $0.agentModeViewModel === self }
+                    && self.sessions[tabID] === session && stopFence.permitsStart(of: session)
+                    && self.agentSessionLinkObserverEndpoint(tabID: tabID) == endpoint
+                    && self.composerSubmitClaimIsCurrent(claim)
+                    && !deletion.isPermanentlyDeleted(sessionID: expectedSessionID)
+                    && !deletion.isDeletionInProgress(sessionID: expectedSessionID)
+                    && AgentSessionLinkDeliveryReadiness.failure(snapshot: Self.agentSessionLinkDeliveryReadinessSnapshot(
+                        session: session, endpointMatchesGrant: true, isClosing: false, ignoresComposerSubmissionInFlight: true
+                    )) == nil
+            }
+            let outcome: AgentSessionLinkSendTransactionOutcome = if let persisted {
+                await startPersistedNoncomposerTurn(
+                    session: session, tabID: tabID, claim: claim, savedItemID: persisted.targetItemID,
+                    acceptedAt: persisted.acceptedAt, providerMessage: text, stopFence: stopFence,
+                    dispatchIsCurrent: isCurrent
+                )
+            } else {
+                await persistAndStartNoncomposerTurn(
+                    session: session, tabID: tabID, workspaceID: endpoint.workspaceID,
+                    claim: claim, displayText: text, providerMessage: text, workflow: nil,
+                    attribution: nil, stopFence: stopFence, dispatchIsCurrent: isCurrent
+                )
+            }
+            let result = Self.delegationDecisionOutcome(outcome)
+            if case .indeterminate = result {
+                session.appendItem(.error("The approval notice's save is unconfirmed. It may already be on disk; it will not be duplicated or claimed delivered. Check this session before retrying.", sequenceIndex: session.nextSequenceIndex))
+            }
+            return result
+        }
+        let submission = submitPreparedUserTurn(
+            tabID: tabID, session: session, trimmedText: text,
+            attachmentsToSend: [], taggedFilesToSend: [], activeWorkflow: nil,
+            managedTurn: AgentNoncomposerTurn(
+                endpoint: endpoint, providerText: text, sink: AgentSessionLinkManagedSteerSink()
+            ),
+            stopFence: AgentRunStartStopFence(session: session), isLocalComposerInput: false
+        )
+        if case .submitted = submission { return .submitted }
+        return .retry
+    }
+
+    static func delegationDecisionOutcome(_ outcome: AgentSessionLinkSendTransactionOutcome) -> DelegationDecisionDeliveryOutcome {
+        switch outcome {
+        case .blocked(.persistenceIndeterminate): .indeterminate
+        case .blocked: .retry
+        case let .delivered(delivery) where delivery.deliveryState == .persisted || delivery.deliveryState == .runStartFailed: .persisted(delivery)
+        case .delivered: .submitted
+        }
     }
 
     /// Shares prepared submission and provider settlement without borrowing link authority.

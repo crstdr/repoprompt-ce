@@ -1,28 +1,15 @@
-import Darwin
 import Foundation
 import RepoPromptDomainRuntime
+import RepoPromptPersistence
 
-// Scope intent is authority. A launch must durably mark the document open before restoring any
-// grant, and only a final, frozen snapshot may seal it for the next launch. Atomic replacement
-// protects against process interruption; this does not claim power-loss durability.
-
-/// Versioned on-disk envelope. Version 2 requires an explicit launch-state field when decoding.
+/// Legacy import envelope only. Never rewritten by the transactional continuity implementation.
 struct DelegationScopeDocument: Codable, Equatable {
     static let currentVersion = 2
-    /// Bounded tombstone list; the oldest entries drop first.
-    static let maxRevokedScopeIDs = 1024
-
     let version: Int
     let scopes: [DomainDelegationScopeGrant]
     let revokedScopeIDs: [UUID]?
     let cleanShutdown: Bool
-
-    init(
-        version: Int = DelegationScopeDocument.currentVersion,
-        scopes: [DomainDelegationScopeGrant],
-        revokedScopeIDs: [UUID]? = nil,
-        cleanShutdown: Bool = false
-    ) {
+    init(version: Int = currentVersion, scopes: [DomainDelegationScopeGrant], revokedScopeIDs: [UUID]? = nil, cleanShutdown: Bool = true) {
         self.version = version
         self.scopes = scopes
         self.revokedScopeIDs = revokedScopeIDs
@@ -30,453 +17,169 @@ struct DelegationScopeDocument: Codable, Equatable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case version
-        case scopes
+        case version, scopes
         case revokedScopeIDs = "revoked_scope_ids"
-        case cleanShutdown = "clean_shutdown"
-    }
-}
-
-private struct DelegationScopeDocumentHeader: Decodable {
-    let version: Int
-}
-
-/// Kept separate so a missing v2 launch-state field can never acquire the legacy default.
-private struct LegacyDelegationScopeDocument: Decodable {
-    let scopes: [DomainDelegationScopeGrant]
-    let revokedScopeIDs: [UUID]?
-
-    private enum CodingKeys: String, CodingKey {
-        case scopes
-        case revokedScopeIDs = "revoked_scope_ids"
-    }
-}
-
-private struct DelegationScopeLaunchState: Decodable {
-    let cleanShutdown: Bool
-
-    private enum CodingKeys: String, CodingKey {
         case cleanShutdown = "clean_shutdown"
     }
 }
 
 enum DelegationScopePersistenceBlockReason: Equatable {
     case unsupportedFutureSchema(onDiskVersion: Int, supportedVersion: Int)
-    case unreadable
+    case unreadable, ownershipUnavailable, openingWriteFailed, invalidLaunchState
     case fileTooLarge(byteCount: Int)
     case tooManyRows(rowCount: Int)
-    case ownershipUnavailable
-    case openingWriteFailed
-    case invalidLaunchState
-
     var diagnosticLabel: String {
         switch self {
         case .unsupportedFutureSchema: "future_schema"
         case .unreadable: "unreadable"
-        case .fileTooLarge: "file_too_large"
-        case .tooManyRows: "too_many_rows"
         case .ownershipUnavailable: "ownership_unavailable"
         case .openingWriteFailed: "opening_write_failed"
         case .invalidLaunchState: "invalid_launch_state"
+        case .fileTooLarge: "file_too_large"
+        case .tooManyRows: "too_many_rows"
         }
     }
 
     var message: String {
-        switch self {
-        case .unsupportedFutureSchema:
-            "Saved delegations require a newer version of RepoPrompt. They were preserved and no authority was restored."
-        case .unreadable:
-            "Saved delegations could not be read safely. No authority was restored. Resolve the storage problem and restart RepoPrompt."
-        case .fileTooLarge, .tooManyRows:
-            "Saved delegations exceed the supported storage limit. They were preserved and no authority was restored."
-        case .ownershipUnavailable:
-            "Delegation storage is unavailable or another RepoPrompt process owns it. Delegation persistence is blocked. Close the other process or resolve the storage problem, then restart."
-        case .openingWriteFailed:
-            "Delegation storage could not be prepared safely for this launch. No authority was restored. Resolve the storage problem and restart RepoPrompt."
-        case .invalidLaunchState:
-            "Delegation storage has no valid state for this launch. No authority was restored. Restart RepoPrompt; if this persists, restore a valid backup."
-        }
+        "Saved delegation continuity is unavailable (\(diagnosticLabel)). Existing bytes are preserved. New explicit user approvals remain usable in this process; saving is separate and will retry."
     }
 }
 
 enum DelegationScopeLoadResult: Equatable {
-    enum Source: String, Equatable {
-        case missing
-        case loaded
-        case quarantined
-        case legacyRequiresApproval
-        case uncleanRequiresApproval
-    }
-
+    enum Source: String, Equatable { case missing, loaded, migrated, quarantined }
     case ready(source: Source, grants: [DomainDelegationScopeGrant], revokedScopeIDs: [UUID])
     case blocked(DelegationScopePersistenceBlockReason)
     case suppressed
 }
 
 enum DelegationScopeWriteOutcome: String, Equatable {
-    case applied
-    case unchanged
-    /// Persistence is suppressed, not open, finalized, or preserved/blocked.
-    case blocked
-    /// Encoding or atomic replacement failed. Old disk and memory state survive.
-    case writeFailed
+    case applied, unchanged, pending, blocked, writeFailed, rejected
 }
 
-/// Atomic, versioned store for durable delegation-scope intent.
-///
-/// Beside `agentSessionOversightLinks.json`:
-/// `~/Library/Application Support/RepoPrompt CE/delegationScopes.json`
-actor DelegationScopeStore {
+/// Typed continuity adapter, not the live approval owner. It has no lifetime flock and no cached
+/// startup failure. A failed open/transaction can be retried on this same object. All mutations are
+/// row deltas with stable operation receipts; neither missing rows nor a stale snapshot imply revoke.
+final class DelegationScopeStore: @unchecked Sendable {
     static let filename = "delegationScopes.json"
     static let backupsDirectoryName = "Backups"
-    static let maxFileByteCount = 4 * 1024 * 1024
-    static let maxDecodedRowCount = 4096
-    private static let maxQuarantineAttempts = 4
-
-    private let fileURL: URL
-    private let backupsDirectoryURL: URL
+    let repository: OverseerContinuityRepository
     private let mode: AgentSessionOversightPersistenceMode
-    private let maxFileByteCount: Int
-    private let maxDecodedRowCount: Int
-    private let fileManager: FileManager
-    private let writer: @Sendable (Data, URL) throws -> Void
-    private let now: @Sendable () -> Date
-    private let makeUUID: @Sendable () -> UUID
-
-    private var didLoad = false
-    private var settledSource: DelegationScopeLoadResult.Source?
-    private var blockReason: DelegationScopePersistenceBlockReason?
-    private var grants: [DomainDelegationScopeGrant] = []
-    private var revokedScopeIDs: [UUID] = []
-    private var ownership: DelegationScopeFileOwnership?
-    /// Set before final I/O, including failures. No queued snapshot can write after finalization.
-    private var finalizationOutcome: DelegationScopeWriteOutcome?
+    private let beforeCommit: @Sendable () throws -> Void
+    private let lock = NSLock()
+    private var closed = false
+    private var cachedGrants: [DomainDelegationScopeGrant] = []
+    private var failure: String?
+    private var recoveryWarning: String?
+    private var receipt: OverseerContinuityReceipt?
+    var lastReceipt: OverseerContinuityReceipt? {
+        lock.withLock { receipt }
+    }
 
     init(
         fileURL: URL,
-        backupsDirectoryURL: URL,
+        backupsDirectoryURL _: URL,
         mode: AgentSessionOversightPersistenceMode,
-        fileManager: FileManager = .default,
-        writer: @escaping @Sendable (Data, URL) throws -> Void = { data, url in
-            try data.write(to: url, options: .atomic)
-        },
-        now: @escaping @Sendable () -> Date = { Date() },
-        makeUUID: @escaping @Sendable () -> UUID = { UUID() },
-        maxFileByteCount: Int = DelegationScopeStore.maxFileByteCount,
-        maxDecodedRowCount: Int = DelegationScopeStore.maxDecodedRowCount
+        beforeCommit: @escaping @Sendable () throws -> Void = {},
+        databaseURL: URL? = nil,
+        profile: String = "temporary-overseer",
+        legacyPolicy: OverseerLegacyPolicy = .sameProfile
     ) {
-        self.fileURL = fileURL.standardizedFileURL
-        self.backupsDirectoryURL = backupsDirectoryURL
         self.mode = mode
-        self.fileManager = fileManager
-        self.writer = writer
-        self.now = now
-        self.makeUUID = makeUUID
-        self.maxFileByteCount = maxFileByteCount
-        self.maxDecodedRowCount = maxDecodedRowCount
+        self.beforeCommit = beforeCommit
+        repository = OverseerContinuityRepository(databaseURL: databaseURL ?? fileURL.deletingLastPathComponent().appendingPathComponent("Overseer/continuity.sqlite"), profile: profile, legacyURL: fileURL, kind: .scope, mode: mode, legacyPolicy: legacyPolicy)
     }
 
-    deinit {
-        ownership?.release()
-    }
-
-    /// Production location, beside `agentSessionOversightLinks.json`.
-    static func production(
-        mode: AgentSessionOversightPersistenceMode,
-        fileManager: FileManager = .default
-    ) -> DelegationScopeStore {
-        let base = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)
-            .first!
-            .appendingPathComponent("RepoPrompt CE", isDirectory: true)
-        return DelegationScopeStore(
-            fileURL: base.appendingPathComponent(filename),
-            backupsDirectoryURL: base.appendingPathComponent(backupsDirectoryName, isDirectory: true),
+    static func production(mode: AgentSessionOversightPersistenceMode, fileManager: FileManager = .default) -> DelegationScopeStore {
+        let locations = OverseerContinuityRepository.production(fileManager: fileManager)
+        return .init(
+            fileURL: locations.legacyDirectory.appendingPathComponent(filename),
+            backupsDirectoryURL: locations.legacyDirectory,
             mode: mode,
-            fileManager: fileManager
+            databaseURL: locations.databaseURL,
+            profile: locations.profile,
+            legacyPolicy: .userReview
         )
     }
 
-    // MARK: - Load
+    var diagnostic: String? {
+        lock.withLock { failure ?? recoveryWarning } ?? repository.diagnostic
+    }
 
-    /// Claims this path for the launch and writes an open document before returning any authority.
-    /// Repeat calls report the settled classification without another opening write.
+    /// Successfully decoded continuity descriptions, never an authorization input.
+    var restoredDescriptions: [DomainDelegationScopeGrant] {
+        lock.withLock { cachedGrants }
+    }
+
     func loadForLaunch() -> DelegationScopeLoadResult {
         guard mode.performsProductionFileIO else { return .suppressed }
-        guard finalizationOutcome == nil else { return .blocked(.invalidLaunchState) }
-        if didLoad {
-            if let blockReason { return .blocked(blockReason) }
-            guard ownership?.isCurrent == true else { return block(.ownershipUnavailable) }
-            return .ready(source: settledSource ?? .loaded, grants: grants, revokedScopeIDs: revokedScopeIDs)
-        }
-        didLoad = true
-
         do {
-            try fileManager.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-            ownership = try DelegationScopeFileOwnership.acquire(for: fileURL)
+            let rows = try repository.load()
+            var grants: [DomainDelegationScopeGrant] = []
+            var revoked: [UUID] = []
+            var invalidIDs: [String] = []
+            for row in rows {
+                do {
+                    guard let id = UUID(uuidString: row.id) else { throw OverseerContinuityError.invalidRecord }
+                    if row.terminal { revoked.append(id)
+                        continue
+                    }
+                    let grant = try JSONDecoder().decode(DomainDelegationScopeGrant.self, from: row.payload)
+                    let canonical = try OverseerContinuityRepository.scopeRow(grant)
+                    guard canonical.id == row.id, canonical.ownerID == row.ownerID, canonical.parentID == row.parentID,
+                          canonical.anchorID == row.anchorID, canonical.workspaceID == row.workspaceID,
+                          canonical.capabilities == row.capabilities,
+                          canonical.expiresAt?.timeIntervalSince1970 == row.expiresAt?.timeIntervalSince1970 else { throw OverseerContinuityError.invalidRecord }
+                    grants.append(grant)
+                } catch { invalidIDs.append(row.id) }
+            }
+            lock.withLock { cachedGrants = grants
+                failure = nil
+                recoveryWarning = invalidIDs.isEmpty ? nil : "Invalid scope entries remain preserved and inactive for recovery: \(invalidIDs.joined(separator: ", ")). Other valid committed grants restore normally."
+            }
+            return .ready(source: rows.isEmpty ? .missing : .loaded, grants: grants, revokedScopeIDs: revoked)
         } catch {
-            return block(.ownershipUnavailable)
-        }
-
-        guard fileManager.fileExists(atPath: fileURL.path) else {
-            return openLaunch(source: .missing, grants: [], revoked: [])
-        }
-        if let size = (try? fileManager.attributesOfItem(atPath: fileURL.path))?[.size] as? NSNumber,
-           size.intValue > maxFileByteCount
-        {
-            return block(.fileTooLarge(byteCount: size.intValue))
-        }
-        guard let data = try? Data(contentsOf: fileURL) else { return block(.unreadable) }
-        guard data.count <= maxFileByteCount else { return block(.fileTooLarge(byteCount: data.count)) }
-
-        let decoder = JSONDecoder()
-        guard let header = try? decoder.decode(DelegationScopeDocumentHeader.self, from: data) else {
-            return quarantineAndStartEmpty()
-        }
-        guard header.version <= DelegationScopeDocument.currentVersion else {
-            return block(.unsupportedFutureSchema(
-                onDiskVersion: header.version,
-                supportedVersion: DelegationScopeDocument.currentVersion
-            ))
-        }
-        switch header.version {
-        case 1:
-            guard let legacy = try? decoder.decode(LegacyDelegationScopeDocument.self, from: data) else {
-                return quarantineAndStartEmpty()
+            lock.withLock { failure = "Continuity open failed: \(error). New user-approved authority still works in this process. Retry saving; no saved data was replaced." }
+            if case let OverseerContinuityError.incompatibleSchema(version) = error {
+                return .blocked(.unsupportedFutureSchema(onDiskVersion: version, supportedVersion: 1))
             }
-            guard legacy.scopes.count <= maxDecodedRowCount else {
-                return block(.tooManyRows(rowCount: legacy.scopes.count))
-            }
-            // Legacy bytes cannot prove whether their last revocation reached disk. Explicit user
-            // approval is required; reading a v1 grant never reactivates it.
-            return openLaunch(source: .legacyRequiresApproval, grants: [], revoked: legacy.revokedScopeIDs ?? [])
-        case DelegationScopeDocument.currentVersion:
-            guard (try? decoder.decode(DelegationScopeLaunchState.self, from: data)) != nil else {
-                return block(.invalidLaunchState)
-            }
-            guard let document = try? decoder.decode(DelegationScopeDocument.self, from: data) else {
-                return quarantineAndStartEmpty()
-            }
-            guard document.scopes.count <= maxDecodedRowCount else {
-                return block(.tooManyRows(rowCount: document.scopes.count))
-            }
-            guard document.cleanShutdown else {
-                return openLaunch(source: .uncleanRequiresApproval, grants: [], revoked: document.revokedScopeIDs ?? [])
-            }
-            var seen: Set<UUID> = []
-            let uniqueGrants = document.scopes.filter { seen.insert($0.id).inserted }
-            return openLaunch(source: .loaded, grants: uniqueGrants, revoked: document.revokedScopeIDs ?? [])
-        default:
-            return block(.invalidLaunchState)
+            return .blocked(.unreadable)
         }
     }
 
-    private func openLaunch(
-        source: DelegationScopeLoadResult.Source,
-        grants candidates: [DomainDelegationScopeGrant],
-        revoked: [UUID]
-    ) -> DelegationScopeLoadResult {
-        // Required even for an empty or otherwise unchanged document: restoration cannot precede
-        // the durable fence which makes a failed later revocation safe across process restart.
-        guard writeSnapshot(grants: candidates, revoked: revoked, cleanShutdown: false) == .applied else {
-            return block(blockReason ?? .openingWriteFailed)
-        }
-        settledSource = source
-        return .ready(source: source, grants: grants, revokedScopeIDs: revokedScopeIDs)
-    }
-
-    private func block(_ reason: DelegationScopePersistenceBlockReason) -> DelegationScopeLoadResult {
-        blockReason = reason
-        return .blocked(reason)
-    }
-
-    /// Moves the intact source aside with no-replace semantics, then opens an empty v2 document. If
-    /// the file cannot be moved it stays where it is and mutation stays blocked.
-    private func quarantineAndStartEmpty() -> DelegationScopeLoadResult {
-        guard ownership?.isCurrent == true else { return block(.ownershipUnavailable) }
-        try? fileManager.createDirectory(at: backupsDirectoryURL, withIntermediateDirectories: true)
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withYear, .withMonth, .withDay, .withTime, .withTimeZone]
-        let stamp = formatter.string(from: now()).replacingOccurrences(of: ":", with: "")
-        for _ in 0 ..< Self.maxQuarantineAttempts {
-            let destination = backupsDirectoryURL.appendingPathComponent(
-                "delegationScopes.corrupt.\(stamp).\(makeUUID().uuidString).json"
-            )
-            guard !fileManager.fileExists(atPath: destination.path) else { continue }
-            do {
-                try fileManager.moveItem(at: fileURL, to: destination)
-                return openLaunch(source: .quarantined, grants: [], revoked: [])
-            } catch {
-                guard !fileManager.fileExists(atPath: fileURL.path) else { continue }
-                break
-            }
-        }
-        return block(.unreadable)
-    }
-
-    // MARK: - Mutation
-
-    /// Ordinary writes keep the launch open, including grants approved during this process.
-    func replace(
-        with newGrants: [DomainDelegationScopeGrant],
-        revokedScopeIDs newRevoked: [UUID] = []
-    ) -> DelegationScopeWriteOutcome {
-        guard canWriteOpenLaunch else { return .blocked }
-        let ordered = newGrants.sorted { $0.id.uuidString < $1.id.uuidString }
-        let tombstones = Array(newRevoked.suffix(DelegationScopeDocument.maxRevokedScopeIDs))
-        guard ordered != grants || tombstones != revokedScopeIDs else { return .unchanged }
-        return writeSnapshot(grants: ordered, revoked: tombstones, cleanShutdown: false)
-    }
-
-    /// Seals exactly the caller's frozen final snapshot. The first attempt is terminal even when
-    /// writing fails; late queued writes and repeated finalization cannot overwrite its outcome.
-    func finishLaunch(
-        with newGrants: [DomainDelegationScopeGrant],
-        revokedScopeIDs newRevoked: [UUID] = []
-    ) -> DelegationScopeWriteOutcome {
-        if let finalizationOutcome { return finalizationOutcome }
-        let mayFinish = canWriteOpenLaunch
-        finalizationOutcome = .blocked
-        guard mayFinish else { return .blocked }
-        let outcome = writeSnapshot(grants: newGrants, revoked: newRevoked, cleanShutdown: true)
-        finalizationOutcome = outcome
-        return outcome
-    }
-
-    private var canWriteOpenLaunch: Bool {
-        guard mode.performsProductionFileIO, didLoad, settledSource != nil,
-              blockReason == nil, finalizationOutcome == nil
-        else { return false }
-        guard ownership?.isCurrent == true else {
-            blockReason = .ownershipUnavailable
-            return false
-        }
-        return true
-    }
-
-    private func writeSnapshot(
-        grants newGrants: [DomainDelegationScopeGrant],
-        revoked newRevoked: [UUID],
-        cleanShutdown: Bool
-    ) -> DelegationScopeWriteOutcome {
-        guard ownership?.isCurrent == true else {
-            blockReason = .ownershipUnavailable
-            return .blocked
-        }
-        guard newGrants.count <= maxDecodedRowCount else { return .blocked }
-        let ordered = newGrants.sorted { $0.id.uuidString < $1.id.uuidString }
-        let tombstones = Array(newRevoked.suffix(DelegationScopeDocument.maxRevokedScopeIDs))
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    func record(operationID: UUID, grants: [DomainDelegationScopeGrant], revoked: [UUID], deletedSessions: [UUID] = []) -> DelegationScopeWriteOutcome {
+        guard mode.performsProductionFileIO, !lock.withLock({ closed }) else { return .blocked }
         do {
-            let data = try encoder.encode(DelegationScopeDocument(
-                scopes: ordered,
-                revokedScopeIDs: tombstones.isEmpty ? nil : tombstones,
-                cleanShutdown: cleanShutdown
-            ))
-            guard data.count <= maxFileByteCount else { return .blocked }
-            try writer(data, fileURL)
+            try beforeCommit()
+            let mutations = try deletedSessions.map { OverseerContinuityMutation.deletedSession($0.uuidString) }
+                + revoked.map { OverseerContinuityMutation.revokeScope($0.uuidString) }
+                + grants.filter { !revoked.contains($0.id) }.map { try .grant(OverseerContinuityRepository.scopeRow($0)) }
+            guard !mutations.isEmpty else { return .unchanged }
+            let receipt = try repository.commit(operationID: operationID, mutations: mutations, origin: "live-scope-owner")
+            lock.withLock { self.receipt = receipt
+                failure = nil
+            }
+            return .applied
         } catch {
-            return .writeFailed
+            let rejected = (error as? OverseerContinuityError)?.isPermanentTransitionFailure == true
+            lock.withLock { failure = "Continuity save failed: \(error). The live user decision still applies; this change is not durably saved. " + (rejected ? "These exact bytes cannot be retried; inspect the conflicting saved identity and make a fresh user decision." : "Saving will retry.") }
+            return rejected ? .rejected : .writeFailed
         }
-        grants = ordered
-        revokedScopeIDs = tombstones
-        return .applied
+    }
+
+    /// Compatibility entry point for callers/tests. This is additive, not a snapshot replacement:
+    /// only explicit terminal IDs revoke; omitted rows belong to other owners and remain untouched.
+    func replace(with grants: [DomainDelegationScopeGrant], revokedScopeIDs: [UUID] = []) -> DelegationScopeWriteOutcome {
+        record(operationID: UUID(), grants: grants, revoked: revokedScopeIDs)
     }
 
     var currentGrants: [DomainDelegationScopeGrant] {
-        grants
+        if case let .ready(_, grants, _) = loadForLaunch() { return grants }
+        return lock.withLock { cachedGrants }
     }
 
     #if DEBUG
-        /// Simulates process exit without a clean final snapshot. Also releases a normally finished
-        /// store so restart tests can acquire the same real path without depending on ARC timing.
         func closeWithoutSealingForTesting() {
-            if finalizationOutcome == nil { finalizationOutcome = .blocked }
-            ownership?.release()
-            ownership = nil
+            lock.withLock { closed = true }
         }
     #endif
-}
-
-/// Locks a stable sibling, never the JSON inode replaced by atomic writes. The lock file remains
-/// in place after release so overlapping owners cannot acquire different inodes for the same path.
-private final class DelegationScopeFileOwnership: @unchecked Sendable {
-    private struct FileIdentity: Equatable {
-        let device: dev_t
-        let inode: ino_t
-        let owner: uid_t
-        let mode: mode_t
-
-        var isRegularFile: Bool {
-            mode & mode_t(S_IFMT) == mode_t(S_IFREG)
-        }
-    }
-
-    private enum OwnershipError: Error {
-        case unavailable
-    }
-
-    private let lockURL: URL
-    private let descriptor: Int32
-    private let identity: FileIdentity
-    private let stateLock = NSLock()
-    private var released = false
-
-    static func acquire(for fileURL: URL) throws -> DelegationScopeFileOwnership {
-        let lockURL = fileURL.deletingLastPathComponent().resolvingSymlinksInPath()
-            .appendingPathComponent(fileURL.lastPathComponent + ".lock")
-        let descriptor = Darwin.open(lockURL.path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, mode_t(0o600))
-        guard descriptor >= 0 else { throw OwnershipError.unavailable }
-        do {
-            guard let initial = identity(for: descriptor), initial.isRegularFile, initial.owner == getuid(),
-                  identity(at: lockURL.path) == initial,
-                  fchmod(descriptor, mode_t(0o600)) == 0,
-                  let secured = identity(for: descriptor), secured.isRegularFile, secured.owner == getuid(),
-                  identity(at: lockURL.path) == secured,
-                  flock(descriptor, LOCK_EX | LOCK_NB) == 0,
-                  identity(for: descriptor) == secured, identity(at: lockURL.path) == secured
-            else { throw OwnershipError.unavailable }
-            return DelegationScopeFileOwnership(lockURL: lockURL, descriptor: descriptor, identity: secured)
-        } catch {
-            Darwin.close(descriptor)
-            throw error
-        }
-    }
-
-    private init(lockURL: URL, descriptor: Int32, identity: FileIdentity) {
-        self.lockURL = lockURL
-        self.descriptor = descriptor
-        self.identity = identity
-    }
-
-    deinit {
-        release()
-    }
-
-    var isCurrent: Bool {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        return !released && Self.identity(for: descriptor) == identity && Self.identity(at: lockURL.path) == identity
-    }
-
-    func release() {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        guard !released else { return }
-        released = true
-        _ = flock(descriptor, LOCK_UN)
-        Darwin.close(descriptor)
-    }
-
-    private static func identity(for descriptor: Int32) -> FileIdentity? {
-        var info = stat()
-        guard fstat(descriptor, &info) == 0 else { return nil }
-        return FileIdentity(device: info.st_dev, inode: info.st_ino, owner: info.st_uid, mode: info.st_mode)
-    }
-
-    private static func identity(at path: String) -> FileIdentity? {
-        var info = stat()
-        guard lstat(path, &info) == 0 else { return nil }
-        return FileIdentity(device: info.st_dev, inode: info.st_ino, owner: info.st_uid, mode: info.st_mode)
-    }
 }

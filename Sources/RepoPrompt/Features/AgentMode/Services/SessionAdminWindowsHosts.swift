@@ -9,7 +9,11 @@ import RepoPromptWorkspaceCore
 @MainActor
 enum SessionAdminWindows {
     static func owningViewModel(for sessionID: UUID) -> AgentModeViewModel? {
-        WindowStatesManager.shared.allWindows
+        let manager = WindowStatesManager.shared
+        if manager.preparedOversightOwnerLocations[sessionID]?.isCurrent == true,
+           !manager.preparedOversightHandoffs.contains(sessionID),
+           let owner = manager.preparedOversightWindows[sessionID], !owner.isClosing { return owner.agentModeViewModel }
+        return manager.allWindows
             .first { !$0.isClosing && $0.agentModeViewModel.ownerValidatedSessionIndex[sessionID] != nil }?
             .agentModeViewModel
     }
@@ -19,6 +23,52 @@ enum SessionAdminWindows {
               let session = try? viewModel.authoritativeLiveSession(for: sessionID)
         else { return nil }
         return (viewModel, session)
+    }
+}
+
+/// A saved carrier witness, not a permission. Preparation borrows its workspace/tab in a private
+/// runtime composition; the real tab, stash and active workspace are never edited.
+@MainActor
+struct SavedOversightSessionLocation {
+    weak var window: WindowState?
+    let workspace: WorkspaceModel
+    let tab: ComposeTabState
+    let stashedTabID: UUID?
+    let entry: AgentSessionIndexEntry
+
+    var isCurrent: Bool {
+        guard let window,
+              let current = window.workspaceManager.workspace(withID: workspace.id) else { return false }
+        if window.workspaceManager.activeWorkspaceID == workspace.id,
+           let latest = window.agentModeViewModel.ownerValidatedSessionIndex[entry.id],
+           latest.tabID != entry.tabID || latest.parentSessionID != entry.parentSessionID
+           || latest.createdByOverseerSessionID != entry.createdByOverseerSessionID
+           || latest.organizationalParentID != entry.organizationalParentID
+           || latest.delegationScopeID != entry.delegationScopeID { return false }
+        let tabs = current.composeTabs.filter { $0.id == tab.id }
+        let stashes = current.stashedTabs.filter { $0.tab.id == tab.id }
+        // The target's carrier and provenance matter, not the other chat currently displayed
+        // in it. Stashing/unstashing is UI placement, not withdrawal of managed-task consent.
+        return tabs.count + stashes.count == 1
+    }
+
+    func agreesOnCarrierAndProvenance(with other: Self) -> Bool {
+        workspace.id == other.workspace.id && tab.id == other.tab.id
+            && entry.parentSessionID == other.entry.parentSessionID
+            && entry.createdByOverseerSessionID == other.entry.createdByOverseerSessionID
+            && entry.organizationalParentID == other.entry.organizationalParentID
+            && entry.delegationScopeID == other.entry.delegationScopeID
+    }
+
+    var runtimeWorkspace: WorkspaceModel {
+        var copy = workspace
+        var carrier = tab
+        carrier.name = entry.name
+        carrier.activeAgentSessionID = entry.id
+        copy.composeTabs = [carrier]
+        copy.stashedTabs = []
+        copy.activeComposeTabID = carrier.id
+        return copy
     }
 }
 
@@ -57,22 +107,60 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         target: UUID,
         isStillAuthorized: @escaping @MainActor () -> Bool
     ) async -> SessionAdminLinkOutcome {
-        // Exact live incarnations, so the Add's endpoint fences and the delegated authority are
-        // re-proved together at every commit point inside the shared durable transaction.
+        await addLink(observer: observer, target: target, sourceScopeID: nil, isStillAuthorized: isStillAuthorized)
+    }
+
+    func addLink(
+        observer: UUID, target: UUID, sourceScopeID: UUID?,
+        isStillAuthorized: @escaping @MainActor () -> Bool
+    ) async -> SessionAdminLinkOutcome {
+        guard !Task.isCancelled, isStillAuthorized() else { return .revoked }
+        let manager = WindowStatesManager.shared
+        let initialObservers = WindowStatesManager.shared.agentSessionLinkCandidates(forSessionIDs: [observer], includeLocation: false)
+        guard let initialObserver = initialObservers[observer]?.only?.domainEndpoint else {
+            return .failed("observer_changed: The requesting session has no exact current binding; nothing was linked.")
+        }
+        manager.beginPreparedOversightPreparation(target)
+        defer { manager.endPreparedOversightPreparation(target) }
+        let prepared = await manager.prepareSavedOversightTarget(target, isStillAuthorized: isStillAuthorized)
+        guard isStillAuthorized(), !Task.isCancelled else { return .revoked }
+        guard case let .success(owner) = prepared,
+              let location = manager.preparedOversightLocations[target], location.isCurrent
+        else {
+            let code = if case let .failure(reason) = prepared { reason.rawValue } else { "target_binding_changed" }
+            return .failed("\(code): The exact saved target could not be prepared. Ask the user to check whether it was deleted, moved or has conflicting saved copies; nothing was linked.")
+        }
+        guard !owner.isClosing else { return .revoked }
+        // Re-read after hydration: no captured endpoint, deletion state or ambiguity claim earns a link.
+        let current = AgentSessionCarrierResolver.capture(windows: WindowStatesManager.shared.allWindows, sessionIDs: [target])
+        guard !current.ambiguousSessionIDs.contains(target), !current.replicatedSessionIDs.contains(target) else {
+            return .failed("target_ambiguous: Target ownership changed during preparation. Use session_admin inventory; nothing was linked.")
+        }
         let candidates = WindowStatesManager.shared.agentSessionLinkCandidates(
             forSessionIDs: [observer, target], includeLocation: false
         )
-        guard let observerEndpoint = candidates[observer]?.only?.domainEndpoint,
-              let targetEndpoint = candidates[target]?.only?.domainEndpoint
-        else { return .failed("Both sessions must be live and unambiguous to link.") }
+        guard let observerEndpoint = candidates[observer]?.only?.domainEndpoint, observerEndpoint == initialObserver else {
+            return .failed("observer_changed: The requesting session's exact binding changed; nothing was linked.")
+        }
+        guard let targetEndpoint = candidates[target]?.only?.domainEndpoint,
+              targetEndpoint.windowID == owner.windowID,
+              targetEndpoint.workspaceID == location.workspace.id, targetEndpoint.tabID == location.tab.id,
+              location.isCurrent,
+              !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: target),
+              !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: target)
+        else { return .failed("target_unloaded_unpreparable: The exact target binding changed during preparation. Use session_admin inventory; nothing was linked.") }
         let outcome = await bridge().addDelegatedMonitorLink(
             observerEndpoint: observerEndpoint,
             targetEndpoint: targetEndpoint,
-            authorization: AgentSessionLinkDelegatedAddAuthorization(isCurrent: isStillAuthorized)
+            authorization: AgentSessionLinkDelegatedAddAuthorization(sourceScopeID: sourceScopeID, isCurrent: isStillAuthorized)
         )
         switch outcome {
-        case .added: return .linked
-        case .alreadyLinked: return .alreadyLinked
+        case .added, .alreadyLinked:
+            if manager.hasPreparedRuntime(target) {
+                manager.preparedOversightConsentPairs[target, default: []].update(with: .init(observerSessionID: observer, targetSessionID: target, sourceScopeID: sourceScopeID))
+            }
+            if case .added = outcome { return .linked }
+            return .alreadyLinked
         case .failed, .rejected:
             let message = outcome.failureMessage ?? "The link could not be created."
             // `.revoked` promises nothing was left behind; a compensation that could not be written

@@ -175,19 +175,39 @@ final class AgentSessionAdministrationCore: AgentSessionAdministrationService {
             return .denied(.callerNotAgentSession, sessionID: nil)
         }
         let scope: DomainDelegationScopeRecord
+        // Off means off: a global grant left from an earlier "on" never outlives the setting.
+        scopes.reconcileGlobalAutoApprove()
         if let scopeID = request.scopeID {
             // The authority checks grantee identity before disclosing anything about this scope.
             guard let record = scopes.record(id: scopeID) else { return .denied(.unknownScope, sessionID: nil) }
             scope = record
+        } else if let global = scopes.ensureGlobalAutoApproveScope(for: callerSessionID) {
+            // Global auto-approve: the one unrestricted grant covers every operation and session, with
+            // no request, no scope choice and no card. Authorization below still runs against it.
+            scope = global
         } else {
             let live = scopes.liveScopes(grantedTo: callerSessionID)
-            switch live.count {
-            case 0: return .denied(.unknownScope, sessionID: nil)
-            case 1: scope = live[0]
-            default: return .scopeSelectionRequired(scopeIDs: live.map(\.id))
+            var required = request.operation.requiredScopeCapabilities(for: .idle)
+            if request.operation == .adminLink { required.formUnion([.observe, .control]) }
+            let capable = live.filter { record in
+                scopes.scopeChain(from: record.id).allSatisfy { required.isSubset(of: $0.grant.capabilities) }
+            }
+            // Select by capability only, never guess from target membership. The ordinary authority
+            // below still proves membership, state-dependent capabilities, guardrails and leases.
+            if capable.count == 1 {
+                scope = capable[0]
+            } else if live.count == 1 {
+                scope = live[0] // Preserve the actionable capability-missing result.
+            } else if live.isEmpty {
+                return .denied(.unknownScope, sessionID: nil)
+            } else {
+                return .scopeSelectionRequired(scopeIDs: (capable.isEmpty ? live : capable).map(\.id))
             }
         }
 
+        guard scope.grant.granteeSessionID == callerSessionID else {
+            return .denied(.granteeMismatch, sessionID: nil)
+        }
         // Scope-level reads with no target/state/usage projection must not enumerate every session.
         guard !request.targetSessionIDs.isEmpty || request.operation.scopeGuardrailUse != nil else {
             return authorize(request, scope: scope, projector: projector)
@@ -229,7 +249,7 @@ final class AgentSessionAdministrationCore: AgentSessionAdministrationService {
         }
         var usage: [UUID: DomainDelegationScopeUsage] = [:]
         if request.operation.scopeGuardrailUse != nil {
-            for record in chain {
+            for record in chain where request.operation.requiresScopeUsage(for: record.grant.guardrails) {
                 // In-flight creations (spawn, fork, worktree_create) count until they settle.
                 guard let evidence = projector.usageEvidence(
                     of: record.grant, spawnParentSessionID: request.targetSessionIDs.first
