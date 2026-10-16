@@ -15457,6 +15457,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // apply/hydration (including same-revision A3), replacement and reset remain writers.
         if !isLiveRefresh || !presentation.reusesPreviousArchive {
             session.archivedTranscriptSnapshot = presentation.archivedSnapshot
+        } else {
+            #if DEBUG
+                assert(presentation.archivedSnapshot == session.archivedTranscriptSnapshot, "Live refresh archive reuse must preserve the installed snapshot")
+            #endif
         }
         session.transcriptProjection = materializedTranscriptProjection(for: session)
         if reconcilesQuietSourceRetirement { session.reconcileQuietSourceIDs(previousAnchors: previousQuietSourceAnchors) }

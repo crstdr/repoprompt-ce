@@ -2661,6 +2661,8 @@ extension CodexResumeWedgeCommitTests {
             "missing-usage-metadata-mixed",
             "missing-usage-metadata-misaligned",
             "malformed-usage-metadata",
+            "missing-user-id",
+            "null-user-id",
             "missing-assistant-id",
             "missing-reasoning-id",
             "bad-summary-part",
@@ -2696,6 +2698,8 @@ extension CodexResumeWedgeCommitTests {
                     }
                     var extra: (String, [String: CodexJSONValue])?
                     switch scenario {
+                    case "missing-user-id": raw["id"] = nil
+                    case "null-user-id": raw["id"] = .null
                     case "missing-usage-metadata-context": annotate(["agents_md.instructions"])
                     case "missing-usage-metadata-goal": annotate(["user.goal"])
                     case "missing-usage-metadata-hook": annotate(["hooks.additional_context"])
