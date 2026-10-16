@@ -15,11 +15,10 @@ import RepoPromptSettingsCore
 @MainActor
 final class AgentTabSession: ObservableObject {
     let tabID: UUID
+    var quietLedger = AgentRunQuietLedger()
+    var nonCodexContentMessageID: String?
     let perfRecorder: any AgentModePerfRecording
     private var suppressSourceItemsChanged = false
-    /// Bounded to one segment. Runtime-only; never serialized or inferred from transcript rows.
-    var passiveWakeSegment: AgentSessionLinkPassiveWakeSegment?
-    let passiveWakeEvidenceChanged = PassthroughSubject<Void, Never>()
 
     /// Canonical runtime source-item suffix. Coordinators and tests mutate this list,
     /// but it only retains the mutable full-detail working turns; older compacted
@@ -27,9 +26,11 @@ final class AgentTabSession: ObservableObject {
     @Published var items: [AgentChatItem] = [] {
         didSet {
             guard !suppressSourceItemsChanged else { return }
-            invalidatePassiveWakeEvidence()
+            if let owner = activeRunOwnership { quietLedger.invalidateRange(owner: owner) }
+            let previousIDs = liveItemIDs
             repairStoredSourceItemsIfNeeded(diagnosticContext: "items.didSet")
             rebuildSourceItemDerivedState()
+            reconcileQuietSourceIDs(previousLiveIDs: previousIDs)
             invalidateLocalInputStructure()
             onSourceItemsChanged?(self, .structural)
         }
@@ -165,7 +166,16 @@ final class AgentTabSession: ObservableObject {
     var workingTranscriptProjection: AgentTranscriptProjection = .empty
     var transcriptProjection: AgentTranscriptProjection = .empty
     var turnProjectionCaches: [UUID: AgentTranscriptTurnProjectionCache] = [:]
-    var archivedTranscriptSnapshot: AgentArchivedTranscriptSnapshot = .empty
+    var archivedTranscriptSnapshot: AgentArchivedTranscriptSnapshot = .empty {
+        didSet {
+            quietTranscriptDisplayCache = nil
+            quietTranscriptArchiveDisplayCache = nil
+        }
+    }
+
+    var quietTranscriptDisplayCache: AgentQuietTranscriptDisplayCache?
+    var quietTranscriptArchiveDisplayCache: AgentQuietTranscriptDisplayCache.Archive?
+    var onQuietDisplayMaskChanged: ((AgentTabSession) -> Void)?
     var isCompressedHistoryRevealed: Bool = false
     var isTranscriptWindowExpanded: Bool = false
     var transcriptProjectionProtection: AgentTranscriptProjectionProtection = .none
@@ -196,8 +206,8 @@ final class AgentTabSession: ObservableObject {
     @Published var runState: AgentSessionRunState = .idle {
         didSet {
             guard runState != oldValue else { return }
-            if runState == .failed || runState == .cancelled || runState == .waitingForUser || runState == .waitingForQuestion || runState == .waitingForApproval {
-                notePassiveWakeActivity()
+            if runState == .waitingForApproval || runState == .waitingForQuestion {
+                noteAcceptedTaskInput()
             }
             noteMonitorObservationInputsChanged()
             onRunStateChanged?(self)
@@ -912,7 +922,6 @@ final class AgentTabSession: ObservableObject {
     /// Installs the provider process run identity for a starting or resumed
     /// run. The installing path owns the identity until it is cleared.
     func installRunID(_ runID: UUID) {
-        if self.runID != runID { invalidatePassiveWakeEvidence() }
         runLifecycle.installRunID(runID)
     }
 
@@ -920,10 +929,7 @@ final class AgentTabSession: ObservableObject {
     /// stale cleanup cannot clear a successor run's identity.
     @discardableResult
     func clearRunID(ifCurrent runID: UUID) -> Bool {
-        if self.runID == runID, passiveWakeSegment != nil, !passiveWakeHasSettledTerminalProof {
-            invalidatePassiveWakeEvidence()
-        }
-        return runLifecycle.clearRunID(ifCurrent: runID)
+        runLifecycle.clearRunID(ifCurrent: runID)
     }
 
     var activeRunOwnership: AgentRunOwnership? {
@@ -980,7 +986,6 @@ final class AgentTabSession: ObservableObject {
         didSet {
             // Usage recorded under another provider must never be reported as this provider's load.
             if selectedAgent != oldValue {
-                invalidatePassiveWakeEvidence()
                 selectedClaudeEffortRaw = nil
                 batchingContextVouchSignals {
                     vouchedContextCount = nil
@@ -1355,7 +1360,6 @@ final class AgentTabSession: ObservableObject {
             let oldIdentity = oldValue.map { ObjectIdentifier($0) }
             let newIdentity = codexController.map { ObjectIdentifier($0) }
             guard oldIdentity != newIdentity else { return }
-            if newIdentity != nil { invalidatePassiveWakeEvidence() }
             resetCodexHookGateBinding()
             codexControllerGeneration = UUID()
             codexAuthoritativeActiveTurn = nil
@@ -1417,9 +1421,7 @@ final class AgentTabSession: ObservableObject {
         didSet {
             if let controller = claudeController,
                oldValue.map { ObjectIdentifier($0) } != ObjectIdentifier(controller)
-            {
-                invalidatePassiveWakeEvidence()
-            }
+            {}
         }
     }
 
@@ -1628,8 +1630,11 @@ final class AgentTabSession: ObservableObject {
         // The lifecycle facade owns terminal-commit phase state, so bridge it into the explicit
         // oversight change channel from that authority.
         runLifecycle.onTerminalCommitPhaseChange = { [weak self] in
-            self?.noteMonitorObservationInputsChanged()
-            if self?.passiveWakeSegment != nil { self?.passiveWakeEvidenceChanged.send(()) }
+            guard let self else { return }
+            noteMonitorObservationInputsChanged()
+            if !terminalCommitInProgress, quietTranscriptDisplayCache == nil, !quietLedger.hiddenSourceIDs.isEmpty {
+                onQuietDisplayMaskChanged?(self)
+            }
         }
     }
 
@@ -1755,6 +1760,9 @@ final class AgentTabSession: ObservableObject {
     @discardableResult
     func beginPersistentBindingTransition() -> UInt64 {
         invalidateLocalInputStructure()
+        // The existing full endpoint is retired by this generation change. No saved verdicts.
+        resetQuietLedgerForBinding()
+        oversight.clearWakeSuppression()
         oversight.overseerActivation = nil
         // Clear the outgoing proof before the generation moves so it cannot be observed under the
         // incoming incarnation.
@@ -1764,7 +1772,6 @@ final class AgentTabSession: ObservableObject {
         // Terminal commit revisions are scoped to the binding captured by
         // their run ownership. A rebind must not carry that runtime-only
         // classification or publication result into another session.
-        invalidatePassiveWakeEvidence()
         runLifecycle.invalidateTerminalRevisionForBindingTransition()
         authoritativeHydratedBinding = nil
         authoritativeHydratedBindingTransitionGeneration = nil
@@ -1776,6 +1783,8 @@ final class AgentTabSession: ObservableObject {
         if persistentSessionBindingIdentity != binding {
             invalidateLocalInputStructure()
             oversight.overseerActivation = nil
+            oversight.clearWakeSuppression()
+            resetQuietLedgerForBinding()
         }
         persistentSessionBindingIdentity = binding
         persistentSessionBindingDidChange?()
@@ -2002,7 +2011,7 @@ final class AgentTabSession: ObservableObject {
     }
 
     @discardableResult
-    func beginRunAttempt(source: String, attemptID: UUID = UUID(), passiveWakeID: UUID? = nil) -> AgentRunOwnership {
+    func beginRunAttempt(source: String, attemptID: UUID = UUID()) -> AgentRunOwnership {
         // Host-specific responsibilities stay here: Codex routing resets and
         // exactly-once MCP prepared-epoch consumption. The neutral attempt
         // initialization (terminal-state reset + tracker begin) is delegated
@@ -2029,7 +2038,10 @@ final class AgentTabSession: ObservableObject {
             ),
             attemptID: attemptID
         )
-        bindPassiveWakeEvidence(to: ownership, wakeID: passiveWakeID)
+        nonCodexContentMessageID = nil
+        let previousFacts = quietLedger.facts
+        quietLedger.begin(owner: ownership, startKey: nextSequenceIndex, provider: .init(agentKind: selectedAgent))
+        if previousFacts != quietLedger.facts { noteMonitorObservationInputsChanged() }
         #if DEBUG
             perfRecorder.increment("run.lifecycle.attempt.started")
             perfRecorder.increment("run.lifecycle.attempt.started.source.\(source)")
@@ -2080,7 +2092,7 @@ final class AgentTabSession: ObservableObject {
             retryIntent: retryIntent,
             timestampUptimeNanoseconds: timestampUptimeNanoseconds
         )
-        if case .accepted = result, kind == .toolActivity || kind == .interaction { notePassiveWakeActivity() }
+        noteQuietProgress(result, kind: kind, stage: stage, retryIntent: retryIntent)
         recordRunProgressDiagnostic(result, kind: kind, stage: stage)
         return result
     }
@@ -2088,14 +2100,17 @@ final class AgentTabSession: ObservableObject {
     @discardableResult
     func acceptRunProgress(_ signal: AgentRunProgressSignal) -> AgentRunProgressAcceptance {
         let result = runLifecycle.acceptProgress(signal)
+        noteQuietProgress(result, kind: signal.kind, stage: signal.stage, retryIntent: signal.retryIntent)
         recordRunProgressDiagnostic(result, kind: signal.kind, stage: signal.stage)
         return result
     }
 
     @discardableResult
     func endRunAttempt(ifCurrent ownership: AgentRunOwnership, source: String) -> Bool {
+        let ownsQuietSource = isCurrentRunAttemptForCurrentBinding(ownership)
         guard runLifecycle.endAttempt(ifCurrent: ownership) else { return false }
-        if passiveWakeSegment != nil, !terminalCommitInProgress { passiveWakeEvidenceChanged.send(()) }
+        if ownsQuietSource { _ = quietLedger.end(owner: ownership, authoritativeOwner: ownership) }
+        noteMonitorObservationInputsChanged()
         recordRunAttemptEnded(ownership, source: source)
         return true
     }
@@ -2103,7 +2118,10 @@ final class AgentTabSession: ObservableObject {
     @discardableResult
     func endCurrentRunAttempt(source: String) -> Bool {
         guard let ownership = activeRunOwnership else { return false }
+        let ownsQuietSource = isCurrentRunAttemptForCurrentBinding(ownership)
         guard runLifecycle.endAttempt(ifCurrent: ownership) else { return false }
+        if ownsQuietSource { _ = quietLedger.end(owner: ownership, authoritativeOwner: ownership) }
+        noteMonitorObservationInputsChanged()
         recordRunAttemptEnded(ownership, source: source)
         return true
     }
@@ -2112,6 +2130,128 @@ final class AgentTabSession: ObservableObject {
     func endRunAttempt(ifCurrentAttemptID attemptID: UUID, source: String) -> Bool {
         guard let ownership = activeRunOwnership, ownership.attemptID == attemptID else { return false }
         return endRunAttempt(ifCurrent: ownership, source: source)
+    }
+
+    private func noteQuietProgress(
+        _ acceptance: AgentRunProgressAcceptance,
+        kind: AgentRunLivenessSignalKind,
+        stage: AgentRunLifecycleStage,
+        retryIntent: AgentRunRetryIntent
+    ) {
+        guard case let .accepted(snapshot) = acceptance,
+              isCurrentRunAttemptForCurrentBinding(snapshot.ownership)
+        else { return }
+        if kind == .toolActivity || kind == .interaction || stage == .waitingForInteraction
+            || stage == .retrying || stage == .cancelling || retryIntent != .none
+        {
+            quietLedger.noteOccurrence(owner: snapshot.ownership)
+        }
+    }
+
+    /// Accepted synchronous task boundary only, never called by an unqualified provider callback.
+    func noteAcceptedTaskInput() {
+        guard let owner = activeRunOwnership, isCurrentRunAttemptForCurrentBinding(owner) else { return }
+        quietLedger.noteOccurrence(owner: owner)
+    }
+
+    func noteAcceptedStream(_ result: AIStreamResult, owner: AgentRunOwnership) {
+        guard isCurrentRunAttemptForCurrentBinding(owner) else { return }
+        quietLedger.noteAcceptedStream(result, owner: owner)
+    }
+
+    func sealQuietCheckIn(owner: AgentRunOwnership, terminalState: AgentSessionRunState, normal: Bool, hasSuccessor: Bool) {
+        guard isCurrentRunAttemptForCurrentBinding(owner) else { return }
+        // Only positively routine candidates need a range. No history materialization or stored
+        // array offset: binary-search the already ordered live suffix. Missing retained rows fail open.
+        let start = normal && terminalState == .completed && !hasSuccessor ? quietLedger.candidateStartKey(owner: owner) : nil
+        let rows = start.map { quietSourceSuffix(in: items, startKey: $0) } ?? items[items.endIndex...]
+        let maskRevision = quietLedger.displayMaskRevision
+        quietLedger.settle(
+            owner: owner, terminalState: terminalState, classifiesQuietCheckIn: normal,
+            hasSuccessor: hasSuccessor, endKey: nextSequenceIndex - 1,
+            rangeIsComplete: start != nil, rows: rows
+        )
+        quietDisplayMaskDidChange(since: maskRevision)
+    }
+
+    func quietRunFacts(capturedState: AgentSessionRunState) -> AgentRunQuietFacts? {
+        guard !bindingTransitionInProgress else { return nil }
+        if let owner = activeRunOwnership, !isCurrentRunAttemptForCurrentBinding(owner) { return nil }
+        return quietLedger.sourceFacts(owner: activeRunOwnership, capturedState: capturedState)
+    }
+
+    /// Share the same lifetime with every actual old-marker producer, including ordinary new-owner
+    /// native reentry. Claim-cache entries and acknowledged auth replay do not retain it.
+    func retainQuietMarkerProducer(for claim: AgentSessionLinkOutboundPromptClaim?) -> AgentQuietMarkerProducerLifetime? {
+        guard let claim, let wakeID = claim.dispatchID.autoWakeID,
+              let binding = currentRestorationBindingToken,
+              var attempt = oversight.pendingAutoWake, attempt.wakeID == wakeID,
+              let endpoint = claim.passive?.observerEndpoint, attempt.observerEndpoint == endpoint,
+              endpoint.tabID == tabID, endpoint.sessionID == activeAgentSessionID,
+              endpoint.persistentBindingGeneration == persistentSessionBindingIdentity?.generation,
+              endpoint.bindingTransitionGeneration == bindingTransitionGeneration
+        else { return nil }
+        // Callback membership belongs to the already-quiet wake, not a later claim's qualification.
+        // Attention or claim-cache loss may make this producer ordinary while it can still accept
+        // the old wake's marker. Only creating a new cohort requires routine qualification.
+        if let lifetime = attempt.quietMarkerProducerLifetime { return lifetime }
+        guard claim.routineQuietCheckIn else { return nil }
+        let lifetime = AgentQuietMarkerProducerLifetime(wakeID: wakeID, binding: binding, session: self)
+        attempt.quietMarkerProducerLifetime = lifetime
+        oversight.pendingAutoWake = attempt
+        return lifetime
+    }
+
+    /// Existing source/projection mutation owners supply their indexed proof. No new address list,
+    /// pending map, baseline snapshot, or per-item history traversal is created.
+    func reconcileQuietSourceIDs(previousLiveIDs: Set<UUID> = [], previousAnchors: [UUID: AgentTranscriptAnchor] = [:]) {
+        let currentIDs = liveItemIDs
+        let currentAnchors = fullTranscriptProjection.rowAnchorIndex
+        let maskRevision = quietLedger.displayMaskRevision
+        quietLedger.reconcileSourceIDs(
+            wasMaterialized: { previousLiveIDs.contains($0) || previousAnchors[$0] != nil },
+            isRetained: { currentIDs.contains($0) || currentAnchors[$0] != nil }
+        )
+        quietDisplayMaskDidChange(since: maskRevision)
+    }
+
+    private func discardMaterializedQuietSourceProof() {
+        let ids = liveItemIDs
+        let anchors = fullTranscriptProjection.rowAnchorIndex
+        let maskRevision = quietLedger.displayMaskRevision
+        quietLedger.discardSourceProof(isMaterialized: { ids.contains($0) || anchors[$0] != nil })
+        quietDisplayMaskDidChange(since: maskRevision)
+    }
+
+    func retireQuietUnmaterializedWake(_ wakeID: UUID) {
+        let revision = quietLedger.displayMaskRevision
+        quietLedger.retireUnmaterializedWake(wakeID)
+        quietDisplayMaskDidChange(since: revision)
+    }
+
+    private func resetQuietLedgerForBinding() {
+        let hadMask = !quietLedger.hiddenSourceIDs.isEmpty
+        quietLedger = AgentRunQuietLedger()
+        quietTranscriptDisplayCache = nil
+        quietTranscriptArchiveDisplayCache = nil
+        if hadMask { onQuietDisplayMaskChanged?(self) }
+    }
+
+    private func quietDisplayMaskDidChange(since revision: UInt64) {
+        guard quietLedger.displayMaskRevision != revision else { return }
+        quietTranscriptDisplayCache = nil
+        quietTranscriptArchiveDisplayCache = nil
+        onQuietDisplayMaskChanged?(self)
+    }
+
+    private func quietSourceSuffix(in rows: [AgentChatItem], startKey: Int) -> ArraySlice<AgentChatItem> {
+        var lower = rows.startIndex
+        var upper = rows.endIndex
+        while lower < upper {
+            let middle = lower + (upper - lower) / 2
+            if rows[middle].sequenceIndex < startKey { lower = middle + 1 } else { upper = middle }
+        }
+        return rows[lower...]
     }
 
     private func recordRunAttemptEnded(_ ownership: AgentRunOwnership, source: String) {
@@ -2348,8 +2488,11 @@ final class AgentTabSession: ObservableObject {
         dispatch: SourceItemsDispatch,
         payloadUpdate: SourceItemPayloadUpdate = .rebuildFromSource,
         localInputIdentity: LocalInputIdentityDisposition = .invalidate,
-        diagnosticContext: String
+        diagnosticContext: String,
+        preservesQuietRange: Bool = false
     ) {
+        if !preservesQuietRange, let owner = activeRunOwnership { quietLedger.invalidateRange(owner: owner) }
+        let previousIDs = liveItemIDs
         let repair = repairedSourceItems(newItems, diagnosticContext: diagnosticContext)
         let repairedItems = repair.items
         switch localInputIdentity {
@@ -2374,6 +2517,7 @@ final class AgentTabSession: ObservableObject {
         items = repairedItems
         suppressSourceItemsChanged = false
         rebuildSourceItemDerivedState(payloadUpdate: payloadUpdate)
+        if !preservesQuietRange { reconcileQuietSourceIDs(previousLiveIDs: previousIDs) }
         sourceItemsRevision &+= 1
         derivedTranscriptSyncState = nil
         if case let .notify(mutation) = dispatch {
@@ -2388,6 +2532,7 @@ final class AgentTabSession: ObservableObject {
         let repair = AgentSourceItemIDRepair.repairDuplicateIDs(in: candidateItems)
         assert(repair.didRepair == (repair.items != candidateItems))
         if repair.didRepair {
+            if let owner = activeRunOwnership { quietLedger.invalidateRange(owner: owner) }
             AgentSourceItemIDRepair.logDiagnostics(
                 repair.diagnostics,
                 context: "tab_session tab_id=\(tabID.uuidString) \(diagnosticContext)"
@@ -2413,6 +2558,7 @@ final class AgentTabSession: ObservableObject {
     ) -> Bool {
         let repair = AgentSourceItemIDRepair.repairDuplicateIDs(in: candidateItems)
         guard repair.didRepair else { return false }
+        if let owner = activeRunOwnership { quietLedger.invalidateRange(owner: owner) }
         AgentSourceItemIDRepair.logDiagnostics(
             repair.diagnostics,
             context: "tab_session tab_id=\(tabID.uuidString) \(diagnosticContext)"
@@ -2582,6 +2728,11 @@ final class AgentTabSession: ObservableObject {
     ) {
         if let previousItem, previousItem.id != updatedItem?.id {
             liveItemIDs.remove(previousItem.id)
+            if fullTranscriptProjection.rowAnchorIndex[previousItem.id] == nil {
+                let maskRevision = quietLedger.displayMaskRevision
+                quietLedger.retireSourceIDs([previousItem.id])
+                quietDisplayMaskDidChange(since: maskRevision)
+            }
             setEphemeralToolResultPayload(nil, for: previousItem.id)
         }
         guard let updatedItem else { return }
@@ -2687,6 +2838,7 @@ final class AgentTabSession: ObservableObject {
     func mutateItemsBatch(
         mutation: AgentModeViewModel.SourceItemsMutation = .structural,
         touchActivity: Bool = true,
+        preservesQuietRange: Bool = false,
         _ body: (inout [AgentChatItem]) -> Void
     ) -> Bool {
         let previousItems = items
@@ -2697,7 +2849,8 @@ final class AgentTabSession: ObservableObject {
             updatedItems,
             dispatch: .notify(mutation),
             localInputIdentity: .batchDiff,
-            diagnosticContext: "mutateItemsBatch"
+            diagnosticContext: "mutateItemsBatch",
+            preservesQuietRange: preservesQuietRange
         )
         if touchActivity {
             lastActivityAt = Date()
@@ -2733,6 +2886,9 @@ final class AgentTabSession: ObservableObject {
         reason: SilentItemReplacementReason,
         payloadUpdate: SourceItemPayloadUpdate
     ) {
+        if reason == .persistedSessionHydration || reason == .routeActivation || reason == .clearedChat || reason == .stressHarnessReset {
+            discardMaterializedQuietSourceProof()
+        }
         #if DEBUG
             if AgentTranscriptDebugInstrumentation.isEnabled {
                 AgentTranscriptDebugInstrumentation.emitSessionItemsReplacement(.init(
@@ -2745,7 +2901,6 @@ final class AgentTabSession: ObservableObject {
                 ))
             }
         #endif
-        if reason != .retentionCompaction { invalidatePassiveWakeEvidence() }
         // `pendingToolFinalizationRepair` and `codexCommandStatusReconciliation` commit a mutated
         // copy of the working list — in-place repairs that must not cost tracked inputs their
         // epoch. Hydration, activation, clears and test overrides stay structural.
@@ -2786,6 +2941,13 @@ final class AgentTabSession: ObservableObject {
             return false
         }
 
+        if let owner = activeRunOwnership, let start = quietLedger.startKey(owner: owner),
+           previousItem.sequenceIndex >= start || compactedItem.sequenceIndex >= start,
+           previousItem.id != compactedItem.id || previousItem.sequenceIndex != compactedItem.sequenceIndex
+           || (previousItem.kind != compactedItem.kind && !(previousItem.kind == .toolCall && compactedItem.kind == .toolResult))
+        {
+            quietLedger.invalidateRange(owner: owner)
+        }
         suppressSourceItemsChanged = true
         items[index] = compactedItem
         suppressSourceItemsChanged = false
@@ -2880,6 +3042,7 @@ final class AgentTabSession: ObservableObject {
     }
 
     func clearDerivedTranscriptCaches() {
+        let previousAnchors = fullTranscriptProjection.rowAnchorIndex
         transcript = .empty
         baseTranscriptProjection = .empty
         fullTranscriptProjection = .empty
@@ -2895,6 +3058,7 @@ final class AgentTabSession: ObservableObject {
         transcriptPerformanceSnapshot = .empty
         rawToolResultPayloadRenderRevisionByItemID = [:]
         derivedTranscriptSyncState = nil
+        reconcileQuietSourceIDs(previousAnchors: previousAnchors)
     }
 
     func replaceItems(_ items: [AgentChatItem]) {
@@ -2909,6 +3073,7 @@ final class AgentTabSession: ObservableObject {
     }
 
     func appendItem(_ item: AgentChatItem) {
+        if item.kind == .user { noteAcceptedTaskInput() }
         var newItem = item
         newItem.sequenceIndex = nextSequenceIndex
         nextSequenceIndex += 1
@@ -2948,6 +3113,13 @@ final class AgentTabSession: ObservableObject {
             isDirty = true
             return
         }
+        if let owner = activeRunOwnership, let start = quietLedger.startKey(owner: owner),
+           previousItem.sequenceIndex >= start || updatedItem.sequenceIndex >= start,
+           previousItem.id != updatedItem.id || previousItem.sequenceIndex != updatedItem.sequenceIndex
+           || (previousItem.kind != updatedItem.kind && !(previousItem.kind == .toolCall && updatedItem.kind == .toolResult))
+        {
+            quietLedger.invalidateRange(owner: owner)
+        }
         suppressSourceItemsChanged = true
         items[index] = updatedItem
         suppressSourceItemsChanged = false
@@ -2955,7 +3127,8 @@ final class AgentTabSession: ObservableObject {
         reconcileIncrementalEphemeralPayload(previousItem: previousItem, updatedItem: updatedItem)
         updateToolCorrelationIndexes(previousItem: previousItem, updatedItem: updatedItem, at: index)
         finishIncrementalSourceItemsMutation(
-            .replace(index: index, previousKind: previousItem.kind, currentKind: updatedItem.kind)
+            previousItem.id == updatedItem.id
+                ? .replace(index: index, previousKind: previousItem.kind, currentKind: updatedItem.kind) : .structural
         )
         lastActivityAt = Date()
         isDirty = true
@@ -2974,13 +3147,23 @@ final class AgentTabSession: ObservableObject {
             isDirty = true
             return
         }
+        if let owner = activeRunOwnership, let start = quietLedger.startKey(owner: owner),
+           previousItem.sequenceIndex >= start || updatedItem.sequenceIndex >= start,
+           previousItem.id != updatedItem.id || previousItem.sequenceIndex != updatedItem.sequenceIndex
+           || (previousItem.kind != updatedItem.kind && !(previousItem.kind == .toolCall && updatedItem.kind == .toolResult))
+        {
+            quietLedger.invalidateRange(owner: owner)
+        }
         suppressSourceItemsChanged = true
         items[index] = updatedItem
         suppressSourceItemsChanged = false
         nextSequenceIndex = max(nextSequenceIndex, updatedItem.sequenceIndex + 1)
         reconcileIncrementalEphemeralPayload(previousItem: previousItem, updatedItem: updatedItem)
         updateToolCorrelationIndexes(previousItem: previousItem, updatedItem: updatedItem, at: index)
-        finishIncrementalSourceItemsMutation(.mutate(index: index, itemKind: updatedItem.kind))
+        finishIncrementalSourceItemsMutation(
+            previousItem.id == updatedItem.id
+                ? .mutate(index: index, itemKind: updatedItem.kind) : .structural
+        )
         lastActivityAt = Date()
         isDirty = true
     }
@@ -2997,6 +3180,9 @@ final class AgentTabSession: ObservableObject {
                 candidate.position = position - 1
                 localComposerCandidates[token] = candidate
             }
+        }
+        if let owner = activeRunOwnership, let start = quietLedger.startKey(owner: owner), removed.sequenceIndex >= start {
+            quietLedger.invalidateRange(owner: owner)
         }
         suppressSourceItemsChanged = true
         items.remove(at: index)
@@ -3026,6 +3212,13 @@ final class AgentTabSession: ObservableObject {
             isDirty = true
             return
         }
+        if let owner = activeRunOwnership, let start = quietLedger.startKey(owner: owner),
+           previousItem.sequenceIndex >= start || updatedItem.sequenceIndex >= start,
+           previousItem.id != updatedItem.id || previousItem.sequenceIndex != updatedItem.sequenceIndex
+           || (previousItem.kind != updatedItem.kind && !(previousItem.kind == .toolCall && updatedItem.kind == .toolResult))
+        {
+            quietLedger.invalidateRange(owner: owner)
+        }
         suppressSourceItemsChanged = true
         items[index] = updatedItem
         suppressSourceItemsChanged = false
@@ -3033,7 +3226,8 @@ final class AgentTabSession: ObservableObject {
         reconcileIncrementalEphemeralPayload(previousItem: previousItem, updatedItem: updatedItem)
         updateToolCorrelationIndexes(previousItem: previousItem, updatedItem: updatedItem, at: index)
         finishIncrementalSourceItemsMutation(
-            .replace(index: index, previousKind: previousItem.kind, currentKind: updatedItem.kind)
+            previousItem.id == updatedItem.id
+                ? .replace(index: index, previousKind: previousItem.kind, currentKind: updatedItem.kind) : .structural
         )
         lastActivityAt = Date()
         isDirty = true

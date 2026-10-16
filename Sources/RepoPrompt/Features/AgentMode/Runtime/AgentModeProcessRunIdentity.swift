@@ -61,7 +61,6 @@ enum AgentModeProcessRunIdentity {
     /// that suspension is also invalid in the new context. Run-scoped cleanup
     /// must use `AgentTabSession.clearRunID(ifCurrent:)` instead.
     static func clearProcessRunID(for session: AgentTabSession) {
-        if !session.passiveWakeHasSettledTerminalProof { session.invalidatePassiveWakeEvidence() }
         session.runLifecycle.forceClearRunID()
     }
 }
