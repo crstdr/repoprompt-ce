@@ -1894,7 +1894,7 @@
             "type" : "integer"
           },
           "max_output_bytes" : {
-            "description" : "[read] Approximate pre-JSON UTF-8 limit; default 8000, max 20000.",
+            "description" : "[read] Approximate pre-JSON UTF-8 page limit; default 8000, max 20000. Rows use the page budget; budget-clipped rows carry a clip marker.",
             "type" : "integer"
           },
           "message" : {

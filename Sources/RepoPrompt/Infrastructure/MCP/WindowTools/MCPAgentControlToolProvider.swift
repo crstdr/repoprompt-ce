@@ -129,7 +129,7 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
                     "timeout_seconds": .number(description: "[wait] Max seconds; default 60; 0 polls immediately."),
                     "from": .string(description: "[read] Fresh page origin: tail (default/newest) or start (oldest).", enum: ["tail", "start"]),
                     "max_items": .integer(description: "[list, read] Item limit: list 32 default, read 30; max 100."),
-                    "max_output_bytes": .integer(description: "[read] Approximate pre-JSON UTF-8 limit; default 8000, max 20000."),
+                    "max_output_bytes": .integer(description: "[read] Approximate pre-JSON UTF-8 page limit; default 8000, max 20000. Rows use the page budget; budget-clipped rows carry a clip marker."),
                     "message": .string(description: "[create_lane, send, steer] Attributed message, max 16000 UTF-8 bytes."),
                     "idempotency_key": .string(description: "[create_lane, send, cancel_pending_send, steer, compact, stop] New per operation; reuse only for the same request. Max 200 UTF-8 bytes."),
                     "model_id": .string(),

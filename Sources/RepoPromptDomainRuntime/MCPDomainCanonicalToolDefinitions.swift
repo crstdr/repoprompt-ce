@@ -2066,7 +2066,7 @@ package enum MCPDomainCanonicalToolDefinitions {
                     ["tail", "start"]
                 ),
                 "max_items": integerSchema("[list, read] Item limit: list 32 default, read 30; max 100."),
-                "max_output_bytes": integerSchema("[read] Approximate pre-JSON UTF-8 limit; default 8000, max 20000."),
+                "max_output_bytes": integerSchema("[read] Approximate pre-JSON UTF-8 page limit; default 8000, max 20000. Rows use the page budget; budget-clipped rows carry a clip marker."),
                 "message": stringSchema("[send, steer] Attributed message, max 16000 UTF-8 bytes."),
                 "idempotency_key": stringSchema("[send, cancel_pending_send, steer, compact] New per message or compaction; reuse only for the same retry. Max 200 UTF-8 bytes."),
                 "delivery": enumStringSchema(
