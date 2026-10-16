@@ -197,7 +197,7 @@ final class CodexAppServerFramingTests: XCTestCase {
             )
             try await controller.test_beginBindingSession()
             await controller.test_bufferNotificationDuringBinding(.init(method: "thread/tokenUsage/updated", params: [
-                "threadId": .string("thread-fixture"),
+                "threadId": .string("thread-fixture"), "turnId": .string("active-b"),
                 "tokenUsage": .object(["last": .object(["totalTokens": .number(123)]), "total": .object(["totalTokens": .number(456)]), "modelContextWindow": .number(1000)])
             ]))
             let request = beginRequest(client, method: "thread/resume")

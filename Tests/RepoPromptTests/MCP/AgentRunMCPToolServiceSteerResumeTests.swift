@@ -15,6 +15,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         session.hasLoadedPersistedState = true
         session.selectedAgent = .codexExec
         session.installRunID(UUID())
+        _ = session.beginRunAttempt(source: "resident-steer-fixture")
         session.runState = .waitingForUser
         session.instructionWaitID = UUID()
         viewModel.storeDraftText(for: session.tabID, "local draft")
