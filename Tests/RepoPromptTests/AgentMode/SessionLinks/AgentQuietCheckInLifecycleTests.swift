@@ -299,6 +299,18 @@ final class AgentQuietCheckInLifecycleTests: XCTestCase {
         }
     }
 
+    func testClaudeControllerMalformedSuccessfulResultValuesRemainOrdinary() async {
+        for value in [#"{"unexpected":"content"}"#, #"["content"]"#, "42", "null", "true"] {
+            await assertClaudeControllerQuietCompletion(
+                [], quiet: false, expectedTexts: [], finalResultValue: value, expectsUncertainty: true
+            )
+        }
+        // Omitted output and well-formed empty output are legitimate silent completions.
+        await assertClaudeControllerQuietCompletion([], quiet: true, expectedTexts: [], finalText: nil)
+        await assertClaudeControllerQuietCompletion([], quiet: true, expectedTexts: [], finalText: "")
+        await assertClaudeControllerQuietCompletion([], quiet: true, expectedTexts: ["[ack]"])
+    }
+
     func testClaudeControllerMalformedKnownDeltaPayloadsRemainOrdinary() async {
         let start = #"{"type":"stream_event","event":{"type":"message_start","message":{"id":"m","content":[]}}}"#
         for (type, field) in [("text_delta", "text"), ("thinking_delta", "thinking"), ("signature_delta", "signature")] {
@@ -483,6 +495,7 @@ final class AgentQuietCheckInLifecycleTests: XCTestCase {
         quiet: Bool,
         expectedTexts: [String],
         finalText: String? = "[ack]",
+        finalResultValue: String? = nil,
         expectsUncertainty: Bool = false,
         file: StaticString = #filePath,
         line: UInt = #line
@@ -497,7 +510,8 @@ final class AgentQuietCheckInLifecycleTests: XCTestCase {
         let stream = await controller.events
         let turnID = await controller.test_beginTurnTracking()
         s.claudeExpectedTurnIDs.insert(turnID)
-        let result = finalText.map { #"{"type":"result","subtype":"success","result":"\#($0)"}"# }
+        let result = finalResultValue.map { #"{"type":"result","subtype":"success","result":\#($0)}"# }
+            ?? finalText.map { #"{"type":"result","subtype":"success","result":"\#($0)"}"# }
             ?? #"{"type":"result","subtype":"success"}"#
         for payload in [#"{"type":"system","subtype":"session_state_changed","session_state":"running"}"#]
             + wire + [result, #"{"type":"system","subtype":"session_state_changed","session_state":"idle"}"#]

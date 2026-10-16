@@ -1746,6 +1746,7 @@ final actor ClaudeNativeProcessSessionController {
             // Initialization and running/idle lifecycle are represented by typed results.
             return !["init", "session_state_changed"].contains(payload["subtype"] as? String ?? "")
         case "result":
+            if let result = payload["result"], !(result is String) { return true }
             return payload["subtype"] as? String != "success" || payload["is_error"] as? Bool == true
         case "rate_limit_event":
             let info = payload["rate_limit_info"] as? [String: Any]
