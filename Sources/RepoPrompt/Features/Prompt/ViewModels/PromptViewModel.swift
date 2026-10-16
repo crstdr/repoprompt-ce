@@ -2531,6 +2531,11 @@ class PromptViewModel: ObservableObject {
             .store(in: &cancellables)
 
         fileManager.$autoCodemapFiles
+            // Root/selection reconciliation can republish an unchanged list while a save is
+            // being prepared; only a real change may invalidate it. Dedupe before dropFirst
+            // so the initial value is the comparison baseline.
+            .map { $0.map(\.fullPath) }
+            .removeDuplicates()
             .dropFirst()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
@@ -2541,6 +2546,11 @@ class PromptViewModel: ObservableObject {
             .store(in: &cancellables)
 
         fileManager.$manualCodemapFiles
+            // Root/selection reconciliation can republish an unchanged list while a save is
+            // being prepared; only a real change may invalidate it. Dedupe before dropFirst
+            // so the initial value is the comparison baseline.
+            .map { $0.map(\.fullPath) }
+            .removeDuplicates()
             .dropFirst()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
@@ -2975,11 +2985,17 @@ class PromptViewModel: ObservableObject {
             let activeIdx = manager.workspaces[index].composeTabs.firstIndex(where: { $0.id == activeID })
         else { return }
 
-        let currentName = manager.workspaces[index].composeTabs[activeIdx].name
+        let storedTab = manager.workspaces[index].composeTabs[activeIdx]
         let snapshot = manager.collectComposeTabSnapshot(
-            name: currentName,
-            base: manager.workspaces[index].composeTabs[activeIdx]
+            name: storedTab.name,
+            base: storedTab
         )
+        // `collectComposeTabSnapshot` always stamps a fresh `lastModified`. Leaving a tab without
+        // editing it is not a modification: a timestamp-only write re-dated the outgoing session's
+        // sidebar row and forced a full sidebar row rebuild on every switch (#1373).
+        var timestampNeutral = snapshot
+        timestampNeutral.lastModified = storedTab.lastModified
+        guard timestampNeutral != storedTab else { return }
         _ = manager.updateStoredComposeTabSnapshot(snapshot, workspaceID: manager.workspaces[index].id)
     }
 
@@ -5156,8 +5172,9 @@ class PromptViewModel: ObservableObject {
             dirtyTabIDs.insert(activeID)
             manager.markWorkspaceDirty()
         } else if !isDirty, wasDirty {
+            // Clearing a presentation-only dirty badge changes no workspace bytes.
+            // Bumping the save version here can exhaust an unrelated in-flight save.
             dirtyTabIDs.remove(activeID)
-            manager.markWorkspaceDirty()
         }
     }
 

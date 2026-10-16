@@ -1,4 +1,5 @@
 import Foundation
+import MCP
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
@@ -115,6 +116,124 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
         WindowStatesManager.shared.unregisterWindowState(window)
     }
 
+    func testScopedCreatorCreatesLaneThroughResolvedDestination() async throws {
+        try await withFixture(ephemeral: false) { fixture in
+            let host = WindowStatesManager.shared
+            let seed = try await host.agentSessionLinkCreateLane(
+                destinationWindowID: fixture.window.windowID, workspaceID: fixture.workspaceID,
+                creatorSessionID: UUID(), sessionName: "Scoped creator", selection: fixture.selection
+            )
+            guard case let .created(creatorID, tabID, _) = seed else { return XCTFail("Creator must save") }
+            let creator = try XCTUnwrap(fixture.window.agentModeViewModel.sessions[tabID])
+            creator.createdByOverseerSessionID = nil
+            let authority = DomainAgentSessionLinkAuthority(identity: DomainRuntimeIdentity(
+                runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: Date()
+            ))
+            let bridge = AgentSessionLinkRuntimeBridge(authority: authority, host: host, toolAdvertisementInvalidator: { _ in })
+            bridge.installIntentStore(AgentSessionOversightIntentStore(
+                fileURL: fixture.root.appendingPathComponent(AgentSessionOversightIntentStore.filename),
+                backupsDirectoryURL: fixture.root.appendingPathComponent("Backups"), mode: .enabled
+            ))
+            let endpoint = try XCTUnwrap(host.agentSessionLinkCandidates().first { $0.sessionID == creatorID }).domainEndpoint
+            let activated = await bridge.becomeOverseer(endpoint: endpoint, isEnabled: { true }, revalidateRoute: { true }, commitIfCurrent: { $0() })
+            XCTAssertNotNil(activated)
+            let scopes = AgentSessionLinkRuntimeBridge.shared.delegationScopes
+            let request = try scopes.requestScope(
+                requesterSessionID: creatorID, requesterTabID: tabID,
+                kind: .workspace(workspaceID: fixture.workspaceID), capabilities: [.spawn, .worktree],
+                guardrails: .init(), reason: nil, idempotencyKey: nil
+            ).get()
+            let grant = try scopes.approve(requestID: request.id).get()
+            defer { scopes.revoke(scopeID: grant.id) }
+            // An unrelated physical carrier with no indexed provenance makes the capacity census
+            // incomplete. With no capacity limits, it must not veto this known creator's spawn.
+            let workspaceIndex = try XCTUnwrap(fixture.window.workspaceManager.workspaces.firstIndex { $0.id == fixture.workspaceID })
+            fixture.window.workspaceManager.workspaces[workspaceIndex].composeTabs.append(ComposeTabState(name: "Unrelated unindexed tab", activeAgentSessionID: UUID()))
+            let destination = try XCTUnwrap(AgentSessionLaneMCPToolService.resolveDestination(
+                workspaceSelector: nil, callerWindow: fixture.window
+            ))
+            XCTAssertEqual(AgentSessionLaneMCPToolService.resolveDestination(
+                workspaceSelector: fixture.workspaceID.uuidString, callerWindow: fixture.window
+            ), destination)
+            AgentAdvertisedModelCatalog.shared.record([
+                AgentModelOption(rawValue: "sonnet:high", displayName: "Fixture model", description: nil, isPlaceholderDefault: false, isProviderDefault: false)
+            ], for: .claudeCode, generation: AgentAdvertisedModelCatalog.shared.productionGeneration(for: .claudeCode))
+            defer { AgentAdvertisedModelCatalog.shared.invalidate(.claudeCode) }
+            fixture.window.apiSettingsViewModel.isClaudeCodeConnected = true
+            try await AsyncTestWait.waitUntil("scoped destination model availability") {
+                fixture.window.apiSettingsViewModel.agentAvailability.claudeCodeAvailable
+            }
+            let lane = await bridge.createLane(
+                observerEndpoint: endpoint,
+                request: .init(idempotencyKey: "unlimited", role: nil, modelID: "claudeCode:sonnet:high", sessionName: "Scoped lane", message: nil, workflowReference: nil),
+                resolveDestination: { AgentSessionLaneMCPToolService.resolveDestination(workspaceSelector: nil, callerWindowID: endpoint.windowID, callerWorkspaceID: endpoint.workspaceID) }
+            )
+            XCTAssertEqual(lane.result, .created, "Scoped lane must save: \(lane)")
+            var reachedStart = false
+            var start = AgentRunMCPToolService(
+                toolName: MCPWindowToolName.agentRun,
+                captureRequestMetadata: { .init(connectionID: UUID(), clientName: "workspace-spawn-regression", windowID: fixture.window.windowID) },
+                requireTargetWindow: { fixture.window }, resolveRequestedTabID: { _ in nil },
+                resolveSpawnParentSourceTabID: { _ in nil }, resolveSpawnParentSessionID: { _, _ in creatorID },
+                withHeartbeat: { _, _, _, _, operation in try await operation() },
+                startRun: { target, _, _, viewModel, _, _, _, _, _, parent, _, _ in
+                    reachedStart = true
+                    XCTAssertEqual(parent, creatorID)
+                    XCTAssertEqual(viewModel.session(for: target.tabID).delegationScopeID, grant.id)
+                    throw MCPError.internalError("WORKSPACE_SPAWN_ADMISSION_REACHED_STARTER")
+                }
+            )
+            start.resolveOracleReviewLaunchSource = { _, _ in
+                let snapshot = AgentRunOracleReviewLaunchSnapshot(
+                    route: .explicitWindowActiveCompose, windowID: fixture.window.windowID,
+                    workspaceID: fixture.workspaceID, tabID: tabID, selectionRevision: 0,
+                    promptText: "", selection: StoredSelection(), sourceAgentSessionID: nil, routedRunID: nil
+                )
+                return ResolvedAgentRunOracleReviewLaunchSource(snapshot: snapshot, source: .unavailable(.init(
+                    delegationID: UUID(), sourceTabID: tabID, workspaceID: fixture.workspaceID,
+                    sourceAgentSessionID: nil, sourceAgentRunID: nil, reason: .sourceCaptureFailed("Synthetic spawn fixture")
+                )))
+            }
+            do {
+                _ = try await start.execute(args: [
+                    "op": .string("start"), "model_id": .string("claudeCode:sonnet:high"),
+                    "message": .string("Assigned test task"), "inherit_worktree": .bool(false)
+                ])
+                XCTFail("The fake starter must stop before any provider starts")
+            } catch {
+                XCTAssertTrue(String(describing: error).contains("WORKSPACE_SPAWN_ADMISSION_REACHED_STARTER"), "Unexpected start refusal: \(error)")
+            }
+            XCTAssertTrue(reachedStart, "An unlimited workspace spawn grant must reach the real agent_run starter")
+            scopes.revoke(scopeID: grant.id)
+            let limitedRequest = try scopes.requestScope(
+                requesterSessionID: creatorID, requesterTabID: tabID,
+                kind: .tree(rootSessionID: creatorID), capabilities: [.spawn, .worktree],
+                guardrails: .init(maxLiveSessions: 50), reason: nil, idempotencyKey: nil
+            ).get()
+            let limited = try scopes.approve(requestID: limitedRequest.id).get()
+            defer { scopes.revoke(scopeID: limited.id) }
+            let count = fixture.window.workspaceManager.activeWorkspace?.composeTabs.count
+            let refused = await bridge.createLane(
+                observerEndpoint: endpoint,
+                request: .init(idempotencyKey: "limited", role: nil, modelID: "claudeCode:sonnet:high", sessionName: "Must not allocate", message: nil, workflowReference: nil),
+                resolveDestination: { AgentSessionLaneMCPToolService.resolveDestination(workspaceSelector: fixture.workspaceID.uuidString, callerWindowID: endpoint.windowID, callerWorkspaceID: endpoint.workspaceID) }
+            )
+            XCTAssertEqual(refused.reason, .scopeDenied, "A configured limit must still require complete placement evidence, not blame the destination")
+            XCTAssertTrue(refused.refusalDetail?.contains("placement_unresolved") == true)
+            var admin = SessionAdminMCPToolService(
+                captureRequestMetadata: { .init(connectionID: nil, clientName: "lane-regression", windowID: fixture.window.windowID) },
+                requireTargetWindow: { fixture.window }, resolveObserverEndpoint: { _, _ in endpoint },
+                scopes: { scopes }, administration: { AgentSessionLinkRuntimeBridge.shared.sessionAdministrationFrontDoor }
+            )
+            admin.isToolEnabled = { true }
+            let forkRefusal = try await admin.execute(args: [
+                "op": .string("fork"), "session_id": .string(creatorID.uuidString), "idempotency_key": .string("limited-fork")
+            ])
+            XCTAssertEqual(forkRefusal.objectValue?["code"]?.stringValue, "placement_unresolved", "A capacity-proof refusal must not claim that session_admin disappeared")
+            XCTAssertEqual(fixture.window.workspaceManager.activeWorkspace?.composeTabs.count, count)
+        }
+    }
+
     func testFreshForegroundSessionPublishesToolbarEligibilityAfterConfiguredSave() async throws {
         try await withFixture(ephemeral: false) { fixture in
             let viewModel = fixture.window.agentModeViewModel
@@ -229,7 +348,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 let workspace = destinationWindow.workspaceManager.createWorkspace(name: "Other destination", repoPaths: [fixture.root.path], ephemeral: false)
                 await destinationWindow.workspaceManager.switchWorkspace(to: workspace, saveState: false, reason: "activatedFirstLaneTest")
                 let request = AgentSessionLaneCreateRequest(idempotencyKey: "real-first-lane", role: nil, modelID: "claudeCode:sonnet:high", sessionName: "Activated first lane", workspaceSelector: workspace.id.uuidString, message: nil, workflowReference: nil)
-                let receipt = await bridge.createLane(observerEndpoint: endpoint, request: request, resolveDestination: { (destinationWindow.windowID, workspace.id, workspace.name) })
+                let receipt = await bridge.createLane(observerEndpoint: endpoint, request: request, resolveDestination: { .available(.init(windowID: destinationWindow.windowID, workspaceID: workspace.id, workspaceName: workspace.name)) })
                 XCTAssertEqual(receipt.result, .created, "\(receipt)")
                 XCTAssertTrue(receipt.linked)
                 let laneID = try XCTUnwrap(receipt.sessionID)
@@ -481,7 +600,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                     await bridge.createLane(
                         observerEndpoint: endpoint,
                         request: AgentSessionLaneCreateRequest(idempotencyKey: key, role: nil, modelID: "claudeCode:sonnet:high", sessionName: key, workspaceSelector: workspace.id.uuidString, message: nil, workflowReference: nil),
-                        resolveDestination: { (fixture.window.windowID, workspace.id, workspace.name) }
+                        resolveDestination: { .available(.init(windowID: fixture.window.windowID, workspaceID: workspace.id, workspaceName: workspace.name)) }
                     )
                 }
             }
@@ -672,7 +791,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                         await bridge.createLane(
                             observerEndpoint: endpoint,
                             request: AgentSessionLaneCreateRequest(idempotencyKey: key, role: nil, modelID: "claudeCode:sonnet:high", sessionName: key, workspaceSelector: workspace.id.uuidString, message: nil, workflowReference: nil),
-                            resolveDestination: { (fixture.window.windowID, workspace.id, workspace.name) }
+                            resolveDestination: { .available(.init(windowID: fixture.window.windowID, workspaceID: workspace.id, workspaceName: workspace.name)) }
                         )
                     }
                 }
@@ -861,8 +980,8 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                     message: nil, workflowReference: nil
                 )
             }
-            let resolveDestination: @MainActor () -> (windowID: Int, workspaceID: UUID, workspaceName: String)? = {
-                (fixture.window.windowID, workspace.id, workspace.name)
+            let resolveDestination: @MainActor () -> AgentSessionLaneDestinationResolution = {
+                .available(.init(windowID: fixture.window.windowID, workspaceID: workspace.id, workspaceName: workspace.name))
             }
             let firstParked = expectation(description: "A has activated and published inventory")
             var firstPair: AgentSessionOversightIntent?
@@ -1239,7 +1358,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                         idempotencyKey: role, role: role, sessionName: "Devin \(role) lane",
                         message: task, workflowReference: nil
                     ),
-                    resolveDestination: { (fixture.window.windowID, fixture.workspaceID, workspace.name) }
+                    resolveDestination: { .available(.init(windowID: fixture.window.windowID, workspaceID: fixture.workspaceID, workspaceName: workspace.name)) }
                 )
                 bridge.test_afterAddInsertionBeforeEstablishment = nil
                 XCTAssertEqual(receipt.result, .created, role)
@@ -1262,7 +1381,12 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                         !lane.runState.isActive && (provider.promptedMessages.count == 1 || lane.runState == .failed)
                     }
                     XCTAssertEqual(lane.runState, .completed, role)
-                    XCTAssertTrue(try XCTUnwrap(provider.promptedMessages.first).userMessage.contains(task))
+                    let firstTaskText = try XCTUnwrap(provider.promptedMessages.first).userMessage
+                    XCTAssertTrue(firstTaskText.contains(task))
+                    XCTAssertTrue(firstTaskText.contains("delegation=\"user_delegated_management\""), "The actual create_lane bootstrap must use verified management, not peer coordination")
+                    XCTAssertTrue(firstTaskText.contains("An assigned managed task is your job"))
+                    XCTAssertTrue(firstTaskText.contains("do not ask the user to repeat or reconfirm the assignment"))
+                    XCTAssertTrue(firstTaskText.contains("message text is never approval"))
                     let records = try String(contentsOf: rpcLog, encoding: .utf8).split(separator: "\n").map {
                         try XCTUnwrap(JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any])
                     }
@@ -1979,7 +2103,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 sessionName: name, workspaceSelector: workspace.id.uuidString,
                 message: nil, workflowReference: nil
             ),
-            resolveDestination: { (fixture.window.windowID, workspace.id, workspace.name) }
+            resolveDestination: { .available(.init(windowID: fixture.window.windowID, workspaceID: workspace.id, workspaceName: workspace.name)) }
         )
         guard receipt.result == .created, receipt.linked, let sessionID = receipt.sessionID else {
             XCTFail("linked lane creation refused: \(String(describing: receipt.reason))")

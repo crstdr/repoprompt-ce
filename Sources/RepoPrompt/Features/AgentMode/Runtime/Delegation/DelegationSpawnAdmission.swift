@@ -37,6 +37,7 @@ enum DelegationSpawnAdmission {
         case unscoped
         case admitted(Admission)
         case denied(DomainDelegationScopeDenial)
+        case creatorPlacementUnresolved(String)
         /// The existing target (or a session in its subtree) is the grantee or root of a live scope.
         case targetAnchorsScope
         /// Starting the existing target would move it between live scopes (`count` of them change).
@@ -67,16 +68,20 @@ enum DelegationSpawnAdmission {
         scopes: DelegationScopeRuntime,
         projector: any DelegationMembershipProjector
     ) throws -> [DomainDelegationScopeRecord] {
+        // A global auto-approve grant has no guardrails to count against, so it is not a delegation
+        // that can bound or block a creation.
+        let liveScopes = scopes.allLiveScopes().filter { !$0.grant.unrestricted }
+        // These creation surfaces already have their own caller authority. With no delegation
+        // anywhere, missing scope provenance cannot hide a limit or revoke that authority.
+        guard !liveScopes.isEmpty else { return [] }
         // Ambiguous ancestry can hide the scope that should count this spawn. It must never
         // become the absence of delegation and consequently an unscoped admission.
-        guard projector.pointResolutionState(for: creator) != .replicated,
-              !projector.authorityConflictInAncestry(of: creator)
-        else {
-            throw error(for: .usageProofMissing)
+        if let reason = creatorPlacementFailure(creator, projector: projector) {
+            throw error(for: .usageProofMissing, subreason: reason)
         }
-        return scopes.allLiveScopes().filter { record in
+        return liveScopes.filter { record in
             switch record.grant.kind {
-            case .allSessions:
+            case .session, .allSessions:
                 false
             case .workspace:
                 isDelegated(creator, under: record, projector: projector)
@@ -121,6 +126,8 @@ enum DelegationSpawnAdmission {
         for record in records {
             var usage: [UUID: DomainDelegationScopeUsage] = [:]
             for scope in scopes.scopeChain(from: record.id) {
+                scopeIDs.insert(scope.id)
+                guard operation.requiresScopeUsage(for: scope.grant.guardrails) else { continue }
                 guard let evidence = projector.usageEvidence(of: scope.grant, spawnParentSessionID: creator) else {
                     return (.usageProofMissing, scopeIDs)
                 }
@@ -178,6 +185,11 @@ enum DelegationSpawnAdmission {
             joiningSessionID = nil
         case let .unplacedSession(sessionID):
             joiningSessionID = sessionID
+        }
+        if !scopes.allLiveScopes().isEmpty,
+           let reason = creatorPlacementFailure(creator, projector: projector)
+        {
+            return .creatorPlacementUnresolved(reason)
         }
         let records: [DomainDelegationScopeRecord]
         do {
@@ -267,6 +279,12 @@ enum DelegationSpawnAdmission {
         }
     }
 
+    private static func creatorPlacementFailure(_ creator: UUID, projector: any DelegationMembershipProjector) -> String? {
+        if projector.pointResolutionState(for: creator) == .replicated { return "creator_replicated" }
+        if projector.authorityConflictInAncestry(of: creator) { return "creator_ancestry_conflict" }
+        return nil
+    }
+
     /// Production entry used by the MCP surfaces: admits or throws the recoverable scope error.
     /// Pair every non-nil result with `finish(_:)`. A `.placedSession` target is already placed: it
     /// never moves, so nothing is admitted, counted, or stamped.
@@ -286,6 +304,8 @@ enum DelegationSpawnAdmission {
             return admission
         case let .denied(denial):
             throw error(for: denial)
+        case let .creatorPlacementUnresolved(reason):
+            throw error(for: .usageProofMissing, subreason: reason)
         case .targetAnchorsScope:
             throw error(code: "spawn_target_anchors_scope", fields: [
                 "detail": .string(
@@ -317,8 +337,9 @@ enum DelegationSpawnAdmission {
     }
 
     /// Structured, recoverable refusal: a stable code followed by a JSON object.
-    static func error(for denial: DomainDelegationScopeDenial) -> MCPError {
+    static func error(for denial: DomainDelegationScopeDenial, subreason: String? = nil) -> MCPError {
         var fields: [String: Value] = [:]
+        if let subreason { fields["subreason"] = .string(subreason) }
         switch denial {
         case let .guardrailExceeded(guardrail, limit, current):
             fields["guardrail"] = .string(guardrail.rawValue)
@@ -329,6 +350,11 @@ enum DelegationSpawnAdmission {
             )
         case let .capabilityMissing(capability):
             fields["capability"] = .string(capability.rawValue)
+            fields["detail"] = .string("Call session_admin request_scope with capabilities including \(capability.rawValue), then wait for the user's approval. Call scope_status for the operation catalog and current grants.")
+        case .usageProofMissing, .membershipProofMissing:
+            fields["reason"] = .string("placement_unresolved")
+            if fields["subreason"] == nil { fields["subreason"] = .string("usage_evidence_unavailable") }
+            fields["detail"] = .string("Scope capacity or creator provenance cannot be proved from the loaded sessions. Load or resolve ambiguous session bindings, then retry. Call session_admin scope_status to inspect limits; another capability grant alone will not repair placement.")
         default:
             break
         }
@@ -338,6 +364,8 @@ enum DelegationSpawnAdmission {
     private static func error(code: String, fields: [String: Value]) -> MCPError {
         var fields = fields
         fields["code"] = .string(code)
+        if fields["subreason"] == nil { fields["subreason"] = .string(code) }
+        fields["next_call"] = .object(["tool": .string("session_admin"), "arguments": .object(["op": .string("scope_status")])])
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let json = (try? encoder.encode(Value.object(fields))).map { String(decoding: $0, as: UTF8.self) } ?? "{}"
