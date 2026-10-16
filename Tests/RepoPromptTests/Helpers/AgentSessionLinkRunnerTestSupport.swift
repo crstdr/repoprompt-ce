@@ -81,7 +81,9 @@ final class AgentSessionLinkRunnerHarness {
         acpProviderFactory: @escaping AgentModeViewModel.ACPProviderFactory = { _, _ in nil },
         workspacePath: String = FileManager.default.currentDirectoryPath,
         sessionLinkHost: AgentModeViewModel? = nil,
-        replayTranscript: Bool = false
+        replayTranscript: Bool = false,
+        codexController: (any CodexSessionControlling)? = nil,
+        claudeControllerFactory: ClaudeAgentModeCoordinator.ClaudeControllerFactory? = nil
     ) {
         self.stubSystemPrompt = stubSystemPrompt
         self.headlessProviderFactory = headlessProviderFactory
@@ -93,7 +95,7 @@ final class AgentSessionLinkRunnerHarness {
             items: []
         )
 
-        let codexController = LifecycleNoopCodexController(recorder: recorder)
+        let codexController = codexController ?? LifecycleNoopCodexController(recorder: recorder)
         let policyInstaller: AgentModeViewModel.ConnectionPolicyInstaller = { _, _, _, _, _, _, _, runID, _, _, _, _, _ in
             // No MCP infrastructure in these suites: signal routing immediately so the bootstrap lease
             // resolves instead of waiting for a connection that will never arrive.
@@ -104,6 +106,7 @@ final class AgentSessionLinkRunnerHarness {
             testWindowID: 1,
             testWorkspacePath: workspacePath,
             codexControllerFactory: { _, _, _, _, _, _ in codexController },
+            claudeControllerFactory: claudeControllerFactory,
             headlessProviderFactory: headlessProviderFactory,
             acpProviderFactory: acpProviderFactory,
             connectionPolicyInstaller: policyInstaller,

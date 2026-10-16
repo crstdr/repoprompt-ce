@@ -2796,6 +2796,7 @@ extension CodexResumeWedgeCommitTests {
 extension CodexResumeWedgeCommitTests {
     func testMalformedNativeAssistantAndReasoningDeltasRemainOrdinary() async throws {
         let cases: [(String, [String: CodexJSONValue], Bool)] = [
+            ("missing-turn", ["itemId": .string("probe"), "delta": .string("")], true),
             ("missing-delta", ["itemId": .string("probe")], true),
             ("null-delta", ["itemId": .string("probe"), "delta": .null], true),
             ("number-delta", ["itemId": .string("probe"), "delta": .number(42)], true),
@@ -2830,7 +2831,7 @@ extension CodexResumeWedgeCommitTests {
                     var events = quietPlainCodexNotifications(reasoning: true, ack: ack, replacement: false)
                     var params = payload
                     params["threadId"] = .string(Self.oldThreadID)
-                    params["turnId"] = .string("plain-turn")
+                    params["turnId"] = name == "missing-turn" ? nil : .string("plain-turn")
                     params["summaryIndex"] = .number(0)
                     params["contentIndex"] = .number(0)
                     events.insert((method, params), at: name.hasPrefix("completed-") ? events.count - 2 : 5)

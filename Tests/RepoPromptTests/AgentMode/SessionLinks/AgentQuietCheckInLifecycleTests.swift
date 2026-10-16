@@ -544,7 +544,7 @@ final class AgentQuietCheckInLifecycleTests: XCTestCase {
         XCTAssertEqual(streams.filter { $0.type == "session_state_changed" }.compactMap(\.text), ["running", "idle"], file: file, line: line)
         XCTAssertFalse(streams.contains { $0.text == "Provider completion recovery" }, file: file, line: line)
         let uncertaintyIndex = streams.firstIndex { $0.type == "event" }
-        XCTAssertEqual(uncertaintyIndex != nil, expectsUncertainty, "\(wire)", file: file, line: line)
+        XCTAssertEqual(streams.count { $0.type == "event" }, expectsUncertainty ? 1 : 0, "\(wire)", file: file, line: line)
         if let uncertaintyIndex, let finalIndex = streams.firstIndex(where: { $0.type == "final_content" }) {
             XCTAssertLessThan(uncertaintyIndex, finalIndex, file: file, line: line)
         }

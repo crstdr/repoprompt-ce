@@ -2814,6 +2814,10 @@ private actor MonitorRemovalConnection: MCPServerConnection {
 }
 
 actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
+    func emit(_ event: NativeAgentRuntimeEvent) {
+        continuation?.yield(event)
+    }
+
     private var configuration = SessionLinkNativeConfigurationFixture()
     private(set) var sentMessages: [String] = []
     private(set) var shutdownCount = 0
@@ -2949,6 +2953,10 @@ final class MonitorCodexDispatchRecorder: @unchecked Sendable {
 }
 
 final class MonitorFakeCodexController: CodexSessionControllerPassiveStubDefaults, @unchecked Sendable {
+    func emit(_ event: CodexNativeSessionController.Event) {
+        continuation.yield(event)
+    }
+
     private let dispatches: MonitorCodexDispatchRecorder
     private let lock = NSLock()
     private var started: [String] = []
