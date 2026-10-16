@@ -2794,6 +2794,73 @@ extension CodexResumeWedgeCommitTests {
 }
 
 extension CodexResumeWedgeCommitTests {
+    func testMalformedNativeAssistantAndReasoningDeltasRemainOrdinary() async throws {
+        let cases: [(String, [String: CodexJSONValue], Bool)] = [
+            ("missing-delta", ["itemId": .string("probe")], true),
+            ("null-delta", ["itemId": .string("probe"), "delta": .null], true),
+            ("number-delta", ["itemId": .string("probe"), "delta": .number(42)], true),
+            ("object-delta", ["itemId": .string("probe"), "delta": .object([:])], true),
+            ("missing-item", ["delta": .string("")], true),
+            ("null-item", ["itemId": .null, "delta": .string("")], true),
+            ("object-item", ["itemId": .object([:]), "delta": .string("")], true),
+            ("number-item", ["itemId": .number(42), "delta": .string("")], true),
+            ("array-item", ["itemId": .array([.string("probe")]), "delta": .string("")], true),
+            ("bool-item", ["itemId": .bool(true), "delta": .string("")], true),
+            ("completed-malformed", ["itemId": .string("thought"), "delta": .number(42)], true),
+            ("completed-valid", ["itemId": .string("thought"), "delta": .string("")], false),
+            ("fallback-item", ["item_id": .string("probe"), "delta": .string("")], false),
+            ("nested-item", ["item": .object(["id": .string("probe")]), "delta": .string("")], false),
+            ("empty-delta", ["itemId": .string("probe"), "delta": .string("")], false)
+        ]
+        for method in ["item/agentMessage/delta", "item/reasoning/summaryTextDelta", "item/reasoning/textDelta"] {
+            for ack in [false, true] {
+                for (name, payload, malformed) in cases {
+                    let label = "\(method) \(name) ack=\(ack)"
+                    let f = makeFixture([])
+                    f.viewModel.test_initializeRunService()
+                    let runID = UUID()
+                    f.session.installRunID(runID)
+                    let controller = CodexNativeSessionController(client: CodexAppServerClient(), runID: runID, tabID: f.session.tabID, windowID: -1, workspacePaths: .uniform(nil))
+                    f.session.codexController = controller
+                    f.session.codexConversationID = Self.oldThreadID
+                    let owner = try XCTUnwrap(f.session.activeRunOwnership)
+                    let wakeID = UUID()
+                    f.session.quietLedger.markRoutineWake(owner: owner, wakeID: wakeID)
+                    await controller.test_installThreadState(threadID: Self.oldThreadID, authoritativeTurnID: "plain-turn", routingTurnID: "plain-turn")
+                    var events = quietPlainCodexNotifications(reasoning: true, ack: ack, replacement: false)
+                    var params = payload
+                    params["threadId"] = .string(Self.oldThreadID)
+                    params["turnId"] = .string("plain-turn")
+                    params["summaryIndex"] = .number(0)
+                    params["contentIndex"] = .number(0)
+                    events.insert((method, params), at: name.hasPrefix("completed-") ? events.count - 2 : 5)
+                    for (method, params) in events {
+                        await controller.test_handleNotification(method: method, params: params)
+                    }
+                    await controller.shutdown()
+                    var warnings: [String] = []
+                    var deltas = 0
+                    for await event in controller.events {
+                        if case let .livenessActivity(activity) = event, activity.kind == .warning { warnings.append(activity.method) }
+                        switch event {
+                        case .canonicalAssistantDelta, .reasoningDelta: deltas += 1
+                        default: break
+                        }
+                        await f.coordinator.test_handleCodexNativeEvent(event, session: f.session, sourceController: controller)
+                    }
+                    XCTAssertEqual(warnings, malformed ? [method] : [], label)
+                    let expectedProbeDeltas = malformed || name == "completed-valid" ? 0 : 1
+                    XCTAssertEqual(deltas, 2 + (ack ? 1 : 0) + expectedProbeDeltas, "\(label): no duplicate typed delta on uncertainty or completed-item dedup")
+                    XCTAssertEqual(f.session.runState, .completed, label)
+                    XCTAssertEqual(f.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: malformed ? 1 : 0), label)
+                    XCTAssertEqual(f.session.quietLedger.hiddenSourceIDs.contains(wakeID), !malformed, label)
+                    if malformed { XCTAssertTrue(f.session.quietLedger.hiddenSourceIDs.isEmpty, label) }
+                    f.session.saveDebounceTask?.cancel()
+                }
+            }
+        }
+    }
+
     private func makeQuietToolProgressFixture() async throws -> (Fixture, CodexNativeSessionController, AgentRunOwnership) {
         let f = makeFixture([])
         f.viewModel.test_initializeRunService()

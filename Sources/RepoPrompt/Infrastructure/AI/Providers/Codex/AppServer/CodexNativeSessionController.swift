@@ -3675,20 +3675,23 @@ final class CodexNativeSessionController {
                 await emit(.contextCompacted(turnID: compactionTurnID))
             }
         case "item/agentMessage/delta":
-            if let delta = params["delta"] as? String,
-               let scope = Self.canonicalItemScope(from: params),
-               !completedCanonicalItemScopes.contains(scope)
-            {
-                var state = assistantEmittedTextByTurnID[scope.turnID]
-                    ?? AssistantEmittedTextState(itemID: scope.itemID, text: "")
-                if state.itemID != scope.itemID {
-                    state = AssistantEmittedTextState(itemID: scope.itemID, text: delta)
-                } else {
-                    state.text.append(delta)
-                }
-                assistantEmittedTextByTurnID[scope.turnID] = state
-                await emit(.canonicalAssistantDelta(text: delta, scope: scope))
+            guard let delta = params["delta"] as? String,
+                  params["itemId"] == nil || params["itemId"] is String,
+                  let scope = Self.canonicalItemScope(from: params)
+            else {
+                await emitUnrepresentedQuietActivity(method: notification.method, params: params)
+                break
             }
+            guard !completedCanonicalItemScopes.contains(scope) else { break }
+            var state = assistantEmittedTextByTurnID[scope.turnID]
+                ?? AssistantEmittedTextState(itemID: scope.itemID, text: "")
+            if state.itemID != scope.itemID {
+                state = AssistantEmittedTextState(itemID: scope.itemID, text: delta)
+            } else {
+                state.text.append(delta)
+            }
+            assistantEmittedTextByTurnID[scope.turnID] = state
+            await emit(.canonicalAssistantDelta(text: delta, scope: scope))
         case "codex/event/agent_message":
             let legacyTurnID = Self.notificationTurnID(from: params)
             let legacyItemID = Self.notificationItemID(
@@ -3765,37 +3768,43 @@ final class CodexNativeSessionController {
                 }
             }
         case "item/reasoning/summaryTextDelta":
-            if let delta = params["delta"] as? String,
-               let scope = Self.canonicalItemScope(from: params),
-               !completedCanonicalItemScopes.contains(scope)
-            {
-                let summaryIndex = intValue(params["summaryIndex"]) ?? intValue(params["summary_index"])
-                let groupID = makeReasoningGroupID(kind: "summary", itemID: scope.itemID, index: summaryIndex)
-                await emit(.reasoningDelta(.init(
-                    text: delta,
-                    kind: .summary,
-                    itemID: scope.itemID,
-                    groupID: groupID,
-                    index: summaryIndex,
-                    scope: scope
-                )))
+            guard let delta = params["delta"] as? String,
+                  params["itemId"] == nil || params["itemId"] is String,
+                  let scope = Self.canonicalItemScope(from: params)
+            else {
+                await emitUnrepresentedQuietActivity(method: notification.method, params: params)
+                break
             }
+            guard !completedCanonicalItemScopes.contains(scope) else { break }
+            let summaryIndex = intValue(params["summaryIndex"]) ?? intValue(params["summary_index"])
+            let groupID = makeReasoningGroupID(kind: "summary", itemID: scope.itemID, index: summaryIndex)
+            await emit(.reasoningDelta(.init(
+                text: delta,
+                kind: .summary,
+                itemID: scope.itemID,
+                groupID: groupID,
+                index: summaryIndex,
+                scope: scope
+            )))
         case "item/reasoning/textDelta":
-            if let delta = params["delta"] as? String,
-               let scope = Self.canonicalItemScope(from: params),
-               !completedCanonicalItemScopes.contains(scope)
-            {
-                let contentIndex = intValue(params["contentIndex"]) ?? intValue(params["content_index"])
-                let groupID = makeReasoningGroupID(kind: "text", itemID: scope.itemID, index: contentIndex)
-                await emit(.reasoningDelta(.init(
-                    text: delta,
-                    kind: .text,
-                    itemID: scope.itemID,
-                    groupID: groupID,
-                    index: contentIndex,
-                    scope: scope
-                )))
+            guard let delta = params["delta"] as? String,
+                  params["itemId"] == nil || params["itemId"] is String,
+                  let scope = Self.canonicalItemScope(from: params)
+            else {
+                await emitUnrepresentedQuietActivity(method: notification.method, params: params)
+                break
             }
+            guard !completedCanonicalItemScopes.contains(scope) else { break }
+            let contentIndex = intValue(params["contentIndex"]) ?? intValue(params["content_index"])
+            let groupID = makeReasoningGroupID(kind: "text", itemID: scope.itemID, index: contentIndex)
+            await emit(.reasoningDelta(.init(
+                text: delta,
+                kind: .text,
+                itemID: scope.itemID,
+                groupID: groupID,
+                index: contentIndex,
+                scope: scope
+            )))
         case let method where Self.isItemLifecycleNotificationMethod(method):
             let item = Self.canonicalItem(from: params)
             let typeRaw = item.map { normalizedTypeString(from: $0) } ?? ""
