@@ -3262,7 +3262,7 @@ extension CodexResumeWedgeCommitTests {
     func testQuietAckWithModerationMetadataBeforeCompletion() async throws {
         // v0.160.1 defines metadata as arbitrary JSON, including scalar and null values.
         for metadata: CodexJSONValue in [.object([:]), .array([]), .string("annotation"), .number(1), .bool(false), .null] {
-            try await replayQuietAckModerationMetadata([
+            try await replayQuietAckProtocolMetadata([
                 "threadId": .string(Self.oldThreadID), "turnId": .string("plain-turn"), "metadata": metadata
             ], malformed: false)
         }
@@ -3270,12 +3270,69 @@ extension CodexResumeWedgeCommitTests {
 
     func testMalformedModerationMetadataKeepsAckOrdinary() async throws {
         // Missing required metadata is malformed; a null value itself is valid JSON.
-        try await replayQuietAckModerationMetadata([
+        try await replayQuietAckProtocolMetadata([
             "threadId": .string(Self.oldThreadID), "turnId": .string("plain-turn")
         ], malformed: true)
     }
 
-    private func replayQuietAckModerationMetadata(_ payload: [String: CodexJSONValue], malformed: Bool) async throws {
+    /// Canonical v0.160.1 outer envelopes. Settings are an opaque snapshot, not turn input.
+    private var quietThreadSettingsNotification: [String: CodexJSONValue] {
+        ["threadId": .string(Self.oldThreadID), "threadSettings": .object([
+            "cwd": .string("/workspace"), "approvalPolicy": .string("on-request"), "approvalsReviewer": .string("user"),
+            "sandboxPolicy": .object(["type": .string("readOnly")]), "model": .string("test-model"), "modelProvider": .string("test-provider"),
+            "collaborationMode": .object(["mode": .string("default"), "settings": .object(["model": .string("test-model")])])
+        ])]
+    }
+
+    func testQuietAckWithThreadSettingsAndNeutralMetadataBeforeTurnStartedAndCompletion() async throws {
+        let notifications: [(String, [String: CodexJSONValue])] = [
+            ("thread/settings/updated", quietThreadSettingsNotification),
+            // The embedded snapshot is deliberately opaque; only its object envelope is checked.
+            ("thread/settings/updated", ["threadId": .string(Self.oldThreadID), "threadSettings": .object([:])]),
+            ("thread/name/updated", ["threadId": .string(Self.oldThreadID), "threadName": .string("Thread name")]),
+            ("thread/name/updated", ["threadId": .string(Self.oldThreadID), "threadName": .null]),
+            ("thread/name/updated", ["threadId": .string(Self.oldThreadID)])
+        ]
+        for beforeTurnStarted in [true, false] {
+            for (method, payload) in notifications {
+                try await replayQuietAckProtocolMetadata(payload, malformed: false, method: method, beforeTurnStarted: beforeTurnStarted)
+            }
+        }
+    }
+
+    func testMalformedThreadSettingsAndNeutralMetadataKeepAckOrdinary() async throws {
+        var notifications: [(String, [String: CodexJSONValue])] = []
+        for value: CodexJSONValue? in [nil, .null, .string("invalid"), .number(1), .bool(true), .array([])] {
+            var payload: [String: CodexJSONValue] = ["threadId": .string(Self.oldThreadID)]
+            payload["threadSettings"] = value
+            notifications.append(("thread/settings/updated", payload))
+        }
+        for value: CodexJSONValue in [.number(1), .bool(true), .array([]), .object([:])] {
+            notifications.append(("thread/name/updated", ["threadId": .string(Self.oldThreadID), "threadName": value]))
+        }
+        for method in ["thread/settings/updated", "thread/name/updated"] {
+            for threadID: CodexJSONValue? in [nil, .null, .object([:]), .string("")] {
+                var payload = method == "thread/settings/updated" ? quietThreadSettingsNotification
+                    : ["threadId": .string(Self.oldThreadID), "threadName": .string("Thread name")]
+                payload["threadId"] = threadID
+                notifications.append((method, payload))
+            }
+        }
+        for beforeTurnStarted in [true, false] {
+            for (method, payload) in notifications {
+                try await replayQuietAckProtocolMetadata(payload, malformed: true, method: method, beforeTurnStarted: beforeTurnStarted)
+            }
+        }
+    }
+
+    func testRealToolCallWithThreadSettingsKeepsAckOrdinary() async throws {
+        try await replayQuietAckProtocolMetadata(quietThreadSettingsNotification, malformed: false, method: "thread/settings/updated", beforeTurnStarted: true, realTool: true)
+    }
+
+    private func replayQuietAckProtocolMetadata(
+        _ payload: [String: CodexJSONValue], malformed: Bool, method: String = "turn/moderationMetadata",
+        beforeTurnStarted: Bool = false, realTool: Bool = false
+    ) async throws {
         let f = makeFixture([])
         defer { f.session.saveDebounceTask?.cancel() }
         f.viewModel.test_initializeRunService()
@@ -3287,25 +3344,49 @@ extension CodexResumeWedgeCommitTests {
         let owner = try XCTUnwrap(f.session.activeRunOwnership)
         let wakeID = UUID()
         f.session.quietLedger.markRoutineWake(owner: owner, wakeID: wakeID)
-        await controller.test_installThreadState(threadID: Self.oldThreadID, authoritativeTurnID: "plain-turn", routingTurnID: "plain-turn")
+        await controller.test_installThreadState(threadID: Self.oldThreadID, authoritativeTurnID: beforeTurnStarted ? nil : "plain-turn", routingTurnID: beforeTurnStarted ? nil : "plain-turn")
         var events = quietPlainCodexNotifications(reasoning: false, ack: true, replacement: false)
-        // Replay the live ordering: routine wake, [ack] agent message, moderation, completion.
-        let completionIndex = try XCTUnwrap(events.firstIndex { $0.0 == "turn/completed" })
-        events.insert(("turn/moderationMetadata", payload), at: completionIndex)
+        if realTool {
+            events.insert(("item/started", [
+                "threadId": .string(Self.oldThreadID), "turnId": .string("plain-turn"),
+                "item": .object([
+                    "id": .string("command"),
+                    "type": .string("commandExecution"),
+                    "command": .string("echo test"),
+                    "cwd": .string("/workspace"),
+                    "processId": .string("1"),
+                    "status": .string("inProgress"),
+                    "commandActions": .array([]),
+                    "aggregatedOutput": .null,
+                    "exitCode": .null,
+                    "durationMs": .null
+                ])
+            ]), at: 1)
+        }
+        // Settings can arrive before turn/started; moderation arrives before completion.
+        let insertionIndex = beforeTurnStarted ? 0 : try XCTUnwrap(events.firstIndex { $0.0 == "turn/completed" })
+        events.insert((method, payload), at: insertionIndex)
         for (method, params) in events {
             await controller.test_handleNotification(method: method, params: params)
         }
         await controller.shutdown()
         var warnings: [String] = []
+        var toolEvents = 0
         for await event in controller.events {
             if case let .livenessActivity(activity) = event, activity.kind == .warning { warnings.append(activity.method) }
+            switch event {
+            case .toolCall, .commandExecutionRunning: toolEvents += 1
+            default: break
+            }
             await f.coordinator.test_handleCodexNativeEvent(event, session: f.session, sourceController: controller)
         }
-        XCTAssertEqual(warnings, malformed ? ["turn/moderationMetadata"] : [])
+        let ordinary = malformed || realTool
+        XCTAssertEqual(warnings, malformed ? [method] : (realTool ? ["item/started"] : []), method)
+        if realTool { XCTAssertGreaterThan(toolEvents, 0, "Real tool activity must reach the coordinator") }
         XCTAssertEqual(f.session.runState, .completed)
-        XCTAssertEqual(f.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: malformed ? 1 : 0))
-        XCTAssertEqual(f.session.quietLedger.hiddenSourceIDs.contains(wakeID), !malformed)
-        if malformed { XCTAssertTrue(f.session.quietLedger.hiddenSourceIDs.isEmpty) }
+        XCTAssertEqual(f.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: ordinary ? 1 : 0))
+        XCTAssertEqual(f.session.quietLedger.hiddenSourceIDs.contains(wakeID), !ordinary)
+        if ordinary { XCTAssertTrue(f.session.quietLedger.hiddenSourceIDs.isEmpty) }
         else { XCTAssertGreaterThan(f.session.quietLedger.hiddenSourceIDs.count, 1, "The ack row is hidden with the wake") }
     }
 }
