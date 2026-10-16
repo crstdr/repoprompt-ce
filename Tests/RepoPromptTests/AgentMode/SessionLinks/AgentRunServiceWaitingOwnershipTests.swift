@@ -90,7 +90,7 @@ final class AgentRunServiceWaitingOwnershipTests: XCTestCase {
                         try handle.close()
                     }
                 } else { codex.emit(.turnCompleted(turnID: "turn-\(turn)", status: .completed)) }
-                try await AsyncTestWait.waitUntil("real terminal completion") { session.runState == .completed && session.activeRunOwnership == nil }
+                try await AsyncTestWait.waitUntil("real terminal completion (\(agent))", timeout: 10) { session.runState == .completed && session.activeRunOwnership == nil }
                 await session.agentTask?.value
                 XCTAssertNotNil(session.runLifecycle.lastTerminalCommitRevision)
             }
