@@ -1,253 +1,185 @@
 import Foundation
 import RepoPromptDomainRuntime
+import RepoPromptPersistence
 
-// Durable delegation-scope intent: the user's active scope grants (and their attenuated children)
-// and nothing else.
-//
-// Modeled on `AgentSessionOversightIntentStore`: one actor, a versioned document, defensive size/row
-// guards, quarantine of malformed supported-schema files into `Backups/`, preserve-and-block for
-// future schemas, and write-through atomic replacement with no suspension between the disk write and
-// the in-memory commit. Unlike oversight links, scope intent *is* authority, so revoked and expired
-// scopes are removed from the file; generations are process-local and never written, and a launch
-// reactivates every persisted grant under a fresh generation (`DomainDelegationScopeAuthority`).
-
-/// Versioned on-disk envelope.
+/// Legacy import envelope only. Never rewritten by the transactional continuity implementation.
 struct DelegationScopeDocument: Codable, Equatable {
-    static let currentVersion = 1
-    /// Bounded tombstone list; the oldest entries drop first.
-    static let maxRevokedScopeIDs = 1024
-
+    static let currentVersion = 2
     let version: Int
     let scopes: [DomainDelegationScopeGrant]
-    /// Revocation tombstones. A grant listed here is never reactivated, even if a stale or restored
-    /// copy of the file still lists it. Optional so older v1 files (without the key) still decode.
     let revokedScopeIDs: [UUID]?
-
-    init(
-        version: Int = DelegationScopeDocument.currentVersion,
-        scopes: [DomainDelegationScopeGrant],
-        revokedScopeIDs: [UUID]? = nil
-    ) {
+    let cleanShutdown: Bool
+    init(version: Int = currentVersion, scopes: [DomainDelegationScopeGrant], revokedScopeIDs: [UUID]? = nil, cleanShutdown: Bool = true) {
         self.version = version
         self.scopes = scopes
         self.revokedScopeIDs = revokedScopeIDs
+        self.cleanShutdown = cleanShutdown
     }
 
     private enum CodingKeys: String, CodingKey {
-        case version
-        case scopes
+        case version, scopes
         case revokedScopeIDs = "revoked_scope_ids"
+        case cleanShutdown = "clean_shutdown"
     }
 }
 
-private struct DelegationScopeDocumentHeader: Decodable {
-    let version: Int
+enum DelegationScopePersistenceBlockReason: Equatable {
+    case unsupportedFutureSchema(onDiskVersion: Int, supportedVersion: Int)
+    case unreadable, ownershipUnavailable, openingWriteFailed, invalidLaunchState
+    case fileTooLarge(byteCount: Int)
+    case tooManyRows(rowCount: Int)
+    var diagnosticLabel: String {
+        switch self {
+        case .unsupportedFutureSchema: "future_schema"
+        case .unreadable: "unreadable"
+        case .ownershipUnavailable: "ownership_unavailable"
+        case .openingWriteFailed: "opening_write_failed"
+        case .invalidLaunchState: "invalid_launch_state"
+        case .fileTooLarge: "file_too_large"
+        case .tooManyRows: "too_many_rows"
+        }
+    }
+
+    var message: String {
+        "Saved delegation continuity is unavailable (\(diagnosticLabel)). Existing bytes are preserved. New explicit user approvals remain usable in this process; saving is separate and will retry."
+    }
 }
 
 enum DelegationScopeLoadResult: Equatable {
-    enum Source: String, Equatable {
-        case missing
-        case loaded
-        case quarantined
-    }
-
+    enum Source: String, Equatable { case missing, loaded, migrated, quarantined }
     case ready(source: Source, grants: [DomainDelegationScopeGrant], revokedScopeIDs: [UUID])
-    case blocked(AgentSessionOversightPersistenceBlockReason)
+    case blocked(DelegationScopePersistenceBlockReason)
     case suppressed
 }
 
 enum DelegationScopeWriteOutcome: String, Equatable {
-    case applied
-    case unchanged
-    /// Persistence is suppressed, not yet loaded, or the file is preserved/blocked.
-    case blocked
-    /// Encoding or atomic replacement failed. Old disk and memory state survive.
-    case writeFailed
+    case applied, unchanged, pending, blocked, writeFailed, rejected
 }
 
-/// Atomic, versioned store for durable delegation-scope intent.
-///
-/// Beside `agentSessionOversightLinks.json`:
-/// `~/Library/Application Support/RepoPrompt CE/delegationScopes.json`
-actor DelegationScopeStore {
+/// Typed continuity adapter, not the live approval owner. It has no lifetime flock and no cached
+/// startup failure. A failed open/transaction can be retried on this same object. All mutations are
+/// row deltas with stable operation receipts; neither missing rows nor a stale snapshot imply revoke.
+final class DelegationScopeStore: @unchecked Sendable {
     static let filename = "delegationScopes.json"
     static let backupsDirectoryName = "Backups"
-    static let maxFileByteCount = 4 * 1024 * 1024
-    static let maxDecodedRowCount = 4096
-    private static let maxQuarantineAttempts = 4
-
-    private let fileURL: URL
-    private let backupsDirectoryURL: URL
+    let repository: OverseerContinuityRepository
     private let mode: AgentSessionOversightPersistenceMode
-    private let maxFileByteCount: Int
-    private let maxDecodedRowCount: Int
-    private let fileManager: FileManager
-    private let writer: @Sendable (Data, URL) throws -> Void
-    private let now: @Sendable () -> Date
-    private let makeUUID: @Sendable () -> UUID
-
-    private var didLoad = false
-    private var settledSource: DelegationScopeLoadResult.Source?
-    private var blockReason: AgentSessionOversightPersistenceBlockReason?
-    private var grants: [DomainDelegationScopeGrant] = []
-    private var revokedScopeIDs: [UUID] = []
+    private let beforeCommit: @Sendable () throws -> Void
+    private let lock = NSLock()
+    private var closed = false
+    private var cachedGrants: [DomainDelegationScopeGrant] = []
+    private var failure: String?
+    private var recoveryWarning: String?
+    private var receipt: OverseerContinuityReceipt?
+    var lastReceipt: OverseerContinuityReceipt? {
+        lock.withLock { receipt }
+    }
 
     init(
         fileURL: URL,
-        backupsDirectoryURL: URL,
+        backupsDirectoryURL _: URL,
         mode: AgentSessionOversightPersistenceMode,
-        fileManager: FileManager = .default,
-        writer: @escaping @Sendable (Data, URL) throws -> Void = { data, url in
-            try data.write(to: url, options: .atomic)
-        },
-        now: @escaping @Sendable () -> Date = { Date() },
-        makeUUID: @escaping @Sendable () -> UUID = { UUID() },
-        maxFileByteCount: Int = DelegationScopeStore.maxFileByteCount,
-        maxDecodedRowCount: Int = DelegationScopeStore.maxDecodedRowCount
+        beforeCommit: @escaping @Sendable () throws -> Void = {},
+        databaseURL: URL? = nil,
+        profile: String = "temporary-overseer",
+        legacyPolicy: OverseerLegacyPolicy = .sameProfile
     ) {
-        self.fileURL = fileURL
-        self.backupsDirectoryURL = backupsDirectoryURL
         self.mode = mode
-        self.fileManager = fileManager
-        self.writer = writer
-        self.now = now
-        self.makeUUID = makeUUID
-        self.maxFileByteCount = maxFileByteCount
-        self.maxDecodedRowCount = maxDecodedRowCount
+        self.beforeCommit = beforeCommit
+        repository = OverseerContinuityRepository(databaseURL: databaseURL ?? fileURL.deletingLastPathComponent().appendingPathComponent("Overseer/continuity.sqlite"), profile: profile, legacyURL: fileURL, kind: .scope, mode: mode, legacyPolicy: legacyPolicy)
     }
 
-    /// Production location, beside `agentSessionOversightLinks.json`.
-    static func production(
-        mode: AgentSessionOversightPersistenceMode,
-        fileManager: FileManager = .default
-    ) -> DelegationScopeStore {
-        let base = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)
-            .first!
-            .appendingPathComponent("RepoPrompt CE", isDirectory: true)
-        return DelegationScopeStore(
-            fileURL: base.appendingPathComponent(filename),
-            backupsDirectoryURL: base.appendingPathComponent(backupsDirectoryName, isDirectory: true),
+    static func production(mode: AgentSessionOversightPersistenceMode, fileManager: FileManager = .default) -> DelegationScopeStore {
+        let locations = OverseerContinuityRepository.production(fileManager: fileManager)
+        return .init(
+            fileURL: locations.legacyDirectory.appendingPathComponent(filename),
+            backupsDirectoryURL: locations.legacyDirectory,
             mode: mode,
-            fileManager: fileManager
+            databaseURL: locations.databaseURL,
+            profile: locations.profile,
+            legacyPolicy: .userReview
         )
     }
 
-    // MARK: - Load
+    var diagnostic: String? {
+        lock.withLock { failure ?? recoveryWarning } ?? repository.diagnostic
+    }
 
-    /// Reads the file once per launch; repeat calls report the settled classification.
+    /// Successfully decoded continuity descriptions, never an authorization input.
+    var restoredDescriptions: [DomainDelegationScopeGrant] {
+        lock.withLock { cachedGrants }
+    }
+
     func loadForLaunch() -> DelegationScopeLoadResult {
         guard mode.performsProductionFileIO else { return .suppressed }
-        if didLoad {
-            if let blockReason { return .blocked(blockReason) }
-            return .ready(source: settledSource ?? .loaded, grants: grants, revokedScopeIDs: revokedScopeIDs)
-        }
-        didLoad = true
-
-        guard fileManager.fileExists(atPath: fileURL.path) else {
-            return settle(.missing)
-        }
-        if let size = (try? fileManager.attributesOfItem(atPath: fileURL.path))?[.size] as? NSNumber,
-           size.intValue > maxFileByteCount
-        {
-            return block(.fileTooLarge(byteCount: size.intValue))
-        }
-        guard let data = try? Data(contentsOf: fileURL) else { return block(.unreadable) }
-        guard data.count <= maxFileByteCount else { return block(.fileTooLarge(byteCount: data.count)) }
-
-        // Default `Date` coding round-trips exactly, so an unchanged authority never rewrites.
-        let decoder = JSONDecoder()
-        guard let header = try? decoder.decode(DelegationScopeDocumentHeader.self, from: data) else {
-            return quarantineAndStartEmpty()
-        }
-        guard header.version <= DelegationScopeDocument.currentVersion else {
-            return block(.unsupportedFutureSchema(
-                onDiskVersion: header.version,
-                supportedVersion: DelegationScopeDocument.currentVersion
-            ))
-        }
-        guard let document = try? decoder.decode(DelegationScopeDocument.self, from: data) else {
-            return quarantineAndStartEmpty()
-        }
-        guard document.scopes.count <= maxDecodedRowCount else {
-            return block(.tooManyRows(rowCount: document.scopes.count))
-        }
-        // Duplicate IDs collapse onto the first row; a load never writes.
-        var seen: Set<UUID> = []
-        grants = document.scopes.filter { seen.insert($0.id).inserted }
-        revokedScopeIDs = Array((document.revokedScopeIDs ?? []).suffix(DelegationScopeDocument.maxRevokedScopeIDs))
-        return settle(.loaded)
-    }
-
-    private func settle(_ source: DelegationScopeLoadResult.Source) -> DelegationScopeLoadResult {
-        settledSource = source
-        return .ready(source: source, grants: grants, revokedScopeIDs: revokedScopeIDs)
-    }
-
-    private func block(_ reason: AgentSessionOversightPersistenceBlockReason) -> DelegationScopeLoadResult {
-        blockReason = reason
-        return .blocked(reason)
-    }
-
-    /// Moves the intact source aside with no-replace semantics, then starts empty and writable. If
-    /// the file cannot be moved it stays where it is and mutation stays blocked.
-    private func quarantineAndStartEmpty() -> DelegationScopeLoadResult {
-        try? fileManager.createDirectory(at: backupsDirectoryURL, withIntermediateDirectories: true)
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withYear, .withMonth, .withDay, .withTime, .withTimeZone]
-        let stamp = formatter.string(from: now()).replacingOccurrences(of: ":", with: "")
-        for _ in 0 ..< Self.maxQuarantineAttempts {
-            let destination = backupsDirectoryURL.appendingPathComponent(
-                "delegationScopes.corrupt.\(stamp).\(makeUUID().uuidString).json"
-            )
-            guard !fileManager.fileExists(atPath: destination.path) else { continue }
-            do {
-                try fileManager.moveItem(at: fileURL, to: destination)
-                return settle(.quarantined)
-            } catch {
-                guard !fileManager.fileExists(atPath: fileURL.path) else { continue }
-                break
-            }
-        }
-        return block(.unreadable)
-    }
-
-    // MARK: - Mutation
-
-    /// Replaces the durable set with exactly `newGrants` (the authority's active grants) and the
-    /// given revocation tombstones (bounded, oldest dropped first).
-    func replace(
-        with newGrants: [DomainDelegationScopeGrant],
-        revokedScopeIDs newRevoked: [UUID] = []
-    ) -> DelegationScopeWriteOutcome {
-        guard mode.performsProductionFileIO, didLoad, blockReason == nil else { return .blocked }
-        let ordered = newGrants.sorted { $0.id.uuidString < $1.id.uuidString }
-        let tombstones = Array(newRevoked.suffix(DelegationScopeDocument.maxRevokedScopeIDs))
-        guard ordered != grants.sorted(by: { $0.id.uuidString < $1.id.uuidString }) || tombstones != revokedScopeIDs else {
-            return .unchanged
-        }
-        guard ordered.count <= maxDecodedRowCount else { return .blocked }
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         do {
-            let data = try encoder.encode(DelegationScopeDocument(
-                scopes: ordered,
-                revokedScopeIDs: tombstones.isEmpty ? nil : tombstones
-            ))
-            guard data.count <= maxFileByteCount else { return .blocked }
-            try? fileManager.createDirectory(
-                at: fileURL.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            try writer(data, fileURL)
+            let rows = try repository.load()
+            var grants: [DomainDelegationScopeGrant] = []
+            var revoked: [UUID] = []
+            var invalidIDs: [String] = []
+            for row in rows {
+                do {
+                    guard let id = UUID(uuidString: row.id) else { throw OverseerContinuityError.invalidRecord }
+                    if row.terminal { revoked.append(id)
+                        continue
+                    }
+                    let grant = try JSONDecoder().decode(DomainDelegationScopeGrant.self, from: row.payload)
+                    let canonical = try OverseerContinuityRepository.scopeRow(grant)
+                    guard canonical.id == row.id, canonical.ownerID == row.ownerID, canonical.parentID == row.parentID,
+                          canonical.anchorID == row.anchorID, canonical.workspaceID == row.workspaceID,
+                          canonical.capabilities == row.capabilities,
+                          canonical.expiresAt?.timeIntervalSince1970 == row.expiresAt?.timeIntervalSince1970 else { throw OverseerContinuityError.invalidRecord }
+                    grants.append(grant)
+                } catch { invalidIDs.append(row.id) }
+            }
+            lock.withLock { cachedGrants = grants
+                failure = nil
+                recoveryWarning = invalidIDs.isEmpty ? nil : "Invalid scope entries remain preserved and inactive for recovery: \(invalidIDs.joined(separator: ", ")). Other valid committed grants restore normally."
+            }
+            return .ready(source: rows.isEmpty ? .missing : .loaded, grants: grants, revokedScopeIDs: revoked)
         } catch {
-            return .writeFailed
+            lock.withLock { failure = "Continuity open failed: \(error). New user-approved authority still works in this process. Retry saving; no saved data was replaced." }
+            if case let OverseerContinuityError.incompatibleSchema(version) = error {
+                return .blocked(.unsupportedFutureSchema(onDiskVersion: version, supportedVersion: 1))
+            }
+            return .blocked(.unreadable)
         }
-        grants = ordered
-        revokedScopeIDs = tombstones
-        return .applied
+    }
+
+    func record(operationID: UUID, grants: [DomainDelegationScopeGrant], revoked: [UUID], deletedSessions: [UUID] = []) -> DelegationScopeWriteOutcome {
+        guard mode.performsProductionFileIO, !lock.withLock({ closed }) else { return .blocked }
+        do {
+            try beforeCommit()
+            let mutations = try deletedSessions.map { OverseerContinuityMutation.deletedSession($0.uuidString) }
+                + revoked.map { OverseerContinuityMutation.revokeScope($0.uuidString) }
+                + grants.filter { !revoked.contains($0.id) }.map { try .grant(OverseerContinuityRepository.scopeRow($0)) }
+            guard !mutations.isEmpty else { return .unchanged }
+            let receipt = try repository.commit(operationID: operationID, mutations: mutations, origin: "live-scope-owner")
+            lock.withLock { self.receipt = receipt
+                failure = nil
+            }
+            return .applied
+        } catch {
+            let rejected = (error as? OverseerContinuityError)?.isPermanentTransitionFailure == true
+            lock.withLock { failure = "Continuity save failed: \(error). The live user decision still applies; this change is not durably saved. " + (rejected ? "These exact bytes cannot be retried; inspect the conflicting saved identity and make a fresh user decision." : "Saving will retry.") }
+            return rejected ? .rejected : .writeFailed
+        }
+    }
+
+    /// Compatibility entry point for callers/tests. This is additive, not a snapshot replacement:
+    /// only explicit terminal IDs revoke; omitted rows belong to other owners and remain untouched.
+    func replace(with grants: [DomainDelegationScopeGrant], revokedScopeIDs: [UUID] = []) -> DelegationScopeWriteOutcome {
+        record(operationID: UUID(), grants: grants, revoked: revokedScopeIDs)
     }
 
     var currentGrants: [DomainDelegationScopeGrant] {
-        grants
+        if case let .ready(_, grants, _) = loadForLaunch() { return grants }
+        return lock.withLock { cachedGrants }
     }
+
+    #if DEBUG
+        func closeWithoutSealingForTesting() {
+            lock.withLock { closed = true }
+        }
+    #endif
 }

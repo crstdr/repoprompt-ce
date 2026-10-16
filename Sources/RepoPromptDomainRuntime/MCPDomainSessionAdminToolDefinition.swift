@@ -45,23 +45,23 @@ package enum MCPDomainSessionAdminToolDefinition {
         description: """
         Administer Agent sessions inside a delegation scope the user granted to this session. Agent sessions only.
 
-        A scope is user-approved authority over a set of sessions: `tree` (this session's owned subtree), `workspace`, or `all_sessions`. Capabilities: observe, organize, control, restructure, spawn, worktree; `destructive` is a reserved flag no op requires. `all_sessions` may hold only observe, organize, and restructure. Membership comes from RepoPrompt's own provenance, never from arguments; naming a session grants nothing.
+        A scope is user-approved authority over a set of sessions: `session` (the grantee and one exact `session_id`, never descendants), `tree` (this session's owned subtree), `workspace`, or `all_sessions`. Capabilities: observe, organize, control, restructure, spawn, worktree; `destructive` is a reserved flag no op requires. `all_sessions` may hold only observe, organize, and restructure. Membership comes from RepoPrompt's own provenance, never from arguments; naming a session grants nothing.
 
         For cleanup/organizing, request `observe` together with mutation capabilities, then use `inventory` to select targets. A `workspace` scope covers only that workspace; cross-workspace `history` results are not scope membership.
 
         **Scope ops**
         - `request_scope`: ask the user for a scope. Returns `pending_user_approval` and a `request_id`; nothing is granted until the user approves the card.
-        - `scope_status`: your live scopes, or one `scope_id`/`request_id` (pending, granted, denied, revoked, expired).
-        - `release_scope`: give up one of your scopes; revokes its nested scopes too.
+        - `scope_status`: call first, without selectors, for an operation catalog (tools, ops, required capabilities) alongside your current grants. Or inspect one `scope_id`/`request_id` (pending, granted, denied, revoked, expired). For a one-target request, `become_overseer` with `session_id` and optional `message` requests one exact-target approval and automatically prepares, links and dispatches; it does not require a filler user turn or a mid-turn catalog refresh.
+        - `release_scope`: give up one of your scopes with `scope_id` (revokes its nested scopes too), or cancel your own pending request with `request_id`. Selectors are exclusive. A granted request requires releasing its actual scope; canceling a request grants no authority.
         - `confirmation_status`: read one of your batch cards by `confirmation_id`.
 
-        **Inventory** (observe; scope members only): `inventory` (filter, limit; history-backed and may be incomplete), `get` (session_id), `tree` (session_id? root), `links` (session_id?).
+        **Inventory** (observe; scope members only): `inventory` (filter, limit; history-backed and may be incomplete), `get` (session_id), `tree` (session_id? root), `links` (session_id?). `total_complete` describes the selected records/filter; `history_complete` describes the selected history coverage. Global endpoint/link/orphan coverage is separate. An incomplete zero never proves an empty workspace. Organization fields are omitted when `organization_complete` is false and unknown fields never match pin/group/archive filters.
         **Organize** (organize): `rename` (name), `set_pin` (pinned), `reorder_pins` (order + expected_order CAS), `set_group` (group; empty string ungroups), `reorder_groups` (workspace, order + expected_order CAS), `archive`, `unarchive`. Reversible calls return an `undo_token` for `undo`. Only sessions in a workspace an open window shows can be changed; others report `workspace_not_loaded`.
         **Release** (restructure): `release` unlinks links among scope members and clears their Auto-wake; `retire` also stops (control) and archives.
         Target ops take `session_id`, `targets`, or `filter`; `preview: true` lists exact items and effects.
 
         **Structure ops** (members only; membership never grows by moving sessions)
-        - `link`: oversight link from you to each member target (`observer_must_be_caller` for any other observer). New links need observe + control; existing links are never upgraded. `unlink`: from `observer_session_id` (default you), both in scope.
+        - `link`: oversight link from you to each member target (`observer_must_be_caller` for any other observer). `link` needs restructure; new links additionally need observe + control. Existing links are never upgraded. Omit scope_id when exactly one active scope holds the needed capabilities. `unlink`: from `observer_session_id` (default you), both in scope.
         - `reparent`: move targets under member `parent_session_id`. `adopt`: bring outside sessions and their subtrees under a member (user card; user-granted scopes only; never another scope's overseer). Refused with `placement_affects_other_scopes` if another scope's membership would change, `placement_unresolved` if a chain runs through an unloaded workspace.
         - `attenuate`: give member `session_id` a nested scope with `capabilities`/`guardrails` no wider than yours.
         - `set_model` (`model_id`), `set_effort` (`effort`): idle targets, needs control. `fork`: one target, needs spawn and `idempotency_key`; the fork joins your scope.
@@ -80,8 +80,8 @@ package enum MCPDomainSessionAdminToolDefinition {
                 ]),
                 "kind": .object([
                     "type": .string("string"),
-                    "enum": .array([.string("tree"), .string("workspace"), .string("all_sessions")]),
-                    "description": .string("[request_scope] Scope kind; default tree rooted at this session.")
+                    "enum": .array([.string("session"), .string("tree"), .string("workspace"), .string("all_sessions")]),
+                    "description": .string("[request_scope] Scope kind; session needs the exact session_id and defaults to observe + control + restructure. Default tree is rooted at this session.")
                 ]),
                 "workspace": .object([
                     "type": .string("string"),
@@ -114,8 +114,8 @@ package enum MCPDomainSessionAdminToolDefinition {
                     "description": .string("[request_scope, attenuate] Proposed guardrails; the user may tighten them.")
                 ]),
                 "reason": .stringSchema("[request_scope] Why you need the scope; shown on the approval card. Max 500 UTF-8 bytes."),
-                "scope_id": .stringSchema("[scope_status, release_scope, other ops except undo] Scope UUID; optional when you hold exactly one live scope."),
-                "request_id": .stringSchema("[scope_status] Request UUID returned by request_scope."),
+                "scope_id": .stringSchema("[scope_status, release_scope, other ops except undo] Scope UUID; optional when you hold exactly one live scope. release_scope accepts either scope_id or request_id, never both."),
+                "request_id": .stringSchema("[scope_status, release_scope] Your request UUID returned by request_scope. release_scope cancels only a pending request; use scope_id to release an already granted scope."),
                 "session_id": .stringSchema("[target ops] One target session UUID."),
                 "targets": .object([
                     "type": .string("array"),

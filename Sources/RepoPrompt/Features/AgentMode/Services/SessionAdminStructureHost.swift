@@ -23,6 +23,14 @@ enum SessionAdminLinkOutcome: Equatable {
     case failed(String)
 }
 
+/// A fork crossed its creation boundary but a later required step failed. Its identity must be
+/// returned and retained for idempotent retries; a delegated caller must never delete it as rollback.
+struct SessionAdminPartialForkError: Error {
+    let sessionID: UUID
+    let code: String
+    let detail: String
+}
+
 enum SessionAdminLifecycleOutcome: Equatable {
     case applied(changed: Bool, fields: [String: String])
     /// The target is not in a state that accepts the change (busy, closing, revoked).
@@ -50,6 +58,11 @@ protocol SessionAdminStructureHost: AnyObject {
         target: UUID,
         isStillAuthorized: @escaping @MainActor () -> Bool
     ) async -> SessionAdminLinkOutcome
+    /// Exact-target approvals retain their consent dependency across runtime and restoration.
+    func addLink(
+        observer: UUID, target: UUID, sourceScopeID: UUID?,
+        isStillAuthorized: @escaping @MainActor () -> Bool
+    ) async -> SessionAdminLinkOutcome
     /// Stops the active link through the bridge's ordinary Stop. `isStillAuthorized` is evaluated
     /// synchronously after the link lookup and right before the Stop.
     func stopLink(
@@ -69,7 +82,19 @@ protocol SessionAdminStructureHost: AnyObject {
     ) async -> SessionAdminLifecycleOutcome
     /// Forks `sessionID` into a new background tab without focusing it and without inheriting
     /// oversight links. Returns the new session's ID.
-    func fork(sessionID: UUID, upToItemID: UUID?) async throws -> UUID
+    func fork(
+        sessionID: UUID, upToItemID: UUID?, isStillAuthorized: @escaping @MainActor () -> Bool
+    ) async throws -> UUID
+}
+
+extension SessionAdminStructureHost {
+    func addLink(
+        observer: UUID, target: UUID, sourceScopeID: UUID?,
+        isStillAuthorized: @escaping @MainActor () -> Bool
+    ) async -> SessionAdminLinkOutcome {
+        guard sourceScopeID == nil else { return .failed("source_scope_unavailable: This host cannot retain exact-target consent; nothing was linked.") }
+        return await addLink(observer: observer, target: target, isStillAuthorized: isStillAuthorized)
+    }
 }
 
 struct SessionAdminWorktreeInfo: Equatable {

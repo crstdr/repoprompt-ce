@@ -208,7 +208,15 @@ scalarPreferences.modelRouter.customInstructions
 
 The base group is a schema-v9 feature fence. Its absence leaves the document's minimum schema unchanged; any presence requires v9 so older typed writers reject the document instead of silently dropping router consent. A nonnil primary provider, subagent provider, or custom guidance field requires v10. Clearing all three returns the content-derived minimum to v9. The group stores no API keys or backend secrets. Unknown nonblank backend, role, and provider raws are preserved during sibling edits and ignored by current runtime validation. An unknown backend is never replaced by the first registered backend.
 
-Missing values resolve disabled and do not materialize defaults. First enable explicitly writes the selected backend plus the current known role/provider policy; subsequently discovered roles/providers are not silently authorized. Scope provider fields are optional limits over the allowed-provider set. Custom guidance is trimmed on supported writes, removed when empty, and bounded to 1,000 characters and 4,096 UTF-8 bytes. `GlobalSettingsStore.modelRouterSettingsRevision` is process-local and changes only after an actual in-memory router mutation. Future/foreign blocking, compatible import, raw unknown-field preservation, and rollback rules remain those of the owning global settings document.
+Missing values resolve disabled. Production materializes Jev only for an absent Router service raw value before initial demand reconciliation; blank/unknown raw values are preserved and unavailable, not normalized into a different service. Provider scope fields are optional preferences: an available selected provider narrows that scope's candidates to it, while an unavailable selection falls back to the other connected providers. The legacy candidate-role and allowed-provider arrays remain for schema/rollback preservation but no longer authorize the provider-catalog frontier. Custom guidance is trimmed on supported writes, removed when empty, and bounded to 1,000 characters and 4,096 UTF-8 bytes. `GlobalSettingsStore.modelRouterSettingsRevision` is process-local and changes only after an actual in-memory Router mutation. Future/foreign blocking, compatible import, raw unknown-field preservation, and rollback rules remain those of the owning global settings document.
+
+## Independent Auto Effort service selection
+
+The existing `scalarPreferences.agentMode.autoEffortEnabled` flag remains a separate, default-off user intent. The optional `scalarPreferences.agentMode.autoEffortBackendRawValue` is an **independent exact decision-service selection**. An absent field resolves to Jev in memory for existing users without writing or raising the document schema. An explicit known, blank, or unknown raw value is preserved through unrelated edits; blank/unknown values resolve unavailable and never silently select Jev or the Router's service. Writing the explicit field requires schema v12, so an older v11 writer rejects the document rather than silently reinterpreting a non-Jev selection. For its service selection, Auto Effort persists only the raw value; its revision is process-local, held in memory, and advances only on actual enablement/selection/install changes. Removing a decision-service credential does not clear this flag or selection; the feature keeps manual effort until its selected service is usable.
+
+## Legacy routing-profile settings
+
+`scalarPreferences.modelRoutingProfiles.remoteUpdatesDisabled` and `lastCheckAt` are deprecated, inert optional fields retained for schema-v12 Codable and rollback compatibility. The content-derived schema fence still requires v12 whenever either value is present. Current code has no active manager reader/writer for them: it does not materialize, update, clear, or migrate them. Unrelated settings edits preserve both values and continue to write a schema-v12-compatible document, allowing an older v12-aware app to read them after rollback. These fields do not control any current profile behavior; bundled routing profiles are the only source. See [model routing](model-routing.md) and the [bundled profile publication boundary](routing-profile-publication.md).
 
 ## Agent Mode Handoff instructions
 
@@ -386,34 +394,63 @@ Those keys write the global backing fields. Workspace-specific Agent Models over
 
 ## Delegation scope intent
 
-Delegation scopes are not settings, but their durable intent lives beside the oversight-link file
-and follows the same preserve-first rules:
+Delegation scopes are not settings. `DelegationScopeRuntime` owns current user decisions;
+continuity storage records them but never authorizes or vetoes a live action. Scope grants/revokes,
+link intent, and delegation worktree ownership share a row-transaction repository:
 
 ```text
-~/Library/Application Support/RepoPrompt CE/delegationScopes.json
+Release: ~/Library/Application Support/RepoPrompt CE/Overseer/continuity.sqlite
+Debug:   ~/Library/Application Support/RepoPrompt CE Debug/Overseer/continuity.sqlite
 ```
 
-- Owner: `DelegationScopeStore` (`Features/AgentMode/Runtime/Delegation`), bootstrapped by
-  `WindowStatesManager` with the same `AgentSessionOversightPersistenceMode` as
-  `agentSessionOversightLinks.json`. Suppressed launches perform no file I/O.
-- Payload: a versioned document (`version`, `scopes`, optional `revoked_scope_ids`) holding only the
-  **active** grants: scope ID, grantee session, kind, capabilities, guardrails (including the
-  per-scope bulk confirmation threshold), origin (user or attenuated parent), and grant time.
-  Revoked and expired scopes are removed. `revoked_scope_ids` is a bounded (1,024, oldest dropped)
-  tombstone list: a tombstoned grant, or a child of one, is never reactivated even if a stale copy of
-  the file still lists it. Generations, leases, pending `request_scope` cards, and batch
-  confirmations are process-local and never written.
-- Writes are serialized write-through, retried once on failure, and surfaced in the "Active
-  delegations" list when they fail. `applicationWillTerminate` performs a bounded synchronous
-  flush so a revocation made just before quitting is durable.
-- Launch: the file is read once, and every grant is reactivated under a **fresh generation**.
-  Grants past their expiry, tombstoned grants, and attenuated grants whose parent is missing,
-  inactive, or no longer satisfies the attenuation invariants (tree rooted at the grantee,
-  capabilities a subset, guardrails no looser) are not reactivated, so a reload can never undo a
-  cascade or widen a child.
-- Recovery: a future `version` is preserved and blocks writes; malformed bytes are moved intact to
-  `Backups/delegationScopes.corrupt.<stamp>.<uuid>.json` and the store starts empty; oversized files
-  and row counts are preserved and block writes. Nothing is ever partially salvaged or evicted.
+- Owner: typed app adapters (`DelegationScopeStore`, `AgentSessionOversightIntentStore`, and
+  `WorktreeOwnershipStore`) over `RepoPromptPersistence.OverseerContinuityStore`. The locations
+  above are overseer-only, not an all-app path migration. `OverseerContinuityRepository.production()`
+  is the sole path seam for the database and legacy input; both use the same profile directory.
+  #1381 replaces that seam's directory composition with the shared app-profile policy, without
+  adding adapter-specific paths. Debug does not open the release legacy source or its lock.
+  Suppressed launches perform no file I/O.
+- Storage uses short SQLite `BEGIN IMMEDIATE` transactions, DELETE rollback journal,
+  `synchronous=EXTRA`, `fullfsync=ON`, and foreign keys. Effective settings are checked on open;
+  an Apple version string is not evidence of the upstream WAL-reset fix. No lifetime flock remains.
+  The three adapters serialize short database access in-process; lock acquisition and SQLite busy
+  waiting are bounded. Schema creation rechecks the version inside its transaction.
+- Each transition writes only its rows and an operation-ID/digest/revision receipt atomically.
+  Scope creation is immutable; explicit revocation cascades permanently to descendants. Deleted
+  anchors and terminal scope identities are retained without a pruning cap. Link/worktree updates
+  compare their acknowledged row revision, so a stale owner cannot replace another owner's row.
+  Omission never means deletion. Receipt replay is idempotent and cannot repeat an effect.
+- Live explicit user approval/revocation applies in its current process immediately. Grants save
+  separately with bounded backoff. A scope revoke/deletion attempts its own synchronous transaction
+  before returning, never behind an unrelated grant. Only a committed receipt acknowledges durable
+  revocation. If that entire write fails, the local deny remains and the affected IDs are reported
+  as **unsettled**; no record exists to carry that unsaved decision across process death. The next
+  launch can recover only the last committed state, including a grant whose revoke never saved.
+  This limitation is not a durable-revoke acknowledgement or a blanket invalidation of other grants.
+  Quit settlement has a two-second deadline and reports unacknowledged transactions honestly.
+  Impossible row transitions are retained as failed diagnostics, not retried forever at the queue
+  head; independent rows can still save. `continuity_save_state` and the UI distinguish **saved**,
+  **pending**, **failed**, and explicitly **not_persisted**, with the cause and retry guidance.
+  A pending or failed change is not promised to survive a kill or reach another process. Storage
+  failure neither manufactures approval nor denies an approved task. Caller/target routing, scope
+  membership, expiry, and revocation checks remain mandatory.
+- Launch restores compatible saved grants under fresh generations without clean-shutdown gating.
+  Retry uses the same store/runtime after an open failure; restoration cannot replace newer live
+  decisions or reactivate locally deleted anchors. Generations, leases, pending cards, batch
+  confirmations, and live-only authority remain process-local.
+- Legacy `delegationScopes.json` (v1/v2), `agentSessionOversightLinks.json`, and
+  `delegationWorktreeOwnership.json` are **read-only sources**. Exact stable bytes and individual
+  accepted/rejected rows are archived with provenance in the destination. Unknown schema, malformed
+  data and invalid terminal history remain recoverable, never quarantined, rewritten, silently
+  dropped, or used as approval. Destination rows/terminal identities win. Valid same-profile legacy
+  rows migrate idempotently; release factories preserve existing links and worktree ownership.
+  Same-profile debug links and ownership also migrate. Historically mixed sources, when explicitly
+  supplied for recovery, and unknown scope authority are preserved for explicit recovery instead
+  of being silently promoted. The scope recovery card displays root descriptions
+  and requires a new explicit user approval, issuing new identities rather than reviving old IDs
+  or lifting attenuated grants. Other valid database rows restore normally; malformed entries stay
+  preserved and inactive with a diagnostic. Legacy bytes are read without opening or probing the
+  release lock. An unavailable legacy source cannot veto a new approval.
 
 ### Organizational placement and delegated worktree ownership
 
@@ -432,19 +469,11 @@ and follows the same preserve-first rules:
   a bump would make every not-yet-reopened workspace's index unreadable to the cross-workspace
   `history` scan until rebuilt, changing external `history` output. A record missing the fields
   falls back to spawn provenance, and placement only exists after this build writes it.
-- **Worktree ownership.**
-
-  ```text
-  ~/Library/Application Support/RepoPrompt CE/delegationWorktreeOwnership.json
-  ```
-
-  Owner: `WorktreeOwnershipStore` (`Features/AgentMode/Runtime/Delegation`), bootstrapped by
-  `WindowStatesManager` with the oversight persistence mode (suppressed launches stay in memory).
-  A versioned document (`version`, `worktrees`) recording, per worktree created under a scope,
-  `created_by_session_id`, `delegation_scope_id`, `created_at`, and, after `worktree_release`,
-  `released_at` / `released_by_session_id` (the stale mark). It never authorizes and never removes a
-  worktree; removing or pruning worktrees stays human-only. A future `version` is preserved and
-  blocks writes; malformed bytes move to `Backups/delegationWorktreeOwnership.corrupt.<uuid>.json`.
+- **Worktree ownership.** `WorktreeOwnershipStore` records one transactional continuity row per
+  worktree, including creator/scope/time and release marks. Current provenance remains usable while
+  saving retries; tool results report `ownership_continuity_save_state` separately. It never
+  authorizes or removes a worktree. Release records are not arbitrarily pruned; an explicit rebind
+  is a new revision-checked transition, not a stale snapshot replacement.
 
 ## Sidebar groups on compose tabs
 

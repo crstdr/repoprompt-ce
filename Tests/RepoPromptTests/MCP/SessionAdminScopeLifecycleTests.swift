@@ -2,13 +2,161 @@ import Foundation
 import MCP
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptPersistence
 import RepoPromptVCS
 import XCTest
+
+/// Deterministic failure injection before a real SQLite transaction.
+private final class DelegationScopeFileWriteGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var failing = false
+    private var rejection: OverseerContinuityError?
+    func setRejection(_ error: OverseerContinuityError?) {
+        lock.withLock { rejection = error }
+    }
+
+    func setFailing(_ value: Bool) {
+        lock.withLock { failing = value }
+    }
+
+    func check() throws {
+        if let rejection = lock.withLock({ rejection }) { throw rejection }
+        if lock.withLock({ failing }) { throw CocoaError(.fileWriteOutOfSpace) }
+    }
+}
+
+private final class ScopeBlockedWriter: @unchecked Sendable {
+    let entered = XCTestExpectation(description: "writer reached the pre-commit barrier")
+    let release = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var armed = true
+    func check() {
+        let block = lock.withLock { let result = armed
+            armed = false
+            return result
+        }
+        if block { entered.fulfill()
+            release.wait()
+        }
+    }
+}
 
 /// App-side delegation scopes: durable store, runtime, the `session_admin` scope lifecycle over MCP,
 /// and the shared administration core's single authority check and batch cards.
 @MainActor
 final class SessionAdminScopeLifecycleTests: XCTestCase {
+    func testTargetedRequestReusesOnlyPendingAndContinuesFreshGrantedDeniedAndCancelledRequests() async throws {
+        for terminal in ["granted", "denied", "cancelled"] {
+            let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
+            let caller = UUID(), target = UUID()
+            @MainActor func request() throws -> DelegationScopeRequest {
+                try runtime.requestScope(
+                    requesterSessionID: caller, requesterTabID: nil, kind: .session(targetSessionID: target),
+                    capabilities: [.observe, .control, .restructure], guardrails: .init(),
+                    reason: "same task", idempotencyKey: "same-key", reusePendingOnly: true
+                ).get()
+            }
+            let original = try request()
+            XCTAssertEqual(try request().id, original.id, "Only a pending card is deduplicated")
+            var scopeID: UUID?
+            switch terminal {
+            case "granted": scopeID = try runtime.approve(requestID: original.id).get().id
+            case "denied": runtime.deny(requestID: original.id)
+            default: _ = runtime.withdrawRequest(id: original.id, requesterSessionID: caller)
+            }
+            let next = try request()
+            XCTAssertNotEqual(next.id, original.id, terminal)
+            XCTAssertEqual(next.state, .pending)
+            var continuedScopeID: UUID?
+            XCTAssertTrue(runtime.installOverseeContinuation(requestID: next.id) { continuedScopeID = $0.id })
+            let reusedConsent = runtime.continueOverseeWithExistingConsent(requestID: next.id)
+            XCTAssertEqual(reusedConsent, terminal == "granted")
+            if let scopeID {
+                try await AsyncTestWait.waitUntil("fresh task reuses real live consent") { continuedScopeID == scopeID }
+            } else { XCTAssertNil(continuedScopeID) }
+        }
+    }
+
+    func testIdenticalOverseeTaskReusesRunningAndRecentlyFinishedRequestAcrossClientKeys() async throws {
+        var date = Date()
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, now: { date }, notifyCatalogChanged: { _ in })
+        let caller = UUID(), target = UUID()
+        @MainActor func request(_ reason: String = "say hi") throws -> DelegationScopeRequest {
+            try runtime.requestScope(
+                requesterSessionID: caller, requesterTabID: nil, kind: .session(targetSessionID: target),
+                capabilities: [.observe, .control, .restructure], guardrails: .init(), reason: reason,
+                idempotencyKey: UUID().uuidString, reusePendingOnly: true
+            ).get()
+        }
+        var release: CheckedContinuation<Void, Never>?
+        defer { release?.resume() }
+        var starts = 0
+        var finished = false
+        let original = try request()
+        XCTAssertTrue(runtime.installOverseeContinuation(requestID: original.id) { _ in
+            starts += 1
+            await withCheckedContinuation { release = $0 }
+            finished = true
+        })
+        _ = try runtime.approve(requestID: original.id).get()
+        try await AsyncTestWait.waitUntil("first continuation running") { release != nil }
+        XCTAssertEqual(try request().id, original.id, "A new client key must not create another task")
+        XCTAssertTrue(runtime.continueOverseeWithExistingConsent(requestID: original.id))
+        XCTAssertNotEqual(try request("different task").id, original.id)
+        XCTAssertEqual(starts, 1)
+        release?.resume()
+        release = nil
+        try await AsyncTestWait.waitUntil("first continuation finished") { finished }
+        XCTAssertEqual(try request().id, original.id, "Absorb a retry just after completion too")
+        date = date.addingTimeInterval(31)
+        XCTAssertNotEqual(try request().id, original.id, "A later deliberate repeat remains possible")
+        XCTAssertEqual(starts, 1)
+        runtime.freezeForTermination()
+    }
+
+    func testRefusedLinkDoesNotAbsorbCorrectedRetryAsRecentlyDelivered() async throws {
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
+        let caller = UUID(), target = UUID()
+        @MainActor func request() throws -> DelegationScopeRequest {
+            try runtime.requestScope(
+                requesterSessionID: caller,
+                requesterTabID: nil,
+                kind: .session(targetSessionID: target),
+                capabilities: [.observe, .control, .restructure],
+                guardrails: .init(),
+                reason: "say hi",
+                idempotencyKey: UUID().uuidString,
+                reusePendingOnly: true
+            ).get()
+        }
+        let original = try request()
+        XCTAssertTrue(runtime.installOverseeContinuation(requestID: original.id) { _ in
+            runtime.notifyOverseeContinuation(
+                sessionID: caller,
+                tabID: UUID(),
+                requestID: original.id,
+                result: "oversee target=\(target.uuidString); link_refused: target_binding_changed"
+            )
+        })
+        _ = try runtime.approve(requestID: original.id).get()
+        try await AsyncTestWait.waitUntil("refused continuation settles") { runtime.test_activeOverseeContinuationCount == 0 }
+        XCTAssertNotEqual(try request().id, original.id)
+        runtime.freezeForTermination()
+    }
+
+    func testOverseeRefusalNoticesContainOnlyCodesAndCardReasonIsBounded() {
+        let privateDetail = "target_unloaded_unpreparable: SECRET /Users/private/project workspace title"
+        let outcome = AgentSessionAdministrationOutcome.completed(.object(["items": .array([.object([
+            "result": .string("not_applied"), "detail": .string(privateDetail)
+        ])])]))
+        XCTAssertEqual(AgentSessionLinkRuntimeBridge.overseeLinkRefusalCode(outcome), "target_unloaded_unpreparable")
+        XCTAssertEqual(AgentSessionLinkRuntimeBridge.overseeDeliveryRefusalCode(.workflowUnavailable(reference: privateDetail)), "workflow_unavailable")
+        XCTAssertEqual(DelegationScopeApprovalCard.displayReason("short"), "short")
+        let text = DelegationScopeApprovalCard.displayReason(String(repeating: "x", count: 32768))
+        XCTAssertLessThan(text.count, 1100)
+        XCTAssertTrue(text.hasSuffix("… (truncated)"))
+    }
+
     private var temporaryDirectory: URL!
 
     override func setUp() async throws {
@@ -23,11 +171,54 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
 
     // MARK: - Fixtures
 
-    private func makeStore(mode: AgentSessionOversightPersistenceMode = .enabled) -> DelegationScopeStore {
-        DelegationScopeStore(
-            fileURL: temporaryDirectory.appendingPathComponent(DelegationScopeStore.filename),
-            backupsDirectoryURL: temporaryDirectory.appendingPathComponent("Backups", isDirectory: true),
-            mode: mode
+    private func makeStore(
+        mode: AgentSessionOversightPersistenceMode = .enabled,
+        directory: URL? = nil,
+        beforeCommit: @escaping @Sendable () throws -> Void = {}
+    ) -> DelegationScopeStore {
+        let directory = directory ?? temporaryDirectory!
+        return DelegationScopeStore(
+            fileURL: directory.appendingPathComponent(DelegationScopeStore.filename),
+            backupsDirectoryURL: directory.appendingPathComponent("Backups", isDirectory: true),
+            mode: mode,
+            beforeCommit: beforeCommit
+        )
+    }
+
+    private var scopeFile: URL {
+        temporaryDirectory.appendingPathComponent(DelegationScopeStore.filename)
+    }
+
+    private func scopeDocument() throws -> DelegationScopeDocument {
+        if case let .ready(_, grants, revoked) = makeStore().loadForLaunch() {
+            return DelegationScopeDocument(scopes: grants, revokedScopeIDs: revoked.isEmpty ? nil : revoked)
+        }
+        return try JSONDecoder().decode(DelegationScopeDocument.self, from: Data(contentsOf: scopeFile))
+    }
+
+    private func grantScope(
+        _ runtime: DelegationScopeRuntime, to overseer: UUID
+    ) throws -> DomainDelegationScopeRecord {
+        let request = try runtime.requestScope(
+            requesterSessionID: overseer, requesterTabID: nil, kind: .tree(rootSessionID: overseer),
+            capabilities: [.observe, .organize], guardrails: .init(maxDepth: 2), reason: "tidy", idempotencyKey: nil
+        ).get()
+        return try runtime.approve(requestID: request.id).get()
+    }
+
+    private func authorizationRequest(_ record: DomainDelegationScopeRecord) -> DomainDelegationScopeAuthorizationRequest {
+        .init(
+            operation: .adminInventory,
+            caller: .agentSession(record.grant.granteeSessionID),
+            scopeID: record.id,
+            presentedGeneration: record.generation
+        )
+    }
+
+    private func lease(_ record: DomainDelegationScopeRecord) -> DomainDelegationScopeLease {
+        .init(
+            scopeID: record.id, generation: record.generation, capability: .observe,
+            granteeSessionID: record.grant.granteeSessionID, targetSessionID: record.grant.granteeSessionID
         )
     }
 
@@ -41,9 +232,9 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         var endpoint: DomainAgentSessionLinkEndpointIdentity?
         var enabled = true
 
-        init() {
+        init(runtime injectedRuntime: DelegationScopeRuntime? = nil) {
             let box = notificationBox
-            runtime = DelegationScopeRuntime(notifyCatalogChanged: { box.ids.append($0) })
+            runtime = injectedRuntime ?? DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { box.ids.append($0) })
             core = AgentSessionAdministrationCore(
                 scopes: runtime,
                 projector: SpawnProvenanceDelegationMembershipProjector(source: source)
@@ -130,58 +321,602 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         return try fixture.runtime.approve(requestID: request.id).get()
     }
 
-    // MARK: - Store
-
-    func testStoreRoundTripsActiveGrantsAndReloadsUnderAFreshRuntime() async throws {
-        let store = makeStore()
-        let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
-        await runtime.bootstrap(store: store)
-        let overseer = UUID()
-        let request = try runtime.requestScope(
-            requesterSessionID: overseer, requesterTabID: nil, kind: .tree(rootSessionID: overseer),
-            capabilities: [.observe, .organize], guardrails: .init(maxDepth: 2), reason: "tidy", idempotencyKey: nil
-        ).get()
-        let granted = try runtime.approve(requestID: request.id).get()
-        await runtime.flushPersistence()
-
-        let reloaded = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
-        await reloaded.bootstrap(store: makeStore())
-        let live = reloaded.liveScopes(grantedTo: overseer)
-        XCTAssertEqual(live.map(\.id), [granted.id])
-        XCTAssertEqual(live.first?.grant, granted.grant)
-
-        // Revocation removes the row durably.
-        reloaded.revoke(scopeID: granted.id)
-        await reloaded.flushPersistence()
-        let again = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
-        await again.bootstrap(store: makeStore())
-        XCTAssertFalse(again.hasLiveScope(grantedTo: overseer))
+    func testReadOnlyApprovalAllowlistFailsClosedForShellAndMutationOptions() {
+        let allowed = [
+            "git --no-pager -c core.fsmonitor= -c core.hooksPath=/dev/null status --short", "git --no-pager log --no-ext-diff --no-textconv --oneline -n5",
+            "git --no-pager -c core.fsmonitor= -c core.hooksPath=/dev/null diff --no-ext-diff --no-textconv --stat HEAD~1",
+            "gh run view 123 --log-failed", "grep -rn needle Sources"
+        ]
+        for command in allowed {
+            XCTAssertTrue(AgentSessionLinkReadOnlyApprovalPolicy.allows(command), command)
+        }
+        let denied = [
+            "git status; rm -rf .", "git status && echo unsafe", "git diff > output", "grep $(touch x) Sources",
+            "grep `touch x` Sources", "grep needle ~/.ssh/config", "grep needle Sources\ntouch x", "bash -c git status", "env git status",
+            "git --no-pager status --short", "git --no-pager diff --no-ext-diff --no-textconv",
+            "git --no-pager -c core.fsmonitor= -c core.hooksPath=/dev/null -c alias.diff=unsafe diff",
+            "git -c alias.log=unsafe log", "git --no-pager diff --output=out", "git --no-pager log --ext-diff",
+            "git --no-pager reset --hard", "gh run view 123 --web", "gh run cancel 123",
+            "./conductor job list", "conductor job status abc", "./conductor job wait --request-key validation --full-log",
+            "conductor job list", "./conductor job cancel abc", "./conductor app relaunch", "grep 'quoted pattern' Sources"
+        ]
+        for command in denied {
+            XCTAssertFalse(AgentSessionLinkReadOnlyApprovalPolicy.allows(command), command)
+        }
+        let refusal = AgentSessionLaneMCPToolService.render(.refused(.destinationUnavailable)).objectValue
+        XCTAssertEqual(refusal?["result"], .string("destination_unavailable"))
+        XCTAssertEqual(refusal?["subreason"], .string("destination_changed"))
+        XCTAssertEqual(refusal?["next_call"]?.objectValue?["tool"], .string("manage_workspaces"))
     }
 
-    func testStorePreservesFutureSchemaQuarantinesMalformedAndSuppressesIO() async throws {
-        let fileURL = temporaryDirectory.appendingPathComponent(DelegationScopeStore.filename)
-        try Data(#"{"version": 99, "scopes": []}"#.utf8).write(to: fileURL)
-        let future = makeStore()
-        let futureLoad = await future.loadForLaunch()
-        XCTAssertEqual(futureLoad, .blocked(.unsupportedFutureSchema(onDiskVersion: 99, supportedVersion: 1)))
-        let futureWrite = await future.replace(with: [])
-        XCTAssertEqual(futureWrite, .blocked)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: fileURL.path))
+    func testGrantAllIsExplicitRevocableAndNotAvailableThroughMCPArguments() async throws {
+        let fixture = Fixture()
+        let overseer = UUID()
+        fixture.endpoint = fixture.makeEndpoint(session: overseer)
+        var decisions: [(UUID, String)] = []
+        fixture.runtime.test_scopeDecision = { decisions.append(($0, $1)) }
+        let request = try fixture.runtime.requestScope(
+            requesterSessionID: overseer, requesterTabID: nil, kind: .tree(rootSessionID: overseer),
+            capabilities: [.observe], guardrails: .init(maxLiveSessions: 4), expiresInSeconds: 60,
+            reason: nil, idempotencyKey: nil
+        ).get()
+        XCTAssertTrue(decisions.isEmpty)
+        XCTAssertThrowsError(try fixture.runtime.approve(requestID: request.id, capabilities: [.spawn]).get())
+        let scope = try fixture.runtime.approve(requestID: request.id, grantAllForSession: true).get()
+        XCTAssertEqual(scope.grant.capabilities, DomainDelegationScopeCapability.fullPreset)
+        XCTAssertNil(scope.grant.guardrails.expiresAt)
+        XCTAssertEqual(scope.grant.guardrails.maxLiveSessions, 4)
+        XCTAssertEqual(decisions.count, 1)
+        XCTAssertEqual(decisions.first?.0, overseer)
+        XCTAssertTrue(decisions.first?.1.contains("granted") == true)
+        fixture.runtime.revoke(scopeID: scope.id)
+        XCTAssertFalse(fixture.runtime.hasLiveScope(grantedTo: overseer))
+        XCTAssertEqual(decisions.count, 2)
+        XCTAssertTrue(decisions.last?.1.contains("revoked") == true)
+        do {
+            _ = try await fixture.call(["op": .string("request_scope"), "grant_all": .bool(true)])
+            XCTFail("Grant all is a user action, never an agent argument")
+        } catch {}
+        let denied = try fixture.runtime.requestScope(
+            requesterSessionID: overseer, requesterTabID: nil, kind: .allSessions,
+            capabilities: [.observe], guardrails: .init(), reason: nil, idempotencyKey: nil
+        ).get()
+        fixture.runtime.deny(requestID: denied.id)
+        XCTAssertEqual(decisions.count, 3)
+        XCTAssertTrue(decisions.last?.1.contains("denied") == true)
+        let global = try fixture.runtime.requestScope(
+            requesterSessionID: overseer, requesterTabID: nil, kind: .allSessions,
+            capabilities: [.observe], guardrails: .init(), reason: nil, idempotencyKey: nil
+        ).get()
+        XCTAssertEqual(try fixture.runtime.approve(requestID: global.id, grantAllForSession: true).get().grant.capabilities, DomainDelegationScopeCapability.allSessionsPermitted)
+    }
 
-        try Data("not json".utf8).write(to: fileURL)
-        let malformed = makeStore()
-        let malformedLoad = await malformed.loadForLaunch()
-        XCTAssertEqual(malformedLoad, .ready(source: .quarantined, grants: [], revokedScopeIDs: []))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path))
-        let backups = try FileManager.default.contentsOfDirectory(atPath: temporaryDirectory.appendingPathComponent("Backups").path)
-        XCTAssertEqual(backups.count, 1)
+    func testGrantAllForSessionAndGlobalSettingApproveLaterRequestsWithoutAnotherCard() async throws {
+        let fixture = Fixture()
+        let overseer = UUID()
+        fixture.endpoint = fixture.makeEndpoint(session: overseer)
+        var globalEnabled = false
+        fixture.runtime.isGlobalAutoApproveEnabled = { globalEnabled }
+        func requestID(_ value: [String: Value]) throws -> UUID {
+            try XCTUnwrap(value["request_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+        }
 
-        let suppressed = makeStore(mode: .suppressed)
-        let suppressedLoad = await suppressed.loadForLaunch()
-        XCTAssertEqual(suppressedLoad, .suppressed)
-        let suppressedWrite = await suppressed.replace(with: [])
-        XCTAssertEqual(suppressedWrite, .blocked)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path))
+        // No standing consent: the request waits for a card.
+        let first = try await fixture.call(["op": .string("request_scope"), "capabilities": .array([.string("observe")])])
+        XCTAssertEqual(first["result"], .string("pending_user_approval"))
+        let firstScope = try fixture.runtime.approve(requestID: requestID(first), grantAllForSession: true).get()
+        XCTAssertEqual(fixture.runtime.sessionWideApprovals, [overseer])
+
+        // Grant all covers this session's later requests of any kind: granted at once, no card.
+        let second = try await fixture.call([
+            "op": .string("request_scope"), "kind": .string("all_sessions"), "capabilities": .array([.string("observe")])
+        ])
+        XCTAssertEqual(second["result"], .string("granted"))
+        XCTAssertEqual(try fixture.runtime.requests[requestID(second)]?.state.label, "granted")
+        XCTAssertEqual(fixture.runtime.allLiveScopes().count, 2)
+
+        // Another session gets no free pass from this session's Grant all.
+        let other = UUID()
+        fixture.endpoint = fixture.makeEndpoint(session: other)
+        let otherRequest = try await fixture.call(["op": .string("request_scope"), "capabilities": .array([.string("observe")])])
+        XCTAssertEqual(otherRequest["result"], .string("pending_user_approval"))
+        try fixture.runtime.deny(requestID: requestID(otherRequest))
+
+        // Revoking one of the session's grants withdraws its standing approval.
+        fixture.endpoint = fixture.makeEndpoint(session: overseer)
+        fixture.runtime.revoke(scopeID: firstScope.id)
+        XCTAssertTrue(fixture.runtime.sessionWideApprovals.isEmpty)
+        let third = try await fixture.call(["op": .string("request_scope"), "capabilities": .array([.string("observe")])])
+        XCTAssertEqual(third["result"], .string("pending_user_approval"))
+        try fixture.runtime.deny(requestID: requestID(third))
+
+        // The global setting is global: any request is answered with one unrestricted grant that
+        // holds every capability over every session, however narrow the request was.
+        globalEnabled = true
+        fixture.endpoint = fixture.makeEndpoint(session: other)
+        let global = try await fixture.call(["op": .string("request_scope"), "capabilities": .array([.string("observe")])])
+        XCTAssertEqual(global["result"], .string("granted"))
+        let globalScope = try XCTUnwrap(fixture.runtime.allLiveScopes().first { $0.grant.granteeSessionID == other })
+        XCTAssertEqual(globalScope.grant.kind, .allSessions)
+        XCTAssertEqual(globalScope.grant.capabilities, DomainDelegationScopeCapability.fullPreset)
+        XCTAssertTrue(globalScope.grant.unrestricted)
+        XCTAssertFalse(fixture.runtime.sessionWideApprovals.contains(other), "the global setting is not Grant all")
+        fixture.runtime.reconcileGlobalAutoApprove()
+        XCTAssertTrue(fixture.runtime.hasLiveScope(grantedTo: other), "still on: the global grant stays")
+
+        // Turning the setting off withdraws every global grant at once.
+        globalEnabled = false
+        fixture.runtime.reconcileGlobalAutoApprove()
+        XCTAssertFalse(fixture.runtime.hasLiveScope(grantedTo: other), "off means off")
+        // Stopping a standing approval from Active delegations brings the card back.
+        fixture.endpoint = fixture.makeEndpoint(session: overseer)
+        let again = try await fixture.call(["op": .string("request_scope"), "capabilities": .array([.string("observe")])])
+        _ = try fixture.runtime.approve(requestID: requestID(again), grantAllForSession: true).get()
+        fixture.runtime.endSessionWideApproval(sessionID: overseer)
+        let afterStop = try await fixture.call(["op": .string("request_scope"), "capabilities": .array([.string("observe")])])
+        XCTAssertEqual(afterStop["result"], .string("pending_user_approval"))
+    }
+
+    func testRequestScopeAcceptsSessionKindWithItsSessionID() async throws {
+        let fixture = Fixture()
+        let overseer = UUID()
+        let target = UUID()
+        fixture.endpoint = fixture.makeEndpoint(session: overseer)
+        let value = try await fixture.call([
+            "op": .string("request_scope"), "kind": .string("session"), "session_id": .string(target.uuidString),
+            "capabilities": .array([.string("observe"), .string("control")])
+        ])
+        XCTAssertEqual(value["result"], .string("pending_user_approval"))
+        let id = try XCTUnwrap(value["request_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+        XCTAssertEqual(fixture.runtime.requests[id]?.kind, .session(targetSessionID: target))
+    }
+
+    func testDiscoveryCatalogDoesNotClaimLaneOrRunCreationNeedsSpawn() throws {
+        let rows = try XCTUnwrap(SessionAdminMCPToolService.operationCatalog().arrayValue).compactMap(\.objectValue)
+        func row(_ tool: String, _ op: String) throws -> [String: Value] {
+            try XCTUnwrap(rows.first { $0["tool"] == .string(tool) && $0["op"] == .string(op) }, "\(tool).\(op)")
+        }
+        for (tool, op) in [("agent_session_link", "create_lane"), ("agent_run", "start")] {
+            let entry = try row(tool, op)
+            // Creation is authorized by activation/a link (lanes) or routing (runs); a scope only adds
+            // limits. Listing spawn as required made agents refuse to try.
+            XCTAssertNil(entry["scope_capabilities"], "\(tool).\(op) requires no scope capability")
+            XCTAssertFalse(entry["guidance"]?.stringValue?.isEmpty ?? true)
+        }
+    }
+
+    func testGlobalAutoApproveAuthorizesEveryOperationWithoutRequestScopeOrCard() async throws {
+        let fixture = Fixture()
+        let overseer = UUID()
+        let unrelated = UUID()
+        let lane = UUID()
+        for id in [overseer, unrelated, lane] {
+            fixture.source.add(id, parent: nil)
+        }
+        var global = false
+        fixture.runtime.isGlobalAutoApproveEnabled = { global }
+        let handler = RecordingHandler([.adminRename, .adminRetire])
+        fixture.core.register(handler)
+        func perform(
+            _ operation: DomainAgentSessionTargetOperation, _ targets: [UUID], key: String? = nil
+        ) async throws -> AgentSessionAdministrationOutcome {
+            try await fixture.core.perform(.init(
+                operation: operation, caller: .agentSession(overseer), targetSessionIDs: targets, idempotencyKey: key
+            ))
+        }
+
+        guard case .denied(.unknownScope, _) = try await perform(.adminRename, [unrelated]) else {
+            return XCTFail("with the setting off and no grant, nothing is authorized")
+        }
+        XCTAssertTrue(fixture.runtime.allLiveScopes().isEmpty)
+
+        global = true
+        guard case .completed = try await perform(.adminRename, [unrelated]) else {
+            return XCTFail("global on: an unrelated session is managed without any request")
+        }
+        var many: [UUID] = []
+        for _ in 0 ..< 40 {
+            let id = UUID()
+            fixture.source.add(id, parent: nil)
+            many.append(id)
+        }
+        guard case .completed = try await perform(.adminRename, many, key: "bulk") else {
+            return XCTFail("global on: no bulk card")
+        }
+        guard case .completed = try await perform(.adminRetire, [lane], key: "retire") else {
+            return XCTFail("global on: no always-carded retire card")
+        }
+        XCTAssertEqual(handler.batches.count, 3)
+        XCTAssertTrue(fixture.runtime.confirmations.confirmations.isEmpty, "no card was ever raised")
+        let scopes = fixture.runtime.allLiveScopes()
+        XCTAssertEqual(scopes.count, 1, "one standing global grant is minted once and reused")
+        let scope = try XCTUnwrap(scopes.first)
+        XCTAssertEqual(scope.grant.granteeSessionID, overseer)
+        XCTAssertEqual(scope.grant.kind, .allSessions)
+        XCTAssertEqual(scope.grant.capabilities, DomainDelegationScopeCapability.fullPreset)
+        XCTAssertTrue(scope.grant.unrestricted)
+        XCTAssertNil(scope.grant.guardrails.expiresAt)
+
+        global = false
+        fixture.runtime.reconcileGlobalAutoApprove()
+        XCTAssertTrue(fixture.runtime.allLiveScopes().isEmpty, "turning the setting off revokes the global grant")
+        guard case .denied = try await perform(.adminRename, [unrelated]) else {
+            return XCTFail("off means off")
+        }
+    }
+
+    func testScopeStatusDiscoversOperationsAndCurrentGrantsBeforeFailure() async throws {
+        let fixture = Fixture()
+        let overseer = UUID()
+        fixture.endpoint = fixture.makeEndpoint(session: overseer)
+        let scope = try grantTree(fixture, grantee: overseer)
+        let value = try await fixture.call(["op": .string("scope_status")])
+        let catalog = try XCTUnwrap(value["operation_catalog"]?.arrayValue).compactMap(\.objectValue)
+        let link = try XCTUnwrap(catalog.first { $0["tool"] == .string("session_admin") && $0["op"] == .string("link") })
+        XCTAssertEqual(try Set(XCTUnwrap(link["scope_capabilities"]?.arrayValue).compactMap(\.stringValue)), ["observe", "control", "restructure"])
+        XCTAssertTrue(catalog.contains { $0["tool"] == .string("agent_session_link") && $0["op"] == .string("create_lane") })
+        XCTAssertTrue(catalog.contains { $0["tool"] == .string("agent_run") && $0["op"] == .string("start") })
+        let steer = try XCTUnwrap(catalog.first { $0["tool"] == .string("agent_run") && $0["op"] == .string("steer") })
+        XCTAssertEqual(steer["authority"], .string("direct_child_or_exact_manage_link"))
+        XCTAssertEqual(steer["managed_target_op"], .string("steer"))
+        XCTAssertNil(steer["scope_capabilities"], "A broad scope must not be advertised as raw child control authority")
+        XCTAssertEqual(value["scopes"]?.arrayValue?.first?.objectValue?["scope_id"], .string(scope.id.uuidString))
+    }
+
+    func testImplicitScopeSelectsUniqueCapableGrantAndRefusesAmbiguity() throws {
+        let fixture = Fixture()
+        let overseer = UUID(), target = UUID()
+        fixture.source.add(overseer, parent: nil)
+        fixture.source.add(target, parent: overseer)
+        let request = try fixture.runtime.requestScope(
+            requesterSessionID: overseer, requesterTabID: nil, kind: .tree(rootSessionID: overseer),
+            capabilities: [.observe], guardrails: .init(), reason: nil, idempotencyKey: nil
+        ).get()
+        _ = try fixture.runtime.approve(requestID: request.id).get()
+        let capable = try grantTree(fixture, grantee: overseer)
+        let link = AgentSessionAdministrationRequest(operation: .adminLink, caller: .agentSession(overseer), targetSessionIDs: [target])
+        guard case let .authorized(batch) = fixture.core.authorize(link) else { return XCTFail("Unique capable grant must be selected") }
+        XCTAssertEqual(batch.scope.id, capable.id)
+        _ = try grantTree(fixture, grantee: overseer)
+        guard case let .scopeSelectionRequired(ids) = fixture.core.authorize(link) else { return XCTFail("Multiple capable grants must require selection") }
+        XCTAssertEqual(ids.count, 2)
+    }
+
+    // MARK: - Transactional continuity, not a live permission gate
+
+    func testStoreRoundTripsCommittedGrantsWithoutAnyTerminationSeal() async throws {
+        let store = makeStore()
+        let runtime = DelegationScopeRuntime(persistenceMode: .requiresStore, notifyCatalogChanged: { _ in })
+        await runtime.bootstrap(store: store)
+        let kept = try grantScope(runtime, to: UUID())
+        let revoked = try grantScope(runtime, to: UUID())
+        XCTAssertTrue(runtime.authorize(authorizationRequest(kept)).isAuthorized, "Live approval does not wait for a disk commit")
+        await runtime.flushPersistence()
+        XCTAssertEqual(runtime.continuityState, "saved")
+        runtime.revoke(scopeID: revoked.id)
+        XCTAssertFalse(runtime.authorize(authorizationRequest(revoked)).isAuthorized)
+        await runtime.flushPersistence()
+        // No quit, freeze, seal, or JSON rewrite is necessary for committed continuity.
+        let restarted = DelegationScopeRuntime(persistenceMode: .requiresStore, notifyCatalogChanged: { _ in })
+        await restarted.bootstrap(store: makeStore())
+        XCTAssertEqual(restarted.liveScopes(grantedTo: kept.grant.granteeSessionID).map(\.id), [kept.id])
+        XCTAssertFalse(restarted.hasLiveScope(grantedTo: revoked.grant.granteeSessionID))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: scopeFile.path), "New writes must never recreate the legacy JSON")
+    }
+
+    func testFractionalExpiryRoundTripsWithoutDiscardingAValidGrant() throws {
+        let date = Date(timeIntervalSince1970: 2_000_000_000.123456)
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, now: { date }, notifyCatalogChanged: { _ in })
+        let requester = UUID()
+        let request = try runtime.requestScope(
+            requesterSessionID: requester,
+            requesterTabID: nil,
+            kind: .tree(rootSessionID: requester),
+            capabilities: [.observe],
+            guardrails: .init(),
+            expiresInSeconds: 60,
+            reason: nil,
+            idempotencyKey: nil
+        ).get()
+        let record = try runtime.approve(requestID: request.id).get()
+        let store = makeStore()
+        XCTAssertEqual(store.replace(with: [record.grant]), .applied)
+        guard case let .ready(_, grants, _) = store.loadForLaunch() else { return XCTFail("Fractional epoch conversion must not discard a valid grant") }
+        XCTAssertEqual(grants, [record.grant])
+    }
+
+    func testMixedSourceRecoveryRequiresUserActionPreservesExpiryAndDoesNotReapproveOnRestart() async throws {
+        let date = Date(timeIntervalSince1970: 2_000_000_000.123456), requester = UUID()
+        let prior = DelegationScopeRuntime(persistenceMode: .ephemeral, now: { date }, notifyCatalogChanged: { _ in })
+        let request = try prior.requestScope(
+            requesterSessionID: requester, requesterTabID: nil, kind: .tree(rootSessionID: requester),
+            capabilities: [.observe, .organize], guardrails: .init(maxLiveSessions: 3), expiresInSeconds: 60,
+            reason: nil, idempotencyKey: nil
+        ).get()
+        let original = try prior.approve(requestID: request.id).get().grant
+        let bytes = try JSONEncoder().encode(DelegationScopeDocument(scopes: [original]))
+        try bytes.write(to: scopeFile)
+        let makeRecoveryStore = { [self] in
+            DelegationScopeStore(fileURL: scopeFile, backupsDirectoryURL: temporaryDirectory, mode: .enabled, legacyPolicy: .userReview)
+        }
+        let runtime = DelegationScopeRuntime(persistenceMode: .requiresStore, now: { date }, notifyCatalogChanged: { _ in })
+        await runtime.bootstrap(store: makeRecoveryStore())
+        XCTAssertFalse(runtime.hasLiveScope(grantedTo: requester))
+        let offer = try XCTUnwrap(runtime.continuityRecoveryOffers.first)
+        runtime.approveContinuityRecovery(sourceID: offer.id) // Explicit user-facing recovery action.
+        let recovered = try XCTUnwrap(runtime.liveScopes(grantedTo: requester).first)
+        XCTAssertNotEqual(recovered.id, original.id)
+        XCTAssertEqual(recovered.grant.capabilities, original.capabilities)
+        XCTAssertEqual(recovered.grant.guardrails, original.guardrails, "Recovery cannot remove the displayed absolute expiry or limits")
+        await runtime.flushPersistence()
+        let restarted = DelegationScopeRuntime(persistenceMode: .requiresStore, now: { date }, notifyCatalogChanged: { _ in })
+        await restarted.bootstrap(store: makeRecoveryStore())
+        XCTAssertEqual(restarted.liveScopes(grantedTo: requester).map(\.id), [recovered.id])
+        XCTAssertTrue(restarted.continuityRecoveryOffers.isEmpty, "Already saved compatible authority needs no repeated approval")
+        XCTAssertEqual(try Data(contentsOf: scopeFile), bytes)
+    }
+
+    func testLegacyLockAndFailedOpenNeverVetoExplicitLiveApprovedTask() async throws {
+        let locations = OverseerContinuityRepository.production()
+        XCTAssertEqual(locations.databaseURL.deletingLastPathComponent().deletingLastPathComponent(), locations.legacyDirectory)
+        #if DEBUG
+            XCTAssertEqual(locations.legacyDirectory.lastPathComponent, "RepoPrompt CE Debug")
+        #else
+            XCTAssertEqual(locations.legacyDirectory.lastPathComponent, "RepoPrompt CE")
+        #endif
+        let legacyGrant = try grantScope(DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in }), to: UUID())
+        let original = try JSONEncoder().encode(DelegationScopeDocument(scopes: [legacyGrant.grant]))
+        try original.write(to: scopeFile)
+        let child = Process(), ready = Pipe(), release = Pipe()
+        child.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        child.arguments = ["-c", "import fcntl,sys; f=open(sys.argv[1],'a'); fcntl.flock(f,fcntl.LOCK_EX); print('locked',flush=True); sys.stdin.readline()", scopeFile.path + ".lock"]
+        child.standardOutput = ready
+        child.standardInput = release
+        try child.run()
+        defer { if child.isRunning { child.terminate()
+            child.waitUntilExit()
+        } }
+        XCTAssertEqual(String(data: ready.fileHandleForReading.availableData, encoding: .utf8), "locked\n")
+        for failOpen in [true, false] {
+            let directory = temporaryDirectory.appendingPathComponent("destination-\(failOpen)")
+            let obstruction = directory.appendingPathComponent("blocked")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            if failOpen { try Data("not a directory".utf8).write(to: obstruction) }
+            let store = DelegationScopeStore(
+                fileURL: scopeFile,
+                backupsDirectoryURL: directory,
+                mode: .enabled,
+                databaseURL: obstruction.appendingPathComponent("Overseer/continuity.sqlite"),
+                legacyPolicy: .userReview
+            )
+            let runtime = DelegationScopeRuntime(persistenceMode: .requiresStore, notifyCatalogChanged: { _ in })
+            await runtime.bootstrap(store: store)
+            XCTAssertTrue(runtime.canUseAuthority)
+            XCTAssertNil(runtime.authorityUnavailableReason)
+            XCTAssertFalse(runtime.hasLiveScope(grantedTo: legacyGrant.grant.granteeSessionID), "Unknown mixed saved grants cannot become permission")
+            let fixture = Fixture(runtime: runtime), caller = UUID(), target = UUID()
+            fixture.endpoint = fixture.makeEndpoint(session: caller)
+            fixture.source.add(caller, parent: nil)
+            fixture.source.add(target, parent: caller)
+            let handler = RecordingHandler([.adminRename])
+            fixture.core.register(handler)
+            do {
+                _ = try await fixture.call(["op": .string("rename"), "session_id": .string(target.uuidString), "name": .string("Unapproved")])
+                XCTFail("Storage failure cannot invent authority before the user approves")
+            } catch {}
+            XCTAssertTrue(handler.batches.isEmpty)
+            let requested = try await fixture.call(["op": .string("request_scope"), "capabilities": .array([.string("observe"), .string("organize")])])
+            XCTAssertEqual(requested["authority_available"], .bool(true))
+            let id = try XCTUnwrap(requested["request_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+            let grant = try runtime.approve(requestID: id).get() // Actual app-owned user approval, never a tool argument.
+            let result = try await fixture.call(["op": .string("rename"), "session_id": .string(target.uuidString), "name": .string("Assigned task")])
+            XCTAssertEqual(handler.batches.count, 1, "The approved action must actually reach its handler")
+            XCTAssertNotNil(result["result"])
+            await runtime.flushPersistence()
+            let status = try await fixture.call(["op": .string("scope_status")])
+            XCTAssertEqual(status["authority_available"], .bool(true))
+            XCTAssertEqual(status["continuity_save_state"], .string(failOpen ? "failed" : "saved"))
+            if failOpen {
+                XCTAssertNotNil(status["continuity_detail"])
+                XCTAssertTrue(runtime.isCurrent(lease(grant)))
+                try FileManager.default.removeItem(at: obstruction)
+                await runtime.retryContinuityNow()
+                XCTAssertEqual(runtime.continuityState, "saved", "The same failed runtime must recover without relaunch")
+            }
+            XCTAssertEqual(try Data(contentsOf: scopeFile), original, "A debug repair cannot modify the mixed/release source")
+            runtime.revoke(scopeID: grant.id)
+            await runtime.flushPersistence()
+            XCTAssertFalse(runtime.authorize(authorizationRequest(grant)).isAuthorized)
+        }
+        release.fileHandleForWriting.write(Data("done\n".utf8))
+        child.waitUntilExit()
+    }
+
+    func testFailedSaveKeepsLiveApprovalAndLocalRevokeAndRetriesSameOperation() async throws {
+        let gate = DelegationScopeFileWriteGate()
+        let store = makeStore(beforeCommit: { try gate.check() })
+        let runtime = DelegationScopeRuntime(persistenceMode: .requiresStore, notifyCatalogChanged: { _ in })
+        await runtime.bootstrap(store: store)
+        gate.setFailing(true)
+        let grant = try grantScope(runtime, to: UUID())
+        await runtime.flushPersistence()
+        XCTAssertEqual(runtime.continuityState, "failed")
+        XCTAssertTrue(runtime.authorize(authorizationRequest(grant)).isAuthorized)
+        XCTAssertNil(runtime.lastContinuityOperationID, "A failed write cannot produce a committed receipt")
+        runtime.revoke(scopeID: grant.id)
+        XCTAssertFalse(runtime.authorize(authorizationRequest(grant)).isAuthorized)
+        await runtime.flushPersistence()
+        gate.setFailing(false)
+        await runtime.retryContinuityNow()
+        XCTAssertEqual(runtime.continuityState, "saved")
+        XCTAssertNotNil(runtime.lastContinuityOperationID)
+        let restored = DelegationScopeRuntime(persistenceMode: .requiresStore, notifyCatalogChanged: { _ in })
+        await restored.bootstrap(store: makeStore())
+        XCTAssertFalse(restored.hasLiveScope(grantedTo: grant.grant.granteeSessionID))
+    }
+
+    func testSavedGrantFailedRevokeReportsUnsettledWithoutClaimingCrashDurability() async throws {
+        let gate = DelegationScopeFileWriteGate()
+        let runtime = DelegationScopeRuntime(persistenceMode: .requiresStore, notifyCatalogChanged: { _ in })
+        await runtime.bootstrap(store: makeStore(beforeCommit: { try gate.check() }))
+        let revoked = try grantScope(runtime, to: UUID()), unrelated = try grantScope(runtime, to: UUID())
+        await runtime.flushPersistence()
+        let committedGrantReceipt = runtime.lastContinuityOperationID
+        gate.setFailing(true)
+        runtime.revoke(scopeID: revoked.id)
+        XCTAssertFalse(runtime.authorize(authorizationRequest(revoked)).isAuthorized)
+        XCTAssertEqual(runtime.unsettledScopeIDs, [revoked.id])
+        XCTAssertTrue(runtime.persistenceStatusMessage?.contains("unsettled") == true)
+        XCTAssertEqual(runtime.lastContinuityOperationID, committedGrantReceipt, "Failed revoke cannot masquerade as a committed receipt")
+        await runtime.flushPersistence()
+        runtime.freezeForTermination() // Crash boundary: no retry can now commit the failed write.
+        let settled = await runtime.settleForTermination(timeout: 0.05)
+        XCTAssertFalse(settled)
+        let restarted = DelegationScopeRuntime(persistenceMode: .requiresStore, notifyCatalogChanged: { _ in })
+        await restarted.bootstrap(store: makeStore())
+        XCTAssertTrue(restarted.hasLiveScope(grantedTo: unrelated.grant.granteeSessionID), "Never wipe unrelated valid continuity")
+        // No record exists for a wholly failed transaction. The receipt explicitly reports that
+        // recovery can only restore the last committed grant; it must never claim a durable revoke.
+        XCTAssertTrue(restarted.hasLiveScope(grantedTo: revoked.grant.granteeSessionID))
+        gate.setFailing(false)
+    }
+
+    func testRevokeCommitsBeforeReturnAndSurvivesStaleLegacyImportAndRestart() async throws {
+        let runtime = DelegationScopeRuntime(persistenceMode: .requiresStore, notifyCatalogChanged: { _ in })
+        await runtime.bootstrap(store: makeStore())
+        let grant = try grantScope(runtime, to: UUID()), kept = try grantScope(runtime, to: UUID())
+        await runtime.flushPersistence()
+        runtime.revoke(scopeID: grant.id)
+        XCTAssertEqual(runtime.continuityState, "saved", "A successful terminal transaction is acknowledged before revoke returns")
+        XCTAssertFalse(makeStore().currentGrants.contains { $0.id == grant.id })
+        try JSONEncoder().encode(DelegationScopeDocument(scopes: [grant.grant, kept.grant])).write(to: scopeFile)
+        let restart = DelegationScopeRuntime(persistenceMode: .requiresStore, notifyCatalogChanged: { _ in })
+        await restart.bootstrap(store: makeStore())
+        XCTAssertFalse(restart.hasLiveScope(grantedTo: grant.grant.granteeSessionID))
+        XCTAssertEqual(restart.liveScopes(grantedTo: kept.grant.granteeSessionID).map(\.id), [kept.id])
+    }
+
+    func testPermanentGrantRejectionDoesNotStrandALaterRevokeOrIndependentGrant() async throws {
+        let gate = DelegationScopeFileWriteGate()
+        let runtime = DelegationScopeRuntime(persistenceMode: .requiresStore, notifyCatalogChanged: { _ in })
+        await runtime.bootstrap(store: makeStore(beforeCommit: { try gate.check() }))
+        let saved = try grantScope(runtime, to: UUID())
+        await runtime.flushPersistence()
+        gate.setRejection(.terminalIdentity)
+        _ = try grantScope(runtime, to: UUID())
+        await runtime.flushPersistence()
+        XCTAssertTrue(runtime.persistenceStatusMessage?.contains("rejected") == true)
+        gate.setRejection(nil)
+        runtime.revoke(scopeID: saved.id)
+        let later = try grantScope(runtime, to: UUID())
+        await runtime.flushPersistence()
+        XCTAssertEqual(runtime.continuityState, "failed", "The rejected operation remains honestly failed even after unrelated success")
+        XCTAssertFalse(makeStore().currentGrants.contains { $0.id == saved.id })
+        XCTAssertTrue(makeStore().currentGrants.contains { $0.id == later.id })
+    }
+
+    func testBlockedWriterQuitDeadlineAndLateDeletionsDuringAndAfterSettlement() async throws {
+        let block = ScopeBlockedWriter()
+        let runtime = DelegationScopeRuntime(persistenceMode: .requiresStore, notifyCatalogChanged: { _ in })
+        await runtime.bootstrap(store: makeStore(beforeCommit: { block.check() }))
+        let first = try grantScope(runtime, to: UUID())
+        await fulfillment(of: [block.entered], timeout: 3)
+        defer { block.release.signal() }
+        runtime.freezeForTermination()
+        let enteredSettlement = expectation(description: "termination settlement started")
+        let start = ContinuousClock.now
+        let settling = Task { @MainActor in
+            enteredSettlement.fulfill()
+            return await runtime.settleForTermination(timeout: 0.25)
+        }
+        await fulfillment(of: [enteredSettlement], timeout: 3)
+        runtime.revokeAll(involving: first.grant.granteeSessionID)
+        let settled = await settling.value
+        XCTAssertFalse(settled)
+        XCTAssertLessThan(start.duration(to: .now), .seconds(1), "Do not structurally join a blocked writer past the deadline")
+        let after = UUID()
+        runtime.revokeAll(involving: after)
+        block.release.signal()
+        await runtime.flushPersistence()
+        let rows = try makeStore().repository.database.rows(kind: .scope)
+        XCTAssertEqual(rows.first { $0.id == first.id.uuidString }?.terminal, true)
+        let later = try grantScope(DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in }), to: after)
+        XCTAssertEqual(makeStore().replace(with: [later.grant]), .rejected, "A deletion after settlement still permanently fences its session")
+    }
+
+    func testMalformedScopeEntryDoesNotDiscardUnrelatedCommittedGrant() async throws {
+        let store = makeStore()
+        let runtime = DelegationScopeRuntime(persistenceMode: .requiresStore, notifyCatalogChanged: { _ in })
+        await runtime.bootstrap(store: store)
+        let valid = try grantScope(runtime, to: UUID())
+        await runtime.flushPersistence()
+        let badID = UUID().uuidString, bytes = Data("malformed grant payload".utf8)
+        _ = try store.repository.database.commit(operationID: UUID(), origin: "corrupt-fixture", mutations: [.grant(.init(kind: .scope, id: badID, payload: bytes))])
+        let restarted = DelegationScopeRuntime(persistenceMode: .requiresStore, notifyCatalogChanged: { _ in })
+        let restartStore = makeStore()
+        await restarted.bootstrap(store: restartStore)
+        XCTAssertEqual(restarted.liveScopes(grantedTo: valid.grant.granteeSessionID).map(\.id), [valid.id])
+        XCTAssertEqual(try restartStore.repository.database.rows(kind: .scope).first { $0.id == badID }?.payload, bytes)
+        XCTAssertTrue(restarted.persistenceStatusMessage?.contains("preserved and inactive") == true)
+    }
+
+    func testMalformedLegacyTerminalHistoryPreservesBytesWithoutSilentlyRestoringGrant() throws {
+        let grant = try grantScope(DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in }), to: UUID())
+        var document = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(DelegationScopeDocument(scopes: [grant.grant]))) as? [String: Any])
+        document["revoked_scope_ids"] = ["not-a-valid-uuid"]
+        let bytes = try JSONSerialization.data(withJSONObject: document, options: [.sortedKeys])
+        try bytes.write(to: scopeFile)
+        let store = makeStore()
+        XCTAssertTrue(store.currentGrants.isEmpty, "Unparseable terminal history cannot silently grant authority")
+        XCTAssertEqual(try Data(contentsOf: scopeFile), bytes)
+        XCTAssertEqual(try store.repository.database.legacySources().first?.bytes, bytes)
+        XCTAssertTrue(store.diagnostic?.contains("malformed terminal history") == true)
+    }
+
+    func testLegacySourcesArePreservedIncludingUnknownRowsAndUncleanV1() throws {
+        let grant = try grantScope(DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in }), to: UUID())
+        for (index, bytes) in try [JSONEncoder().encode(DelegationScopeDocument(version: 1, scopes: [grant.grant], cleanShutdown: false)), Data("not JSON".utf8), Data(#"{"version":99,"scopes":[]}"#.utf8)].enumerated() {
+            let directory = temporaryDirectory.appendingPathComponent("source-\(index)")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let file = directory.appendingPathComponent(DelegationScopeStore.filename)
+            try bytes.write(to: file)
+            let store = makeStore(directory: directory)
+            guard case let .ready(_, grants, _) = store.loadForLaunch() else { return XCTFail("Legacy recovery must not poison the destination") }
+            XCTAssertEqual(grants.map(\.id), index == 0 ? [grant.id] : [])
+            XCTAssertEqual(try Data(contentsOf: file), bytes)
+            XCTAssertEqual(try store.repository.database.legacySources().first?.bytes, bytes)
+        }
+    }
+
+    func testStaleSnapshotsCannotEraseOtherRowsOrResurrectTerminalIDs() throws {
+        let first = makeStore(), second = makeStore()
+        _ = first.loadForLaunch()
+        _ = second.loadForLaunch()
+        let one = try grantScope(DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in }), to: UUID())
+        let two = try grantScope(DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in }), to: UUID())
+        XCTAssertEqual(first.replace(with: [one.grant]), .applied)
+        XCTAssertEqual(second.replace(with: [two.grant]), .applied)
+        XCTAssertEqual(Set(first.currentGrants.map(\.id)), [one.id, two.id])
+        XCTAssertEqual(first.replace(with: [], revokedScopeIDs: [one.id]), .applied)
+        XCTAssertEqual(second.replace(with: [one.grant]), .rejected)
+        XCTAssertEqual(first.currentGrants.map(\.id), [two.id])
+    }
+
+    func testSuppressionPerformsNoFileIOButExplicitAuthorityStillWorks() async throws {
+        let untouched = temporaryDirectory.appendingPathComponent("suppressed-does-not-exist")
+        let runtime = DelegationScopeRuntime(persistenceMode: .requiresStore, notifyCatalogChanged: { _ in })
+        let store = DelegationScopeStore(
+            fileURL: untouched.appendingPathComponent(DelegationScopeStore.filename),
+            backupsDirectoryURL: untouched,
+            mode: .suppressed,
+            legacyPolicy: .userReview
+        )
+        await runtime.bootstrap(store: store)
+        let grant = try grantScope(runtime, to: UUID())
+        XCTAssertTrue(runtime.authorize(authorizationRequest(grant)).isAuthorized)
+        XCTAssertNil(runtime.durableDeletionUnavailableReason)
+        XCTAssertEqual(runtime.continuityState, "not_persisted")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: untouched.path))
     }
 
     // MARK: - undo strict keys
@@ -270,6 +1005,59 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         XCTAssertEqual(afterRelease["scope"]?.objectValue?["state"], .string("revoked"))
         let none = try await fixture.call(["op": .string("release_scope")])
         XCTAssertEqual(none["result"], .string("no_live_scope"))
+    }
+
+    func testRequesterCanWithdrawPendingScopeWithoutGrantingAuthority() async throws {
+        let fixture = Fixture()
+        let requester = UUID(), tab = UUID()
+        let endpoint = fixture.makeEndpoint(session: requester, tab: tab)
+        fixture.endpoint = endpoint
+        let requested = try await fixture.call([
+            "op": .string("request_scope"), "idempotency_key": .string("withdraw-pending")
+        ])
+        let requestID = try XCTUnwrap(requested["request_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+        let release: [String: Value] = ["op": .string("release_scope"), "request_id": .string(requestID.uuidString)]
+        fixture.endpoint = fixture.makeEndpoint(session: UUID())
+        do {
+            _ = try await fixture.call(release)
+            XCTFail("another requester cannot withdraw the pending card")
+        } catch {}
+        XCTAssertEqual(fixture.runtime.pendingRequests(forTab: tab, sessionID: requester).map(\.id), [requestID])
+        fixture.endpoint = endpoint
+        let cancelled = try await fixture.call(release)
+        XCTAssertEqual(cancelled["result"], .string("cancelled"))
+        XCTAssertTrue(fixture.runtime.pendingRequests(forTab: tab, sessionID: requester).isEmpty)
+        XCTAssertFalse(fixture.runtime.hasLiveScope(grantedTo: requester))
+        XCTAssertThrowsError(try fixture.runtime.approve(requestID: requestID).get(), "a stale approval card cannot mint authority")
+        let repeated = try await fixture.call(release)
+        XCTAssertEqual(repeated["result"], .string("already_cancelled"))
+        let status = try await fixture.call(["op": .string("scope_status"), "request_id": .string(requestID.uuidString)])
+        XCTAssertEqual(status["result"], .string("cancelled"))
+        let retriedRequest = try await fixture.call([
+            "op": .string("request_scope"), "idempotency_key": .string("withdraw-pending")
+        ])
+        XCTAssertEqual(retriedRequest["request_id"], requested["request_id"], "withdrawal keeps the idempotency receipt")
+        XCTAssertEqual(retriedRequest["result"], .string("cancelled"))
+    }
+
+    func testRequestWithdrawalDoesNotReleaseAnAlreadyGrantedScope() async throws {
+        let fixture = Fixture()
+        let requester = UUID()
+        fixture.endpoint = fixture.makeEndpoint(session: requester)
+        let requested = try await fixture.call(["op": .string("request_scope")])
+        let requestID = try XCTUnwrap(requested["request_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+        let granted = try fixture.runtime.approve(requestID: requestID).get()
+        let result = try await fixture.call(["op": .string("release_scope"), "request_id": .string(requestID.uuidString)])
+        XCTAssertEqual(result["result"], .string("request_not_pending"))
+        XCTAssertTrue(fixture.runtime.hasLiveScope(grantedTo: requester))
+        do {
+            _ = try await fixture.call([
+                "op": .string("release_scope"), "request_id": .string(requestID.uuidString),
+                "scope_id": .string(granted.id.uuidString)
+            ])
+            XCTFail("request and grant selectors must not be ambiguous")
+        } catch {}
+        XCTAssertTrue(fixture.runtime.hasLiveScope(grantedTo: requester))
     }
 
     func testRequestScopeIdempotencyReplaysAndConflicts() async throws {
@@ -659,7 +1447,7 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
     func testGrantRevokeReleaseAndExpiryRepublishTheGranteeCatalog() throws {
         var clock = Date(timeIntervalSince1970: 2_000_000)
         let box = NotificationBox()
-        let runtime = DelegationScopeRuntime(now: { clock }, notifyCatalogChanged: { box.ids.append($0) })
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, now: { clock }, notifyCatalogChanged: { box.ids.append($0) })
         let overseer = UUID()
         func grant(seconds: Int? = nil) throws -> DomainDelegationScopeRecord {
             let request = try runtime.requestScope(
@@ -678,41 +1466,46 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         _ = try grant(seconds: 60)
         XCTAssertEqual(box.ids.count, 5)
         clock = clock.addingTimeInterval(61)
+        let revisionBeforeCatalogRead = runtime.revision
+        XCTAssertFalse(runtime.hasLiveScopeForCatalog(grantedTo: overseer))
+        XCTAssertEqual(runtime.revision, revisionBeforeCatalogRead, "Catalog reads must not publish or persist expiration")
+        XCTAssertEqual(box.ids.count, 5, "Memory-only discovery does not schedule catalog maintenance")
         XCTAssertFalse(runtime.hasLiveScope(grantedTo: overseer))
         XCTAssertEqual(box.ids.count, 6, "expiry relists")
     }
 
-    func testRevocationIsDurableThroughTombstonesAndTheTerminationFlush() async throws {
-        let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
-        await runtime.bootstrap(store: makeStore())
+    func testTerminationSealsRevocationAndCleanReloadStillHonorsTombstones() async throws {
+        let store = makeStore()
+        let runtime = DelegationScopeRuntime(persistenceMode: .requiresStore, notifyCatalogChanged: { _ in })
+        await runtime.bootstrap(store: store)
         let overseer = UUID()
-        let request = try runtime.requestScope(
-            requesterSessionID: overseer, requesterTabID: nil, kind: .tree(rootSessionID: overseer),
-            capabilities: [.observe], guardrails: .init(), reason: nil, idempotencyKey: nil
-        ).get()
-        let record = try runtime.approve(requestID: request.id).get()
+        let record = try grantScope(runtime, to: overseer)
         await runtime.flushPersistence()
         runtime.revoke(scopeID: record.id)
-        // No await: the synchronous termination flush alone must make the revocation durable.
-        runtime.flushForTermination()
-        let reloaded = makeStore()
-        guard case let .ready(_, grants, revoked) = await reloaded.loadForLaunch() else {
-            return XCTFail("store must load")
-        }
-        XCTAssertTrue(grants.isEmpty)
-        XCTAssertEqual(revoked, [record.id])
+        // The final snapshot must include the revoke even when its ordinary write is still queued.
+        runtime.freezeForTermination(allowRestoration: true)
+        let sealed = await runtime.settleForTermination()
+        XCTAssertTrue(sealed)
+        await runtime.flushPersistence()
+        XCTAssertTrue(try scopeDocument().scopes.isEmpty)
+        XCTAssertEqual(try scopeDocument().revokedScopeIDs, [record.id])
+        store.closeWithoutSealingForTesting()
 
-        // A stale file that still lists the grant next to its tombstone never brings it back.
-        let fileURL = temporaryDirectory.appendingPathComponent(DelegationScopeStore.filename)
-        let stale = DelegationScopeDocument(scopes: [record.grant], revokedScopeIDs: [record.id])
-        try JSONEncoder().encode(stale).write(to: fileURL)
-        let relaunched = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
-        await relaunched.bootstrap(store: makeStore())
+        // Domain reactivation remains the only decision owner. A clean file with a stale row next
+        // to its tombstone never brings the grant back.
+        let stale = DelegationScopeDocument(scopes: [record.grant], revokedScopeIDs: [record.id], cleanShutdown: true)
+        try JSONEncoder().encode(stale).write(to: scopeFile)
+        let nextStore = makeStore()
+        let relaunched = DelegationScopeRuntime(persistenceMode: .requiresStore, notifyCatalogChanged: { _ in })
+        await relaunched.bootstrap(store: nextStore)
         XCTAssertFalse(relaunched.hasLiveScope(grantedTo: overseer))
+        await relaunched.flushPersistence()
+        XCTAssertTrue(try scopeDocument().scopes.isEmpty)
+        nextStore.closeWithoutSealingForTesting()
     }
 
     func testAgentProposedGuardrailsAreClampedAndApprovalCannotWidenTheRequest() throws {
-        let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
         let overseer = UUID()
         func request(threshold: Int, seconds: Int? = 600) throws -> DelegationScopeRequest {
             try runtime.requestScope(
@@ -752,7 +1545,7 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
     }
 
     func testGrantCardIsCancelledWhenTheTabSessionChanges() throws {
-        let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
         let overseer = UUID()
         let tab = UUID()
         let request = try runtime.requestScope(
@@ -894,6 +1687,7 @@ final class SessionAdminStructureTests: XCTestCase {
         var placements: [(session: UUID, parent: UUID, scope: UUID?)] = []
         var placementAttempts: [UUID] = []
         var placementFailures: Set<UUID> = []
+        var placementPersistenceFailures: Set<UUID> = []
         var onPlacementAttempt: (@MainActor () -> Void)?
         fileprivate var links: [Pair: Set<DomainAgentSessionLinkCapability>] = [:]
         fileprivate var added: [Pair] = []
@@ -905,6 +1699,8 @@ final class SessionAdminStructureTests: XCTestCase {
         var effortCalls: [(UUID, String)] = []
         var lastAuthorization: (@MainActor () -> Bool)?
         var forkCalls: [UUID] = []
+        var onForkPreparation: (@MainActor () -> Void)?
+        var forkPersistenceFails = false
         var nextFork = UUID()
         /// Runs inside each placement's durable write, after the in-memory write (a slow disk rewrite).
         var onPersist: (@MainActor () async -> Void)?
@@ -932,7 +1728,13 @@ final class SessionAdminStructureTests: XCTestCase {
                 boundWorktreeIDs: old?.boundWorktreeIDs ?? [], runState: old?.runState ?? .idle
             )
             let onPersist = onPersist
-            return DelegationPlacementCommit(pendingWrite: Task { @MainActor in await onPersist?() })
+            let persistenceFails = placementPersistenceFailures.contains(sessionID)
+            return DelegationPlacementCommit(pendingWrite: Task { @MainActor in
+                await onPersist?()
+                if persistenceFails {
+                    throw NSError(domain: "PlacementFixture", code: 2, userInfo: [NSLocalizedDescriptionKey: "Placement persistence failed"])
+                }
+            })
         }
 
         func activeLinkCapabilities(observer: UUID, target: UUID) async -> Set<DomainAgentSessionLinkCapability>? {
@@ -990,9 +1792,18 @@ final class SessionAdminStructureTests: XCTestCase {
             return effort == "bogus" ? .invalid("unsupported") : .applied(changed: true, fields: ["effort": effort])
         }
 
-        func fork(sessionID: UUID, upToItemID _: UUID?) async throws -> UUID {
+        func fork(
+            sessionID: UUID,
+            upToItemID _: UUID?,
+            isStillAuthorized: @escaping @MainActor () -> Bool
+        ) async throws -> UUID {
+            onForkPreparation?()
+            guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
             forkCalls.append(sessionID)
             provenance.add(nextFork, parent: nil)
+            if forkPersistenceFails {
+                throw SessionAdminPartialForkError(sessionID: nextFork, code: "persist_failed", detail: "Injected first-save failure")
+            }
             return nextFork
         }
     }
@@ -1149,7 +1960,7 @@ final class SessionAdminStructureTests: XCTestCase {
     @MainActor
     final class Fixture {
         let provenance = Provenance()
-        let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
         let structure: StructureHost
         let worktrees = WorktreeHost()
         let ownership = WorktreeOwnershipStore()
@@ -1669,6 +2480,56 @@ final class SessionAdminStructureTests: XCTestCase {
         let limited = try await fixture.value(.adminFork, caller: overseer, targets: [a], key: "fork-2")
         XCTAssertEqual(limited["code"], .string("scope_guardrail_exceeded"))
         XCTAssertEqual(limited["guardrail"], .string("max_live_sessions"))
+    }
+
+    func testForkPartialPersistenceReceiptsReplayWithoutCreatingAnotherSession() async throws {
+        for failure in ["first_save", "placement", "placement_save"] {
+            let fixture = Fixture()
+            let overseer = UUID(), source = UUID()
+            fixture.provenance.add(overseer, parent: nil)
+            fixture.provenance.add(source, parent: overseer)
+            try fixture.grant(overseer)
+            let forked = fixture.structure.nextFork
+            if failure == "first_save" { fixture.structure.forkPersistenceFails = true }
+            if failure == "placement" { fixture.structure.placementFailures.insert(forked) }
+            if failure == "placement_save" { fixture.structure.placementPersistenceFailures.insert(forked) }
+            let first = try await fixture.value(.adminFork, caller: overseer, targets: [source], key: "partial-fork")
+            XCTAssertEqual(first["result"], .string("partial"))
+            XCTAssertEqual(first["forked_session_id"], .string(forked.uuidString))
+            XCTAssertEqual(first["changed_count"], .int(1))
+            XCTAssertEqual(first["joined_scope"], .bool(failure == "placement_save"))
+            XCTAssertEqual(first["code"], .string(failure == "placement" ? "placement_failed" : "persist_failed"))
+            let replay = try await fixture.value(.adminFork, caller: overseer, targets: [source], key: "partial-fork")
+            XCTAssertEqual(replay["result"], .string("replayed"))
+            XCTAssertEqual(replay["forked_session_id"], first["forked_session_id"])
+            XCTAssertEqual(replay["code"], first["code"])
+            XCTAssertEqual(replay["joined_scope"], first["joined_scope"])
+            XCTAssertEqual(replay["changed_count"], .int(0))
+            XCTAssertEqual(fixture.structure.forkCalls, [source])
+            XCTAssertNotNil(fixture.provenance.sessions[forked])
+        }
+    }
+
+    func testForkRechecksScopeAndMembershipAfterPreparation() async throws {
+        for revokeScope in [true, false] {
+            let fixture = Fixture()
+            let overseer = UUID(), source = UUID()
+            fixture.provenance.add(overseer, parent: nil)
+            fixture.provenance.add(source, parent: overseer)
+            let scope = try fixture.grant(overseer)
+            fixture.structure.onForkPreparation = {
+                if revokeScope {
+                    fixture.runtime.revoke(scopeID: scope.id)
+                } else {
+                    fixture.provenance.add(source, parent: UUID())
+                }
+            }
+            let result = try await fixture.value(.adminFork, caller: overseer, targets: [source], key: "fork-raced")
+            XCTAssertEqual(items(result)[source.uuidString]?["code"], .string("scope_revoked"))
+            XCTAssertTrue(fixture.structure.forkCalls.isEmpty)
+            XCTAssertTrue(fixture.structure.placements.isEmpty)
+            XCTAssertNil(fixture.provenance.sessions[fixture.structure.nextFork])
+        }
     }
 
     // MARK: - Worktrees on behalf
@@ -2545,7 +3406,7 @@ final class SessionAdminStructureTests: XCTestCase {
         XCTAssertEqual(fixture.structure.forkCalls.count, 1)
     }
 
-    func testWorktreeOwnershipStoreBlocksFutureSchemaAndQuarantinesCorruptFiles() async throws {
+    func testWorktreeOwnershipStorePreservesUnsupportedLegacyBytesWithoutVetoingCurrentProvenance() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("wt-ownership-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: directory) }
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -2555,7 +3416,7 @@ final class SessionAdminStructureTests: XCTestCase {
         try Data(#"{"version": 99, "worktrees": []}"#.utf8).write(to: fileURL)
         let future = WorktreeOwnershipStore()
         await future.bootstrap(fileURL: fileURL, backupsDirectoryURL: backups)
-        XCTAssertEqual(future.loadState, .blocked("unsupported_future_schema"))
+        XCTAssertEqual(future.loadState, .ready)
         future.markReleased([WorktreeHost.summary("w")], bySessionID: UUID(), at: Date())
         await future.flushPersistence()
         XCTAssertEqual(try String(contentsOf: fileURL, encoding: .utf8), #"{"version": 99, "worktrees": []}"#, "a future file is preserved")
@@ -2564,8 +3425,42 @@ final class SessionAdminStructureTests: XCTestCase {
         let corrupt = WorktreeOwnershipStore()
         await corrupt.bootstrap(fileURL: fileURL, backupsDirectoryURL: backups)
         XCTAssertEqual(corrupt.loadState, .ready)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path))
-        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: backups.path).count, 1)
+        XCTAssertEqual(try String(contentsOf: fileURL, encoding: .utf8), "not json")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: backups.path))
+        let database = OverseerContinuityStore(databaseURL: directory.appendingPathComponent("Overseer/continuity.sqlite"), profile: "temporary-overseer")
+        XCTAssertEqual(try database.legacySources().count, 2)
+        XCTAssertEqual(future.saveState, "saved")
+    }
+
+    func testWorktreeContinuityFailureKeepsLiveCreationAndReleaseAndRetries() async {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("wt-continuity-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent(WorktreeOwnershipStore.filename)
+        let gate = DelegationScopeFileWriteGate()
+        let ownership = WorktreeOwnershipStore(beforeCommit: { try gate.check() })
+        await ownership.bootstrap(fileURL: file, backupsDirectoryURL: nil)
+        gate.setFailing(true)
+        let creator = UUID(), scope = UUID()
+        ownership.recordCreation(
+            .init(worktreeID: "w", repositoryID: "r", repoRootPath: "/r", path: "/managed/w", branch: nil, isPrunable: false),
+            createdBySessionID: creator,
+            delegationScopeID: scope,
+            at: Date(timeIntervalSince1970: 100)
+        )
+        await ownership.flushPersistence()
+        XCTAssertEqual(ownership.saveState, "failed")
+        XCTAssertEqual(ownership.record(worktreeID: "w")?.createdBySessionID, creator)
+        ownership.markReleased([WorktreeHost.summary("w")], bySessionID: creator, at: Date(timeIntervalSince1970: 200))
+        XCTAssertTrue(ownership.ownedUnreleasedWorktreeIDs(createdBy: [creator]).isEmpty)
+        await ownership.flushPersistence()
+        gate.setFailing(false)
+        await ownership.flushPersistence()
+        XCTAssertEqual(ownership.saveState, "saved")
+        let restored = WorktreeOwnershipStore()
+        await restored.bootstrap(fileURL: file, backupsDirectoryURL: nil)
+        XCTAssertEqual(restored.record(worktreeID: "w")?.createdBySessionID, creator)
+        XCTAssertEqual(restored.record(worktreeID: "w")?.delegationScopeID, scope)
+        XCTAssertEqual(restored.record(worktreeID: "w")?.releasedAt, Date(timeIntervalSince1970: 200))
     }
 
     /// The pre-load stale mark is merged onto the durable ownership row, never lost.
@@ -2588,6 +3483,10 @@ final class SessionAdminStructureTests: XCTestCase {
         let row = try XCTUnwrap(second.record(worktreeID: "w1"))
         XCTAssertEqual(row.createdBySessionID, creator, "the durable creator survives")
         XCTAssertEqual(row.releasedAt, Date(timeIntervalSince1970: 200), "the pre-load release survives")
+        await second.flushPersistence()
+        let third = WorktreeOwnershipStore()
+        await third.bootstrap(fileURL: fileURL, backupsDirectoryURL: nil)
+        XCTAssertEqual(third.record(worktreeID: "w1"), row, "The merged release must be a committed row transition, not just a projection")
     }
 
     /// Production wiring: structure ops registered through Lane B's front door get filter targeting,
@@ -2604,7 +3503,7 @@ final class SessionAdminStructureTests: XCTestCase {
             inventoryProvenance.add(id, parent: parent, workspace: workspace)
             organizer.add(id, workspace: workspace, name: id == outsider ? "Outsider" : "Member")
         }
-        let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
         let projector = SpawnProvenanceDelegationMembershipProjector(source: provenance)
         let core = AgentSessionAdministrationCore(scopes: runtime, projector: projector)
         // The overseer's tab, live-bound to it: cards are presented and approved only there.
@@ -2692,7 +3591,7 @@ final class SessionAdminStructureTests: XCTestCase {
             organizer.add(id, workspace: workspace, name: name)
             names.map[id] = name
         }
-        let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
         let projector = SpawnProvenanceDelegationMembershipProjector(source: provenance)
         let core = AgentSessionAdministrationCore(scopes: runtime, projector: projector)
         // The overseer's tab, live-bound to it: cards are presented and approved only there.
@@ -2802,6 +3701,36 @@ final class SessionAdminStructureTests: XCTestCase {
         XCTAssertFalse(rendered.contains("Research"))
     }
 
+    func testWorktreeMigrationAndRejectedRowDoNotLoseOwnershipOrBlockRelease() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("wt-migration-\(UUID())")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent(WorktreeOwnershipStore.filename)
+        let creator = UUID(), scope = UUID()
+        let legacy = WorktreeOwnershipRecord(worktreeID: "saved", path: "/r/saved", createdBySessionID: creator, delegationScopeID: scope, createdAt: Date(timeIntervalSince1970: 1))
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let bytes = try encoder.encode(WorktreeOwnershipDocument(version: 1, worktrees: [legacy]))
+        try bytes.write(to: file)
+        let gate = DelegationScopeFileWriteGate()
+        let store = WorktreeOwnershipStore(beforeCommit: { try gate.check() })
+        await store.bootstrap(fileURL: file, backupsDirectoryURL: nil, legacyPolicy: .sameProfile)
+        XCTAssertEqual(store.ownedUnreleasedWorktreeIDs(createdBy: [creator]), ["saved"])
+        XCTAssertEqual(try Data(contentsOf: file), bytes)
+        gate.setRejection(.revisionConflict)
+        store.recordCreation(.init(worktreeID: "rejected", repositoryID: "r", repoRootPath: "/r", path: "/r/rejected", branch: "b", isPrunable: false), createdBySessionID: creator, delegationScopeID: scope, at: Date())
+        await store.flushPersistence()
+        gate.setRejection(nil)
+        store.markReleased([WorktreeHost.summary("saved")], bySessionID: creator, at: Date(timeIntervalSince1970: 2))
+        await store.flushPersistence()
+        XCTAssertEqual(store.saveState, "failed", "Retain the rejected operation diagnostic while later rows progress")
+        let restart = WorktreeOwnershipStore()
+        await restart.bootstrap(fileURL: file, backupsDirectoryURL: nil)
+        XCTAssertEqual(restart.record(worktreeID: "saved")?.releasedAt, Date(timeIntervalSince1970: 2))
+        XCTAssertNil(restart.record(worktreeID: "rejected"))
+        XCTAssertEqual(try Data(contentsOf: file), bytes)
+    }
+
     func testWorktreeOwnershipStoreRoundTripsAndMarksReleased() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("wt-ownership-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -2838,10 +3767,14 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
     final class FakeOrganizer: AgentSessionOrganizingBackend {
         var states: [UUID: AgentSessionOrganizeState] = [:]
         var stopped: [UUID] = []
+        /// Distinguishes cancellation admission from its terminal outcome in receipt regressions.
+        var stopOutcomeOverride: AgentSessionRunStopOutcome?
         /// Every session whose stored state any write touched, in order.
         var written: [UUID] = []
         /// Archive calls; each re-checks authorization inside the stash's mutation context.
         var archiveAuthorizationChecks = 0
+        /// Fail archive after the normal commit-time authority check, without changing stored state.
+        var rejectedArchiveSessionIDs: Set<UUID> = []
         /// Run state of the same session in another window (production aggregates every window).
         var otherWindowRunStates: [UUID: DomainDelegationScopeTargetState] = [:]
         /// Runs inside each per-session stash, at its suspension point before the commit-time check.
@@ -2942,26 +3875,33 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
                 onStashSuspension?(id)
                 await Task.yield()
                 archiveAuthorizationChecks += 1
-                guard isAuthorized(id) else { continue }
+                guard isAuthorized(id), !rejectedArchiveSessionIDs.contains(id) else { continue }
                 states[id]?.isArchived = true
                 changed.insert(id)
             }
             return changed
         }
 
-        func unarchive(_ sessionIDs: [UUID]) -> Set<UUID> {
-            var changed: Set<UUID> = []
-            for id in sessionIDs where states[id]?.isArchived == true {
+        func unarchive(
+            _ sessionIDs: [UUID], isAuthorized: @escaping @MainActor (UUID) -> Bool
+        ) async -> AgentSessionUnarchiveOutcome {
+            var outcome = AgentSessionUnarchiveOutcome()
+            for id in sessionIDs where states[id]?.isArchived == true && isAuthorized(id) {
                 states[id]?.isArchived = false
-                changed.insert(id)
+                outcome.restored.insert(id)
             }
-            return changed
+            return outcome
         }
 
-        func stopRun(_ sessionID: UUID) async -> Bool {
+        func stopRun(
+            _ sessionID: UUID, isStillAuthorized: @escaping @MainActor () -> Bool
+        ) async -> AgentSessionRunStopOutcome {
+            guard isStillAuthorized() else {
+                return AgentSessionRunStopOutcome(initiatedCancellation: false, stopped: false)
+            }
             stopped.append(sessionID)
             states[sessionID]?.runState = .idle
-            return true
+            return stopOutcomeOverride ?? AgentSessionRunStopOutcome(initiatedCancellation: true, stopped: true)
         }
     }
 
@@ -2973,6 +3913,10 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         var historyOnly: [DomainAgentSessionInventoryRecord] = []
         var idleDays: [UUID: Double] = [:]
         var creators: [UUID: UUID] = [:]
+        var recordsComplete = true
+        var endpointsComplete = true
+        var omittedSessionIDs: Set<UUID> = []
+        var readCount = 0
         let now: Date
 
         init(organizer: FakeOrganizer, provenance: FakeProvenance, links: FakeLinks, now: Date) {
@@ -2983,6 +3927,7 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         }
 
         func snapshot() async -> DomainAgentSessionInventorySnapshot {
+            readCount += 1
             let loaded = organizer.states.values.map { state in
                 DomainAgentSessionInventoryRecord(
                     sessionID: state.sessionID, name: state.name, workspaceID: state.workspaceID, isLoaded: true,
@@ -2998,7 +3943,10 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
                 live: links.live.map { ($0.observerSessionID, $0.targetSessionID, $0.linkID, $0.generation) },
                 persisted: links.persisted.map { ($0.observerSessionID, $0.targetSessionID) }
             )
-            return DomainAgentSessionInventorySnapshot(records: loaded + historyOnly, edges: edges, isComplete: true)
+            return DomainAgentSessionInventorySnapshot(
+                records: (loaded + historyOnly).filter { !omittedSessionIDs.contains($0.sessionID) },
+                edges: edges, isComplete: endpointsComplete, recordsComplete: recordsComplete
+            )
         }
     }
 
@@ -3024,7 +3972,11 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
             (live, persisted)
         }
 
-        func stopLink(_ item: DomainAgentSessionLinkInventoryItem) async -> AgentMonitorStopOutcome {
+        func stopLink(
+            _ item: DomainAgentSessionLinkInventoryItem,
+            isStillAuthorized: @escaping @MainActor () -> Bool
+        ) async -> AgentMonitorStopOutcome {
+            guard isStillAuthorized() else { return .failed(message: "authority ended") }
             if failingLinkIDs.contains(item.linkID) { return .failed(message: "injected stop failure") }
             stoppedLinkIDs.append(item.linkID)
             live.removeAll { $0.linkID == item.linkID }
@@ -3044,7 +3996,7 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
     private final class Fixture {
         let window = WindowState()
         let tabBindings = FakeTabBindings()
-        let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
         let provenance = FakeProvenance()
         let organizer = FakeOrganizer()
         let links = FakeLinks()
@@ -3281,6 +4233,40 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         XCTAssertEqual(fixture.organizer.states[outsider]?.sidebarGroupOrder, 1)
     }
 
+    func testReorderGroupsUndoPreservesLaterGroupAssignmentAtSameRank() async throws {
+        let fixture = Fixture()
+        let a = fixture.member("A")
+        let b = fixture.member("B")
+        try fixture.grant()
+        _ = try await fixture.call(["op": .string("set_group"), "session_id": .string(a.uuidString), "group": .string("Alpha")])
+        _ = try await fixture.call(["op": .string("set_group"), "session_id": .string(b.uuidString), "group": .string("Beta")])
+        let applied = try await fixture.call([
+            "op": .string("reorder_groups"), "workspace": .string(fixture.workspace.uuidString),
+            "order": .array([.string("Beta"), .string("Alpha")]),
+            "expected_order": .array([.string("Alpha"), .string("Beta")])
+        ])
+        let token = try XCTUnwrap(applied["undo_token"]?.stringValue)
+        XCTAssertEqual(fixture.organizer.states[a]?.sidebarGroupOrder, 1)
+        XCTAssertEqual(fixture.organizer.states[b]?.sidebarGroupOrder, 0)
+
+        // A later user edit moves B to another group with the same numeric order.
+        fixture.organizer.states[b]?.sidebarGroup = "Gamma"
+        fixture.organizer.written.removeAll()
+        let undone = try await fixture.call(["op": .string("undo"), "undo_token": .string(token)])
+        XCTAssertEqual(undone["result"], .string("partially_undone"))
+        XCTAssertEqual(undone["changed_count"], .int(1))
+        XCTAssertEqual(items(undone)[a.uuidString], "changed")
+        XCTAssertEqual(items(undone)[b.uuidString], "skipped")
+        let rows = try XCTUnwrap(undone["items"]?.arrayValue)
+        let skipped = try XCTUnwrap(rows.compactMap(\.objectValue).first { $0["session_id"]?.stringValue == b.uuidString })
+        XCTAssertEqual(skipped["reason"], .string("changed_since"))
+        XCTAssertEqual(fixture.organizer.states[a]?.sidebarGroup, "Alpha")
+        XCTAssertEqual(fixture.organizer.states[a]?.sidebarGroupOrder, 0, "unchanged group identity remains undoable")
+        XCTAssertEqual(fixture.organizer.states[b]?.sidebarGroup, "Gamma")
+        XCTAssertEqual(fixture.organizer.states[b]?.sidebarGroupOrder, 0, "old undo must preserve the later group's rank")
+        XCTAssertEqual(fixture.organizer.written, [a])
+    }
+
     func testSetGroupWithEmptyStringClearsTheGroup() async throws {
         let fixture = Fixture()
         let a = fixture.member("A")
@@ -3507,6 +4493,18 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         let reused = try await fixture.call(["op": .string("undo"), "undo_token": .string(token)])
         XCTAssertEqual(reused["result"], .string("undo_unavailable"))
 
+        // One user edit after the original operation must not hide the other target's undo.
+        let renamedAgain = try await fixture.call(["op": .string("rename"), "targets": ids([a, b]), "name": .string("Again")])
+        let partialToken = try XCTUnwrap(renamedAgain["undo_token"]?.stringValue)
+        fixture.organizer.states[b]?.name = "User title"
+        let partialUndo = try await fixture.call(["op": .string("undo"), "undo_token": .string(partialToken)])
+        XCTAssertEqual(partialUndo["result"], .string("partially_undone"))
+        XCTAssertEqual(partialUndo["changed_count"], .int(1))
+        XCTAssertEqual(fixture.organizer.states[a]?.name, "A")
+        XCTAssertEqual(fixture.organizer.states[b]?.name, "User title")
+        let partialReused = try await fixture.call(["op": .string("undo"), "undo_token": .string(partialToken)])
+        XCTAssertEqual(partialReused["result"], .string("undo_unavailable"))
+
         let archived = try await fixture.call(["op": .string("archive"), "session_id": .string(b.uuidString)])
         XCTAssertEqual(fixture.organizer.states[b]?.isArchived, true)
         let archiveToken = try XCTUnwrap(archived["undo_token"]?.stringValue)
@@ -3561,6 +4559,230 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         } catch {}
     }
 
+    func testFilteredPreviewAndMutationRetainIncompleteCoverageAndExactReplay() async throws {
+        let fixture = Fixture()
+        let known = fixture.member("Known", group: "Cleanup")
+        let omitted = fixture.member("Omitted", group: "Cleanup")
+        fixture.inventory.recordsComplete = false
+        fixture.inventory.endpointsComplete = false
+        fixture.inventory.omittedSessionIDs = [omitted]
+        try fixture.grant()
+        let args: [String: Value] = [
+            "op": .string("set_pin"), "filter": .object(["group": .string("Cleanup")]),
+            "pinned": .bool(true), "idempotency_key": .string("partial-filter-pin")
+        ]
+        let preview = try await fixture.call(args.merging(["preview": .bool(true)]) { $1 })
+        XCTAssertEqual(preview["result"], .string("preview"))
+        XCTAssertEqual(preview["item_count"], .int(1))
+        XCTAssertEqual(preview["selection_complete"], .bool(false))
+        let coverage = try XCTUnwrap(preview["selection"]?.objectValue)
+        XCTAssertEqual(coverage["domain"], .string("loaded_scope_members"))
+        XCTAssertEqual(coverage["read_mode"], .string("loaded_only"))
+        XCTAssertEqual(coverage["records_complete"], .bool(false))
+        XCTAssertEqual(coverage["endpoints_complete"], .bool(false))
+        XCTAssertEqual(fixture.organizer.states[known]?.isPinned, false)
+        XCTAssertEqual(fixture.organizer.states[omitted]?.isPinned, false)
+        XCTAssertTrue(fixture.runtime.confirmations.confirmations.isEmpty)
+
+        let applied = try await fixture.call(args)
+        XCTAssertEqual(applied["result"], .string("partial"))
+        XCTAssertEqual(applied["selected_result"], .string("applied"))
+        XCTAssertEqual(applied["changed_count"], .int(1))
+        XCTAssertEqual(Set(items(applied).keys), [known.uuidString])
+        XCTAssertEqual(applied["selection"], preview["selection"])
+        XCTAssertEqual(fixture.organizer.states[known]?.isPinned, true)
+        XCTAssertEqual(fixture.organizer.states[omitted]?.isPinned, false)
+
+        // A later complete scan must not widen an already committed idempotent operation.
+        fixture.inventory.recordsComplete = true
+        fixture.inventory.endpointsComplete = true
+        fixture.inventory.omittedSessionIDs = []
+        let reads = fixture.inventory.readCount
+        let replay = try await fixture.call(args)
+        XCTAssertEqual(replay["idempotent_replay"], .bool(true))
+        XCTAssertEqual(replay["result"], .string("partial"))
+        XCTAssertEqual(replay["selection"], applied["selection"])
+        XCTAssertEqual(fixture.inventory.readCount, reads)
+        XCTAssertEqual(fixture.organizer.states[omitted]?.isPinned, false)
+
+        let explicit = try await fixture.call([
+            "op": .string("set_pin"), "session_id": .string(omitted.uuidString), "pinned": .bool(true)
+        ])
+        XCTAssertEqual(explicit["result"], .string("applied"))
+        XCTAssertNil(explicit["selection"])
+        XCTAssertNil(explicit["selection_complete"])
+        XCTAssertEqual(fixture.inventory.readCount, reads, "explicit authorized targets do not enumerate inventory")
+        XCTAssertEqual(fixture.organizer.states[omitted]?.isPinned, true)
+    }
+
+    func testIncompleteFilteredZeroCannotClaimNoMatchesOrConsumeAnIdempotencyKey() async throws {
+        let fixture = Fixture()
+        let target = fixture.member("Missing from read", group: "Cleanup")
+        fixture.inventory.recordsComplete = false
+        fixture.inventory.endpointsComplete = false
+        fixture.inventory.omittedSessionIDs = [target]
+        try fixture.grant()
+        let args: [String: Value] = [
+            "op": .string("set_pin"), "filter": .object(["group": .string("Cleanup")]),
+            "pinned": .bool(true), "idempotency_key": .string("incomplete-empty")
+        ]
+        for preview in [true, false] {
+            let result = try await fixture.call(args.merging(["preview": .bool(preview)]) { $1 })
+            XCTAssertEqual(result["result"], .string("incomplete"))
+            XCTAssertEqual(result["code"], .string("inventory_incomplete"))
+            XCTAssertEqual(result["retryable"], .bool(true))
+            XCTAssertEqual(result["selection_complete"], .bool(false))
+            XCTAssertNil(result["items"], "an incomplete zero is not a successful empty target set")
+            XCTAssertNil(result["idempotent_replay"])
+        }
+        XCTAssertEqual(fixture.organizer.states[target]?.isPinned, false)
+        XCTAssertTrue(fixture.runtime.confirmations.confirmations.isEmpty)
+        fixture.inventory.omittedSessionIDs = []
+        let retry = try await fixture.call(args)
+        XCTAssertEqual(retry["result"], .string("partial"))
+        XCTAssertEqual(retry["changed_count"], .int(1))
+        XCTAssertNil(retry["idempotent_replay"])
+        XCTAssertEqual(fixture.organizer.states[target]?.isPinned, true)
+    }
+
+    func testFilteredCardRetainsOriginalCoverageAndOnlyApprovedTargets() async throws {
+        let fixture = Fixture()
+        let selected = [fixture.member("A", group: "Cleanup"), fixture.member("B", group: "Cleanup")]
+        let omitted = fixture.member("C", group: "Cleanup")
+        fixture.inventory.recordsComplete = false
+        fixture.inventory.endpointsComplete = false
+        fixture.inventory.omittedSessionIDs = [omitted]
+        try fixture.grant(threshold: 1)
+        let pending = try await fixture.call([
+            "op": .string("set_pin"), "filter": .object(["group": .string("Cleanup")]),
+            "pinned": .bool(true), "idempotency_key": .string("partial-filter-card")
+        ])
+        let cardID = try XCTUnwrap(pending["confirmation_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+        XCTAssertEqual(pending["result"], .string("pending_confirmation"))
+        XCTAssertEqual(pending["selection_complete"], .bool(false))
+        let before = try await fixture.call([
+            "op": .string("confirmation_status"), "confirmation_id": .string(cardID.uuidString)
+        ])
+        XCTAssertEqual(before["selection"], pending["selection"])
+        fixture.runtime.confirmations.setItem(selected[1], ticked: false, confirmationID: cardID)
+        fixture.inventory.recordsComplete = true
+        fixture.inventory.endpointsComplete = true
+        fixture.inventory.omittedSessionIDs = []
+        let reads = fixture.inventory.readCount
+        await fixture.approveAndApply(cardID)
+        XCTAssertEqual(fixture.inventory.readCount, reads, "approval applies the captured selection without a fresh census")
+        XCTAssertEqual(fixture.organizer.states[selected[0]]?.isPinned, true)
+        XCTAssertEqual(fixture.organizer.states[selected[1]]?.isPinned, false)
+        XCTAssertEqual(fixture.organizer.states[omitted]?.isPinned, false)
+        let after = try await fixture.call([
+            "op": .string("confirmation_status"), "confirmation_id": .string(cardID.uuidString)
+        ])
+        XCTAssertEqual(after["result"], .string("partial"))
+        XCTAssertEqual(after["selection"], pending["selection"])
+        let receipt = try XCTUnwrap(after["applied_result"]?.objectValue)
+        XCTAssertEqual(receipt["result"], .string("partial"))
+        XCTAssertEqual(receipt["selected_result"], .string("applied"))
+        XCTAssertEqual(receipt["changed_count"], .int(1))
+        XCTAssertEqual(receipt["selection"], pending["selection"])
+        XCTAssertEqual(fixture.runtime.confirmations.confirmations[cardID]?.state, .consumed)
+        await fixture.approveAndApply(cardID)
+        XCTAssertEqual(fixture.organizer.states[selected[1]]?.isPinned, false)
+        XCTAssertEqual(fixture.organizer.states[omitted]?.isPinned, false)
+    }
+
+    func testFilteredCardRetryAfterHandlerFailureKeepsOriginalCoverage() async throws {
+        @MainActor
+        final class FailOnce: AgentSessionAdministrationOperationHandler {
+            let base: AgentSessionOrganizeOperationHandler
+            var shouldFail = true
+            var operations: Set<DomainAgentSessionTargetOperation> {
+                [.adminSetPin]
+            }
+
+            init(base: AgentSessionOrganizeOperationHandler) {
+                self.base = base
+            }
+
+            func confirmationItems(
+                for request: AgentSessionAdministrationRequest, scope: DomainDelegationScopeRecord
+            ) -> [BatchConfirmationItem] {
+                base.confirmationItems(for: request, scope: scope)
+            }
+
+            func perform(_ batch: AgentSessionAdministrationAuthorizedBatch) async throws -> Value {
+                if shouldFail {
+                    shouldFail = false
+                    throw NSError(domain: "FilteredCardRetry", code: 1)
+                }
+                return try await base.perform(batch)
+            }
+        }
+        let fixture = Fixture()
+        let targets = [fixture.member("A", group: "Cleanup"), fixture.member("B", group: "Cleanup")]
+        fixture.inventory.recordsComplete = false
+        fixture.inventory.endpointsComplete = false
+        try fixture.grant(threshold: 1)
+        let runtime = fixture.runtime
+        fixture.frontDoor.register(FailOnce(base: AgentSessionOrganizeOperationHandler(
+            backend: fixture.organizer,
+            isLeaseCurrent: { runtime.isCurrent($0) },
+            holdsControl: { _ in true }
+        )))
+        let args: [String: Value] = [
+            "op": .string("set_pin"), "filter": .object(["group": .string("Cleanup")]),
+            "pinned": .bool(true), "idempotency_key": .string("partial-filter-retry")
+        ]
+        let pending = try await fixture.call(args)
+        let cardID = try XCTUnwrap(pending["confirmation_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+        await fixture.approveAndApply(cardID)
+        XCTAssertEqual(fixture.runtime.confirmations.confirmations[cardID]?.state, .approved)
+        XCTAssertTrue(targets.allSatisfy { fixture.organizer.states[$0]?.isPinned == false })
+        let failed = try await fixture.call([
+            "op": .string("confirmation_status"), "confirmation_id": .string(cardID.uuidString)
+        ])
+        XCTAssertEqual(failed["applied_result"]?.objectValue?["result"], .string("failed"))
+        XCTAssertEqual(failed["selection"], pending["selection"])
+        fixture.inventory.recordsComplete = true
+        fixture.inventory.endpointsComplete = true
+        let retry = try await fixture.call(args.merging(["confirmation_id": .string(cardID.uuidString)]) { $1 })
+        XCTAssertEqual(retry["result"], .string("partial"))
+        XCTAssertEqual(retry["selected_result"], .string("applied"))
+        XCTAssertEqual(retry["changed_count"], .int(2))
+        XCTAssertEqual(retry["selection"], pending["selection"])
+        XCTAssertEqual(fixture.runtime.confirmations.confirmations[cardID]?.state, .consumed)
+        XCTAssertTrue(targets.allSatisfy { fixture.organizer.states[$0]?.isPinned == true })
+        let consumed = try await fixture.call([
+            "op": .string("confirmation_status"), "confirmation_id": .string(cardID.uuidString)
+        ])
+        XCTAssertEqual(consumed["applied_result"]?.objectValue?["selection"], pending["selection"])
+        XCTAssertEqual(consumed["result"], .string("partial"))
+    }
+
+    func testCompleteWorkspaceRecordCoverageDoesNotRequireGlobalEndpointsForSimpleFilter() async throws {
+        let fixture = Fixture()
+        let target = fixture.member("A", group: "Cleanup")
+        fixture.inventory.recordsComplete = true
+        fixture.inventory.endpointsComplete = false
+        let request = try fixture.runtime.requestScope(
+            requesterSessionID: fixture.overseer, requesterTabID: fixture.tab,
+            kind: .workspace(workspaceID: fixture.workspace), capabilities: [.observe, .organize],
+            guardrails: .init(), reason: nil, idempotencyKey: nil
+        ).get()
+        _ = try fixture.runtime.approve(requestID: request.id).get()
+        let result = try await fixture.call([
+            "op": .string("set_pin"), "filter": .object(["group": .string("Cleanup")]), "pinned": .bool(true)
+        ])
+        XCTAssertEqual(result["result"], .string("applied"))
+        XCTAssertEqual(result["changed_count"], .int(1))
+        let coverage = try XCTUnwrap(result["selection"]?.objectValue)
+        XCTAssertEqual(coverage["read_mode"], .string("history_and_loaded"))
+        XCTAssertEqual(coverage["records_complete"], .bool(true))
+        XCTAssertEqual(coverage["endpoints_complete"], .bool(false))
+        XCTAssertNil(result["selection_complete"], "complete history alone cannot prove every loaded carrier's identity/membership")
+        XCTAssertNil(result["selected_result"])
+        XCTAssertEqual(fixture.organizer.states[target]?.isPinned, true)
+    }
+
     func testOrphanFilterAndLinksInventory() async throws {
         let fixture = Fixture()
         let lane = fixture.member("Lane")
@@ -3598,6 +4820,287 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
 
     // MARK: - Release and retire
 
+    func testRetireAlreadyArchivedReportsUnchangedAndReplaysConsumedConfirmation() async throws {
+        for hasLink in [false, true] {
+            let fixture = Fixture()
+            let lane = fixture.member("Archived lane", archived: true)
+            if hasLink {
+                fixture.links.link(fixture.member("Peer"), lane)
+            }
+            try fixture.grant([.observe, .organize, .restructure])
+            let args: [String: Value] = [
+                "op": .string("retire"), "session_id": .string(lane.uuidString),
+                "idempotency_key": .string("retire-already-archived")
+            ]
+            let pending = try await fixture.call(args)
+            let cardID = try XCTUnwrap(pending["confirmation_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+            await fixture.approveAndApply(cardID)
+
+            let statusArgs: [String: Value] = [
+                "op": .string("confirmation_status"), "confirmation_id": .string(cardID.uuidString)
+            ]
+            let status = try await fixture.call(statusArgs)
+            let applied = try XCTUnwrap(status["applied_result"]?.objectValue)
+            let row = try XCTUnwrap(applied["items"]?.arrayValue?.single?.objectValue)
+            let expected: Value = .string(hasLink ? "applied" : "unchanged")
+            XCTAssertEqual(status["confirmation_state"], .string("consumed"))
+            XCTAssertEqual(status["result"], expected)
+            XCTAssertEqual(applied["result"], expected)
+            XCTAssertEqual(applied["changed_count"], .int(hasLink ? 1 : 0))
+            XCTAssertEqual(row["status"], .string(hasLink ? "changed" : "unchanged"))
+            XCTAssertEqual(row["archived"], .bool(true))
+            XCTAssertEqual(row["archive_changed"], .bool(false))
+            XCTAssertEqual(row["archive_result"], .string("already_archived"))
+            XCTAssertNil(row["reason"])
+            XCTAssertEqual(fixture.organizer.archiveAuthorizationChecks, 0)
+            XCTAssertEqual(fixture.links.stoppedLinkIDs.count, hasLink ? 1 : 0)
+            XCTAssertTrue(fixture.links.live.isEmpty, "existing archive state does not skip link release")
+
+            // A later user restore must not be undone by retrying this consumed card's request.
+            fixture.organizer.states[lane]?.isArchived = false
+            let replay = try await fixture.call(args)
+            await fixture.approveAndApply(cardID)
+            let repeatedStatus = try await fixture.call(statusArgs)
+            XCTAssertEqual(replay["confirmation_id"], .string(cardID.uuidString))
+            XCTAssertEqual(replay["confirmation_state"], .string("consumed"))
+            XCTAssertEqual(replay["result"], expected)
+            XCTAssertEqual(replay["applied_result"], status["applied_result"])
+            XCTAssertEqual(repeatedStatus["applied_result"], status["applied_result"])
+            XCTAssertEqual(fixture.organizer.states[lane]?.isArchived, false)
+            XCTAssertEqual(fixture.organizer.archiveAuthorizationChecks, 0)
+            XCTAssertEqual(fixture.links.stoppedLinkIDs.count, hasLink ? 1 : 0)
+        }
+    }
+
+    func testRetireArchiveFailureRetainsPartialEffectsAndConsumedReceipt() async throws {
+        for hasLink in [false, true] {
+            let fixture = Fixture()
+            let lane = fixture.member("Lane")
+            if hasLink {
+                fixture.links.link(fixture.member("Peer"), lane)
+            }
+            fixture.organizer.rejectedArchiveSessionIDs = [lane]
+            try fixture.grant([.observe, .organize, .restructure])
+            let args: [String: Value] = [
+                "op": .string("retire"), "session_id": .string(lane.uuidString),
+                "idempotency_key": .string("retire-archive-failure")
+            ]
+            let pending = try await fixture.call(args)
+            let cardID = try XCTUnwrap(pending["confirmation_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+            await fixture.approveAndApply(cardID)
+            let status = try await fixture.call([
+                "op": .string("confirmation_status"), "confirmation_id": .string(cardID.uuidString)
+            ])
+            let applied = try XCTUnwrap(status["applied_result"]?.objectValue)
+            let row = try XCTUnwrap(applied["items"]?.arrayValue?.single?.objectValue)
+            let expected: Value = .string(hasLink ? "partial" : "failed")
+            XCTAssertEqual(status["confirmation_state"], .string("consumed"))
+            XCTAssertEqual(status["result"], expected)
+            XCTAssertEqual(applied["result"], expected)
+            XCTAssertEqual(applied["changed_count"], .int(0))
+            XCTAssertEqual(applied["committed_changes"] == .bool(true), hasLink)
+            XCTAssertEqual(row["status"], .string("failed"))
+            XCTAssertEqual(row["reason"], .string("archive_rejected"))
+            XCTAssertEqual(row["archived"], .bool(false))
+            XCTAssertEqual(row["archive_changed"], .bool(false))
+            XCTAssertEqual(row["archive_result"], .string("rejected"))
+            XCTAssertEqual(fixture.organizer.states[lane]?.isArchived, false)
+            XCTAssertEqual(fixture.organizer.archiveAuthorizationChecks, 1)
+            XCTAssertEqual(fixture.links.stoppedLinkIDs.count, hasLink ? 1 : 0)
+
+            // Removing the failure does not make the consumed card grant a second attempt.
+            fixture.organizer.rejectedArchiveSessionIDs = []
+            let replay = try await fixture.call(args)
+            await fixture.approveAndApply(cardID)
+            XCTAssertEqual(replay["confirmation_id"], .string(cardID.uuidString))
+            XCTAssertEqual(replay["result"], expected)
+            XCTAssertEqual(replay["applied_result"], status["applied_result"])
+            XCTAssertEqual(fixture.organizer.states[lane]?.isArchived, false)
+            XCTAssertEqual(fixture.organizer.archiveAuthorizationChecks, 1)
+            XCTAssertEqual(fixture.links.stoppedLinkIDs.count, hasLink ? 1 : 0)
+
+            // A new request still requires a new approval before finishing the archive.
+            var freshArgs = args
+            freshArgs["idempotency_key"] = .string("retire-archive-failure-new-attempt")
+            let fresh = try await fixture.call(freshArgs)
+            let freshCardID = try XCTUnwrap(fresh["confirmation_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+            XCTAssertNotEqual(freshCardID, cardID)
+            XCTAssertEqual(fresh["result"], .string("pending_confirmation"))
+            XCTAssertEqual(fixture.organizer.states[lane]?.isArchived, false)
+            await fixture.approveAndApply(freshCardID)
+            let finished = try await fixture.call([
+                "op": .string("confirmation_status"), "confirmation_id": .string(freshCardID.uuidString)
+            ])
+            XCTAssertEqual(finished["confirmation_state"], .string("consumed"))
+            XCTAssertEqual(finished["result"], .string("applied"))
+            XCTAssertEqual(fixture.organizer.states[lane]?.isArchived, true)
+            XCTAssertEqual(fixture.organizer.archiveAuthorizationChecks, 2)
+        }
+    }
+
+    func testRetireKeepsInitiatedStopReceiptWhenCompletionWinsAndArchiveFails() async throws {
+        let fixture = Fixture()
+        do {
+            let lane = fixture.member("Running lane", run: .running)
+            fixture.organizer.stopOutcomeOverride = AgentSessionRunStopOutcome(initiatedCancellation: true, stopped: false)
+            fixture.organizer.rejectedArchiveSessionIDs = [lane]
+            try fixture.grant([.observe, .organize, .restructure, .control])
+            let args: [String: Value] = [
+                "op": .string("retire"), "session_id": .string(lane.uuidString),
+                "idempotency_key": .string("retire-admitted-stop-archive-failure")
+            ]
+            let pending = try await fixture.call(args)
+            let cardID = try XCTUnwrap(pending["confirmation_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+            await fixture.approveAndApply(cardID)
+            let status = try await fixture.call([
+                "op": .string("confirmation_status"), "confirmation_id": .string(cardID.uuidString)
+            ])
+            let applied = try XCTUnwrap(status["applied_result"]?.objectValue)
+            let row = try XCTUnwrap(applied["items"]?.arrayValue?.single?.objectValue)
+            XCTAssertEqual(status["confirmation_state"], .string("consumed"))
+            XCTAssertEqual(status["result"], .string("partial"))
+            XCTAssertEqual(applied["result"], .string("partial"))
+            XCTAssertEqual(applied["committed_changes"], .bool(true))
+            XCTAssertEqual(applied["changed_count"], .int(0))
+            XCTAssertEqual(row["stop_requested"], .bool(true))
+            XCTAssertEqual(row["stopped"], .bool(false), "cancellation admission must not claim the terminal Stop won")
+            XCTAssertEqual(row["status"], .string("failed"))
+            XCTAssertEqual(row["reason"], .string("archive_rejected"))
+            XCTAssertEqual(row["archive_changed"], .bool(false))
+            XCTAssertEqual(row["archive_result"], .string("rejected"))
+            XCTAssertEqual(row["archived"], .bool(false))
+            XCTAssertEqual(fixture.organizer.stopped, [lane])
+            XCTAssertEqual(fixture.organizer.archiveAuthorizationChecks, 1)
+
+            fixture.organizer.stopOutcomeOverride = nil
+            fixture.organizer.rejectedArchiveSessionIDs = []
+            let replay = try await fixture.call(args)
+            await fixture.approveAndApply(cardID)
+            XCTAssertEqual(replay["confirmation_id"], .string(cardID.uuidString))
+            XCTAssertEqual(replay["result"], .string("partial"))
+            XCTAssertEqual(replay["applied_result"], status["applied_result"])
+            XCTAssertEqual(fixture.organizer.stopped, [lane], "replay must not issue a second Stop")
+            XCTAssertEqual(fixture.organizer.archiveAuthorizationChecks, 1)
+            XCTAssertEqual(fixture.organizer.states[lane]?.isArchived, false)
+            await fixture.window.tearDown()
+        } catch {
+            await fixture.window.tearDown()
+            throw error
+        }
+    }
+
+    func testRetireUnlinkFailurePreservesArchiveOutcome() async throws {
+        for alreadyArchived in [false, true] {
+            let fixture = Fixture()
+            let lane = fixture.member("Lane", archived: alreadyArchived)
+            fixture.links.link(fixture.member("Peer"), lane)
+            let failingLink = try XCTUnwrap(fixture.links.live.single?.linkID)
+            fixture.links.failingLinkIDs = [failingLink]
+            try fixture.grant([.observe, .organize, .restructure])
+            let args: [String: Value] = [
+                "op": .string("retire"), "session_id": .string(lane.uuidString),
+                "idempotency_key": .string("retire-unlink-failure")
+            ]
+            let pending = try await fixture.call(args)
+            let cardID = try XCTUnwrap(pending["confirmation_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+            await fixture.approveAndApply(cardID)
+            let status = try await fixture.call([
+                "op": .string("confirmation_status"), "confirmation_id": .string(cardID.uuidString)
+            ])
+            let applied = try XCTUnwrap(status["applied_result"]?.objectValue)
+            let row = try XCTUnwrap(applied["items"]?.arrayValue?.single?.objectValue)
+            let expected: Value = .string(alreadyArchived ? "failed" : "partial")
+            XCTAssertEqual(status["confirmation_state"], .string("consumed"))
+            XCTAssertEqual(status["result"], expected)
+            XCTAssertEqual(applied["result"], expected)
+            XCTAssertEqual(applied["changed_count"], .int(0))
+            XCTAssertEqual(applied["committed_changes"] == .bool(true), !alreadyArchived)
+            XCTAssertEqual(row["status"], .string("failed"))
+            XCTAssertEqual(row["reason"], .string("unlink_failed"))
+            XCTAssertEqual(row["archived"], .bool(true))
+            XCTAssertEqual(row["archive_changed"], .bool(!alreadyArchived))
+            XCTAssertEqual(row["archive_result"], .string(alreadyArchived ? "already_archived" : "changed"))
+            XCTAssertEqual(fixture.organizer.states[lane]?.isArchived, true)
+            XCTAssertEqual(fixture.links.live.map(\.linkID), [failingLink])
+            XCTAssertTrue(fixture.links.stoppedLinkIDs.isEmpty)
+
+            fixture.links.failingLinkIDs = []
+            let replay = try await fixture.call(args)
+            XCTAssertEqual(replay["applied_result"], status["applied_result"])
+            XCTAssertEqual(fixture.links.live.map(\.linkID), [failingLink], "a consumed card does not retry its failed link")
+        }
+    }
+
+    func testReleaseInterruptedTraversalRetainsReceiptButCompletedTraversalRemainsApplied() async throws {
+        for hasRemainingLink in [true, false] {
+            let fixture = Fixture()
+            addTeardownBlock { @MainActor in
+                fixture.links.afterStop = nil
+                await fixture.window.tearDown()
+            }
+            let completedFirst = fixture.member("No links")
+            let lane = fixture.member("Lane")
+            let first = fixture.member("First")
+            let second = fixture.member("Second")
+            fixture.links.link(first, lane)
+            let firstLink = try XCTUnwrap(fixture.links.live.single?.linkID)
+            if hasRemainingLink { fixture.links.link(second, lane) }
+            let remainingLink = hasRemainingLink ? fixture.links.live.last?.linkID : nil
+            try fixture.grant([.observe, .organize, .restructure], threshold: 1)
+            let args: [String: Value] = [
+                "op": .string("release"), "targets": ids([completedFirst, lane]),
+                "idempotency_key": .string("release-interrupted")
+            ]
+            let pending = try await fixture.call(args)
+            let cardID = try XCTUnwrap(pending["confirmation_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+            // Both the target and the remaining counterpart leave the tree after the first commit.
+            // Checking the counterpart first would hide the interruption as an outside-scope link.
+            fixture.links.afterStop = { _ in
+                fixture.provenance.add(lane, parent: UUID(), workspace: fixture.workspace)
+                fixture.provenance.add(second, parent: UUID(), workspace: fixture.workspace)
+            }
+            await fixture.approveAndApply(cardID)
+            let statusArgs: [String: Value] = [
+                "op": .string("confirmation_status"), "confirmation_id": .string(cardID.uuidString)
+            ]
+            let status = try await fixture.call(statusArgs)
+            let applied = try XCTUnwrap(status["applied_result"]?.objectValue)
+            let row = try XCTUnwrap(
+                applied["items"]?.arrayValue?.compactMap(\.objectValue)
+                    .first { $0["session_id"] == .string(lane.uuidString) }
+            )
+            let expected: Value = .string(hasRemainingLink ? "partial" : "applied")
+            XCTAssertEqual(status["confirmation_state"], .string("consumed"))
+            XCTAssertEqual(status["result"], expected)
+            XCTAssertEqual(applied["result"], expected)
+            XCTAssertEqual(applied["committed_changes"], .bool(true))
+            XCTAssertEqual(applied["changed_count"], .int(hasRemainingLink ? 0 : 1))
+            XCTAssertEqual(applied["unlinked_total"], .int(1))
+            XCTAssertEqual(items(applied)[completedFirst.uuidString], "unchanged")
+            XCTAssertEqual(row["status"], .string(hasRemainingLink ? "failed" : "changed"))
+            XCTAssertEqual(row["reason"]?.stringValue, hasRemainingLink ? "scope_no_longer_current" : nil)
+            XCTAssertEqual(row["unlinked"], .int(1))
+            XCTAssertNil(row["links_outside_scope"], "authority loss is not an ordinary outsider filter")
+            XCTAssertEqual(fixture.links.stoppedLinkIDs, [firstLink])
+            XCTAssertEqual(fixture.links.live.map(\.linkID), remainingLink.map { [$0] } ?? [])
+
+            // Restoring membership does not let the consumed approval retry the unfinished link.
+            fixture.provenance.add(lane, parent: fixture.overseer, workspace: fixture.workspace)
+            fixture.provenance.add(second, parent: fixture.overseer, workspace: fixture.workspace)
+            fixture.links.afterStop = nil
+            let replay = try await fixture.call(args)
+            await fixture.approveAndApply(cardID)
+            let repeatedStatus = try await fixture.call(statusArgs)
+            XCTAssertEqual(replay["confirmation_id"], .string(cardID.uuidString))
+            XCTAssertEqual(replay["confirmation_state"], .string("consumed"))
+            XCTAssertEqual(replay["result"], expected)
+            XCTAssertEqual(replay["applied_result"], status["applied_result"])
+            XCTAssertEqual(repeatedStatus["applied_result"], status["applied_result"])
+            XCTAssertEqual(fixture.links.stoppedLinkIDs, [firstLink])
+            XCTAssertEqual(fixture.links.live.map(\.linkID), remainingLink.map { [$0] } ?? [])
+        }
+    }
+
     func testPartiallyCommittedReleaseIsRecordedAndReplayedUnderItsKey() async throws {
         let fixture = Fixture()
         let a = fixture.member("A")
@@ -3615,6 +5118,7 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         let first = try await fixture.call(args)
         XCTAssertEqual(items(first)[a.uuidString], "failed", "a later unlink failed")
         XCTAssertEqual(first["changed_count"], .int(0))
+        XCTAssertEqual(first["result"], .string("partial"))
         XCTAssertEqual(first["committed_changes"], .bool(true), "the first unlink still took effect")
         XCTAssertEqual(fixture.links.stoppedLinkIDs.count, 1)
 
@@ -3622,6 +5126,7 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         fixture.links.failingLinkIDs = []
         let retry = try await fixture.call(args)
         XCTAssertEqual(retry["idempotent_replay"], .bool(true))
+        XCTAssertEqual(retry["result"], .string("partial"))
         XCTAssertEqual(fixture.links.stoppedLinkIDs.count, 1, "a replay unlinks nothing further")
         XCTAssertEqual(fixture.links.live.map(\.linkID), [failing])
 
@@ -3689,6 +5194,9 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         XCTAssertEqual(fixture.organizer.states[lane]?.isArchived, false)
         let status = try await fixture.call(["op": .string("confirmation_status"), "confirmation_id": .string(cardID.uuidString)])
         let applied = try XCTUnwrap(status["applied_result"]?.objectValue)
+        XCTAssertEqual(status["confirmation_state"], .string("consumed"))
+        XCTAssertEqual(status["result"], .string("not_applied"))
+        XCTAssertEqual(applied["result"], .string("not_applied"))
         XCTAssertEqual(applied["requires_control"], ids([lane]), "reported as requires_control, not confirmation_mismatch")
     }
 
@@ -3704,6 +5212,7 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         fixture.organizer.states[turnedRunning]?.runState = .running
 
         let reply = try await fixture.call(["op": .string("archive"), "targets": ids([running, turnedRunning, idle])])
+        XCTAssertEqual(reply["result"], .string("partial"))
         XCTAssertEqual(reply["requires_control"], ids([running]))
         XCTAssertEqual(items(reply)[turnedRunning.uuidString], "skipped")
         XCTAssertEqual(items(reply)[idle.uuidString], "changed")
@@ -3717,6 +5226,7 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         fixture.provenance.add(idle, parent: fixture.overseer, workspace: fixture.workspace, state: .running)
         fixture.organizer.states[idle]?.runState = .running
         let undone = try await fixture.call(["op": .string("undo"), "undo_token": .string(token)])
+        XCTAssertEqual(undone["result"], .string("not_undone"))
         XCTAssertEqual(undone["requires_control"], ids([idle]))
         XCTAssertNil(items(undone)[idle.uuidString], "reported once, under requires_control")
         XCTAssertEqual(fixture.organizer.states[idle]?.isArchived, false, "a running session is not stashed without control")
@@ -3807,9 +5317,12 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         )]
         try fixture.grant()
         let reply = try await fixture.call(["op": .string("set_pin"), "targets": ids([loaded, unloaded]), "pinned": .bool(true)])
+        XCTAssertEqual(reply["result"], .string("partial"))
+        XCTAssertEqual(reply["changed_count"], .int(1))
         XCTAssertEqual(items(reply)[loaded.uuidString], "changed")
         XCTAssertEqual(items(reply)[unloaded.uuidString], "skipped")
         let only = try await fixture.call(["op": .string("set_pin"), "session_id": .string(unloaded.uuidString), "pinned": .bool(true)])
+        XCTAssertEqual(only["result"], .string("not_applied"))
         XCTAssertEqual(items(only)[unloaded.uuidString], "skipped")
         do {
             _ = try await fixture.call(["op": .string("set_pin"), "session_id": .string(UUID().uuidString), "pinned": .bool(true)])
@@ -3857,10 +5370,12 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
             "idempotency_key": .string("pin-noop")
         ]
         let noop = try await fixture.call(args)
+        XCTAssertEqual(noop["result"], .string("unchanged"))
         XCTAssertEqual(items(noop)[a.uuidString], "unchanged")
         fixture.organizer.states[a]?.isPinned = false
         let retry = try await fixture.call(args)
         XCTAssertNil(retry["idempotent_replay"])
+        XCTAssertEqual(retry["result"], .string("applied"))
         XCTAssertEqual(items(retry)[a.uuidString], "changed")
         XCTAssertEqual(fixture.organizer.states[a]?.isPinned, true)
         let replay = try await fixture.call(args)
@@ -3902,6 +5417,18 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
 
     /// A target that starts running while its stash is suspended is refused at commit time, in this
     /// or another window; with `control` the same race archives.
+    func testArchiveRechecksMembershipAfterStashPreparation() async throws {
+        let fixture = Fixture()
+        let target = fixture.member("Moving target")
+        try fixture.grant([.observe, .organize])
+        fixture.organizer.onStashSuspension = { id in
+            fixture.provenance.add(id, parent: UUID(), workspace: fixture.workspace)
+        }
+        let reply = try await fixture.call(["op": .string("archive"), "session_id": .string(target.uuidString)])
+        XCTAssertEqual(reply["changed_count"], .int(0))
+        XCTAssertEqual(fixture.organizer.states[target]?.isArchived, false)
+    }
+
     func testArchiveChecksRunStateAtStashCommitTime() async throws {
         let fixture = Fixture()
         let lane = fixture.member("Lane")
@@ -3966,6 +5493,8 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         await fixture.approveAndApply(cardID)
         let result = try XCTUnwrap(fixture.frontDoor.appliedResult(forConfirmation: cardID)?.objectValue)
         XCTAssertEqual(reason(result, lane), "requires_control")
+        XCTAssertEqual(result["result"], .string("partial"))
+        XCTAssertEqual(result["committed_changes"], .bool(true))
         XCTAssertEqual(fixture.links.stoppedLinkIDs.count, 1, "no link is stopped after the target started running")
         XCTAssertEqual(fixture.links.live.count, 1)
         XCTAssertEqual(organizer.states[lane]?.isArchived, false)
@@ -4021,7 +5550,7 @@ final class DelegationCommitFenceTests: XCTestCase {
             "the old lookup sees the non-presenting catalog copy"
         )
         var windows = [first, second]
-        let runtime = DelegationScopeRuntime(windows: { windows }, notifyCatalogChanged: { _ in })
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, windows: { windows }, notifyCatalogChanged: { _ in })
         let request = try runtime.requestScope(
             requesterSessionID: requester, requesterTabID: tab, kind: .tree(rootSessionID: requester),
             capabilities: [.observe], guardrails: .init(), reason: nil, idempotencyKey: nil
@@ -4138,7 +5667,11 @@ final class DelegationCommitFenceTests: XCTestCase {
             return .revoked
         }
 
-        func fork(sessionID _: UUID, upToItemID _: UUID?) async throws -> UUID {
+        func fork(
+            sessionID _: UUID,
+            upToItemID _: UUID?,
+            isStillAuthorized _: @escaping @MainActor () -> Bool
+        ) async throws -> UUID {
             throw SessionAdminHostError.sessionUnavailable
         }
     }
@@ -4388,6 +5921,122 @@ final class SessionAdminInventoryReadTests: XCTestCase {
         XCTAssertEqual(queries.first, workspace.uuidString)
         XCTAssertTrue(budgets.first === budget)
         XCTAssertFalse(snapshot.isComplete, "workspace absence is not global deletion proof")
+        XCTAssertTrue(snapshot.recordsComplete, "the selected workspace can still have complete record coverage")
+    }
+
+    func testWorkspaceInventoryUsesOwnerSelectedCustomLocationWithoutEnumeratingOtherWorkspaces() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("inventory-owner-location-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let workspaceID = UUID(), caller = UUID(), target = UUID()
+        // Capture both URL representations before storage exists. An unhinted URL must keep
+        // naming this same registered directory after Foundation recognizes it as a directory.
+        let locations = [false, true].map { isDirectory in
+            HistoryWorkspaceLocation(
+                runtimeID: UUID(), workspaceID: workspaceID, name: "Custom inventory",
+                directory: directory.appendingPathComponent("CustomWorkspace", isDirectory: isDirectory)
+            )
+        }
+        let sessions = locations[0].directory.appendingPathComponent("AgentSessions")
+        try FileManager.default.createDirectory(at: sessions, withIntermediateDirectories: true)
+        try JSONEncoder().encode(AgentSessionMetadataIndex(entries: [directRecord(id: target, parent: nil, workspace: workspaceID)]))
+            .write(to: sessions.appendingPathComponent("AgentSessionIndex.json"))
+        for location in locations {
+            let scanner = HistorySessionScanner(
+                applicationSupportRoot: directory,
+                workspaceDirectoryProvider: { _ in XCTFail("workspace inventory must not enumerate the application root")
+                    return []
+                },
+                workspaceLocations: .init(resolve: { selector in
+                    guard selector == .id(workspaceID) else {
+                        XCTFail("scope selector must reach the owner as its UUID")
+                        return .unavailable
+                    }
+                    return .matched(location)
+                })
+            )
+            let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { [] }, links: { ([], []) })
+            let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
+            let scope = try grant(runtime: runtime, caller: caller, kind: .workspace(workspaceID: workspaceID))
+            let handler = AgentSessionInventoryOperationHandler(
+                source: source, scopeChain: { runtime.scopeChain(from: $0) },
+                isScopeCurrent: { runtime.record(id: $0.id)?.generation == $0.generation },
+                isLeaseCurrent: { runtime.isCurrent($0) }
+            )
+            let value = try await handler.perform(.init(
+                request: .init(operation: .adminInventory, caller: .agentSession(caller)),
+                scope: scope, leases: [], bases: [], itemsRequiringControl: [], confirmation: nil
+            ))
+            let reply = try XCTUnwrap(value.objectValue)
+            XCTAssertEqual(reply["total"], .int(1))
+            XCTAssertEqual(reply["total_complete"], .bool(true))
+            XCTAssertEqual(reply["history_complete"], .bool(true))
+            XCTAssertEqual(reply["endpoints_complete"], .bool(false))
+            let rows = try XCTUnwrap(reply["sessions"]?.arrayValue)
+            XCTAssertEqual(rows.compactMap { $0.objectValue?["session_id"]?.stringValue }, [target.uuidString])
+            XCTAssertEqual(rows.first?.objectValue?["workspace_id"], .string(workspaceID.uuidString))
+            let indexReads = await scanner.indexDecodeCountForTesting
+            let transcriptReads = await scanner.transcriptDecodeCountForTesting
+            XCTAssertEqual(indexReads, 1)
+            XCTAssertEqual(transcriptReads, 0)
+        }
+    }
+
+    func testWorkspaceInventorySeparatesRecordCoverageFromUnknownOrganizationAndEndpoints() async throws {
+        let scanner = Scanner()
+        let stored = projectionWorkspace(count: 2)
+        await scanner.setWorkspaces([stored])
+        let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { [] }, links: { ([], []) })
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
+        let caller = UUID()
+        let scope = try grant(runtime: runtime, caller: caller, kind: .workspace(workspaceID: XCTUnwrap(stored.workspaceID)))
+        let handler = AgentSessionInventoryOperationHandler(
+            source: source, scopeChain: { runtime.scopeChain(from: $0) },
+            isScopeCurrent: { runtime.record(id: $0.id)?.generation == $0.generation },
+            isLeaseCurrent: { runtime.isCurrent($0) }
+        )
+        func read(_ filter: [String: Value]? = nil) async throws -> [String: Value] {
+            let batch = AgentSessionAdministrationAuthorizedBatch(
+                request: .init(
+                    operation: .adminInventory, caller: .agentSession(caller),
+                    arguments: filter.map { ["filter": .object($0)] } ?? [:]
+                ), scope: scope, leases: [], bases: [], itemsRequiringControl: [], confirmation: nil
+            )
+            let value = try await handler.perform(batch)
+            return try XCTUnwrap(value.objectValue)
+        }
+        let result = try await read()
+        XCTAssertEqual(result["total"], .int(2))
+        XCTAssertEqual(result["total_complete"], .bool(true))
+        XCTAssertEqual(result["history_complete"], .bool(true))
+        XCTAssertEqual(result["endpoints_complete"], .bool(false))
+        for row in try XCTUnwrap(result["sessions"]?.arrayValue) {
+            let object = try XCTUnwrap(row.objectValue)
+            XCTAssertEqual(object["organization_complete"], .bool(false))
+            XCTAssertNil(object["archived"])
+            XCTAssertNil(object["pinned"])
+            XCTAssertNil(object["group"])
+            XCTAssertEqual(object["orphan_status_complete"], .bool(false))
+        }
+        let filters: [[String: Value]] = [["pinned": .bool(false)], ["archived": .bool(false)], ["group": .string("")]]
+        for filter in filters {
+            let filtered = try await read(filter)
+            XCTAssertEqual(filtered["sessions"], .array([]))
+            XCTAssertEqual(filtered["total_complete"], .bool(false), "unknown sidebar state may hide matches")
+        }
+        let projector = SpawnProvenanceDelegationMembershipProjector(source: SessionAdminScopeLifecycleTests.FakeProvenance())
+        let core = AgentSessionAdministrationCore(scopes: runtime, projector: projector)
+        let frontDoor = AgentSessionAdministrationFrontDoor(
+            core: core, scopes: runtime, projector: projector, inventory: source, liveBoundSession: { _ in caller }
+        )
+        let mutation = Handler()
+        frontDoor.register(mutation)
+        let outcome = try await frontDoor.perform(.init(
+            operation: .adminRename, caller: .agentSession(caller), scopeID: scope.id,
+            arguments: ["filter": .object(["pinned": .bool(false)]), "name": .string("Renamed")]
+        ))
+        guard case let .completed(value) = outcome else { return XCTFail("expected incomplete inventory outcome") }
+        XCTAssertEqual(value.objectValue?["code"], .string("inventory_incomplete"))
+        XCTAssertFalse(mutation.performed, "unknown sidebar state must not produce a mutation or false no-matching result")
     }
 
     func testLoadedOnlyReadDoesNotOpenHistoryAndCannotProveOrphans() async throws {
@@ -4416,7 +6065,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
 
     func testHandlerRechecksAuthorityAfterProductionRead() async throws {
         let scanner = Scanner()
-        let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
         let caller = UUID()
         let scope = try grant(runtime: runtime, caller: caller, kind: .workspace(workspaceID: UUID()))
         let current = Flag(true)
@@ -4456,7 +6105,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
     func testExactLoadedFrontDoorTargetAvoidsUnrelatedProductionHistoryScan() async throws {
         let scanner = Scanner()
         let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { [] }, links: { ([], []) })
-        let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
         let caller = UUID()
         let target = UUID()
         let workspace = UUID()
@@ -4483,7 +6132,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
     func testAuthorizedExactGetDoesNotScanHistoryWhenLoadedProjectionDisappears() async throws {
         let scanner = Scanner()
         let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { [] }, links: { ([], []) })
-        let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
         let caller = UUID()
         let target = UUID()
         let workspace = UUID()
@@ -4512,7 +6161,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
 
     func testFrontDoorRechecksAuthorityBeforeEmptyFilterEarlyResult() async throws {
         let scanner = Scanner()
-        let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
         let caller = UUID()
         let scope = try grant(runtime: runtime, caller: caller, kind: .workspace(workspaceID: UUID()))
         let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { [] }, links: {
@@ -4562,7 +6211,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
     }
 
     func testGranteeGetsTypedBudgetOutcomeButRevocationStillGetsUniformDenial() async throws {
-        let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
         let caller = UUID()
         let scope = try grant(runtime: runtime, caller: caller, kind: .workspace(workspaceID: UUID()))
         let source = FailureSource()
@@ -4587,7 +6236,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
     }
 
     func testHistoryOnlyGetReturnsReadUnavailableInsteadOfAppliedSkippedMutation() async throws {
-        let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
         let caller = UUID()
         let target = UUID()
         let workspace = UUID()
@@ -4621,7 +6270,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
     }
 
     func testIncompleteEndpointCensusRefusesFilterWithRecoverableCode() async throws {
-        let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
         let caller = UUID()
         let target = UUID()
         let workspace = UUID()
@@ -4685,7 +6334,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
     }
 
     func testBoundedLoadedGetWithKnownSameScopeNeighborDoesNotPresentEmptyLinksOrChildren() async throws {
-        let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
         let caller = UUID()
         let target = UUID()
         let child = UUID()
@@ -4734,7 +6383,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
     func testProjectionDeadlineCannotWidenNoLinksMutationFilter() async throws {
         let scanner = Scanner()
         await scanner.setWorkspaces([projectionWorkspace(count: 256)])
-        let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
         let caller = UUID()
         let target = UUID()
         let child = UUID()
@@ -4908,7 +6557,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
     }
 
     func testInventoryReadPredicatesRefuseIncompleteCensusAndPartialRowsOmitNegativeFacts() async throws {
-        let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
         let caller = UUID()
         let target = UUID()
         let workspace = UUID()
@@ -4954,6 +6603,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
         let window: WindowState
         let runtime: MCPDomainRuntime
         let directory: URL
+        let ownsRuntime: Bool
         var carriers: WorkspaceModel?
         var indexEntries: [UUID: AgentSessionIndexEntry] = [:]
 
@@ -4982,28 +6632,42 @@ final class SessionAdminInventoryReadTests: XCTestCase {
             )
         }
 
-        init(window: WindowState, runtime: MCPDomainRuntime, directory: URL) {
+        init(window: WindowState, runtime: MCPDomainRuntime, directory: URL, ownsRuntime: Bool = true) {
             self.window = window
             self.runtime = runtime
             self.directory = directory
+            self.ownsRuntime = ownsRuntime
         }
 
-        static func make(activeID: UUID, parentID: UUID?, stashedID: UUID? = nil) async throws -> LoadedWindowFixture {
+        static func make(
+            activeID: UUID, parentID: UUID?, stashedID: UUID? = nil,
+            agentFactory: WindowStateCompositionFactory.AgentModeViewModelFactory? = nil,
+            processRuntime: MCPDomainRuntime? = nil
+        ) async throws -> LoadedWindowFixture {
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent("inventory-loaded-\(UUID())")
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             // WindowState() is the legacy/no-runtime composition in these headless tests.
             // Persistent creation requires an explicitly started app authority; give this
             // fixture its own bounded storage and lifecycle rather than weakening that guard.
-            let runtime = MCPDomainRuntime(configuration: .init(
+            let runtime = processRuntime ?? MCPDomainRuntime(configuration: .init(
                 mode: .app, profileIdentifier: "inventory-loaded-\(UUID())",
                 storageDirectory: directory.appendingPathComponent("runtime"),
                 workspaceStorageDirectory: directory.appendingPathComponent("Workspaces"),
                 eventDirectory: directory.appendingPathComponent("events"),
                 temporaryDirectory: directory.appendingPathComponent("tmp"), externalReloadInterval: nil
             ))
-            try await runtime.start()
-            let window = WindowState(domainRuntime: runtime)
-            let fixture = LoadedWindowFixture(window: window, runtime: runtime, directory: directory)
+            if processRuntime == nil { try await runtime.start() }
+            let window = if let agentFactory {
+                WindowState(
+                    agentModeViewModelFactory: agentFactory,
+                    contextBuilderProviderFactory: { _, _, _, _ in AgentSessionLinkCapturingHeadlessProvider(failuresRemaining: 1) },
+                    domainRuntime: runtime
+                )
+            } else { WindowState(domainRuntime: runtime) }
+            let fixture = LoadedWindowFixture(window: window, runtime: runtime, directory: directory, ownsRuntime: processRuntime == nil)
+            window.workspaceManager.setWorkspaceSaveConflictHandlerForTesting { fields in
+                print("WORKSPACE_SAVE_CONFLICT \(fields.sorted { $0.key < $1.key })")
+            }
             WindowStatesManager.shared.registerWindowState(window)
             do {
                 await window.workspaceManager.awaitInitialized()
@@ -5054,12 +6718,871 @@ final class SessionAdminInventoryReadTests: XCTestCase {
         }
 
         func cleanup() async {
+            if !ownsRuntime, let carriers { _ = await window.workspaceManager.deleteWorkspaceAsync(carriers) }
             WindowStatesManager.shared.unregisterWindowState(window)
             await window.workspaceManager.debugDrainScheduledSaves()
             await window.tearDown()
-            let shutdown = await runtime.shutdown()
-            XCTAssertEqual(shutdown.finalLifecycle, .stopped)
+            if ownsRuntime {
+                let shutdown = await runtime.shutdown()
+                XCTAssertEqual(shutdown.finalLifecycle, .stopped)
+            }
             try? FileManager.default.removeItem(at: directory)
+        }
+    }
+
+    func testHistoricalAndStashedMetadataResolutionDoesNotChangeVisibleBindingOrHydrate() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            let current = UUID(), historical = UUID(), stashed = UUID()
+            let fixture = try await LoadedWindowFixture.make(activeID: current, parentID: nil, stashedID: stashed)
+            addTeardownBlock { @MainActor in await fixture.cleanup() }
+            let tab = try XCTUnwrap(fixture.carriers?.composeTabs.first)
+            fixture.indexEntries[historical] = AgentSessionIndexEntry(
+                id: historical, tabID: tab.id, name: "Historical", savedAt: .distantPast,
+                itemCount: 0, autoEditEnabled: false, hasUnknownConversationContent: false,
+                isMCPOriginated: false, worktreeBindingSummaries: [], activeWorktreeMergeSummaries: []
+            )
+            try fixture.installCarriers()
+            // The production resolver point-reads the saved payload, not an owner-index snapshot
+            // which an asynchronous sidebar refresh is allowed to replace.
+            let savedWorkspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+            for id in [historical, stashed] {
+                let carrier = try XCTUnwrap(fixture.indexEntries[id])
+                let url = try await AgentSessionDataService.shared.saveAgentSession(AgentSession(
+                    id: id, workspaceID: savedWorkspace.id, composeTabID: carrier.tabID,
+                    name: carrier.name, agentKind: "claudeCode", agentModel: "", isMCPOriginated: false
+                ), for: savedWorkspace)
+                addTeardownBlock { try? FileManager.default.removeItem(at: url) }
+            }
+            let vm = fixture.window.agentModeViewModel
+            let requester = vm.session(for: tab.id)
+            _ = try XCTUnwrap(vm.test_installPersistentSessionBinding(sessionID: current, on: requester, updateWorkspaceMetadata: true))
+            requester.hasLoadedPersistedState = true
+            requester.recordRestorationAuthoritative(.persistedPayloadApplied)
+            _ = try AgentSessionLinkEndpointTestSupport.endpoint(vm, tabID: tab.id)
+            let selected = fixture.window.promptManager.activeComposeTabID
+            let runtimeCount = vm.sessions.count
+            for id in [historical, stashed] {
+                let result = await WindowStatesManager.shared.resolveSavedOversightLocation(id)
+                guard case let .success(location) = result else { return XCTFail("\(result)") }
+                XCTAssertEqual(location.entry.id, id)
+                XCTAssertTrue(location.isCurrent)
+                XCTAssertNil(WindowStatesManager.shared.preparedOversightWindows[id], "Metadata lookup must not create a runtime")
+            }
+            XCTAssertTrue(AgentSessionLinkRuntimeBridge.shared.delegationScopes.pendingRequests(forTab: tab.id, sessionID: current).isEmpty)
+            XCTAssertEqual(vm.sessions.count, runtimeCount)
+            XCTAssertEqual(fixture.window.promptManager.activeComposeTabID, selected)
+            XCTAssertEqual(fixture.window.workspaceManager.activeWorkspace?.composeTabs.first?.activeAgentSessionID, current)
+        }
+    }
+
+    func testReducedTargetApprovalReportsTheMissingCapabilitiesWithoutDelivering() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            let observerFixture = try await LoadedWindowFixture.make(activeID: UUID(), parentID: nil)
+            let targetFixture = try await LoadedWindowFixture.make(activeID: UUID(), parentID: nil)
+            addTeardownBlock { @MainActor in await targetFixture.cleanup()
+                await observerFixture.cleanup()
+            }
+            try observerFixture.installCarriers()
+            try targetFixture.installCarriers()
+            let vm = observerFixture.window.agentModeViewModel
+            let tab = try XCTUnwrap(observerFixture.carriers?.composeTabs.first)
+            let sessionID = try XCTUnwrap(tab.activeAgentSessionID)
+            let session = vm.session(for: tab.id)
+            _ = try XCTUnwrap(vm.test_installPersistentSessionBinding(sessionID: sessionID, on: session, updateWorkspaceMetadata: true))
+            session.hasLoadedPersistedState = true
+            session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(vm, tabID: tab.id)
+            let target = try XCTUnwrap(targetFixture.carriers?.composeTabs.first?.activeAgentSessionID)
+            let bridge = AgentSessionLinkRuntimeBridge.shared
+            var notices: [String] = []
+            bridge.delegationScopes.test_scopeDecision = { _, text in notices.append(text) }
+            addTeardownBlock { @MainActor in bridge.delegationScopes.test_scopeDecision = nil }
+            let response = await bridge.requestTargetedOversight(observer: endpoint, targetSessionID: target, message: "say hi", idempotencyKey: UUID().uuidString)
+            guard case let .string(rawID) = response.objectValue?["request_id"], let id = UUID(uuidString: rawID) else { return XCTFail("Expected one card") }
+            _ = try bridge.delegationScopes.approve(requestID: id, capabilities: [.observe]).get()
+            try await AsyncTestWait.waitUntil("precise reduced-consent notice") { notices.contains { $0.contains("missing_capabilities=control,restructure") } }
+            XCTAssertFalse(notices.contains { $0.contains("task_delivered") || $0.contains("caller_changed_or_scope_revoked") })
+        }
+    }
+
+    func testIdleDecisionIndeterminateSaveIsFlaggedAndPersistedOnlyRetriesStartWithoutAnotherRow() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            for mode in ["indeterminate", "persisted", "exhausted"] {
+                let indeterminate = mode == "indeterminate"
+                let exhausted = mode == "exhausted"
+                let controller = MonitorFakeNativeController()
+                var starts = 0
+                let factory: WindowStateCompositionFactory.AgentModeViewModelFactory = { windowID, prompt, manager, server in
+                    let vm = AgentModeViewModel(
+                        testWindowID: windowID, testWorkspacePath: FileManager.default.temporaryDirectory.path,
+                        codexControllerFactory: { _, _, _, _, _, _ in fatalError("Unexpected Codex") },
+                        claudeControllerFactory: { _, _, _, _ in starts += 1
+                            return controller
+                        },
+                        mcpServerEnabler: { true }, testMCPServer: server,
+                        testWorkspaceFileContextStore: prompt.workspaceFileContextStore
+                    )
+                    vm.promptManager = prompt
+                    vm.workspaceManager = manager
+                    return vm // Real pending-policy installer and lease; no catalog-witness stub.
+                }
+                let requesterID = UUID()
+                let fixture = try await LoadedWindowFixture.make(activeID: requesterID, parentID: nil, agentFactory: factory)
+                var cleaned = false
+                addTeardownBlock { @MainActor in if !cleaned { await fixture.cleanup() } }
+                try fixture.installCarriers()
+                let vm = fixture.window.agentModeViewModel
+                let tab = try XCTUnwrap(fixture.carriers?.composeTabs.first)
+                let session = vm.session(for: tab.id)
+                _ = try XCTUnwrap(vm.test_installPersistentSessionBinding(sessionID: requesterID, on: session, updateWorkspaceMetadata: true))
+                session.hasLoadedPersistedState = true
+                session.recordRestorationAuthoritative(.persistedPayloadApplied)
+                session.selectedAgent = .claudeCode
+                fixture.window.apiSettingsViewModel.isClaudeCodeConnected = true
+                try await AsyncTestWait.waitUntil("notification provider available") { fixture.window.apiSettingsViewModel.agentAvailability.claudeCodeAvailable }
+                _ = try await fixture.window.workspaceManager.saveWorkspaceToFileAsync(XCTUnwrap(fixture.window.workspaceManager.activeWorkspace))
+                var writes = 0
+                vm.test_setAgentSessionSaver { _, _, _ in
+                    writes += 1
+                    if indeterminate { throw CocoaError(.fileWriteOutOfSpace) }
+                    if writes == 1 { session.mcpFollowUpRunPending = true } // Drift after row save, before start.
+                    return fixture.directory.appendingPathComponent("notice.json")
+                }
+                let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, windows: { [fixture.window] }, notifyCatalogChanged: { _ in })
+                runtime.test_suppressDecisionDelivery = false
+                if exhausted { runtime.test_decisionStartRetryDelay = .milliseconds(1) }
+                let request = try runtime.requestScope(
+                    requesterSessionID: requesterID, requesterTabID: tab.id, kind: .session(targetSessionID: UUID()),
+                    capabilities: [.observe], guardrails: .init(), reason: nil, idempotencyKey: nil
+                ).get()
+                _ = try runtime.approve(requestID: request.id).get()
+                if indeterminate {
+                    try await AsyncTestWait.waitUntil("uncertain save flagged, never requeued") {
+                        session.items.contains { $0.kind == .error && $0.text.contains("save is unconfirmed") } && runtime.test_pendingDecisionCount == 0
+                    }
+                    XCTAssertGreaterThanOrEqual(writes, 2, "Both write and compensating removal failed")
+                    XCTAssertEqual(starts, 0)
+                    session.objectWillChange.send()
+                    XCTAssertEqual(runtime.test_pendingDecisionCount, 0)
+                    XCTAssertEqual(AgentModeViewModel.delegationDecisionOutcome(.blocked(.persistenceIndeterminate)), .indeterminate)
+                } else {
+                    try await AsyncTestWait.waitUntil("saved row remains owned for start-only retry") {
+                        runtime.test_pendingDecisionStartCount == 1 || (exhausted && session.items.contains { $0.kind == .error && $0.text.contains("after five retries") })
+                    }
+                    let rows = session.items.filter { $0.kind == .user }
+                    XCTAssertEqual(rows.count, 1)
+                    XCTAssertEqual(starts, 0)
+                    if exhausted {
+                        try await AsyncTestWait.waitUntil("bounded retries visibly give up without another row") {
+                            runtime.test_pendingDecisionCount == 0 && session.items.contains { $0.kind == .error && $0.text.contains("after five retries") }
+                        }
+                        XCTAssertEqual(starts, 0)
+                        XCTAssertEqual(writes, 1)
+                        session.mcpFollowUpRunPending = false
+                        session.objectWillChange.send()
+                        XCTAssertEqual(runtime.test_pendingDecisionCount, 0)
+                    } else {
+                        session.mcpFollowUpRunPending = false
+                        try await AsyncTestWait.waitUntil("saved notice starts without another approval or append", timeout: 15) { await controller.sentCount == 1 }
+                        XCTAssertEqual(starts, 1)
+                    }
+                    XCTAssertEqual(session.items.filter { $0.kind == .user }.map(\.id), rows.map(\.id))
+                    let failedStart = try AgentSessionLinkSendDelivery(targetItemID: XCTUnwrap(rows.first?.id), acceptedAt: Date(), deliveryState: .runStartFailed, resultingRunState: "idle")
+                    XCTAssertEqual(AgentModeViewModel.delegationDecisionOutcome(.delivered(failedStart)), .persisted(failedStart))
+                }
+                runtime.freezeForTermination()
+                vm.test_setAgentSessionSaver { _, _, _ in fixture.directory.appendingPathComponent("notice.json") }
+                await fixture.cleanup()
+                cleaned = true
+            }
+        }
+    }
+
+    func testExactTargetApprovalContinuesColdSavedLinkAndManagedTaskWithoutUserTurn() async throws {
+        try await assertExactTargetFlow(placement: "current")
+    }
+
+    func testExactTargetApprovalPreparesHistoricalSessionWithoutRebindingVisibleTab() async throws {
+        try await assertExactTargetFlow(placement: "historical")
+    }
+
+    func testExactTargetApprovalPreparesStashedSessionWithoutUnstashing() async throws {
+        try await assertExactTargetFlow(placement: "stashed")
+    }
+
+    func testExactTargetApprovalPreparesInactiveWorkspaceWithoutSwitchingIt() async throws {
+        try await assertExactTargetFlow(placement: "inactive")
+    }
+
+    func testPreparedSavedOwnerIsReleasedAfterLinkRetirement() async throws {
+        try await assertExactTargetFlow(placement: "historical", retirement: "retire")
+    }
+
+    func testPreparedSavedOwnerIsReleasedAfterTargetDeletion() async throws {
+        try await assertExactTargetFlow(placement: "historical", retirement: "delete")
+    }
+
+    func testPreparedSavedOwnerHandsOffWhenUserVisitsHistory() async throws {
+        try await assertExactTargetFlow(placement: "historical", retirement: "visit")
+    }
+
+    func testPreparedSavedOwnerIsReleasedWhenUserRebindsCarrier() async throws {
+        try await assertExactTargetFlow(placement: "historical", retirement: "rebind")
+    }
+
+    func testPreparedSavedOwnerIsReleasedWithinTerminationBudget() async throws {
+        try await assertExactTargetFlow(placement: "historical", retirement: "termination")
+    }
+
+    func testPreparedSavedOwnerQuitDoesNotJoinBlockedWriterPastDeadline() async throws {
+        try await assertExactTargetFlow(placement: "historical", retirement: "blocked-termination")
+    }
+
+    func testPreparedSavedOwnerUsesLiveConnectionAuthorityAcrossDisconnectAndReconnect() async throws {
+        try await assertExactTargetFlow(placement: "historical", checksConnectionChanges: true)
+    }
+
+    func testActiveManagedRunSurvivesCarrierSessionSwitch() async throws {
+        try await assertExactTargetFlow(placement: "historical", duringRun: "switch")
+    }
+
+    func testActiveManagedRunSurvivesUnstash() async throws {
+        try await assertExactTargetFlow(placement: "stashed", duringRun: "unstash")
+    }
+
+    func testActiveManagedRunAndSettingsLeaseSurviveSourceWindowClose() async throws {
+        try await assertExactTargetFlow(placement: "inactive", duringRun: "close")
+    }
+
+    func testVisitDuringManagedRunAutomaticallyHandsOffAfterCompletion() async throws {
+        try await assertExactTargetFlow(placement: "historical", retirement: "visit-during", duringRun: "visit")
+    }
+
+    func testExactTargetApprovalAfterRequesterReconnectUsesProductionCatalog() async throws {
+        try await assertExactTargetFlow(placement: "current", reconnectBeforeActivation: true)
+    }
+
+    func testManagedTaskOutlivesSixtySecondWatchAndStillResumesRequester() async throws {
+        try await assertExactTargetFlow(placement: "historical", longWatch: true)
+    }
+
+    func testRearmedWatchStopsOnFailureWithoutDuplicateResult() async throws {
+        try await assertExactTargetFlow(placement: "historical", longWatch: true, terminalStatus: .failed)
+    }
+
+    func testRearmedWatchStopsOnCancellationWithoutDuplicateResult() async throws {
+        try await assertExactTargetFlow(placement: "historical", longWatch: true, terminalStatus: .cancelled)
+    }
+
+    func testRearmedWatchAndActiveOwnerStopOnRevoke() async throws {
+        try await assertExactTargetFlow(placement: "historical", duringRun: "revoke-active", longWatch: true)
+    }
+
+    func testRearmedWatchAndActiveOwnerStopOnDeletion() async throws {
+        try await assertExactTargetFlow(placement: "historical", duringRun: "delete-active", longWatch: true)
+    }
+
+    func testRearmedWatchAndActiveOwnerStopWithinShutdownBudget() async throws {
+        try await assertExactTargetFlow(placement: "historical", duringRun: "shutdown-active", longWatch: true)
+    }
+
+    private func assertExactTargetFlow(placement: String, retirement: String = "revoke", checksConnectionChanges: Bool = false, duringRun: String? = nil, longWatch: Bool = false, terminalStatus: NativeAgentRuntimeTurnStatus = .completed, reconnectBeforeActivation: Bool = false) async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            let requesterID = placement == "current" && !reconnectBeforeActivation ? UUID(uuidString: "EBDD3C4A-E6DE-4D9F-8FA3-5456B640BBE6")! : UUID()
+            let targetID = placement == "current" && !reconnectBeforeActivation ? UUID(uuidString: "7028330D-041A-432C-A6F6-F1C976FAD1AD")! : UUID()
+            let controller = MonitorFakeNativeController()
+            var providerStarts = 0
+            let observerController = MonitorFakeNativeController()
+            let realCatalog = placement == "current"
+            let network = ServerNetworkManager.shared
+            var connections: [UUID: PersistentMCPTestEndpoint] = [:]
+            var registrations: [MCPDomainToolRegistrationHandle] = []
+            var registeredWindows: Set<Int> = []
+            var connectionTasks: [Task<Void, Never>] = []
+            var connectionErrors: [String] = []
+            let catalogChanged = realCatalog ? expectation(description: "Production activation emits tools/list_changed on the real requester socket") : nil
+            catalogChanged?.assertForOverFulfill = false
+            @MainActor func registerCatalog(_ server: MCPServerViewModel, windowID: Int) async throws {
+                if registeredWindows.insert(windowID).inserted {
+                    let registration = try await AppDomainRuntimeComposition.shared.register(server.windowMCPToolCatalogService)
+                    registrations.append(registration.handle)
+                }
+            }
+            if realCatalog { try await AppGlobalMCPServiceComposition.shared.ensureRegistered() }
+            addTeardownBlock { @MainActor in
+                for task in connectionTasks {
+                    await task.value
+                }
+                for (runID, connection) in connections {
+                    connection.client.close()
+                    await connection.connectionManager.stop()
+                    await network.debugRemoveConnection(connection.connectionID)
+                    await network.clearExpectedAgentPID(getpid(), for: AgentProviderKind.claudeMCPClientID, runID: runID)
+                    await network.clearClientConnectionPolicy(for: AgentProviderKind.claudeMCPClientID, runID: runID)
+                }
+                for handle in registrations {
+                    await AppDomainRuntimeComposition.shared.unregister(handle)
+                }
+            }
+            @MainActor func providerFactory(_ controller: MonitorFakeNativeController, catalogPeer: Bool = false, onStart: @escaping @MainActor () -> Void) -> WindowStateCompositionFactory.AgentModeViewModelFactory {
+                { windowID, prompt, manager, server in
+                    let vm = AgentModeViewModel(
+                        testWindowID: windowID, testWorkspacePath: FileManager.default.temporaryDirectory.path,
+                        codexControllerFactory: { _, _, _, _, _, _ in fatalError("This fixture must never launch Codex") },
+                        claudeControllerFactory: { runID, _, windowID, _ in
+                            onStart()
+                            if realCatalog, catalogPeer {
+                                connectionTasks.append(Task { @MainActor in
+                                    do {
+                                        try await registerCatalog(server, windowID: windowID)
+                                        // The external controller is fake; its socket peer is the
+                                        // actual XCTest PID. Policy, route proof and tools/list
+                                        // admission below are real, not a catalog projection stub.
+                                        await network.registerExpectedAgentPID(getpid(), for: AgentProviderKind.claudeMCPClientID, runID: runID)
+                                        connections[runID] = try await PersistentMCPTestEndpoint.make(
+                                            label: "oversee-resumed", networkManager: network,
+                                            clientName: AgentProviderKind.claudeMCPClientID,
+                                            useProductionAgentAdmission: true,
+                                            requiredToolNames: [MCPWindowToolName.agentSessionLink]
+                                        )
+                                    } catch {
+                                        let history = await network.debugRunRoutingHistoryPayload(runID: runID, limit: 20)
+                                        connectionErrors.append("window=\(windowID) run=\(runID): \(error); routing=\(history)")
+                                    }
+                                })
+                            }
+                            return controller
+                        },
+                        // Keep real pending-policy arming: native PID leases must not see a no-op installer.
+                        mcpServerEnabler: { true }, testMCPServer: server,
+                        testWorkspaceFileContextStore: prompt.workspaceFileContextStore
+                    )
+                    vm.promptManager = prompt
+                    vm.workspaceManager = manager
+                    // This disposable provider has no MCP process to register a tools/list reply.
+                    // Supply only its transport/catalog witness; real scope/link authority stays live.
+                    if !realCatalog {
+                        let connectionID = UUID()
+                        vm.test_agentSessionLinkAuthoritativeRunCatalogRouteToken = { [weak vm] runID, _, tabID in
+                            guard let vm, let endpoint = vm.agentSessionLinkObserverEndpoint(tabID: tabID) else { return nil }
+                            let token = AgentSessionLinkRunCatalogRouteToken(
+                                runID: runID, observerEndpoint: endpoint, connectionID: connectionID,
+                                routingAuthorityGeneration: 1, connectionLifecycleGeneration: 1
+                            )
+                            vm.agentSessionLinkPublishRunCatalogProjection(.init(
+                                runID: runID, routeToken: token, projectionRevision: 1,
+                                hasAgentSessionLink: true, hasAnyActiveLink: true
+                            ), to: endpoint)
+                            return token
+                        }
+                        vm.test_agentSessionLinkCurrentRunCatalogRouteToken = { [weak vm] token, tabID in
+                            // The synchronous fence receives the tab ID, not the run ID.
+                            vm?.sessions[tabID]?.runID == token.runID
+                                && vm?.agentSessionLinkObserverEndpoint(tabID: tabID) == token.observerEndpoint
+                        }
+                    }
+                    return vm
+                }
+            }
+            let observerFixture = try await LoadedWindowFixture.make(activeID: requesterID, parentID: nil, agentFactory: providerFactory(observerController, catalogPeer: true, onStart: {}), processRuntime: realCatalog ? AppDomainRuntimeComposition.shared.runtime : nil)
+            let targetFixture = try await LoadedWindowFixture.make(activeID: targetID, parentID: nil, agentFactory: providerFactory(controller, onStart: { providerStarts += 1 }), processRuntime: realCatalog ? AppDomainRuntimeComposition.shared.runtime : nil)
+            addTeardownBlock { @MainActor in
+                await targetFixture.cleanup()
+                await observerFixture.cleanup()
+                WindowStatesManager.shared.attachAgentSessionLinkBridge()
+            }
+            try observerFixture.installCarriers()
+            try targetFixture.installCarriers()
+            let observerVM = observerFixture.window.agentModeViewModel
+            let observerTab = try XCTUnwrap(observerFixture.carriers?.composeTabs.first)
+            let observer = observerVM.session(for: observerTab.id)
+            observer.selectedAgent = .claudeCode
+            _ = try XCTUnwrap(observerVM.test_installPersistentSessionBinding(sessionID: requesterID, on: observer, updateWorkspaceMetadata: true))
+            observer.hasLoadedPersistedState = true
+            observer.recordRestorationAuthoritative(.persistedPayloadApplied)
+            let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(observerVM, tabID: observerTab.id)
+            var targetVM = targetFixture.window.agentModeViewModel
+            let manager = WindowStatesManager.shared
+            let originalPreparedFactory = manager.test_preparedOversightOwnerFactory
+            var backgroundWorkspacePreparations = 0
+            var sourceWorkspacePreparations = 0
+            manager.test_preparedOversightOwnerFactory = { workspace, source in
+                XCTAssertTrue(source === targetFixture.window, "Exact saved carrier must borrow its owning window's runtime context")
+                XCTAssertTrue(source.apiSettingsViewModel.isClaudeCodeConnected, "Source connection must remain available")
+                let owner = WindowState.makePreparedSessionOwner(
+                    workspace: workspace, borrowing: source,
+                    agentModeViewModelFactory: providerFactory(controller, onStart: { providerStarts += 1 })
+                )
+                XCTAssertTrue(owner.apiSettingsViewModel === source.apiSettingsViewModel)
+                XCTAssertTrue(owner.promptManager.apiSettingsViewModel === source.apiSettingsViewModel)
+                XCTAssertTrue(owner.agentModeViewModel.promptManager === owner.promptManager)
+                owner.workspaceManager.setWorkspaceSavePreparationDidFinishHandlerForTesting { _, _, _ in
+                    backgroundWorkspacePreparations += 1
+                }
+                XCTAssertTrue(owner.agentModeViewModel.agentAvailabilityContext.claudeCodeAvailable, "Nonvisual composition must use the same connection authority")
+                return owner
+            }
+            addTeardownBlock { @MainActor in
+                for id in Array(manager.preparedOversightWindows.keys) where id == targetID {
+                    if let owner = manager.preparedOversightWindows.removeValue(forKey: id) {
+                        owner.beginClose()
+                        await owner.tearDownPreparedSessionOwner()
+                    }
+                    manager.preparedOversightCarrierSubscriptions.removeValue(forKey: id)
+                    manager.preparedOversightLocations.removeValue(forKey: id)
+                    manager.preparedOversightOwnerLocations.removeValue(forKey: id)
+                }
+                manager.test_preparedOversightOwnerFactory = originalPreparedFactory
+            }
+            targetFixture.window.apiSettingsViewModel.isClaudeCodeConnected = true
+            observerFixture.window.apiSettingsViewModel.isClaudeCodeConnected = true
+            try await AsyncTestWait.waitUntil("in-memory Claude availability", timeout: 5) {
+                targetFixture.window.apiSettingsViewModel.agentAvailability.claudeCodeAvailable
+                    && observerFixture.window.apiSettingsViewModel.agentAvailability.claudeCodeAvailable
+            }
+            let targetTab = try XCTUnwrap(targetFixture.carriers?.composeTabs.first)
+            let workspaceIndex = try XCTUnwrap(targetFixture.window.workspaceManager.workspaces.firstIndex { $0.id == targetFixture.carriers?.id })
+            targetFixture.window.workspaceManager.workspaces[workspaceIndex].customStoragePath = targetFixture.directory.appendingPathComponent("sessions")
+            let workspace = targetFixture.window.workspaceManager.workspaces[workspaceIndex]
+            // Unlike the read-only inventory fixtures, this test dispatches a real write. Publish
+            // both carriers through the workspace owner so a save cannot reload their older disk tabs.
+            let sourceWorkspaceURL = try await targetFixture.window.workspaceManager.saveWorkspaceToFileAsync(workspace)
+            _ = try await observerFixture.window.workspaceManager.saveWorkspaceToFileAsync(
+                XCTUnwrap(observerFixture.window.workspaceManager.activeWorkspace)
+            )
+            if let prior = targetVM.sessions[targetTab.id] {
+                prior.saveDebounceTask?.cancel()
+                prior.persistedLoadTask?.cancel()
+                await prior.persistedLoadTask?.value
+            }
+            let savedURL = try await AgentSessionDataService.shared.saveAgentSession(AgentSession(
+                id: targetID, workspaceID: workspace.id, composeTabID: targetTab.id, name: "Never visited idle target",
+                agentKind: "claudeCode", agentModel: "", isMCPOriginated: false
+            ), for: workspace)
+            addTeardownBlock { try? FileManager.default.removeItem(at: savedURL) }
+            // Workspace activation can materialize the selected row. Remove only this disposable
+            // runtime to reproduce the never-visited saved carrier, not a fake live endpoint.
+            targetVM.test_removeSession(tabID: targetTab.id)
+            if placement == "stashed" {
+                // Exercise the real mutation owner rather than racing a caller-local stash
+                // replacement against the domain workspace projection's save preparation.
+                _ = await targetFixture.window.promptManager.stashTab(targetTab.id)
+                let stashedWorkspace = try XCTUnwrap(targetFixture.window.workspaceManager.activeWorkspace)
+                XCTAssertTrue(stashedWorkspace.stashedTabs.contains { $0.tab.id == targetTab.id })
+                targetFixture.carriers = stashedWorkspace
+                targetVM.test_removeSession(tabID: targetTab.id)
+            } else if placement == "historical" {
+                var placed = workspace
+                placed.composeTabs[0].activeAgentSessionID = UUID()
+                targetFixture.carriers = placed
+                try targetFixture.installCarriers()
+                _ = try await targetFixture.window.workspaceManager.saveWorkspaceToFileAsync(placed)
+                targetVM.test_removeSession(tabID: targetTab.id)
+            } else if placement == "inactive" {
+                let created = try targetFixture.window.workspaceManager.createPersistentWorkspace(name: "Unrelated visible workspace", repoPaths: [])
+                let other = try await created.publishedWorkspace()
+                let switched = await targetFixture.window.workspaceManager.requestWorkspaceSwitch(to: other)
+                XCTAssertEqual(switched, .switched)
+                XCTAssertNotEqual(targetFixture.window.workspaceManager.activeWorkspaceID, workspace.id)
+            }
+            await targetFixture.window.workspaceManager.awaitOwnSavesForWindowClose()
+            let sourceWorkspaceBytesBefore = try Data(contentsOf: sourceWorkspaceURL)
+            targetFixture.window.workspaceManager.setWorkspaceSavePreparationDidFinishHandlerForTesting { _, _, _ in
+                sourceWorkspacePreparations += 1
+            }
+            let visibleWorkspaceBefore = try XCTUnwrap(targetFixture.window.workspaceManager.activeWorkspace)
+            let windowIDsBefore = manager.allWindows.map(\.windowID)
+            let focusedBefore = targetFixture.window.isCurrentlyFocused
+            let selectedBefore = targetFixture.window.promptManager.activeComposeTabID
+            let bridge = AgentSessionLinkRuntimeBridge.shared
+            WindowStatesManager.shared.attachAgentSessionLinkBridge()
+            let previousWatchClock = bridge.overseeWatchNow
+            var watchClockReads = 0
+            if longWatch {
+                let start = Date()
+                bridge.overseeWatchNow = {
+                    defer { watchClockReads += 1 }
+                    // Advance past the first full 60-second deadline with the provider held.
+                    return start.addingTimeInterval(watchClockReads == 0 ? 0 : 61)
+                }
+            }
+            addTeardownBlock { @MainActor in bridge.overseeWatchNow = previousWatchClock }
+            var decisions: [String] = []
+            bridge.delegationScopes.test_scopeDecision = { _, text in decisions.append(text) }
+            let wasSuppressed = bridge.delegationScopes.test_suppressDecisionDelivery
+            bridge.delegationScopes.test_suppressDecisionDelivery = false
+            addTeardownBlock { @MainActor in
+                bridge.delegationScopes.test_scopeDecision = nil
+                bridge.delegationScopes.test_suppressDecisionDelivery = wasSuppressed
+            }
+            var service = BecomeOverseerMCPToolService(
+                captureRequestMetadata: { .init(connectionID: UUID(), clientName: "exact-target-flow", windowID: endpoint.windowID) },
+                resolveObserverEndpoint: { _ in endpoint }, isEnabled: { true }, bridge: bridge
+            )
+            if !realCatalog {
+                service.prepareActivationCommit = { _, _ in .init(commitIfCurrent: { $0() }, invalidate: {}) }
+            } else {
+                try await registerCatalog(observerFixture.window.mcpServer, windowID: endpoint.windowID)
+                let runID = UUID()
+                observer.installRunID(runID)
+                await network.installClientConnectionPolicy(
+                    for: AgentProviderKind.claudeMCPClientID, windowID: endpoint.windowID,
+                    restrictedTools: AgentModeMCPToolPolicy.restrictedTools, oneShot: true,
+                    reason: "Exact-target activation production route", ttl: 60,
+                    tabID: endpoint.tabID, runID: runID, additionalTools: nil,
+                    purpose: .agentModeRun, taskLabelKind: nil, allowsAgentExternalControlTools: false
+                )
+                await network.setEnabled(true)
+                var initialConnection = try await PersistentMCPTestEndpoint.make(
+                    label: "oversee-bootstrap", networkManager: network,
+                    clientName: AgentProviderKind.claudeMCPClientID,
+                    useProductionAgentAdmission: true,
+                    requiredToolNames: [MCPWindowToolName.becomeOverseer]
+                )
+                if reconnectBeforeActivation {
+                    let predecessor = initialConnection
+                    let token = try XCTUnwrap(predecessor.connectionManager.capabilityToken)
+                    initialConnection = try await PersistentMCPTestEndpoint.make(
+                        label: "oversee-bootstrap-reconnected", networkManager: network,
+                        clientName: AgentProviderKind.claudeMCPClientID,
+                        useProductionAgentAdmission: true, sessionToken: token,
+                        requiredToolNames: [MCPWindowToolName.becomeOverseer]
+                    )
+                    // Exercise real predecessor disconnect after successor admission, not a
+                    // global policy reset. The successor's exact route must survive it.
+                    predecessor.client.close()
+                    await predecessor.connectionManager.stop()
+                    await network.debugRemoveConnection(predecessor.connectionID)
+                    let reconnectedRun = await network.debugCachedRunID(for: initialConnection.connectionID)
+                    XCTAssertEqual(reconnectedRun, runID)
+                    XCTAssertEqual(observerFixture.window.mcpServer.connectionID(forRunID: runID), initialConnection.connectionID)
+                }
+                connections[runID] = initialConnection
+                initialConnection.client.observeNotifications { data in
+                    if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                       object["method"] as? String == "notifications/tools/list_changed"
+                    {
+                        catalogChanged?.fulfill()
+                    }
+                }
+            }
+            @MainActor func executeOversee(_ args: [String: Value]) async throws -> Value {
+                guard realCatalog else { return try await service.execute(args: args) }
+                let connection = try XCTUnwrap(observer.runID.flatMap { connections[$0] })
+                let arguments: [String: Any] = args.reduce(into: ["_rawJSON": true]) { result, entry in
+                    if case let .string(text) = entry.value { result[entry.key] = text }
+                }
+                let response = try await connection.callTool(name: MCPWindowToolName.becomeOverseer, arguments: arguments)
+                let envelope = try MCPExportWatchdogIntegrationTests.responseObject(from: response)
+                let result = try XCTUnwrap(envelope["result"] as? [String: Any])
+                XCTAssertNotEqual(result["isError"] as? Bool, true, response.rawJSON)
+                let content = try XCTUnwrap(result["content"] as? [[String: Any]])
+                let text = content.compactMap { $0["text"] as? String }.joined()
+                return try JSONDecoder().decode(Value.self, from: Data(text.utf8))
+            }
+            let args: [String: Value] = ["session_id": .string(targetID.uuidString), "message": .string("say hi"), "idempotency_key": .string("T30-one-request")]
+            let requested = try await executeOversee(args)
+            if let catalogChanged { await fulfillment(of: [catalogChanged], timeout: 5) }
+            guard case let .object(result) = requested, case let .string(rawID) = result["request_id"], let requestID = UUID(uuidString: rawID) else { return XCTFail("\(requested)") }
+            let request = try XCTUnwrap(bridge.delegationScopes.request(id: requestID, requesterSessionID: requesterID))
+            XCTAssertEqual(request.kind, .session(targetSessionID: targetID))
+            XCTAssertEqual(request.capabilities, [.observe, .control, .restructure])
+            XCTAssertEqual(providerStarts, 0)
+            XCTAssertNil(targetVM.sessions[targetTab.id], "No provider or hydration before consent")
+            if !realCatalog { _ = try await executeOversee(args) }
+            XCTAssertEqual(bridge.delegationScopes.pendingRequests(forTab: endpoint.tabID, sessionID: requesterID).count, 1, "one card, no blind retry")
+            if realCatalog, let runID = observer.runID, let initial = connections.removeValue(forKey: runID) {
+                // The synthetic original turn is over while the human reviews the card. Do not
+                // let its still-open XCTest-PID socket steal the next native run's one-shot policy.
+                initial.client.close()
+                await initial.connectionManager.stop()
+                await network.debugRemoveConnection(initial.connectionID)
+                await network.clearClientConnectionPolicy(for: AgentProviderKind.claudeMCPClientID, windowID: endpoint.windowID, runID: runID)
+                await network.cleanupRunRoutingState(for: runID, windowID: endpoint.windowID)
+            }
+            let granted = try bridge.delegationScopes.approve(
+                requestID: requestID, presentedWindowID: endpoint.windowID,
+                presentedTabID: endpoint.tabID, presentedSessionID: requesterID
+            ).get()
+            try await AsyncTestWait.waitUntil("one approval automatically prepares, links and dispatches", timeout: 15) {
+                decisions.contains { $0.contains("task_delivered") || $0.contains("refused") || $0.contains("failed") || $0.contains("not_dispatched") }
+            }
+            guard decisions.contains(where: { $0.contains("task_delivered") }) else {
+                let failedVM = manager.preparedOversightWindows[targetID]?.agentModeViewModel ?? targetVM
+                let failed = failedVM.sessions[targetTab.id]
+                return XCTFail("\(placement): source-connected=\(targetFixture.window.apiSettingsViewModel.isClaudeCodeConnected), availability=\(failedVM.agentAvailabilityContext.claudeCodeAvailable), starts=\(providerStarts), agent=\(String(describing: failed?.selectedAgent)), state=\(String(describing: failed?.runState)), admission=\(String(describing: failed?.operationAdmissionFailureMessage)), items=\(String(describing: failed?.items.map(\.text))), decisions=\(decisions)")
+            }
+            if placement != "current" {
+                let preparedOwner = try XCTUnwrap(manager.preparedOversightWindows[targetID])
+                XCTAssertTrue(preparedOwner.isPreparedSessionOwner)
+                XCTAssertNil(preparedOwner.nsWindow)
+                XCTAssertFalse(manager.allWindows.contains { $0 === preparedOwner })
+                targetVM = preparedOwner.agentModeViewModel
+            }
+            do {
+                try await AsyncTestWait.waitUntil("assigned task reaches the provider", timeout: 15) { await controller.sentCount == 1 }
+            } catch {
+                return XCTFail("Provider dispatch did not settle: starts=\(providerStarts), state=\(String(describing: targetVM.sessions[targetTab.id]?.runState)), items=\(String(describing: targetVM.sessions[targetTab.id]?.items.map(\.text))), decisions=\(decisions)")
+            }
+            // Retry while the app-owned continuation is watching: point at it, never steer twice.
+            if realCatalog {
+                try await AsyncTestWait.waitUntil("resumed requester has a real catalog connection", timeout: 15) { observer.runID.flatMap { connections[$0] } != nil || !connectionErrors.isEmpty }
+                XCTAssertTrue(connectionErrors.isEmpty, "\(connectionErrors)")
+                let resumedRunID = try XCTUnwrap(observer.runID)
+                let connection = try XCTUnwrap(connections[resumedRunID])
+                let route = await network.authoritativeRunCatalogRouteToken(
+                    runID: resumedRunID, windowID: endpoint.windowID, tabID: endpoint.tabID
+                )
+                let proof = try XCTUnwrap(route, "The resumed requester must own a production route proof, not merely another run's catalog")
+                XCTAssertEqual(proof.runID, resumedRunID)
+                XCTAssertEqual(proof.connectionID, connection.connectionID)
+                XCTAssertEqual(proof.observerEndpoint, endpoint)
+                let mappedRoute = await network.cachedModelRunRoute(connectionID: connection.connectionID)
+                XCTAssertEqual(mappedRoute?.runID, resumedRunID)
+                let listed = try await connection.client.request(method: "tools/list", params: [:])
+                let object = try MCPExportWatchdogIntegrationTests.responseObject(from: listed)
+                let tools = try XCTUnwrap((object["result"] as? [String: Any])?["tools"] as? [[String: Any]])
+                XCTAssertTrue(tools.contains { $0["name"] as? String == MCPWindowToolName.agentSessionLink }, "Resumed real Agent route must discover the management tool")
+                XCTAssertNil(observerVM.test_agentSessionLinkAuthoritativeRunCatalogRouteToken)
+                XCTAssertNil(observerVM.test_agentSessionLinkCurrentRunCatalogRouteToken)
+            }
+            let repeated = try await executeOversee(args)
+            XCTAssertEqual(repeated.objectValue?["result"], .string("continuing_approved_request"))
+            XCTAssertEqual(repeated.objectValue?["request_id"], .string(requestID.uuidString))
+            XCTAssertEqual(providerStarts, 1, "The provider starts for the assigned task, never merely to link")
+            XCTAssertEqual(targetFixture.window.promptManager.activeComposeTabID, selectedBefore)
+            XCTAssertEqual(targetFixture.window.workspaceManager.activeWorkspaceID, visibleWorkspaceBefore.id)
+            XCTAssertEqual(targetFixture.window.workspaceManager.activeWorkspace?.composeTabs.map(\.id), visibleWorkspaceBefore.composeTabs.map(\.id))
+            XCTAssertEqual(targetFixture.window.workspaceManager.activeWorkspace?.composeTabs.map(\.activeAgentSessionID), visibleWorkspaceBefore.composeTabs.map(\.activeAgentSessionID))
+            XCTAssertEqual(targetFixture.window.workspaceManager.activeWorkspace?.stashedTabs.map(\.id), visibleWorkspaceBefore.stashedTabs.map(\.id))
+            XCTAssertEqual(targetFixture.window.workspaceManager.activeWorkspace?.stashedTabs.map(\.tab.activeAgentSessionID), visibleWorkspaceBefore.stashedTabs.map(\.tab.activeAgentSessionID))
+            XCTAssertEqual(manager.allWindows.map(\.windowID), windowIDsBefore)
+            XCTAssertEqual(targetFixture.window.isCurrentlyFocused, focusedBefore)
+            let messages = await controller.sentMessages
+            XCTAssertEqual(messages.count, 1)
+            XCTAssertTrue(messages.first?.contains("say hi") == true)
+            let link = await bridge.delegationActiveLink(observerSessionID: requesterID, targetSessionID: targetID)
+            XCTAssertEqual(link?.sourceScopeID, granted.id)
+            if placement != "current" {
+                XCTAssertEqual(backgroundWorkspacePreparations, 0, "A background runtime never prepares a workspace save")
+                XCTAssertEqual(sourceWorkspacePreparations, 0, "Preparing/running a hidden target must not enlist its UI workspace writer")
+                XCTAssertEqual(try Data(contentsOf: sourceWorkspaceURL), sourceWorkspaceBytesBefore, "Only the exact session payload may be saved; source UI placement bytes stay untouched")
+            }
+            XCTAssertTrue(targetVM.sessions[targetTab.id]?.permitsBoundOperationAndSave == true)
+            XCTAssertFalse(decisions.contains { $0.contains("target_idle_with_new_activity") }, "Dispatch alone is not a reply")
+            if longWatch {
+                try await AsyncTestWait.waitUntil("the first 60-second watch expires while the task stays running") {
+                    decisions.contains { $0.contains("task_still_pending") }
+                }
+                XCTAssertTrue(targetVM.sessions[targetTab.id]?.runState.isActive == true)
+                XCTAssertGreaterThan(watchClockReads, 1)
+            }
+            if let duringRun, duringRun.hasSuffix("-active") {
+                XCTAssertEqual(bridge.test_activeOverseeWatches, 1)
+                switch duringRun {
+                case "revoke-active": _ = bridge.delegationScopes.revoke(scopeID: granted.id)
+                case "delete-active":
+                    let registry = AgentSessionDeletionRegistry.shared
+                    let token = try registry.beginDurableDeletion(sessionID: targetID)
+                    try FileManager.default.removeItem(at: savedURL)
+                    await registry.didCommitDurableDeletion(token)
+                case "shutdown-active":
+                    manager.setTerminatingForTesting(true)
+                    let start = ContinuousClock.now
+                    let settled = await manager.shutdownPreparedOversightOwners(timeout: 2)
+                    XCTAssertTrue(settled)
+                    XCTAssertLessThan(start.duration(to: .now), .seconds(4))
+                    manager.setTerminatingForTesting(false)
+                default: XCTFail("Unknown authority transition")
+                }
+                manager.schedulePreparedOversightCleanup()
+                try await AsyncTestWait.waitUntil("authority teardown leaves no live watcher, continuation or owner", timeout: 5) {
+                    bridge.test_activeOverseeWatches == 0 && bridge.delegationScopes.test_activeOverseeContinuationCount == 0
+                        && manager.preparedOversightWindows[targetID] == nil
+                        && manager.retiringPreparedOversightWindows[targetID] == nil
+                }
+                let stops = await controller.shutdownCount
+                XCTAssertGreaterThan(stops, 0)
+                XCTAssertFalse(decisions.contains { $0.contains("target_idle_with_new_activity") })
+                return
+            }
+            if let duringRun {
+                XCTAssertTrue(targetVM.sessions[targetTab.id]?.runState.isActive == true)
+                switch duringRun {
+                case "switch":
+                    let index = try XCTUnwrap(targetFixture.window.workspaceManager.workspaces.firstIndex { $0.id == workspace.id })
+                    targetFixture.window.workspaceManager.workspaces[index].composeTabs[0].activeAgentSessionID = UUID()
+                case "unstash":
+                    _ = try await targetFixture.window.promptManager.unstashTab(XCTUnwrap(targetFixture.window.workspaceManager.activeWorkspace?.stashedTabs.first?.id))
+                case "close":
+                    targetFixture.window.beginClose()
+                    XCTAssertEqual(targetFixture.window.apiSettingsViewModel.managedRuntimeLeaseCount, 1)
+                    XCTAssertTrue(targetVM.agentAvailabilityContext.claudeCodeAvailable)
+                    let stillLinked = await SessionAdminWindowsStructureHost().addLink(
+                        observer: requesterID, target: targetID, sourceScopeID: granted.id,
+                        isStillAuthorized: { bridge.delegationScopes.linkConsent.permits(scopeID: granted.id, observer: requesterID, target: targetID, at: Date()) }
+                    )
+                    XCTAssertEqual(stillLinked, .alreadyLinked, "An exact live runtime stays usable after its UI carrier closes")
+                case "visit":
+                    let blocked = try await targetFixture.window.agentModeViewModel.activateRoutedAgentSession(
+                        tabID: targetTab.id, sessionID: targetID,
+                        workspace: XCTUnwrap(targetFixture.window.workspaceManager.workspace(withID: workspace.id))
+                    )
+                    XCTAssertEqual(blocked, .blockedByActiveDifferentSession)
+                    XCTAssertNotNil(manager.preparedOversightPendingVisits[targetID])
+                default: XCTFail("Unknown active transition")
+                }
+                manager.schedulePreparedOversightCleanup()
+                await manager.preparedOversightCleanupTask?.value
+                XCTAssertNotNil(manager.preparedOversightWindows[targetID], "Placement must not retire an accepted run")
+                XCTAssertTrue(targetVM.sessions[targetTab.id]?.runState.isActive == true)
+                let live = await bridge.delegationActiveLink(observerSessionID: requesterID, targetSessionID: targetID)
+                XCTAssertEqual(live?.sourceScopeID, granted.id)
+                let intents = await bridge.oversightInventory(includeLocation: false).persisted
+                XCTAssertTrue(intents.contains { $0.observerSessionID == requesterID && $0.targetSessionID == targetID })
+                let shutdowns = await controller.shutdownCount
+                XCTAssertEqual(shutdowns, 0)
+            }
+            let terminalNotice = switch terminalStatus {
+            case .completed: "target_idle_with_new_activity"
+            case .failed: "target_failed_with_new_activity"
+            case .cancelled: "target_cancelled_with_new_activity"
+            }
+            await controller.completeLastTurn(text: "Hi!", status: terminalStatus)
+            // The fake has no MCP peer: the real native bootstrap lease's 10-second routing
+            // deadline settles before its buffered provider events are consumed.
+            try await AsyncTestWait.waitUntil("target completion resumes requester automatically", timeout: 25) {
+                decisions.contains { $0.contains(terminalNotice) }
+            }
+            try await AsyncTestWait.waitUntil("terminal result releases the rearmed watcher and task", timeout: 5) {
+                bridge.test_activeOverseeWatches == 0 && bridge.delegationScopes.test_activeOverseeContinuationCount == 0
+            }
+            XCTAssertEqual(decisions.count(where: { $0.contains(terminalNotice) }), 1)
+            if duringRun == "visit" {
+                try await AsyncTestWait.waitUntil("queued UI visit hydrates the completed session without a second click", timeout: 15) {
+                    manager.preparedOversightWindows[targetID] == nil
+                        && targetFixture.window.agentModeViewModel.sessions[targetTab.id]?.activeAgentSessionID == targetID
+                        && targetFixture.window.agentModeViewModel.sessions[targetTab.id]?.items.contains { $0.text.contains("Hi!") } == true
+                }
+                targetVM = targetFixture.window.agentModeViewModel
+            }
+            XCTAssertTrue(targetVM.sessions[targetTab.id]?.items.contains { $0.kind == .assistant && $0.text.contains("Hi!") } == true)
+            do {
+                try await AsyncTestWait.waitUntil("approval and result actually reach the requester provider without user input", timeout: 30) {
+                    await observerController.completeLastTurn()
+                    return await observerController.sentMessages.contains { $0.contains(terminalNotice) }
+                }
+            } catch {
+                let resumed = await observerController.sentMessages
+                let readiness = AgentModeViewModel.agentSessionLinkDeliveryReadinessSnapshot(session: observer, endpointMatchesGrant: true, isClosing: false)
+                return XCTFail("Requester delivery did not settle: messages=\(resumed), state=\(observer.runState), readiness=\(String(describing: AgentSessionLinkDeliveryReadiness.evaluate(snapshot: readiness))), items=\(observer.items.map(\.text)), terminating=\(WindowStatesManager.shared.isTerminating), admission=\(String(describing: observer.operationAdmissionFailureMessage)), endpoint=\(String(describing: observerVM.agentSessionLinkObserverEndpoint(tabID: observerTab.id))), presentation=\(String(describing: DelegationScopeRuntime.loadedPresentation(forTab: observerTab.id, in: WindowStatesManager.shared.allWindows)?.sessionID)), sameSession=\(observerVM.sessions[observerTab.id] === observer), closing=\(observerFixture.window.isClosing), authority=\(bridge.delegationScopes.availability)")
+            }
+            let resumed = await observerController.sentMessages
+            XCTAssertEqual(resumed.count(where: { $0.contains(terminalNotice) }), 1, "One final result across all watch re-arms")
+            XCTAssertTrue(resumed.contains { $0.contains("RepoPrompt delegation decision") })
+            if checksConnectionChanges {
+                let disconnected = AgentRunStartOutcomeRecorder()
+                targetFixture.window.apiSettingsViewModel.isClaudeCodeConnected = false
+                _ = await targetVM.startAgentRun(tabID: targetTab.id, initialMessage: "must not start while disconnected", startOutcome: disconnected)
+                guard case let .startFailed(reason) = disconnected.outcome else { return XCTFail("Disconnected connection must refuse startup") }
+                XCTAssertTrue(reason?.contains("Claude Code is not connected") == true)
+                let disconnectedSentCount = await controller.sentCount
+                XCTAssertEqual(disconnectedSentCount, 1)
+                targetFixture.window.apiSettingsViewModel.isClaudeCodeConnected = true
+                let reconnected = AgentRunStartOutcomeRecorder()
+                _ = await targetVM.startAgentRun(tabID: targetTab.id, initialMessage: "say hi after reconnect", startOutcome: reconnected)
+                XCTAssertTrue(reconnected.outcome.didStart)
+                try await AsyncTestWait.waitUntil("same canonical owner observes reconnect and starts") { await controller.sentCount == 2 }
+                await controller.completeLastTurn(text: "Hi again!")
+                try await AsyncTestWait.waitUntil("reconnected turn settles", timeout: 25) { targetVM.sessions[targetTab.id]?.runState.isActive == false }
+            }
+            weak var backgroundOwner = manager.preparedOversightWindows[targetID]
+            weak var backgroundRuntime = manager.preparedOversightWindows[targetID]?.agentModeViewModel
+            if placement != "current" {
+                switch retirement {
+                case "retire":
+                    let result = await SessionAdminWindowsStructureHost().stopLink(observer: requesterID, target: targetID, isStillAuthorized: {
+                        bridge.delegationScopes.linkConsent.permits(scopeID: granted.id, observer: requesterID, target: targetID, at: Date())
+                    })
+                    XCTAssertEqual(result, .stopped)
+                case "delete":
+                    let registry = AgentSessionDeletionRegistry.shared
+                    let token = try registry.beginDurableDeletion(sessionID: targetID)
+                    try FileManager.default.removeItem(at: savedURL)
+                    await registry.didCommitDurableDeletion(token)
+                case "visit":
+                    let visited = try await targetFixture.window.agentModeViewModel.activateRoutedAgentSession(
+                        tabID: targetTab.id, sessionID: targetID,
+                        workspace: XCTUnwrap(targetFixture.window.workspaceManager.workspace(withID: workspace.id))
+                    )
+                    XCTAssertEqual(visited, .ready)
+                    XCTAssertTrue(targetFixture.window.agentModeViewModel.sessions[targetTab.id]?.items.contains { $0.text.contains("Hi!") } == true, "Handoff reads the latest settled payload")
+                    XCTAssertEqual(providerStarts, 1, "Visiting an idle owner must not launch another provider")
+                case "visit-during":
+                    XCTAssertNil(manager.preparedOversightWindows[targetID])
+                case "rebind":
+                    let index = try XCTUnwrap(targetFixture.window.workspaceManager.workspaces.firstIndex { $0.id == workspace.id })
+                    targetFixture.window.workspaceManager.workspaces[index].composeTabs[0].activeAgentSessionID = UUID()
+                    manager.schedulePreparedOversightCleanup()
+                    XCTAssertNotNil(manager.preparedOversightWindows[targetID], "UI binding changes do not withdraw live consent")
+                    _ = bridge.delegationScopes.revoke(scopeID: granted.id)
+                case "blocked-termination":
+                    var release: CheckedContinuation<Void, Never>?
+                    var shouldBlock = true
+                    defer {
+                        shouldBlock = false
+                        release?.resume()
+                        manager.setTerminatingForTesting(false)
+                    }
+                    targetVM.test_setAgentSessionSaver { payload, borrowedWorkspace, counts in
+                        if shouldBlock {
+                            shouldBlock = false
+                            await withCheckedContinuation { release = $0 }
+                        }
+                        return try await AgentSessionDataService.shared.saveAgentSession(payload, for: borrowedWorkspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: counts)
+                    }
+                    let ownedSession = try XCTUnwrap(targetVM.sessions[targetTab.id])
+                    ownedSession.isDirty = true
+                    manager.setTerminatingForTesting(true)
+                    let start = ContinuousClock.now
+                    let shutdown = Task { @MainActor in await manager.shutdownPreparedOversightOwners(timeout: 0.05) }
+                    try await AsyncTestWait.waitUntil("real prepared-session writer is blocked") { release != nil }
+                    let settled = await shutdown.value
+                    XCTAssertFalse(settled, "A blocked write is not a durable teardown")
+                    XCTAssertLessThan(start.duration(to: .now), .seconds(2))
+                    XCTAssertNil(manager.preparedOversightWindows[targetID], "Live endpoint was withdrawn at shutdown")
+                    XCTAssertNotNil(backgroundOwner, "The still-writing teardown owns its data until the writer settles")
+                    release?.resume()
+                    release = nil
+                    targetVM = targetFixture.window.agentModeViewModel
+                    try await AsyncTestWait.waitUntil("late writer and nonvisual owner actually released") { backgroundOwner == nil }
+                    manager.setTerminatingForTesting(false)
+                case "termination":
+                    manager.setTerminatingForTesting(true)
+                    let start = ContinuousClock.now
+                    let settled = await manager.shutdownPreparedOversightOwners(timeout: 2)
+                    XCTAssertTrue(settled)
+                    XCTAssertLessThan(start.duration(to: .now), .seconds(4))
+                    manager.setTerminatingForTesting(false)
+                default:
+                    _ = bridge.delegationScopes.revoke(scopeID: granted.id)
+                }
+                // Release this fixture's runtime reference as well, then assert actual lifecycle,
+                // not merely that a candidate lookup stopped returning the endpoint.
+                targetVM = targetFixture.window.agentModeViewModel
+                try await AsyncTestWait.waitUntil("prepared owner, subscriptions and teardown task released after \(retirement)", timeout: 5) {
+                    manager.preparedOversightWindows[targetID] == nil
+                        && manager.retiringPreparedOversightWindows[targetID] == nil
+                        && manager.preparedOversightCarrierSubscriptions[targetID] == nil
+                        && manager.preparedOversightCleanupTask == nil
+                        && backgroundOwner == nil && backgroundRuntime == nil
+                }
+            }
+            _ = bridge.delegationScopes.revoke(scopeID: granted.id)
+            let denied = await bridge.authorizeTarget(operation: .monitorSteer, observerEndpoint: endpoint, targetSessionID: targetID)
+            guard case .failure = denied else { return XCTFail("Exact-target revocation must deny immediately") }
+            bridge.delegationScopes.test_scopeDecision = nil
+            await bridge.test_settleProjections()
         }
     }
 
@@ -5105,7 +7628,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                         [.init(observerSessionID: child, targetSessionID: stashed)]
                     )
                 })
-                let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+                let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
                 let scope = try grant(runtime: runtime, caller: root, kind: .tree(rootSessionID: root))
                 var filter = DomainAgentSessionInventoryFilter()
                 filter.workspaceID = try XCTUnwrap(other.window.workspaceManager.activeWorkspaceID)
@@ -5137,6 +7660,442 @@ final class SessionAdminInventoryReadTests: XCTestCase {
         }
     }
 
+    private func carrierEntry(
+        _ id: UUID, tabID: UUID, savedAt: TimeInterval = 20, state: String? = "idle"
+    ) -> AgentSessionIndexEntry {
+        var entry = AgentSessionIndexEntry(
+            id: id, tabID: tabID, name: "Metadata", savedAt: Date(timeIntervalSince1970: savedAt),
+            itemCount: 1, autoEditEnabled: false, hasUnknownConversationContent: false,
+            isMCPOriginated: false, worktreeBindingSummaries: [], activeWorktreeMergeSummaries: []
+        )
+        entry.lastRunStateRaw = state
+        return entry
+    }
+
+    private func carrierGet(
+        _ source: LiveAgentSessionInventorySource, sessionID: UUID, workspaceID: UUID
+    ) async throws -> [String: Value] {
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
+        let caller = UUID()
+        let scope = try grant(runtime: runtime, caller: caller, kind: .workspace(workspaceID: workspaceID))
+        let handler = AgentSessionInventoryOperationHandler(
+            source: source, scopeChain: { runtime.scopeChain(from: $0) },
+            isScopeCurrent: { runtime.record(id: $0.id)?.generation == $0.generation },
+            isLeaseCurrent: { runtime.isCurrent($0) }
+        )
+        let lease = DomainDelegationScopeLease(
+            scopeID: scope.id, generation: scope.generation, capability: .observe,
+            granteeSessionID: caller, targetSessionID: sessionID
+        )
+        let value = try await handler.perform(.init(
+            request: .init(operation: .adminGet, caller: .agentSession(caller), targetSessionIDs: [sessionID]),
+            scope: scope, leases: [lease], bases: [], itemsRequiringControl: [], confirmation: nil
+        ))
+        return try XCTUnwrap(value.objectValue)
+    }
+
+    private func assertCarrierReadIncomplete(
+        _ source: LiveAgentSessionInventorySource, sessionIDs: Set<UUID>? = nil,
+        file: StaticString = #filePath, line: UInt = #line
+    ) async throws {
+        do {
+            _ = try await source.snapshot(read: .init(loadedOnly: true, sessionIDs: sessionIDs))
+            XCTFail("Conflicting carrier evidence must not produce a successful row", file: file, line: line)
+        } catch let failure as AgentSessionInventoryReadFailure {
+            XCTAssertEqual(failure, .incomplete, file: file, line: line)
+        }
+    }
+
+    func testExactGetAndCensusChooseTheSameCarrierBeforeFilteringRequestedIDs() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            let a = UUID(), b = UUID()
+            let fixture = try await LoadedWindowFixture.make(activeID: b, parentID: nil)
+            do {
+                var workspace = try XCTUnwrap(fixture.carriers)
+                let x = ComposeTabState(name: "X fallback")
+                var y = try XCTUnwrap(workspace.composeTabs.first)
+                y.name = "Y explicit"
+                y.isPinned = true
+                y.sidebarGroup = "Y group"
+                y.sidebarGroupOrder = 7
+                fixture.indexEntries = [
+                    a: carrierEntry(a, tabID: x.id, savedAt: 10),
+                    b: carrierEntry(b, tabID: x.id, savedAt: 20)
+                ]
+                let scanner = Scanner()
+                let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { [fixture.window] }, links: { ([], []) })
+                for tabs in [[x, y], [y, x]] {
+                    workspace.composeTabs = tabs
+                    fixture.carriers = workspace
+                    try fixture.installCarriers()
+                    let census = try await source.snapshot(read: .init(loadedOnly: true))
+                    XCTAssertEqual(Set(census.records.keys), Set([a, b]))
+                    XCTAssertEqual(census.records[a]?.name, x.name)
+                    XCTAssertEqual(census.records[b]?.name, y.name)
+                    for ids in [Set([a]), Set([b]), Set([a, b])] {
+                        let exact = try await source.snapshot(read: .init(loadedOnly: true, sessionIDs: ids))
+                        XCTAssertEqual(Set(exact.records.keys), ids)
+                        for id in ids {
+                            XCTAssertEqual(exact.records[id], census.records[id])
+                        }
+                    }
+                    let result = try await carrierGet(source, sessionID: b, workspaceID: workspace.id)
+                    let row = try XCTUnwrap(result["session"]?.objectValue)
+                    XCTAssertEqual(row["name"], .string(y.name))
+                    XCTAssertEqual(row["pinned"], .bool(true))
+                    XCTAssertEqual(row["group"], .string("Y group"))
+                    XCTAssertEqual(row["group_order"], .int(7))
+                }
+                let scans = await scanner.capturedQueries()
+                let direct = await scanner.capturedDirectQueries()
+                XCTAssertTrue(scans.isEmpty && direct.isEmpty)
+                await fixture.cleanup()
+            } catch {
+                await fixture.cleanup()
+                throw error
+            }
+        }
+    }
+
+    func testExactLiveAddressSurvivesStaleMetadataButPersistedLiveConflictIsIncomplete() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            let b = UUID(), c = UUID()
+            let fixture = try await LoadedWindowFixture.make(activeID: b, parentID: nil)
+            do {
+                var workspace = try XCTUnwrap(fixture.carriers)
+                let x = ComposeTabState(name: "Stale metadata address")
+                var y = try XCTUnwrap(workspace.composeTabs.first)
+                y.name = "Live carrier"
+                y.activeAgentSessionID = nil
+                workspace.composeTabs = [x, y]
+                fixture.carriers = workspace
+                fixture.indexEntries = [c: carrierEntry(c, tabID: x.id)]
+                try fixture.installCarriers()
+                let live = AgentModeViewModel.TabSession(tabID: y.id)
+                live.testInstallPersistentSessionBinding(sessionID: c)
+                live.runState = .running
+                fixture.window.agentModeViewModel.test_installLiveSession(live)
+                let source = LiveAgentSessionInventorySource(scanner: Scanner(), windows: { [fixture.window] }, links: { ([], []) })
+                let exact = try await source.snapshot(read: .init(loadedOnly: true, sessionIDs: [c]))
+                let census = try await source.snapshot(read: .init(loadedOnly: true))
+                XCTAssertEqual(exact.records[c], census.records[c])
+                XCTAssertEqual(exact.records[c]?.name, y.name)
+                XCTAssertEqual(exact.records[c]?.runState, .running)
+
+                // Presentation still prefers C, but B's persisted claim is real authority conflict.
+                y.activeAgentSessionID = b
+                workspace.composeTabs = [x, y]
+                fixture.carriers = workspace
+                try fixture.installCarriers()
+                fixture.window.agentModeViewModel.test_installLiveSession(live)
+                try await assertCarrierReadIncomplete(source, sessionIDs: [c])
+                let result = try await carrierGet(source, sessionID: c, workspaceID: workspace.id)
+                XCTAssertEqual(result["code"], .string("inventory_incomplete"))
+                XCTAssertNil(result["session"])
+                XCTAssertNil(result["sessions"])
+                await fixture.cleanup()
+            } catch {
+                await fixture.cleanup()
+                throw error
+            }
+        }
+    }
+
+    func testNilBoundArchivedCarrierRanksMetadataWithoutPromotingTheHistoryOnlyLoser() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            try await withCarrierWindows(count: 1) { windows in
+                let window = try XCTUnwrap(windows.first)
+                let active = UUID(), older = UUID(), newer = UUID()
+                let activeTab = ComposeTabState(name: "Active carrier", activeAgentSessionID: active)
+                let archived = ComposeTabState(name: "Archived carrier")
+                var workspace = WorkspaceModel(name: "Archived metadata ranking", repoPaths: [], ephemeralFlag: true, composeTabs: [activeTab])
+                workspace.stashedTabs = [StashedTab(tab: archived)]
+                let entries = [
+                    active: carrierEntry(active, tabID: activeTab.id),
+                    older: carrierEntry(older, tabID: archived.id, savedAt: 10),
+                    newer: carrierEntry(newer, tabID: archived.id, savedAt: 20)
+                ]
+                let scanner = Scanner()
+                await scanner.setWorkspaces([.init(
+                    workspaceDir: URL(fileURLWithPath: "/tmp/inventory-archived-carrier"),
+                    workspaceName: workspace.name, workspaceID: workspace.id,
+                    records: [directRecord(id: older, parent: nil, workspace: workspace.id)],
+                    indexReadFailed: false, indexSchemaVersion: nil
+                )])
+                // This exercises projection, not workspace restoration. Install the value fixture
+                // after scanner setup so no durable activation can replace its synthetic metadata.
+                installCarrierWindow(window, workspace: workspace, entries: entries)
+                let installed = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+                XCTAssertEqual(installed.id, workspace.id)
+                XCTAssertEqual(installed.stashedTabs.map(\.tab.id), [archived.id])
+                XCTAssertNil(installed.stashedTabs.first?.tab.activeAgentSessionID)
+                let viewModel = window.agentModeViewModel
+                let owner = try XCTUnwrap(viewModel.sessionIndexStore.sessionIndexOwner)
+                XCTAssertEqual(owner.workspaceID, workspace.id)
+                XCTAssertTrue(viewModel.sessionIndexStore.isOwnerCurrent(owner))
+                XCTAssertEqual(Set(viewModel.test_ownerValidatedSessionIndex.keys), Set(entries.keys))
+                let preferred = try XCTUnwrap(viewModel.preferredSidebarEntry(for: archived.id, tabName: archived.name))
+                XCTAssertEqual(preferred.id, newer)
+
+                let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { [window] }, links: { ([], []) })
+                let census = try await source.snapshot(read: .init(loadedOnly: true))
+                XCTAssertEqual(Set(census.records.keys), Set([active, newer]))
+                let censusWinner = try XCTUnwrap(census.records[newer])
+                for ids in [Set([older]), Set([newer]), Set([older, newer])] {
+                    let exact = try await source.snapshot(read: .init(loadedOnly: true, sessionIDs: ids))
+                    XCTAssertEqual(Set(exact.records.keys), ids.intersection([newer]))
+                    XCTAssertNil(exact.records[older])
+                    if ids.contains(newer) { XCTAssertEqual(try XCTUnwrap(exact.records[newer]), censusWinner) }
+                }
+                XCTAssertEqual(censusWinner.name, archived.name)
+                XCTAssertTrue(censusWinner.isArchived)
+                XCTAssertTrue(censusWinner.isLoaded)
+                XCTAssertTrue(censusWinner.organizationStateIsKnown)
+                let history = try await source.snapshot(read: .init())
+                XCTAssertEqual(Set(history.records.keys), Set([active, older, newer]))
+                let historyLoser = try XCTUnwrap(history.records[older])
+                XCTAssertFalse(historyLoser.isLoaded)
+                XCTAssertFalse(historyLoser.organizationStateIsKnown)
+                let historyWinner = try XCTUnwrap(history.records[newer])
+                XCTAssertTrue(historyWinner.isLoaded)
+                XCTAssertTrue(historyWinner.isArchived)
+                XCTAssertTrue(historyWinner.organizationStateIsKnown)
+                XCTAssertEqual(historyWinner.name, archived.name)
+            }
+        }
+    }
+
+    /// All asynchronous initialization precedes installing these identical value projections.
+    /// These tests exercise production source joining without independent persistent authorities
+    /// turning a same-canonical-carrier fixture into different-workspace conflict accidentally.
+    private func withCarrierWindows(
+        count: Int, _ body: ([WindowState]) async throws -> Void
+    ) async throws {
+        var windows: [WindowState] = []
+        for _ in 0 ..< count {
+            let window = WindowState()
+            windows.append(window)
+            await window.workspaceManager.awaitInitialized()
+        }
+        do { try await body(windows) } catch {
+            for window in windows.reversed() {
+                await window.tearDown()
+            }
+            throw error
+        }
+        for window in windows.reversed() {
+            await window.tearDown()
+        }
+    }
+
+    private func installCarrierWindow(
+        _ window: WindowState, workspace: WorkspaceModel, entries: [UUID: AgentSessionIndexEntry],
+        live: (sessionID: UUID, tabID: UUID, state: AgentSessionRunState)? = nil
+    ) {
+        window.workspaceManager.workspaces = [workspace]
+        window.workspaceManager.activeWorkspace = workspace
+        let vm = window.agentModeViewModel
+        for tabID in Array(vm.sessions.keys) {
+            vm.test_removeSession(tabID: tabID)
+        }
+        let owner = AgentModeViewModel.SessionIndexOwner(workspaceID: workspace.id, activationEpoch: 1)
+        vm.test_installSessionIndexSnapshot(entries, owner: owner, latestOwner: owner, activeWorkspace: workspace)
+        if let live {
+            let session = AgentModeViewModel.TabSession(tabID: live.tabID)
+            session.testInstallPersistentSessionBinding(sessionID: live.sessionID)
+            session.runState = live.state
+            vm.test_installLiveSession(session)
+        }
+    }
+
+    func testInactiveCachedWorkspaceCannotOverrideActiveOwnerInventoryOrReviveRemovedCarrier() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            try await withCarrierWindows(count: 2) { windows in
+                let target = UUID()
+                let original = ComposeTabState(name: "Original", activeAgentSessionID: target)
+                let cached = WorkspaceModel(
+                    name: "Active owner", repoPaths: [], ephemeralFlag: true, composeTabs: [original]
+                )
+                let peer = WorkspaceModel(name: "Other active workspace", repoPaths: [], ephemeralFlag: true)
+                let entries = [target: carrierEntry(target, tabID: original.id)]
+                // Model the owning window's committed projections while the other workspace's
+                // catalog still holds the original active tab. Real mutation/undo is exercised
+                // by the paired production-organizer test; this test covers exact get/census.
+                var changed = original
+                changed.name = "Renamed"
+                changed.isPinned = true
+                changed.sidebarGroup = "New group"
+                changed.sidebarGroupOrder = 3
+                var changedWorkspace = cached
+                changedWorkspace.composeTabs = [changed]
+                var archivedWorkspace = changedWorkspace
+                archivedWorkspace.composeTabs = []
+                archivedWorkspace.stashedTabs = [StashedTab(tab: changed)]
+                var removedWorkspace = cached
+                removedWorkspace.composeTabs = []
+                for projected in [changedWorkspace, archivedWorkspace, cached, removedWorkspace] {
+                    installCarrierWindow(windows[0], workspace: projected, entries: entries)
+                    installCarrierWindow(windows[1], workspace: peer, entries: [:])
+                    windows[1].workspaceManager.workspaces.append(cached)
+                    for ordered in [windows, Array(windows.reversed())] {
+                        let source = LiveAgentSessionInventorySource(scanner: Scanner(), windows: { ordered }, links: { ([], []) })
+                        let exact = try await source.snapshot(read: .init(loadedOnly: true, sessionIDs: [target]))
+                        let census = try await source.snapshot(read: .init(workspaceID: cached.id, loadedOnly: true))
+                        if projected.composeTabs.isEmpty, projected.stashedTabs.isEmpty {
+                            XCTAssertTrue(exact.records.isEmpty)
+                            XCTAssertTrue(census.records.isEmpty, "Inactive cached carrier cannot revive a removed active-owner carrier")
+                            continue
+                        }
+                        let record = try XCTUnwrap(exact.records[target])
+                        XCTAssertEqual(Set(exact.records.keys), [target])
+                        XCTAssertEqual(census.records[target], record)
+                        let expected = try XCTUnwrap(projected.composeTabs.first ?? projected.stashedTabs.first?.tab)
+                        XCTAssertEqual(record.name, expected.name)
+                        XCTAssertEqual(record.isPinned, expected.isPinned)
+                        XCTAssertEqual(record.sidebarGroup, expected.sidebarGroup)
+                        XCTAssertEqual(record.isArchived, !projected.stashedTabs.isEmpty)
+                        let result = try await carrierGet(source, sessionID: target, workspaceID: cached.id)
+                        let row = try XCTUnwrap(result["session"]?.objectValue)
+                        XCTAssertEqual(row["name"], .string(expected.name))
+                        XCTAssertEqual(row["archived"], .bool(!projected.stashedTabs.isEmpty))
+                        XCTAssertEqual(windows[1].workspaceManager.workspace(withID: cached.id)?.composeTabs, [original])
+                    }
+                }
+            }
+        }
+    }
+
+    func testDuplicatePhysicalCarriersFailClosedWithoutPoisoningUnrelatedExactTargets() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            try await withCarrierWindows(count: 2) { windows in
+                let target = UUID(), unaffected = UUID()
+                let tab = ComposeTabState(name: "Duplicate", activeAgentSessionID: target)
+                let other = ComposeTabState(name: "Other carrier", activeAgentSessionID: target)
+                let safe = ComposeTabState(name: "Unaffected", activeAgentSessionID: unaffected)
+                let base = WorkspaceModel(name: "Duplicates", repoPaths: [], ephemeralFlag: true, composeTabs: [tab, safe])
+                let empty = WorkspaceModel(name: "Other workspace", repoPaths: [], ephemeralFlag: true)
+                for shape in ["active-active", "active-stash", "same-tab", "another-workspace"] {
+                    var first = base, second = empty
+                    switch shape {
+                    case "active-active": first.composeTabs.append(other)
+                    case "active-stash": first.stashedTabs = [StashedTab(tab: other)]
+                    case "same-tab": first.composeTabs.append(tab)
+                    default: second.composeTabs = [tab]
+                    }
+                    installCarrierWindow(windows[0], workspace: first, entries: [
+                        target: carrierEntry(target, tabID: tab.id), unaffected: carrierEntry(unaffected, tabID: safe.id)
+                    ])
+                    installCarrierWindow(windows[1], workspace: second, entries: [target: carrierEntry(target, tabID: tab.id)])
+                    for ordered in [windows, Array(windows.reversed())] {
+                        let scanner = Scanner()
+                        let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { ordered }, links: { ([], []) })
+                        let exact = try await source.snapshot(read: .init(loadedOnly: true, sessionIDs: [unaffected]))
+                        XCTAssertEqual(Set(exact.records.keys), Set([unaffected]), shape)
+                        XCTAssertEqual(exact.records[unaffected]?.name, safe.name, shape)
+                        try await assertCarrierReadIncomplete(source, sessionIDs: [target])
+                        try await assertCarrierReadIncomplete(source)
+                        let scans = await scanner.capturedQueries()
+                        XCTAssertTrue(scans.isEmpty)
+                    }
+                }
+            }
+        }
+    }
+
+    func testCanonicalCarrierRuntimeJoinPreservesLiveEvidenceAcrossWindowOrders() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            try await withCarrierWindows(count: 3) { windows in
+                let target = UUID()
+                var tab = ComposeTabState(name: "Canonical carrier", activeAgentSessionID: target)
+                tab.lastModified = Date(timeIntervalSince1970: 20)
+                let workspace = WorkspaceModel(name: "Shared canonical workspace", repoPaths: [], ephemeralFlag: true, composeTabs: [tab])
+                typealias Observation = (live: AgentSessionRunState?, fallback: String?)
+                let cases: [(String, [Observation], DomainAgentSessionInventoryRunState?)] = [
+                    ("absent then live", [(nil, nil), (.running, "idle")], .running),
+                    ("equal live", [(.running, "idle"), (.running, "idle")], .running),
+                    ("different live", [(.running, "idle"), (.idle, "idle")], nil),
+                    ("different fallback", [(nil, "running"), (nil, "idle")], nil),
+                    ("live fallback live", [(.running, "idle"), (nil, "idle"), (.idle, "idle")], nil),
+                    ("conflicting fallback plus live", [(nil, "idle"), (nil, "completed"), (.running, "idle")], .running)
+                ]
+                for (label, observations, expected) in cases {
+                    for (index, observation) in observations.enumerated() {
+                        let entries = observation.fallback.map { [target: carrierEntry(target, tabID: tab.id, state: $0)] } ?? [:]
+                        installCarrierWindow(
+                            windows[index], workspace: workspace, entries: entries,
+                            live: observation.live.map { (target, tab.id, $0) }
+                        )
+                    }
+                    let orders = observations.count == 2 ? [[0, 1], [1, 0]] : [
+                        [0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]
+                    ]
+                    for order in orders {
+                        let ordered = order.map { windows[$0] }
+                        let scanner = Scanner()
+                        let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { ordered }, links: { ([], []) })
+                        let selectors: [Set<UUID>?] = [Set([target]), nil]
+                        for ids in selectors {
+                            if let expected {
+                                let snapshot = try await source.snapshot(read: .init(loadedOnly: true, sessionIDs: ids))
+                                XCTAssertEqual(Set(snapshot.records.keys), Set([target]), "\(label) \(order)")
+                                XCTAssertEqual(snapshot.records[target]?.runState, expected, "\(label) \(order)")
+                            } else {
+                                try await assertCarrierReadIncomplete(source, sessionIDs: ids)
+                            }
+                        }
+                        let result = try await carrierGet(source, sessionID: target, workspaceID: workspace.id)
+                        if let expected {
+                            XCTAssertEqual(result["session"]?.objectValue?["state"], .string(expected.rawValue), label)
+                        } else {
+                            XCTAssertEqual(result["code"], .string("inventory_incomplete"), label)
+                            XCTAssertNil(result["session"], label)
+                        }
+                        let scans = await scanner.capturedQueries()
+                        let direct = await scanner.capturedDirectQueries()
+                        XCTAssertTrue(scans.isEmpty && direct.isEmpty)
+                    }
+                }
+
+                // A shared canonical key cannot reconcile different organization projections.
+                var pinnedWorkspace = workspace
+                pinnedWorkspace.composeTabs[0].isPinned = true
+                let entries = [target: carrierEntry(target, tabID: tab.id)]
+                installCarrierWindow(windows[0], workspace: workspace, entries: entries)
+                installCarrierWindow(windows[1], workspace: pinnedWorkspace, entries: entries)
+                for order in [[0, 1], [1, 0]] {
+                    let source = LiveAgentSessionInventorySource(scanner: Scanner(), windows: { order.map { windows[$0] } }, links: { ([], []) })
+                    try await assertCarrierReadIncomplete(source, sessionIDs: [target])
+                    try await assertCarrierReadIncomplete(source)
+                    let result = try await carrierGet(source, sessionID: target, workspaceID: workspace.id)
+                    XCTAssertEqual(result["code"], .string("inventory_incomplete"))
+                    XCTAssertNil(result["session"])
+                }
+
+                // Real history fallback is weaker than exact live evidence too; keep every other
+                // projected field identical so this tests evidence precedence, not metadata conflict.
+                for window in windows.prefix(2) {
+                    installCarrierWindow(window, workspace: workspace, entries: [:])
+                }
+                installCarrierWindow(windows[1], workspace: workspace, entries: [:], live: (target, tab.id, .running))
+                let scanner = Scanner()
+                var history = directRecord(id: target, parent: nil, workspace: workspace.id)
+                history.savedAt = tab.lastModified
+                history.lastRunStateRaw = "failed"
+                await scanner.setWorkspaces([.init(
+                    workspaceDir: URL(fileURLWithPath: "/tmp/inventory-runtime-evidence"),
+                    workspaceName: workspace.name, workspaceID: workspace.id, records: [history],
+                    indexReadFailed: false, indexSchemaVersion: nil
+                )])
+                for order in [[0, 1], [1, 0]] {
+                    let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { order.map { windows[$0] } }, links: { ([], []) })
+                    let snapshot = try await source.snapshot(read: .init())
+                    XCTAssertEqual(snapshot.records[target]?.runState, .running)
+                    XCTAssertEqual(snapshot.records[target]?.isLoaded, true)
+                }
+            }
+        }
+    }
+
     private func directRecord(id: UUID, parent: UUID?, workspace: UUID?) -> AgentSessionMetadataRecord {
         AgentSessionMetadataRecord(
             id: id, filename: "AgentSession-\(id.uuidString).json", workspaceID: workspace, composeTabID: nil,
@@ -5150,7 +8109,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
     }
 
     func testUnloadedTreeGetAndMixedRenameUseExactPersistedAncestryWithoutGlobalScan() async throws {
-        let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
         let root = UUID(), loaded = UUID(), unloaded = UUID(), ancestor = UUID(), workspace = UUID()
         let scope = try grant(runtime: runtime, caller: root, kind: .tree(rootSessionID: root))
         let provenance = SessionAdminScopeLifecycleTests.FakeProvenance()
@@ -5228,7 +8187,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
             let cold = try await scanner.locateSession(sessionID: unloaded, requestBudget: .standalone())
             XCTAssertEqual(cold.location?.workspaceDir, selected)
             XCTAssertNil(cold.location?.record, "real cold lookup intentionally has location but no cached metadata")
-            let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+            let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
             let scope = try grant(runtime: runtime, caller: root, kind: .tree(rootSessionID: root))
             let provenance = SessionAdminScopeLifecycleTests.FakeProvenance()
             provenance.add(root, parent: nil, workspace: workspace)
@@ -5287,7 +8246,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 XCTAssertNotNil(lookup.location?.record)
                 XCTAssertNil(lookup.location?.record?.workspaceID, "warm legacy records still need scanner-owned placement")
             }
-            let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+            let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
             let scope = try grant(runtime: runtime, caller: caller, kind: .workspace(workspaceID: workspace))
             let provenance = SessionAdminScopeLifecycleTests.FakeProvenance()
             provenance.add(caller, parent: nil, workspace: workspace)
@@ -5345,8 +8304,8 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                     latestOwner: .init(workspaceID: workspace.id, activationEpoch: oldOwner.activationEpoch + 1)
                 )
                 XCTAssertTrue(vm.test_ownerValidatedSessionIndex.isEmpty)
-                let cached = vm.sidebarSessions(for: workspace.composeTabs)
-                XCTAssertTrue(cached.contains { $0.sessionID == target }, "owner invalidation alone does not change the UI cache key")
+                let cached = try XCTUnwrap(vm.sidebarSessionRowsCache)
+                XCTAssertTrue(cached.rows.contains { $0.sessionID == target }, "fixture retains the previously cached presentation row")
                 let scanner = Scanner()
                 let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { [window] }, links: { ([], []) })
                 let snapshot = try await source.snapshot(read: .init(loadedOnly: true))
@@ -5400,7 +8359,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
     }
 
     func testOrdinaryTreeIsBoundedPartialButAbsenceAndEdgePredicatesRequireGlobalHistory() throws {
-        let runtime = DelegationScopeRuntime(notifyCatalogChanged: { _ in })
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
         let caller = UUID()
         let tree = try grant(runtime: runtime, caller: caller, kind: .tree(rootSessionID: caller))
         var filter = DomainAgentSessionInventoryFilter()
@@ -5423,545 +8382,137 @@ final class SessionAdminInventoryReadTests: XCTestCase {
     }
 }
 
-// MARK: - SessionAdminProductionOrganizerJourneyTests regressions
+// MARK: - In-flight structure operation idempotency
 
-/// Exercises the app's real organizing registration, workspace mutations and sidebar projection.
-/// Run only through dev-test's disposable HOME/TMPDIR harness; no provider or visible window opens.
 @MainActor
-final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
-    func testRenamePinGroupAndUndoReachWorkspaceAndSidebarWithoutChangingSelection() async throws {
-        try await MCPSharedServerTestLease.shared.withLease { _ in
-            let fixture = try await Fixture.make()
-            do {
-                let rename = try await fixture.call("rename", ["name": .string("Organized lane")])
-                try fixture.assertTarget(name: "Organized lane", pinned: false, group: nil)
-                XCTAssertEqual(rename["result"], .string("applied"))
-                let pin = try await fixture.call("set_pin", ["pinned": .bool(true)])
-                let group = try await fixture.call("set_group", ["group": .string("Review")])
-                try fixture.assertTarget(name: "Organized lane", pinned: true, group: "Review")
-
-                // The actual workspace persistence payload must carry the same metadata, not just
-                // a successful handler reply or an independently updated sidebar mock.
-                let url = fixture.directory.appendingPathComponent("workspace.json")
-                try JSONEncoder().encode(fixture.workspace()).write(to: url)
-                let saved = try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: url))
-                let savedTab = try XCTUnwrap(saved.composeTabs.first { $0.id == fixture.targetTab.id })
-                XCTAssertEqual(savedTab.name, "Organized lane")
-                XCTAssertTrue(savedTab.isPinned)
-                XCTAssertEqual(savedTab.sidebarGroup, "Review")
-
-                _ = try await fixture.undo(group)
-                _ = try await fixture.undo(pin)
-                _ = try await fixture.undo(rename)
-                try fixture.assertTarget(name: "Target", pinned: false, group: nil)
-                await fixture.cleanup()
-            } catch {
-                await fixture.cleanup()
-                throw error
-            }
-        }
-    }
-
-    func testRenameUndoPreservesLaterSidebarEditInsteadOfClobberingIt() async throws {
-        try await MCPSharedServerTestLease.shared.withLease { _ in
-            let fixture = try await Fixture.make()
-            do {
-                let rename = try await fixture.call("rename", ["name": .string("Agent title")])
-                fixture.window.agentModeViewModel.renameSession(tabID: fixture.targetTab.id, to: "User title")
-                let undo = try await fixture.undo(rename)
-                let item = try XCTUnwrap(undo["items"]?.arrayValue?.first?.objectValue)
-                XCTAssertEqual(item["status"], .string("skipped"))
-                XCTAssertEqual(item["reason"], .string("changed_since"))
-                XCTAssertEqual(undo["changed_count"], .int(0))
-                XCTAssertEqual(undo["result"], .string("not_undone"))
-                try fixture.assertTarget(name: "User title", pinned: false, group: nil)
-                await fixture.cleanup()
-            } catch {
-                await fixture.cleanup()
-                throw error
-            }
-        }
-    }
-
-    func testRenameOnlyAndRenameThenPinSurviveRealPersistenceReloadAndUndo() async throws {
-        try await MCPSharedServerTestLease.shared.withLease { _ in
-            for selectedTarget in [false, true] {
-                for pinAfterRename in [false, true] {
-                    let fixture = try await Fixture.make(ephemeral: false)
-                    do {
-                        let targetSession = fixture.window.agentModeViewModel.session(for: fixture.targetTab.id)
-                        targetSession.hasLoadedPersistedState = true
-                        _ = try XCTUnwrap(fixture.window.agentModeViewModel.test_installPersistentSessionBinding(
-                            sessionID: fixture.targetTab.activeAgentSessionID, on: targetSession, updateWorkspaceMetadata: true
-                        ))
-                        var independent = ComposeTabState(name: "Independent user lane")
-                        independent.promptText = "Unrelated user payload"
-                        independent.isPinned = true
-                        independent.sidebarGroup = "User group"
-                        independent.sidebarGroupOrder = 7
-                        let manager = fixture.window.workspaceManager
-                        let index = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == fixture.workspaceID })
-                        manager.workspaces[index].composeTabs.append(independent)
-                        try fixture.window.promptManager.loadComposeTabsFromWorkspace(fixture.workspace())
-                        if selectedTarget { await fixture.window.promptManager.switchComposeTab(fixture.targetTab.id) }
-                        let selectedID = selectedTarget ? fixture.targetTab.id : fixture.callerTab.id
-                        XCTAssertEqual(fixture.window.promptManager.activeComposeTabID, selectedID)
-                        let title = "Sequence renamed target"
-                        let rename = try await fixture.call("rename", ["name": .string(title)])
-                        XCTAssertEqual(rename["changed_count"], .int(1))
-                        try fixture.assertTarget(name: title, pinned: false, group: nil, selectedTabID: selectedID)
-                        // No sleep or save drain between the two commands: exercise the immediate
-                        // rename→pin sequence before settling the actual workspace writer.
-                        let pin = pinAfterRename ? try await fixture.call("set_pin", ["pinned": .bool(true)]) : nil
-                        if let pin { XCTAssertEqual(pin["changed_count"], .int(1)) }
-                        try fixture.assertTarget(name: title, pinned: pinAfterRename, group: nil, selectedTabID: selectedID)
-                        // Read only after the immediate pair, so this does not hide a write race
-                        // by inserting an inventory await between rename and pin.
-                        try await fixture.assertReadTarget(name: title, pinned: pinAfterRename)
-                        await manager.debugDrainScheduledSaves()
-                        let persistence = await manager.pollAndSaveStateWithOutcomeAsync()
-                        if case .rejected = persistence {
-                            XCTFail("The persistent sequence must not reject its save, got \(persistence)")
-                            await fixture.cleanup()
-                            continue
-                        }
-                        // notRequired is legitimate after the queued save already committed. The
-                        // attempt counter and decoded real file below prove this was not merely an
-                        // ephemeral/manual JSON roundtrip.
-                        XCTAssertGreaterThan(manager.workspaceSaveDiagnosticsForTesting(workspaceID: fixture.workspaceID).attemptCount, 0)
-                        let url = try manager.workspaceFileURL(for: fixture.workspace())
-                        let saved = try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: url))
-                        let savedTarget = try XCTUnwrap(saved.composeTabs.first { $0.id == fixture.targetTab.id })
-                        XCTAssertEqual(savedTarget.name, title)
-                        XCTAssertEqual(savedTarget.isPinned, pinAfterRename)
-                        XCTAssertEqual(saved.composeTabs.first { $0.id == independent.id }, independent)
-                        let currentIndex = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == saved.id })
-                        manager.workspaces[currentIndex] = saved
-                        fixture.window.promptManager.loadComposeTabsFromWorkspace(saved, syncPromptText: true)
-                        try fixture.assertTarget(name: title, pinned: pinAfterRename, group: nil, selectedTabID: selectedID)
-                        try await fixture.assertReadTarget(name: title, pinned: pinAfterRename)
-                        if let pin {
-                            let undoPin = try await fixture.undo(pin)
-                            XCTAssertEqual(undoPin["changed_count"], .int(1))
-                            try fixture.assertTarget(name: title, pinned: false, group: nil, selectedTabID: selectedID)
-                            try await fixture.assertReadTarget(name: title, pinned: false)
-                        }
-                        let undoRename = try await fixture.undo(rename)
-                        XCTAssertEqual(undoRename["result"], .string("undone"))
-                        XCTAssertEqual(undoRename["changed_count"], .int(1))
-                        try fixture.assertTarget(name: "Target", pinned: false, group: nil, selectedTabID: selectedID)
-                        try await fixture.assertReadTarget(name: "Target", pinned: false)
-                        // A rendered row is insufficient: selecting the real runtime target and
-                        // switching back must not republish the title/pin that was just undone.
-                        await fixture.window.promptManager.switchComposeTab(fixture.targetTab.id)
-                        try fixture.assertTarget(name: "Target", pinned: false, group: nil, selectedTabID: fixture.targetTab.id)
-                        try await fixture.assertReadTarget(name: "Target", pinned: false)
-                        if selectedID != fixture.targetTab.id {
-                            await fixture.window.promptManager.switchComposeTab(selectedID)
-                            try fixture.assertTarget(name: "Target", pinned: false, group: nil, selectedTabID: selectedID)
-                            try await fixture.assertReadTarget(name: "Target", pinned: false)
-                        }
-                        XCTAssertEqual(try fixture.workspace().composeTabs.first { $0.id == independent.id }, independent)
-                        await manager.debugDrainScheduledSaves()
-                        let final = try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: url))
-                        XCTAssertEqual(final.composeTabs.first { $0.id == fixture.targetTab.id }?.name, "Target")
-                        XCTAssertEqual(final.composeTabs.first { $0.id == independent.id }, independent)
-                        await fixture.cleanup()
-                    } catch {
-                        await fixture.cleanup()
-                        throw error
-                    }
-                }
-            }
-        }
-    }
-
-    func testArchiveUndoRestoresSidebarCarrierWithoutSelectingTheTarget() async throws {
-        try await MCPSharedServerTestLease.shared.withLease { _ in
-            let fixture = try await Fixture.make()
-            do {
-                let archived = try await fixture.call("archive", [:])
-                let workspace = try fixture.workspace()
-                XCTAssertFalse(workspace.composeTabs.contains { $0.id == fixture.targetTab.id })
-                XCTAssertEqual(workspace.stashedTabs.map(\.tab.id), [fixture.targetTab.id])
-                XCTAssertFalse(
-                    fixture.window.agentModeViewModel.sidebarSessions(for: fixture.window.promptManager.currentComposeTabs)
-                        .contains { $0.sessionID == fixture.targetTab.activeAgentSessionID }
-                )
-                XCTAssertEqual(workspace.activeComposeTabID, fixture.callerTab.id)
-                try await fixture.assertReadTarget(name: "Target", pinned: false, archived: true)
-                _ = try await fixture.undo(archived)
-                XCTAssertTrue(try fixture.workspace().stashedTabs.isEmpty)
-                try fixture.assertTarget(name: "Target", pinned: false, group: nil)
-                try await fixture.assertReadTarget(name: "Target", pinned: false)
-                await fixture.cleanup()
-            } catch {
-                await fixture.cleanup()
-                throw error
-            }
-        }
-    }
-
-    func testGroupAndUnarchiveOnAnotherTabPreserveAndCaptureTheActiveUserDraft() async throws {
-        try await MCPSharedServerTestLease.shared.withLease { _ in
-            for op in ["set_group", "unarchive"] {
-                let fixture = try await Fixture.make()
-                var listenerID: UUID?
-                var flushObserver: NSObjectProtocol?
-                do {
-                    if op == "unarchive" { _ = try await fixture.call("archive", [:]) }
-                    let old = try XCTUnwrap(fixture.workspace().composeTabs.first { $0.id == fixture.callerTab.id })
-                    let draft = "Unsaved user draft during \(op)"
-                    fixture.window.promptManager.promptText = draft
-                    fixture.window.promptManager.testSetDirtyTabIDs([fixture.callerTab.id])
-                    XCTAssertNotEqual(old.promptText, draft)
-                    let evidence = DraftCaptureEvidence()
-                    // Both are synchronous pre-capture boundaries. A direct UI flush may capture
-                    // the draft before a later save clears dirty state; neither path may erase it.
-                    flushObserver = NotificationCenter.default.addObserver(
-                        forName: .willSwitchComposeTab, object: nil, queue: nil
-                    ) { notification in
-                        MainActor.assumeIsolated {
-                            guard notification.userInfo?["windowID"] as? Int == fixture.window.windowID else { return }
-                            if fixture.window.promptManager.promptText == draft,
-                               fixture.window.promptManager.isTabDirty(fixture.callerTab),
-                               fixture.window.promptManager.activeComposeTabID == fixture.callerTab.id
-                            {
-                                evidence.observedDirtyDraftBeforeCapture = true
-                            }
-                        }
-                    }
-                    listenerID = fixture.window.workspaceManager.addBeforeSaveListener { workspace in
-                        guard workspace.id == fixture.workspaceID else { return }
-                        if fixture.window.promptManager.promptText == draft,
-                           fixture.window.promptManager.isTabDirty(fixture.callerTab),
-                           fixture.window.promptManager.activeComposeTabID == fixture.callerTab.id
-                        {
-                            evidence.observedDirtyDraftBeforeCapture = true
-                        }
-                    }
-                    fixture.beforeCallerResolution = {
-                        XCTAssertEqual(
-                            fixture.window.promptManager.promptText,
-                            draft,
-                            "The live draft must reach the command entry before any organizer mutation"
-                        )
-                        XCTAssertEqual(fixture.window.promptManager.activeComposeTabID, fixture.callerTab.id)
-                    }
-                    _ = try await fixture.call(op, op == "set_group" ? ["group": .string("Draft-safe")] : [:])
-                    XCTAssertTrue(evidence.observedDirtyDraftBeforeCapture, "\(op) must not erase dirty state before editor/save capture")
-                    XCTAssertEqual(fixture.window.promptManager.promptText, draft, op)
-                    let workspace = try fixture.workspace()
-                    XCTAssertEqual(workspace.activeComposeTabID, fixture.callerTab.id, op)
-                    XCTAssertEqual(fixture.window.promptManager.activeComposeTabID, fixture.callerTab.id, op)
-                    XCTAssertEqual(workspace.composeTabs.first { $0.id == fixture.callerTab.id }?.promptText, draft, op)
-                    let encoded = try JSONEncoder().encode(workspace)
-                    let saved = try JSONDecoder().decode(WorkspaceModel.self, from: encoded)
-                    XCTAssertEqual(saved.composeTabs.first { $0.id == fixture.callerTab.id }?.promptText, draft, op)
-                    // A subsequent normal dirty-state update may clear the flag once the draft has
-                    // been captured. Its earlier preservation, not perpetual dirtiness, is required.
-                    if let listenerID { fixture.window.workspaceManager.removeBeforeSaveListener(listenerID) }
-                    if let flushObserver { NotificationCenter.default.removeObserver(flushObserver) }
-                    await fixture.cleanup()
-                } catch {
-                    if let listenerID { fixture.window.workspaceManager.removeBeforeSaveListener(listenerID) }
-                    if let flushObserver { NotificationCenter.default.removeObserver(flushObserver) }
-                    await fixture.cleanup()
-                    throw error
-                }
-            }
-        }
-    }
-
+final class SessionAdminInFlightIdempotencyTests: XCTestCase {
     @MainActor
-    private final class DraftCaptureEvidence {
-        var observedDirtyDraftBeforeCapture = false
+    private final class Gate {
+        var paused = false
+        private var continuation: CheckedContinuation<Void, Never>?
+        private var observers: [CheckedContinuation<Void, Never>] = []
+
+        func suspend() async {
+            paused = true
+            for observer in observers {
+                observer.resume()
+            }
+            observers.removeAll()
+            await withCheckedContinuation { continuation = $0 }
+        }
+
+        func waitUntilPaused() async {
+            if paused { return }
+            await withCheckedContinuation { observers.append($0) }
+        }
+
+        func resume() {
+            continuation?.resume()
+            continuation = nil
+        }
     }
 
     @MainActor
     private final class Fixture {
-        let window: WindowState
-        let directory: URL
-        let callerTab = ComposeTabState(name: "Overseer", activeAgentSessionID: UUID())
-        let targetTab = ComposeTabState(name: "Target", activeAgentSessionID: UUID())
-        let scopes = DelegationScopeRuntime()
-        let ownership = WorktreeOwnershipStore()
-        var workspaceID: UUID!
-        var frontDoor: AgentSessionAdministrationFrontDoor!
-        var beforeCallerResolution: (@MainActor () -> Void)?
+        let base = SessionAdminStructureTests.Fixture()
+        let frontDoor: AgentSessionAdministrationFrontDoor
+        let inventory: SessionAdminOrganizingOperationTests.FakeInventory
+        let organizer = SessionAdminOrganizingOperationTests.FakeOrganizer()
+        let provenance = SessionAdminScopeLifecycleTests.FakeProvenance()
+        let links = SessionAdminOrganizingOperationTests.FakeLinks()
+        let caller = UUID()
+        let target = UUID()
+        let tab = UUID()
+        let scopeID: UUID
 
-        private init(window: WindowState, directory: URL) {
-            self.window = window
-            self.directory = directory
-        }
-
-        static func make(ephemeral: Bool = true) async throws -> Fixture {
-            let directory = FileManager.default.temporaryDirectory
-                .appendingPathComponent("session-admin-production-\(UUID())", isDirectory: true)
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            let window = WindowState()
-            let fixture = Fixture(window: window, directory: directory)
-            WindowStatesManager.shared.registerWindowState(window)
-            do {
-                await window.workspaceManager.awaitInitialized()
-                var workspace = window.workspaceManager.createWorkspace(
-                    name: "Organizer journey", repoPaths: [], ephemeral: ephemeral
-                )
-                workspace.customStoragePath = directory
-                workspace.composeTabs = [fixture.callerTab, fixture.targetTab]
-                workspace.activeComposeTabID = fixture.callerTab.id
-                fixture.workspaceID = workspace.id
-                let switched = await window.workspaceManager.reactivateWorkspaceAfterReplacement(
-                    workspace, reason: "sessionAdminProductionJourney"
-                )
-                XCTAssertEqual(switched, .switched)
-                // Activation resolves the manager's canonical workspace, not every field of the
-                // caller's local replacement. Install the actual carriers only after it settles.
-                var current = try fixture.workspace()
-                XCTAssertEqual(current.id, workspace.id)
-                current.customStoragePath = directory
-                current.composeTabs = [fixture.callerTab, fixture.targetTab]
-                current.stashedTabs = []
-                current.activeComposeTabID = fixture.callerTab.id
-                let position = try XCTUnwrap(window.workspaceManager.workspaces.firstIndex { $0.id == current.id })
-                window.workspaceManager.workspaces[position] = current
-                let installed = try fixture.workspace()
-                XCTAssertEqual(installed.composeTabs.map(\.id), [fixture.callerTab.id, fixture.targetTab.id])
-                XCTAssertEqual(
-                    installed.composeTabs.map(\.activeAgentSessionID),
-                    [fixture.callerTab.activeAgentSessionID, fixture.targetTab.activeAgentSessionID]
-                )
-                XCTAssertTrue(installed.stashedTabs.isEmpty)
-                XCTAssertEqual(installed.activeComposeTabID, fixture.callerTab.id)
-                window.promptManager.loadComposeTabsFromWorkspace(installed, syncPromptText: true)
-                XCTAssertEqual(window.promptManager.currentComposeTabs.map(\.id), [fixture.callerTab.id, fixture.targetTab.id])
-                XCTAssertEqual(window.promptManager.activeComposeTabID, fixture.callerTab.id)
-                let owner = AgentModeViewModel.SessionIndexOwner(workspaceID: workspace.id, activationEpoch: 1)
-                let entries = [fixture.callerTab, fixture.targetTab].map { tab in
-                    AgentSessionIndexEntry(
-                        id: tab.activeAgentSessionID!, tabID: tab.id, name: tab.name,
-                        savedAt: Date(timeIntervalSince1970: 0), itemCount: 0, autoEditEnabled: false,
-                        hasUnknownConversationContent: false, isMCPOriginated: false,
-                        worktreeBindingSummaries: [], activeWorktreeMergeSummaries: []
-                    )
-                }
-                try window.agentModeViewModel.test_installSessionIndexSnapshot(
-                    Dictionary(uniqueKeysWithValues: entries.map { ($0.id, $0) }),
-                    owner: owner, latestOwner: owner, activeWorkspace: fixture.workspace()
-                )
-                let caller = window.agentModeViewModel.session(for: fixture.callerTab.id)
-                caller.hasLoadedPersistedState = true
-                _ = try XCTUnwrap(window.agentModeViewModel.test_installPersistentSessionBinding(
-                    sessionID: fixture.callerTab.activeAgentSessionID, on: caller, updateWorkspaceMetadata: true
-                ))
-                _ = try AgentSessionLinkEndpointTestSupport.endpoint(window.agentModeViewModel, tabID: fixture.callerTab.id)
-                let ready = try fixture.workspace()
-                for expected in [fixture.callerTab, fixture.targetTab] {
-                    let carrier = try XCTUnwrap(ready.composeTabs.first { $0.id == expected.id })
-                    XCTAssertEqual(carrier.activeAgentSessionID, expected.activeAgentSessionID)
-                }
-                XCTAssertEqual(ready.activeComposeTabID, fixture.callerTab.id)
-                XCTAssertEqual(
-                    window.agentModeViewModel.explicitActiveSessionID(for: fixture.callerTab.id),
-                    fixture.callerTab.activeAgentSessionID
-                )
-                let core = AgentSessionAdministrationCore.makeProduction(scopes: fixture.scopes, worktreeOwnership: fixture.ownership)
-                fixture.frontDoor = AgentSessionAdministrationFrontDoor.production(core: core, scopes: fixture.scopes)
-                let requested = try fixture.scopes.requestScope(
-                    requesterSessionID: fixture.callerTab.activeAgentSessionID!, requesterTabID: fixture.callerTab.id,
-                    kind: .workspace(workspaceID: workspace.id), capabilities: [.observe, .organize],
-                    guardrails: .init(), reason: nil, idempotencyKey: nil
-                ).get()
-                _ = try fixture.scopes.approve(requestID: requested.id).get()
-                return fixture
-            } catch {
-                await fixture.cleanup()
-                throw error
-            }
-        }
-
-        func workspace() throws -> WorkspaceModel {
-            try XCTUnwrap(window.workspaceManager.activeWorkspace)
-        }
-
-        func call(_ op: String, _ fields: [String: Value]) async throws -> [String: Value] {
-            let service = SessionAdminMCPToolService(
-                captureRequestMetadata: {
-                    self.beforeCallerResolution?()
-                    return .init(connectionID: UUID(), clientName: "organizer-journey", windowID: self.window.windowID)
-                },
-                requireTargetWindow: { self.window },
-                resolveObserverEndpoint: { _, _ in
-                    self.window.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: self.callerTab.id)
-                },
-                scopes: { self.scopes }, administration: { self.frontDoor }, isToolEnabled: { true }
+        init() throws {
+            let workspace = UUID()
+            base.provenance.add(caller, parent: nil, workspace: workspace)
+            base.provenance.add(target, parent: caller, workspace: workspace)
+            provenance.add(caller, parent: nil, workspace: workspace)
+            provenance.add(target, parent: caller, workspace: workspace)
+            organizer.add(caller, workspace: workspace, name: "Caller")
+            organizer.add(target, workspace: workspace, name: "Target")
+            inventory = .init(organizer: organizer, provenance: provenance, links: links, now: Date())
+            let caller = caller, tab = tab
+            frontDoor = .init(
+                core: base.core, scopes: base.runtime, projector: base.projector,
+                inventory: inventory, liveBoundSession: { $0 == tab ? caller : nil }
             )
-            var arguments = fields
-            arguments["op"] = .string(op)
-            if op != "undo", op != "inventory" { arguments["session_id"] = .string(targetTab.activeAgentSessionID!.uuidString) }
-            let reply = try await service.execute(args: arguments)
-            return try XCTUnwrap(reply.objectValue)
+            frontDoor.register(base.worktreeHandler)
+            scopeID = try base.grant(caller).id
         }
 
-        func assertReadTarget(name: String, pinned: Bool, archived: Bool = false) async throws {
-            let get = try await call("get", [:])
-            XCTAssertEqual(get["result"], .string("ok"))
-            let exact = try XCTUnwrap(get["session"]?.objectValue)
-            let inventory = try await call("inventory", ["limit": .int(500)])
-            XCTAssertEqual(inventory["result"], .string("ok"))
-            let listed = try XCTUnwrap(inventory["sessions"]?.arrayValue?.compactMap(\.objectValue).first {
-                $0["session_id"] == .string(targetTab.activeAgentSessionID!.uuidString)
-            })
-            for row in [exact, listed] {
-                XCTAssertEqual(row["name"], .string(name))
-                XCTAssertEqual(row["pinned"], .bool(pinned))
-                XCTAssertEqual(row["archived"], .bool(archived))
-                XCTAssertEqual(row["loaded"], .bool(true))
-                XCTAssertEqual(row["workspace_id"], .string(workspaceID.uuidString))
-            }
-        }
-
-        func undo(_ reply: [String: Value]) async throws -> [String: Value] {
-            let token = try XCTUnwrap(reply["undo_token"]?.stringValue)
-            return try await call("undo", ["undo_token": .string(token)])
-        }
-
-        func assertTarget(name: String, pinned: Bool, group: String?, selectedTabID: UUID? = nil) throws {
-            let workspace = try workspace()
-            let tab = try XCTUnwrap(workspace.composeTabs.first { $0.id == targetTab.id })
-            let row = try XCTUnwrap(
-                window.agentModeViewModel.sidebarSessions(for: window.promptManager.currentComposeTabs)
-                    .first { $0.sessionID == targetTab.activeAgentSessionID }
-            )
-            let projectedTab = try XCTUnwrap(window.promptManager.currentComposeTabs.first { $0.id == targetTab.id })
-            let indexed = try XCTUnwrap(window.agentModeViewModel.ownerValidatedSessionIndex[targetTab.activeAgentSessionID!])
-            XCTAssertEqual(tab.name, name)
-            XCTAssertEqual(projectedTab.name, name)
-            XCTAssertEqual(indexed.name, name)
-            XCTAssertEqual(indexed.tabID, targetTab.id)
-            XCTAssertEqual(row.title, name)
-            XCTAssertEqual(tab.isPinned, pinned)
-            XCTAssertEqual(projectedTab.isPinned, pinned)
-            XCTAssertEqual(projectedTab.activeAgentSessionID, targetTab.activeAgentSessionID)
-            XCTAssertEqual(row.isPinned, pinned)
-            XCTAssertEqual(tab.sidebarGroup, group)
-            XCTAssertEqual(window.workspaceManager.activeWorkspaceID, workspaceID)
-            XCTAssertEqual(workspace.activeComposeTabID, selectedTabID ?? callerTab.id)
-            XCTAssertEqual(window.promptManager.activeComposeTabID, selectedTabID ?? callerTab.id)
-        }
-
-        func cleanup() async {
-            WindowStatesManager.shared.unregisterWindowState(window)
-            await window.tearDown()
-            try? FileManager.default.removeItem(at: directory)
-        }
-    }
-}
-
-@MainActor
-final class AgentSessionInventoryScalingTests: XCTestCase {
-    func testTwoHundredFiftyTargetsShareCarrierAndLivenessCensusAndSeeFreshChanges() async {
-        let window = WindowState()
-        addTeardownBlock { @MainActor in await window.tearDown() }
-        await window.workspaceManager.awaitInitialized()
-        let ids = (0 ..< 250).map { _ in UUID() }
-        var tabs = (0 ..< 1500).map { ComposeTabState(name: "Tab \($0)") }
-        for index in 0 ..< 200 {
-            tabs[index].activeAgentSessionID = ids[index]
-        }
-        tabs[1250].activeAgentSessionID = ids[0] // Duplicate persisted carrier must stay ambiguous.
-        let stashes = (200 ..< 250).map { StashedTab(tab: ComposeTabState(name: "Stash \($0)")) }
-        var workspace = WorkspaceModel(name: "Scale", repoPaths: [], composeTabs: tabs, activeComposeTabID: tabs[0].id)
-        workspace.stashedTabs = stashes
-        window.workspaceManager.workspaces = [workspace]
-        window.workspaceManager.activeWorkspace = workspace
-        window.promptManager.loadComposeTabsFromWorkspace(workspace)
-        let entries = ids.enumerated().map { index, id in
-            AgentSessionIndexEntry(
-                id: id, tabID: index < 200 ? tabs[index].id : stashes[index - 200].tab.id,
-                name: "Indexed \(index)", savedAt: Date(timeIntervalSince1970: 0), itemCount: 1,
-                autoEditEnabled: false, hasUnknownConversationContent: false, isMCPOriginated: false,
-                worktreeBindingSummaries: [], activeWorktreeMergeSummaries: []
+        func request(branch: String = "branch") -> AgentSessionAdministrationRequest {
+            .init(
+                operation: .adminWorktreeCreate, caller: .agentSession(caller), callerTabID: tab,
+                scopeID: scopeID, targetSessionIDs: [target], idempotencyKey: "create-once",
+                arguments: ["branch": .string(branch)]
             )
         }
-        let owner = AgentModeViewModel.SessionIndexOwner(workspaceID: workspace.id, activationEpoch: 1)
-        let vm = window.agentModeViewModel
-        vm.test_installSessionIndexSnapshot(Dictionary(uniqueKeysWithValues: entries.map { ($0.id, $0) }), owner: owner, latestOwner: owner, activeWorkspace: workspace)
-        var windowReads = 0
-        let organizer = OpenWindowsAgentSessionOrganizer(windows: { windowReads += 1
-            return [window]
-        })
-        vm.test_resetPersistentBindingResolutionSnapshotBuildCount()
-        let states = organizer.states(of: ids)
-        XCTAssertEqual(states.count, 250)
-        XCTAssertEqual(states.values.count(where: \.isArchived), 50)
-        XCTAssertEqual(states[ids[0]]?.runState, .unknown)
-        XCTAssertEqual(states[ids[1]]?.runState, .idle)
-        XCTAssertEqual(windowReads, 1, "Do not rediscover windows/carriers per target")
-        XCTAssertEqual(vm.test_persistentBindingResolutionBuildCount, 1)
-        XCTAssertLessThanOrEqual(vm.test_sidebarSessionRowsBuildCount, 1)
 
-        windowReads = 0
-        let changed = organizer.setGroup("Grouped", order: 3, sessionIDs: ids)
-        XCTAssertEqual(changed, Set(ids.prefix(200)))
-        XCTAssertEqual(windowReads, 1, "One carrier census per synchronous mutation region")
-        let fresh = organizer.states(of: ids)
-        XCTAssertEqual(fresh[ids[1]]?.sidebarGroup, "Grouped")
-        XCTAssertNil(fresh[ids[249]]?.sidebarGroup, "Nil-bound stashes must not be mistaken for active tabs")
-
-        windowReads = 0
-        let restoredGroups = Dictionary(uniqueKeysWithValues: ids.prefix(200).map { ($0, (name: String?.none, order: Int?.none)) })
-        XCTAssertEqual(organizer.setGroups(restoredGroups), Set(ids.prefix(200)))
-        XCTAssertEqual(windowReads, 1, "Distinct undo group values must share one carrier census")
-        windowReads = 0
-        XCTAssertEqual(organizer.unarchive(Array(ids.suffix(50))), Set(ids.suffix(50)))
-        XCTAssertEqual(windowReads, 1)
-        XCTAssertTrue(window.workspaceManager.activeWorkspace?.stashedTabs.isEmpty == true)
-        XCTAssertEqual(organizer.states(of: ids).values.count(where: \.isArchived), 0)
-        XCTAssertEqual(organizer.loadedSessionIDs().count, 250)
-    }
-
-    func testChainMembershipAndUsageReuseOneFreshSynchronousCensus() {
-        let ids = (0 ..< 250).map { _ in UUID() }
-        let workspace = UUID()
-        let rows = ids.enumerated().map { index, id in
-            DelegationSessionProvenance(sessionID: id, workspaceID: workspace, parentSessionID: index == 0 ? nil : ids[index - 1], createdByOverseerSessionID: nil, isLive: true, worktreeCount: 1, runState: .idle)
-        }
-        let source = CountingSource(rows: rows)
-        var lookups = 0
-        let projector = SpawnProvenanceDelegationMembershipProjector(source: source, onAncestryLookup: { _ in lookups += 1 })
-        let scope = DomainDelegationScopeGrant(id: UUID(), granteeSessionID: ids[0], kind: .tree(rootSessionID: ids[0]), capabilities: [.observe], guardrails: .init(), origin: .user, grantedAt: Date(timeIntervalSince1970: 0))
-        projector.withSynchronousCensus { census in
-            for id in ids {
-                XCTAssertEqual(census.members(of: scope), ids)
-                XCTAssertEqual(census.usage(of: scope, spawnParentSessionID: id).liveSessionCount, 250)
-                XCTAssertEqual(census.membershipProof(for: id, in: scope)?.treeDepth, ids.firstIndex(of: id))
+        func value(_ request: AgentSessionAdministrationRequest) async throws -> [String: Value] {
+            guard case let .completed(value) = try await frontDoor.perform(request) else {
+                XCTFail("Expected completed response")
+                return [:]
             }
+            return try XCTUnwrap(value.objectValue)
         }
-        XCTAssertEqual(source.censusReads, 1)
-        XCTAssertEqual(source.individualReads, 0)
-        XCTAssertEqual(lookups, 249_498, "Members, usage and parent depth share bounded scalar ancestry lookups")
-        source.rows = [rows[0]]
-        XCTAssertEqual(projector.members(of: scope), [ids[0]], "A later region must not reuse stale membership")
-        XCTAssertEqual(source.censusReads, 2)
     }
 
-    private final class CountingSource: DelegationProvenanceSource {
-        var rows: [DelegationSessionProvenance]
-        var censusReads = 0
-        var individualReads = 0
-        init(rows: [DelegationSessionProvenance]) {
-            self.rows = rows
+    /// Suspend at the real handler's creation boundary, then retry through the production front
+    /// door. Both equal and conflicting concurrent calls must leave the host with one creation.
+    func testConcurrentDirectCreateIsReservedUntilItsReceiptCanBeReplayed() async throws {
+        let fixture = try Fixture()
+        let gate = Gate()
+        fixture.base.worktrees.beforeCreateCommit = { await gate.suspend() }
+        let request = fixture.request()
+        let first = Task { try await fixture.value(request) }
+        await gate.waitUntilPaused()
+        let pending = try await fixture.value(request)
+        XCTAssertEqual(pending["result"], .string("in_progress"))
+        XCTAssertEqual(pending["retryable"], .bool(true))
+        guard case .idempotencyConflict = try await fixture.frontDoor.perform(fixture.request(branch: "different")) else {
+            gate.resume()
+            _ = try await first.value
+            return XCTFail("A different concurrent request must conflict")
         }
+        XCTAssertTrue(fixture.base.worktrees.created.isEmpty)
+        gate.resume()
+        let applied = try await first.value
+        XCTAssertEqual(applied["changed_count"], .int(1))
+        let replay = try await fixture.value(request)
+        XCTAssertEqual(replay["idempotent_replay"], .bool(true))
+        XCTAssertEqual(fixture.base.worktrees.created, [fixture.target])
+    }
 
-        func provenance(for id: UUID) -> DelegationSessionProvenance? {
-            individualReads += 1
-            return rows.first { $0.sessionID == id }
+    func testExplicitRevokedScopeCannotReplayPriorSuccess() async throws {
+        let fixture = try Fixture()
+        let request = fixture.request()
+        _ = try await fixture.value(request)
+        _ = fixture.base.runtime.revoke(scopeID: fixture.scopeID)
+        guard case .denied = try await fixture.frontDoor.perform(request) else {
+            return XCTFail("Revoked authority must reach the core denial before cached success")
         }
+        XCTAssertEqual(fixture.base.worktrees.created, [fixture.target])
+    }
 
-        func allKnownSessions() -> [DelegationSessionProvenance] {
-            censusReads += 1
-            return rows
-        }
+    func testCancelledCreationReleasesReservationWithoutCachingAnEffect() async throws {
+        let fixture = try Fixture()
+        let gate = Gate()
+        fixture.base.worktrees.beforeCreateCommit = { await gate.suspend() }
+        let first = Task { try await fixture.value(fixture.request()) }
+        await gate.waitUntilPaused()
+        first.cancel()
+        gate.resume()
+        // The production handler's commit predicate includes cancellation, so the resumed host
+        // refuses the effect. Either a cancellation or a structured refusal is acceptable.
+        do { _ = try await first.value } catch is CancellationError {} catch { XCTFail("Unexpected error: \(error)") }
+        XCTAssertTrue(fixture.base.worktrees.created.isEmpty)
+        fixture.base.worktrees.beforeCreateCommit = nil
+        let retry = try await fixture.value(fixture.request())
+        XCTAssertNotEqual(retry["result"], .string("in_progress"))
+        XCTAssertNotEqual(retry["idempotent_replay"], .bool(true))
+        XCTAssertEqual(fixture.base.worktrees.created, [fixture.target])
     }
 }

@@ -232,9 +232,15 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
             }
 
             // 2b) Bounded settlement of durable oversight transactions the user already started.
-            // Total deadline, losing branch never awaited: a stuck filesystem must not hold up quit,
-            // and the write-through store means every *reported* Add or Stop is already durable.
+            // Bound settlement of admitted link decisions and their continuity outbox. Live Add/Stop
+            // results are independent of saving; unacknowledged writes are not promised to survive quit.
             await AgentSessionLinkRuntimeBridge.shared.settleIntentTransactions()
+            // Scope authority was frozen synchronously above. Await its pending row saves, not a
+            // final snapshot or clean-shutdown seal. Only acknowledged commits restore continuity.
+            let scopes = AgentSessionLinkRuntimeBridge.shared.delegationScopes
+            if await !(scopes.settleForTermination(timeout: 2)) {
+                print("Overseer continuity unsettled at the two-second quit deadline: \(scopes.persistenceStatusMessage ?? "unacknowledged transactions remain")")
+            }
 
             // 3) Shut down agent processes and MCP tools on the main actor WITHOUT blocking.
             // Kill Claude CLI and Codex app-server processes BEFORE stopping MCP servers,
@@ -260,8 +266,6 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         // Idempotent and synchronous only. Correctness comes from the write-through store and the
         // bounded `.terminateLater` settlement above, never from work attempted here.
         AgentSessionLinkRuntimeBridge.shared.freezeForTermination()
-        // Bounded synchronous write so a revocation made just before quitting is durable.
-        AgentSessionLinkRuntimeBridge.shared.delegationScopes.flushForTermination()
         if !AppLaunchConfiguration.current.suppressesWindowPersistence {
             WindowStatesManager.shared.persistWindowSession(reason: "appWillTerminate")
         }

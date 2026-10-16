@@ -53,6 +53,7 @@ struct DelegationApprovalSlot: View {
                 ForEach(requests) { request in
                     DelegationScopeApprovalCard(
                         request: request,
+                        authorityUnavailableReason: runtime.authorityUnavailableReason,
                         onApprove: { capabilities, threshold in
                             guard let presentedSessionID = sessionID else { return .failure(.unknownScope) }
                             var guardrails = request.guardrails
@@ -63,7 +64,17 @@ struct DelegationApprovalSlot: View {
                                 capabilities: capabilities, guardrails: guardrails
                             )
                         },
-                        onDeny: { runtime.deny(requestID: request.id, reason: "Denied by user") }
+                        onDeny: { runtime.deny(requestID: request.id, reason: "Denied by user") },
+                        onGrantAll: { threshold in
+                            guard let presentedSessionID = sessionID else { return .failure(.unknownScope) }
+                            var guardrails = request.guardrails
+                            guardrails.bulkConfirmationThreshold = threshold
+                            return runtime.approve(
+                                requestID: request.id, presentedWindowID: windowID,
+                                presentedTabID: tabID, presentedSessionID: presentedSessionID,
+                                guardrails: guardrails, grantAllForSession: true
+                            )
+                        }
                     )
                 }
                 ForEach(cards) { card in
@@ -120,18 +131,66 @@ struct DelegationApprovalSlot: View {
 /// oversight monitor popover; renders nothing when no scope is live.
 struct DelegationActiveScopesSection: View {
     @ObservedObject var runtime: DelegationScopeRuntime
+    @AppStorage(DelegationScopeRuntime.autoApproveAllRequestsKey) private var globalAutoApprove = false
 
     var body: some View {
         let scopes = runtime.allLiveScopes()
-        if !scopes.isEmpty || runtime.persistenceFailed {
+        let standing = runtime.sessionWideApprovals.sorted { $0.uuidString < $1.uuidString }
+        if !scopes.isEmpty || !standing.isEmpty || globalAutoApprove || runtime.persistenceStatusMessage != nil
+            || !runtime.continuityRecoveryOffers.isEmpty
+        {
             VStack(alignment: .leading, spacing: 6) {
                 Divider()
                 Text("Active delegations")
                     .font(.headline)
-                if runtime.persistenceFailed {
-                    Label("Delegation changes could not be saved; they apply until RepoPrompt quits.", systemImage: "exclamationmark.triangle")
+                if globalAutoApprove {
+                    Label(
+                        "Overseer full access is on: no approvals or confirmation cards (Settings › Agent Permissions › Overseer).",
+                        systemImage: "checkmark.shield"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                }
+                ForEach(standing, id: \.self) { sessionID in
+                    HStack(alignment: .top, spacing: 8) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(DelegationDisplayNames.sessionTitle(sessionID) ?? "Session \(sessionID.uuidString.prefix(8))")
+                                .lineLimit(1)
+                            Text("Grant all for this session: new requests are approved without a card")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button("Stop auto-approving") { runtime.endSessionWideApproval(sessionID: sessionID) }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                    }
+                }
+                if let message = runtime.persistenceStatusMessage {
+                    Label(message, systemImage: "exclamationmark.triangle")
                         .font(.caption)
                         .foregroundStyle(.orange)
+                    Button("Retry saving continuity") { Task { await runtime.retryContinuityNow() } }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                }
+                if let message = runtime.continuityRecoveryMessage {
+                    Text(message).font(.caption).foregroundStyle(.secondary)
+                }
+                ForEach(runtime.continuityRecoveryOffers) { offer in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Preserved mixed-source delegations — not active authority")
+                            .font(.caption).bold()
+                        ForEach(offer.grants, id: \.id) { grant in
+                            Text("Session \(grant.granteeSessionID.uuidString): \(String(describing: grant.kind)); \(grant.capabilities.map(\.rawValue).sorted().joined(separator: ", ")); limits \(String(describing: grant.guardrails))")
+                                .font(.caption2).textSelection(.enabled)
+                        }
+                        Text("The original source is untouched. This approves new root grants with the displayed membership, capabilities and limits, not old IDs or unrelated authority. \(offer.retainedOtherRows) other rows remain preserved for separate recovery.")
+                            .font(.caption2).foregroundStyle(.secondary)
+                        Button("Approve new live grants from these descriptions") {
+                            runtime.approveContinuityRecovery(sourceID: offer.id)
+                        }.buttonStyle(.bordered).controlSize(.small)
+                    }
                 }
                 ForEach(scopes, id: \.id) { scope in
                     HStack(alignment: .top, spacing: 8) {
@@ -155,6 +214,7 @@ struct DelegationActiveScopesSection: View {
 
     static func summary(_ scope: DomainDelegationScopeRecord) -> String {
         let kind = switch scope.grant.kind {
+        case let .session(target): "only session \(DelegationDisplayNames.sessionTitle(target) ?? target.uuidString)"
         case .tree: "its own tree"
         case let .workspace(workspaceID): "workspace \(DelegationDisplayNames.workspaceName(workspaceID) ?? workspaceID.uuidString.prefix(8).description)"
         case .allSessions: "all sessions"
@@ -172,9 +232,11 @@ struct DelegationActiveScopesSection: View {
 /// One-time approval of a delegation scope requested by an Agent session.
 struct DelegationScopeApprovalCard: View {
     let request: DelegationScopeRequest
+    let authorityUnavailableReason: String?
     /// Approved capabilities (a subset of the request) and the user's bulk-card threshold.
     let onApprove: (Set<DomainDelegationScopeCapability>, Int) -> Result<DomainDelegationScopeRecord, DomainDelegationScopeDenial>
     let onDeny: () -> Void
+    let onGrantAll: ((Int) -> Result<DomainDelegationScopeRecord, DomainDelegationScopeDenial>)?
 
     @State private var selected: Set<DomainDelegationScopeCapability>
     /// Only the user may loosen the agent's (already clamped) threshold.
@@ -183,12 +245,16 @@ struct DelegationScopeApprovalCard: View {
 
     init(
         request: DelegationScopeRequest,
+        authorityUnavailableReason: String? = nil,
         onApprove: @escaping (Set<DomainDelegationScopeCapability>, Int) -> Result<DomainDelegationScopeRecord, DomainDelegationScopeDenial>,
-        onDeny: @escaping () -> Void
+        onDeny: @escaping () -> Void,
+        onGrantAll: ((Int) -> Result<DomainDelegationScopeRecord, DomainDelegationScopeDenial>)? = nil
     ) {
         self.request = request
+        self.authorityUnavailableReason = authorityUnavailableReason
         self.onApprove = onApprove
         self.onDeny = onDeny
+        self.onGrantAll = onGrantAll
         _selected = State(initialValue: request.capabilities)
         _threshold = State(initialValue: request.guardrails.bulkConfirmationThreshold)
     }
@@ -213,7 +279,7 @@ struct DelegationScopeApprovalCard: View {
                     Text("Agent's stated reason (unverified)")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
-                    Text(reason)
+                    Text(Self.displayReason(reason))
                         .font(.callout)
                         .textSelection(.enabled)
                 }
@@ -249,7 +315,11 @@ struct DelegationScopeApprovalCard: View {
                 .font(.caption2)
                 .foregroundStyle(.secondary)
 
-            if let approvalFailure {
+            if let authorityUnavailableReason {
+                Label(authorityUnavailableReason, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            } else if let approvalFailure {
                 Label(approvalFailureMessage(approvalFailure), systemImage: "exclamationmark.triangle")
                     .font(.caption)
                     .foregroundStyle(.orange)
@@ -260,6 +330,17 @@ struct DelegationScopeApprovalCard: View {
                 Button("Deny", action: onDeny)
                     .buttonStyle(.bordered)
                 Spacer()
+                if let onGrantAll {
+                    Button("Grant all for this session") {
+                        switch onGrantAll(threshold) {
+                        case .success: approvalFailure = nil
+                        case let .failure(denial): approvalFailure = denial
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(authorityUnavailableReason != nil)
+                    .hoverTooltip("Grant every capability permitted for the scope shown above, without expiry, and approve this session's later requests without asking again until the app quits. Existing capacity and bulk-change limits remain. Stop auto-approving or revoke any time in Active delegations. Human-only actions remain excluded.")
+                }
                 Button("Grant") {
                     switch onApprove(selected, threshold) {
                     case .success: approvalFailure = nil
@@ -267,7 +348,7 @@ struct DelegationScopeApprovalCard: View {
                     }
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(selected.isEmpty)
+                .disabled(selected.isEmpty || authorityUnavailableReason != nil)
             }
         }
         .padding(12)
@@ -299,9 +380,14 @@ struct DelegationScopeApprovalCard: View {
         }
     }
 
+    static func displayReason(_ reason: String) -> String {
+        reason.count > 1024 ? String(reason.prefix(1024)) + "… (truncated)" : reason
+    }
+
     private var kindDescription: String {
         let requester = request.requesterTitle.map { "\"\($0)\" asks for " } ?? "Asks for "
         let scope = switch request.kind {
+        case let .session(target): "only session \"\(DelegationDisplayNames.sessionTitle(target) ?? target.uuidString)\" (\(target.uuidString))"
         case .tree: "this session and the sessions it creates"
         case .workspace: "every session in workspace \"\(request.workspaceName ?? "this workspace")\""
         case .allSessions: "every session you own"

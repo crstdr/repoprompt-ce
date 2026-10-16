@@ -586,7 +586,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             render: AgentSessionLinkPrompts.rendered
         ))
         XCTAssertEqual(reOwed.laneGuidanceMode, .full)
-        XCTAssertTrue(reOwed.fragment.contains("Guidance revision 13 supersedes"))
+        XCTAssertTrue(reOwed.fragment.contains("Guidance revision 14 supersedes"))
         XCTAssertEqual(reOwed.inventoryGuidanceRevision, AgentSessionLinkPrompts.currentInventoryGuidanceRevision)
         XCTAssertTrue(reOwed.fragment.contains("`compact`"))
         XCTAssertTrue(reOwed.fragment.contains("`stop`"))
@@ -4548,7 +4548,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             fixture.session.oversight.retirePeriodicScheduling()
         }
         fixture.viewModel.agentSessionLinkPeriodicObserverIsLive = { bridge.isPeriodicWakeObserverLive(for: $0) }
-        let failed = registry.beginDurableDeletion(sessionID: fixture.sessionID)
+        let failed = try registry.beginDurableDeletion(sessionID: fixture.sessionID)
         registry.didFailDurableDeletion(failed)
         XCTAssertTrue(fixture.viewModel.agentSessionLinkPeriodicWakeIsEligible(fixture.session, endpoint: endpoint))
         _ = try reservePeriodic(fixture, clock: clock, endpoint: endpoint)
@@ -4563,7 +4563,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             _ = await gate.requirement()
             await cleanup?(sessionID)
         }
-        let token = registry.beginDurableDeletion(sessionID: fixture.sessionID)
+        let token = try registry.beginDurableDeletion(sessionID: fixture.sessionID)
         let deletion = Task { @MainActor in await registry.didCommitDurableDeletion(token) }
         await gate.waitUntilEntered()
         // Assert the contested state, so an unrelated inventory withdrawal cannot make this pass.
@@ -4799,6 +4799,8 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             let session = AgentTabSession(tabID: fixture.tabID)
             session.hasLoadedPersistedState = true
             session.testInstallPersistentSessionBinding(sessionID: UUID())
+            session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            XCTAssertNil(session.operationAdmissionFailureMessage)
             session.oversight.pendingAutoWake = fixture.session.oversight.pendingAutoWake
             session.selectedAgent = .claudeCode
             session.providerSessionID = "missing-original-session"
@@ -5090,10 +5092,14 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         session.oversight.autoWakeOnUpdates = false
         session.hasLoadedPersistedState = true
         session.installRunID(UUID())
-        let sessionID = try XCTUnwrap(
-            viewModel.test_ensureSessionBoundToTab(session),
-            "expected a durable persistent binding"
-        )
+        // Wake admission begins with a restored session, not an unfinished fresh creation.
+        // Keep the proof attached to this binding; competing-writer fixtures remain unready.
+        let sessionID = UUID()
+        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
+            sessionID: sessionID, on: session, updateWorkspaceMetadata: true
+        ))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        XCTAssertNil(session.operationAdmissionFailureMessage)
         let fixture = Fixture(
             viewModel: viewModel,
             session: session,

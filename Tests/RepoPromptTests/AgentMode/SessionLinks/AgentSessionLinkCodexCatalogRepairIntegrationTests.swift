@@ -42,9 +42,33 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
         try await assertRestoredGrantRepairsCatalog(outbound: false, surfaceTransition: .toolbar)
     }
 
-    private enum SurfaceTransition { case activation, upgrade, orchestrator, delegation, toolbar }
+    func testIgnoredScopeGrantNotificationRepairsCatalogAfterQuiescence() async throws {
+        // With oversight enabled, an eligible session lists session_admin from its first turn, so a
+        // scope grant or revocation does not change its surface and needs no repair. The repair
+        // path remains for the oversight-disabled surface, where only scope authority lists it.
+        for oversightEnabled in [false] {
+            try await assertRestoredGrantRepairsCatalog(
+                outbound: false, surfaceTransition: .delegationGrant, oversightEnabled: oversightEnabled
+            )
+        }
+    }
 
-    private func assertRestoredGrantRepairsCatalog(outbound: Bool, surfaceTransition: SurfaceTransition? = nil) async throws {
+    func testIgnoredScopeRevocationNotificationRepairsCatalogAfterQuiescence() async throws {
+        // With oversight enabled, an eligible session lists session_admin from its first turn, so a
+        // scope grant or revocation does not change its surface and needs no repair. The repair
+        // path remains for the oversight-disabled surface, where only scope authority lists it.
+        for oversightEnabled in [false] {
+            try await assertRestoredGrantRepairsCatalog(
+                outbound: false, surfaceTransition: .delegationRevocation, oversightEnabled: oversightEnabled
+            )
+        }
+    }
+
+    private enum SurfaceTransition { case activation, upgrade, orchestrator, delegation, toolbar, delegationGrant, delegationRevocation }
+
+    private func assertRestoredGrantRepairsCatalog(
+        outbound: Bool, surfaceTransition: SurfaceTransition? = nil, oversightEnabled: Bool = true
+    ) async throws {
         #if DEBUG
             let manager = ServerNetworkManager(
                 domainHost: AppDomainRuntimeComposition.shared.runtime.domainHost
@@ -93,11 +117,41 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             session.codexConversationID = conversationID
             session.codexRolloutPath = rolloutPath
             session.codexController = controller
-            _ = try XCTUnwrap(window.agentModeViewModel.test_ensureSessionBoundToTab(session))
+            // Catalog repair begins with an existing restored conversation.
+            _ = try XCTUnwrap(window.agentModeViewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: session, updateWorkspaceMetadata: true))
+            session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            XCTAssertTrue(session.qualifiedRestorationReadiness.isAuthoritative)
             let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(
                 window.agentModeViewModel,
                 tabID: tabID
             )
+            let isScopeRepair = surfaceTransition == .delegationGrant || surfaceTransition == .delegationRevocation
+            let scopes = AgentSessionLinkRuntimeBridge.shared.delegationScopes
+            let scopeSessionID = try XCTUnwrap(session.activeAgentSessionID)
+            func grantScope() throws -> UUID {
+                let request = try scopes.requestScope(
+                    requesterSessionID: scopeSessionID, requesterTabID: tabID,
+                    kind: .tree(rootSessionID: scopeSessionID), capabilities: [.observe],
+                    guardrails: .init(), reason: nil, idempotencyKey: nil
+                ).get()
+                let scope = try scopes.approve(
+                    requestID: request.id, presentedWindowID: window.windowID,
+                    presentedTabID: tabID, presentedSessionID: scopeSessionID
+                ).get()
+                addTeardownBlock { @MainActor in scopes.revoke(scopeID: scope.id) }
+                return scope.id
+            }
+            var scopeToRevoke: UUID?
+            if isScopeRepair {
+                let availability = ToolAvailabilityStore.shared
+                let wasEnabled = availability.isEnabled(MCPWindowToolName.agentSessionLink)
+                XCTAssertTrue(availability.isEnabled(MCPWindowToolName.sessionAdmin))
+                await availability.toggle(MCPWindowToolName.agentSessionLink, enabled: oversightEnabled)
+                addTeardownBlock { @MainActor in
+                    await availability.toggle(MCPWindowToolName.agentSessionLink, enabled: wasEnabled)
+                }
+                if surfaceTransition == .delegationRevocation { scopeToRevoke = try grantScope() }
+            }
             await manager.debugSetSessionLinkCatalogEndpointsForTesting(anyActive: surfaceTransition == .upgrade ? [endpoint] : [], outbound: [])
             if surfaceTransition != nil { session.runState = .running }
             await installAuthoritativePolicy(
@@ -141,7 +195,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 return
             }
             if surfaceTransition == .toolbar {
-                XCTAssertFalse(names.contains(MCPWindowToolName.sessionAdmin))
+                XCTAssertTrue(names.contains(MCPWindowToolName.sessionAdmin), "An eligible session can request a scope from its first turn")
                 let host = WindowStatesManager.shared
                 let authority = DomainAgentSessionLinkAuthority(identity: DomainRuntimeIdentity(
                     runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: Date()
@@ -169,7 +223,8 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                     let activatedNames = try await manager.debugListToolNames(for: connectionID)
                     XCTAssertTrue(activatedNames.contains(MCPWindowToolName.sessionAdmin))
                     XCTAssertTrue(activatedNames.contains(MCPWindowToolName.agentSessionLink))
-                    XCTAssertFalse(activatedNames.contains(MCPWindowToolName.becomeOverseer))
+                    // Activation exposes controls but retains targeted bootstrap discovery.
+                    XCTAssertTrue(activatedNames.contains(MCPWindowToolName.becomeOverseer))
                     XCTAssertFalse(scopes.hasLiveScope(grantedTo: sessionID), "Opt-in is discovery, not user-granted scope authority")
                     let links = await authority.links(forObserver: sessionID)
                     XCTAssertTrue(links.items.isEmpty, "Toolbar consent never manufactures a link")
@@ -203,7 +258,10 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                         }
                     }
                     let retiredNames = try await manager.debugListToolNames(for: connectionID)
-                    XCTAssertEqual(retiredNames.contains(MCPWindowToolName.sessionAdmin), keepScope, "Only independently approved scope authority survives opt-in retirement")
+                    XCTAssertEqual(
+                        retiredNames.contains(MCPWindowToolName.sessionAdmin), keepScope || !disableOversight,
+                        "Retirement keeps scope requests for an eligible session; disabled oversight keeps only approved scope authority"
+                    )
                     XCTAssertFalse(retiredNames.contains(MCPWindowToolName.agentSessionLink), "A durable scope does not fabricate oversight activation or pair grants")
                     XCTAssertEqual(retiredNames.contains(MCPWindowToolName.becomeOverseer), !disableOversight)
                     if let scopeID {
@@ -219,7 +277,8 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                         await availability.toggle(MCPWindowToolName.agentSessionLink, enabled: true)
                         await manager.notifyToolListChangedForAgentSession(sessionID)
                         let reenabledNames = try await manager.debugListToolNames(for: connectionID)
-                        XCTAssertFalse(reenabledNames.contains(MCPWindowToolName.sessionAdmin), "Re-enabling the family cannot revive retired opt-in")
+                        XCTAssertTrue(reenabledNames.contains(MCPWindowToolName.sessionAdmin), "Re-enabling the family restores scope requests for an eligible session")
+                        XCTAssertFalse(reenabledNames.contains(MCPWindowToolName.agentSessionLink), "Re-enabling the family cannot revive retired opt-in")
                         XCTAssertTrue(reenabledNames.contains(MCPWindowToolName.becomeOverseer))
                     }
                 }
@@ -229,18 +288,19 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 return
             }
             if surfaceTransition == .delegation {
-                XCTAssertFalse(names.contains(MCPWindowToolName.sessionAdmin))
+                // An eligible session lists session_admin to request a scope; listing grants nothing.
+                XCTAssertTrue(names.contains(MCPWindowToolName.sessionAdmin))
                 // Inbound oversight alone is not a scope request/administration grant.
                 await manager.debugSetSessionLinkCatalogEndpointsForTesting(anyActive: [endpoint], outbound: [])
                 let inboundNames = try await manager.debugListToolNames(for: connectionID)
                 XCTAssertTrue(inboundNames.contains(MCPWindowToolName.agentSessionLink))
-                XCTAssertFalse(inboundNames.contains(MCPWindowToolName.sessionAdmin))
+                XCTAssertTrue(inboundNames.contains(MCPWindowToolName.sessionAdmin))
                 await manager.debugSetSessionLinkCatalogEndpointsForTesting(anyActive: [endpoint], outbound: [endpoint])
                 let outboundNames = try await manager.debugListToolNames(for: connectionID)
                 XCTAssertTrue(outboundNames.contains(MCPWindowToolName.sessionAdmin))
                 await manager.debugSetSessionLinkCatalogEndpointsForTesting(anyActive: [], outbound: [])
                 let noLinkNames = try await manager.debugListToolNames(for: connectionID)
-                XCTAssertFalse(noLinkNames.contains(MCPWindowToolName.sessionAdmin))
+                XCTAssertTrue(noLinkNames.contains(MCPWindowToolName.sessionAdmin))
 
                 let scopes = AgentSessionLinkRuntimeBridge.shared.delegationScopes
                 let request = try scopes.requestScope(
@@ -263,19 +323,29 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 scopes.revoke(scopeID: scope.id)
                 await manager.notifyToolListChangedForAgentSession(sessionID, forceRelist: true)
                 let revokedNames = try await manager.debugListToolNames(for: connectionID)
-                XCTAssertFalse(revokedNames.contains(MCPWindowToolName.sessionAdmin))
+                XCTAssertTrue(revokedNames.contains(MCPWindowToolName.sessionAdmin))
+                XCTAssertFalse(scopes.hasLiveScope(grantedTo: sessionID), "Listing survives revocation; authority does not")
                 XCTAssertEqual(session.runID, runID, "Scope discovery never retargets the run")
                 XCTAssertNotNil(session.codexController, "Scope changes do not recycle a running provider")
                 return
             }
             let sourceGeneration = session.codexControllerGeneration
-            if surfaceTransition == .activation {
+            if isScopeRepair {
+                XCTAssertEqual(names.contains(MCPWindowToolName.sessionAdmin), surfaceTransition == .delegationRevocation)
+                if let scopeToRevoke {
+                    scopes.revoke(scopeID: scopeToRevoke)
+                } else {
+                    _ = try grantScope()
+                }
+            } else if surfaceTransition == .activation {
                 let state = try XCTUnwrap(window.agentModeViewModel.agentSessionLinkBootstrapState(for: endpoint))
                 XCTAssertTrue(window.agentModeViewModel.agentSessionLinkActivateOverseer(for: endpoint, expected: state))
             } else {
                 await manager.debugSetSessionLinkCatalogEndpointsForTesting(anyActive: [endpoint], outbound: outbound ? [endpoint] : [])
             }
-            await manager.notifyToolListChangedForAgentSession(sessionID)
+            // This connection records notifications but intentionally does not relist: exercise
+            // the stale client catalog rather than healing it in the test before reconciliation.
+            await manager.notifyToolListChangedForAgentSession(sessionID, forceRelist: isScopeRepair)
 
             let stuckProjection = await manager.debugRunCatalogProjection(for: runID)
             let stuck = try XCTUnwrap(stuckProjection)
@@ -285,6 +355,14 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 XCTAssertEqual(stuck.returnedSurface, unlinked.returnedSurface)
                 XCTAssertNotNil(session.codexController, "Busy provider is not replaced")
                 XCTAssertEqual(session.runID, runID)
+                XCTAssertEqual(session.codexSessionLinkCatalogRepairCycle?.observedControllerGeneration, sourceGeneration)
+                if isScopeRepair {
+                    XCTAssertFalse(stuck.hasAnyActiveLink == true)
+                    XCTAssertTrue(AgentSessionLinkCatalogSurface.differs(
+                        toolName: MCPWindowToolName.sessionAdmin,
+                        expected: stuck.expectedSurface, returned: stuck.returnedSurface
+                    ))
+                }
                 session.runState = .completed
                 window.agentModeViewModel.test_codexCoordinator.codexRepairSessionLinkCatalogIfQuiescent(for: session)
             }
@@ -303,6 +381,12 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 let spentGeneration = session.codexControllerGeneration
                 window.agentModeViewModel.test_codexCoordinator.codexRepairSessionLinkCatalogIfQuiescent(for: session)
                 XCTAssertEqual(session.codexControllerGeneration, spentGeneration)
+                // Production retirement clears the old run's provider PID when its transport
+                // terminates (CodexAppServerClient.finishTransportTermination). This no-op controller
+                // has no process, and both runs share the XCTest PID, so mirror that clear; otherwise
+                // the retired run still looks like a live ancestor and the next bootstrap is
+                // correctly refused as ambiguous_run_policy.
+                await manager.clearExpectedAgentPID(getpid(), for: clientName, runID: runID)
                 // The next ordinary installed run re-lists the full surface; no synthetic turn.
                 let nextRunID = UUID()
                 let nextConnectionID = UUID()
@@ -314,9 +398,11 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 let nextApplied = await manager.debugApplyPendingPolicy(clientName: clientName, connectionID: nextConnectionID, clientPid: Int(getpid()), bootstrapClientName: "repoprompt_ce_cli_debug", sessionKey: "next-\(nextRunID)", pidGateTimeout: 0.25, requireRunRouting: true)
                 XCTAssertEqual(nextApplied.outcome, "applied")
                 let nextNames = try await manager.debugListToolNames(for: nextConnectionID)
-                XCTAssertTrue(nextNames.contains(MCPWindowToolName.agentSessionLink))
-                XCTAssertFalse(nextNames.contains(MCPWindowToolName.becomeOverseer))
-                if surfaceTransition == .activation {
+                XCTAssertEqual(nextNames.contains(MCPWindowToolName.agentSessionLink), !isScopeRepair)
+                XCTAssertEqual(nextNames.contains(MCPWindowToolName.becomeOverseer), oversightEnabled, "Eligible roles retain targeted bootstrap; disabled oversight still removes it")
+                if isScopeRepair {
+                    XCTAssertEqual(nextNames.contains(MCPWindowToolName.sessionAdmin), surfaceTransition == .delegationGrant)
+                } else if surfaceTransition == .activation {
                     XCTAssertTrue(nextNames.contains(MCPWindowToolName.sessionAdmin), "A still-activated zero-link overseer can request a scope on the next ordinary run")
                 }
                 let healed = await manager.debugRunCatalogProjection(for: nextRunID)
@@ -571,31 +657,41 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 await window.workspaceManager.awaitInitialized()
                 let observerTab = UUID()
                 let targetTab = UUID()
+                let observerID = UUID()
+                let targetID = UUID()
                 var workspace = WorkspaceModel(name: "Live discovery", repoPaths: [])
                 workspace.isEphemeral = true
                 workspace.composeTabs = [
-                    ComposeTabState(id: observerTab, name: "User-created planning chat"),
-                    ComposeTabState(id: targetTab, name: "Harmless idle target")
+                    ComposeTabState(id: observerTab, name: "User-created planning chat", activeAgentSessionID: observerID),
+                    ComposeTabState(id: targetTab, name: "Harmless idle target", activeAgentSessionID: targetID)
                 ]
                 workspace.activeComposeTabID = observerTab
+                // Restoration must earn both runtime readiness and owner-valid placement metadata.
+                // A fabricated loaded latch has no index row until an unrelated debounced save wins.
+                for tab in workspace.composeTabs {
+                    let payload = try AgentSession(
+                        id: XCTUnwrap(tab.activeAgentSessionID), workspaceID: workspace.id,
+                        composeTabID: tab.id, name: tab.name, agentKind: AgentProviderKind.claudeCode.rawValue,
+                        autoWakeOnOversightUpdates: false
+                    )
+                    _ = try await AgentSessionDataService.shared.saveAgentSession(payload, for: workspace)
+                }
                 window.workspaceManager.workspaces.append(workspace)
                 let switched = await window.workspaceManager.switchWorkspace(to: workspace, saveState: false)
                 XCTAssertTrue(switched.didSwitch)
                 window.promptManager.loadComposeTabsFromWorkspace(workspace, syncPromptText: true)
                 let vm = window.agentModeViewModel
-                vm.test_setAgentSessionSaver { _, _, _ in
-                    FileManager.default.temporaryDirectory.appendingPathComponent("discovery-\(UUID()).json")
+                let observer = await vm.ensureSessionReady(tabID: observerTab, reconnectActiveProviders: false)
+                let target = await vm.ensureSessionReady(tabID: targetTab, reconnectActiveProviders: false)
+                for (session, expectedID) in [(observer, observerID), (target, targetID)] {
+                    XCTAssertEqual(session.activeAgentSessionID, expectedID)
+                    XCTAssertEqual(session.selectedAgent, .claudeCode)
+                    XCTAssertTrue(session.qualifiedRestorationReadiness.isAuthoritative)
+                    XCTAssertEqual(vm.ownerValidatedSessionIndex[expectedID]?.tabID, session.tabID)
+                    let projector = SpawnProvenanceDelegationMembershipProjector.production(worktreeOwnership: bridge.worktreeOwnership)
+                    XCTAssertEqual(projector.pointResolutionState(for: expectedID), .unique)
+                    XCTAssertFalse(projector.authorityConflictInAncestry(of: expectedID))
                 }
-                let observer = vm.session(for: observerTab)
-                let target = vm.session(for: targetTab)
-                for session in [observer, target] {
-                    session.selectedAgent = .claudeCode
-                    session.hasLoadedPersistedState = true
-                    session.oversight.autoWakeOnUpdates = false
-                    _ = try XCTUnwrap(vm.test_ensureSessionBoundToTab(session))
-                }
-                let observerID = try XCTUnwrap(observer.activeAgentSessionID)
-                let targetID = try XCTUnwrap(target.activeAgentSessionID)
                 let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(vm, tabID: observerTab)
                 XCTAssertNil(observer.parentSessionID)
                 XCTAssertFalse(observer.isMCPOriginated)
@@ -632,9 +728,11 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 transport = connection
                 await provider.attach(connection)
                 let turnID = try await provider.sendUserMessage("Hold this synthetic turn until the test releases it.")
+                let heldTurn = await provider.heldTurnSnapshot
+                XCTAssertEqual(heldTurn.activeTurnID, turnID)
                 let before = try await provider.listTools()
                 XCTAssertEqual(before.contains(MCPWindowToolName.agentSessionLink), inbound)
-                XCTAssertEqual(before.contains(MCPWindowToolName.becomeOverseer), !inbound)
+                XCTAssertTrue(before.contains(MCPWindowToolName.becomeOverseer), "Inbound discovery requests no additional authority")
                 let beforeDefinitions = try await provider.definitions(wireCaptureName: inbound ? "inbound-before" : (activate ? "activation-before" : "grant-before"))
                 try DiscoveryArtifactCapture.write(beforeDefinitions, name: inbound ? "inbound-before" : (activate ? "activation-before" : "grant-before"))
                 if inbound {
@@ -714,7 +812,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                             XCTAssertNotNil(observer.oversight.overseerActivation)
                             let tools = try await provider.listTools()
                             XCTAssertTrue(tools.contains(MCPWindowToolName.agentSessionLink))
-                            XCTAssertFalse(tools.contains(MCPWindowToolName.becomeOverseer))
+                            XCTAssertTrue(tools.contains(MCPWindowToolName.becomeOverseer), "Targeted bootstrap remains available after activation")
                         case .exactConnectionPolicyABA:
                             XCTAssertEqual(result["isError"] as? Bool, true, "Exact-connection policy ABA must latch revocation: \(response.rawJSON)")
                             XCTAssertNil(observer.oversight.overseerActivation)
@@ -794,15 +892,15 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 if activate {
                     let paused = expectation(description: "tools/list sampled bootstrap before activation")
                     await manager.debugSetAfterExpectedCatalogSurfaceForTesting {
-                        paused.fulfill()
-                        await catalogGate.hold()
+                        await catalogGate.hold { paused.fulfill() }
                     }
                     delayedCatalog = Task { try await provider.listTools() }
                     await fulfillment(of: [paused], timeout: 2)
                     await manager.debugSetAfterExpectedCatalogSurfaceForTesting(nil)
                 }
-                // Two seconds is deliberately generous for local in-process socket I/O, but detects
-                // delayed delivery or a turn-boundary refresh. No sleeps, polling, or provider inference.
+                // Catalog/activation requests and notification waits retain their two-second watchdogs.
+                // Prove refresh is independent of turn completion and the deliberately held catalog
+                // response; aggregate elapsed time also includes their serial setup and actor hops.
                 let clock = ContinuousClock()
                 let start = clock.now
                 var expectedTargetID = targetID
@@ -828,6 +926,11 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                     let object = try MCPExportWatchdogIntegrationTests.responseObject(from: created)
                     let result = try XCTUnwrap(object["result"] as? [String: Any])
                     XCTAssertNotEqual(result["isError"] as? Bool, true, created.rawJSON)
+                    let createdContent = try XCTUnwrap(result["content"] as? [[String: Any]])
+                    let createdText = createdContent.compactMap { $0["text"] as? String }.joined()
+                    let createdReceipt = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(createdText.utf8)) as? [String: Any])
+                    XCTAssertEqual(createdReceipt["result"] as? String, "created", created.rawJSON)
+                    XCTAssertEqual(createdReceipt["linked"] as? Bool, true, created.rawJSON)
                     let inventory = await authority.links(forObserver: observerID)
                     expectedTargetID = try XCTUnwrap(inventory.items.first?.targetSessionID)
                     XCTAssertNil(observer.oversight.overseerActivation, "Inbound creation needs no bootstrap")
@@ -835,7 +938,13 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 let inventory = await authority.links(forObserver: observerID)
                 let item = inventory.items.first { $0.targetSessionID == expectedTargetID }
                 if let item, !inbound { grant = DomainAgentSessionLinkReference(linkID: item.linkID, generation: item.generation) }
+                await fulfillment(of: [received], timeout: 2)
+                XCTAssertFalse(frames.snapshot.isEmpty)
+                let turnAtNotification = await provider.heldTurnSnapshot
+                XCTAssertEqual(turnAtNotification, heldTurn, "Discovery must notify without interrupting, restarting, or completing the held turn")
                 if activate {
+                    let staleCatalogIsHeld = await catalogGate.isHeld
+                    XCTAssertTrue(staleCatalogIsHeld, "The real notification must arrive before the older tools/list response is released")
                     await catalogGate.release()
                     let stale = try await XCTUnwrap(delayedCatalog).value
                     XCTAssertTrue(stale.contains(MCPWindowToolName.becomeOverseer))
@@ -845,17 +954,16 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                     XCTAssertNotEqual(projection.expectedSurface, projection.returnedSurface, "A late bootstrap completion must preserve newer full expectations")
                     XCTAssertTrue(AgentSessionLinkCodexCatalogRepair.isStuckProjection(projection))
                 }
-                await fulfillment(of: [received], timeout: 2)
-                XCTAssertFalse(frames.snapshot.isEmpty)
                 let after = try await provider.listTools()
                 let visibleElapsed = start.duration(to: clock.now)
+                let turnAtVisibleCatalog = await provider.heldTurnSnapshot
+                XCTAssertEqual(turnAtVisibleCatalog, heldTurn, "The refreshed catalog must be observable on the same uninterrupted provider turn")
                 XCTAssertTrue(after.contains(MCPWindowToolName.agentSessionLink))
-                XCTAssertFalse(after.contains(MCPWindowToolName.becomeOverseer))
+                XCTAssertTrue(after.contains(MCPWindowToolName.becomeOverseer), "Targeted bootstrap remains discoverable in the continuing flow")
                 let afterDefinitions = try await provider.definitions(wireCaptureName: inbound ? "inbound-after" : (activate ? "activation-after" : "grant-after"))
                 try DiscoveryArtifactCapture.write(afterDefinitions, name: inbound ? "inbound-after" : (activate ? "activation-after" : "grant-after"))
                 let full = try XCTUnwrap(afterDefinitions.first { $0["name"] as? String == MCPWindowToolName.agentSessionLink })
                 XCTAssertGreaterThan(DiscoveryArtifactCapture.operations(full).count, 3)
-                XCTAssertLessThan(visibleElapsed, .seconds(2))
                 if activate {
                     let noLinks = await authority.links(forObserver: observerID)
                     XCTAssertTrue(noLinks.items.isEmpty)
@@ -930,7 +1038,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                     await manager.notifyToolListChangedForAgentSession(observerID)
                     let restored = try await provider.listTools()
                     XCTAssertTrue(restored.contains(MCPWindowToolName.agentSessionLink))
-                    XCTAssertFalse(restored.contains(MCPWindowToolName.becomeOverseer))
+                    XCTAssertTrue(restored.contains(MCPWindowToolName.becomeOverseer), "Re-enabling oversight restores bootstrap too")
                 }
                 let response = try await provider.listLinks()
                 let object = try MCPExportWatchdogIntegrationTests.responseObject(from: response)
@@ -955,6 +1063,11 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                     let object = try MCPExportWatchdogIntegrationTests.responseObject(from: created)
                     let result = try XCTUnwrap(object["result"] as? [String: Any])
                     XCTAssertNotEqual(result["isError"] as? Bool, true, created.rawJSON)
+                    let createdContent = try XCTUnwrap(result["content"] as? [[String: Any]])
+                    let createdText = createdContent.compactMap { $0["text"] as? String }.joined()
+                    let createdReceipt = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(createdText.utf8)) as? [String: Any])
+                    XCTAssertEqual(createdReceipt["result"] as? String, "created", created.rawJSON)
+                    XCTAssertEqual(createdReceipt["linked"] as? Bool, true, created.rawJSON)
                     let inventory = await authority.links(forObserver: observerID)
                     XCTAssertEqual(inventory.items.count, 1)
                     let link = try XCTUnwrap(inventory.items.first)
@@ -965,13 +1078,13 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 XCTAssertTrue(observer.claudeController === provider)
                 XCTAssertEqual(observer.runID, runID)
                 XCTAssertEqual(observer.runState, .running)
-                let activeTurn = await provider.activeTurnID
-                XCTAssertEqual(activeTurn, turnID, "No completion, restart, or controller replacement during discovery")
+                let finalTurn = await provider.heldTurnSnapshot
+                XCTAssertEqual(finalTurn, heldTurn, "No completion, interruption, restart, or controller replacement during discovery")
                 XCTAssertNil(observer.parentSessionID)
                 XCTAssertFalse(observer.isMCPOriginated)
                 XCTAssertNil(observer.mcpControlContext)
                 XCTAssertFalse(vm.isMCPControlled(tabID: observerTab))
-                print("LIVE_OVERSEE_DISCOVERY link_to_visible=\(visibleElapsed) budget=2s connection=\(connection.connectionID) turn=\(turnID) notification=\(frames.snapshot)")
+                print("LIVE_OVERSEE_DISCOVERY scenario_to_visible=\(visibleElapsed) catalog_watchdog=2s notification_watchdog=2s held_turn_unchanged=\(finalTurn == heldTurn) connection=\(connection.connectionID) turn=\(turnID) notification=\(frames.snapshot)")
             } catch {
                 await cleanup()
                 throw error
@@ -1000,9 +1113,16 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
     private actor DiscoveryCatalogGate {
         private var released = false
         private var continuation: CheckedContinuation<Void, Never>?
-        func hold() async {
+        var isHeld: Bool {
+            continuation != nil && !released
+        }
+
+        func hold(onHeld: (@Sendable () -> Void)? = nil) async {
             guard !released else { return }
-            await withCheckedContinuation { continuation = $0 }
+            await withCheckedContinuation {
+                continuation = $0
+                onHeld?()
+            }
         }
 
         func release() {
@@ -1036,8 +1156,18 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
 
     /// A controllable provider with a held turn and its own real Agent MCP client; never launches a CLI.
     actor HeldDiscoveryProvider: NativeAgentRuntimeControlling {
+        struct HeldTurnSnapshot: Equatable {
+            let activeTurnID: UUID?
+            let lifecycleRevision: Int
+        }
+
         private var connection: PersistentMCPTestEndpoint?
         private(set) var activeTurnID: UUID?
+        private var lifecycleRevision = 0
+        var heldTurnSnapshot: HeldTurnSnapshot {
+            .init(activeTurnID: activeTurnID, lifecycleRevision: lifecycleRevision)
+        }
+
         private var configuration = SessionLinkNativeConfigurationFixture()
         private let eventPair = AsyncStream<NativeAgentRuntimeEvent>.makeStream()
         var hasActiveSession: Bool {
@@ -1057,9 +1187,13 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
         }
 
         func ensureEventsStreamReady() {}
-        func resetEventsStreamForNewRun() {}
+        func resetEventsStreamForNewRun() {
+            lifecycleRevision += 1
+        }
+
         func startOrResume(existingSessionID _: String?, model _: String?, effortLevel _: NativeAgentRuntimeEffortLevel?, systemPromptOverride _: String?) async throws -> NativeAgentRuntimeSessionRef {
-            currentSessionRef()
+            lifecycleRevision += 1
+            return currentSessionRef()
         }
 
         func currentSessionRef() -> NativeAgentRuntimeSessionRef {
@@ -1081,6 +1215,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
 
         func sendUserMessage(_: String) async throws -> UUID {
             let id = UUID()
+            lifecycleRevision += 1
             activeTurnID = id
             return id
         }
@@ -1107,10 +1242,12 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
         }
 
         func interruptTurn(reason _: String) -> NativeAgentRuntimeInterruptOutcome {
-            .noTurnInFlight
+            lifecycleRevision += 1
+            return .noTurnInFlight
         }
 
         func shutdown() {
+            lifecycleRevision += 1
             activeTurnID = nil
             connection = nil
             eventPair.continuation.finish()
