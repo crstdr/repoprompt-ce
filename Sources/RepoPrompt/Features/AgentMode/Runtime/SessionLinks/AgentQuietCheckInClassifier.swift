@@ -7,17 +7,6 @@ enum AgentQuietCheckInClassifier {
         case quiet(hiddenSourceIDs: Set<UUID>)
     }
 
-    /// Shared by classification and routine-dispatch copy. Calling this predicate is not provider
-    /// enablement: the normal terminal path must first qualify its accepted ingress coverage.
-    static func supports(_ provider: AgentSessionLinkPromptProviderContext) -> Bool {
-        switch provider {
-        case .codexExec, .claudeCode: true
-        // Devin stays disabled for BOTH classification and future copy until exact own-echo U4 proof exists.
-        case .devin, .unselected, .claudeCodeGLM, .kimiCode, .customClaudeCompatible,
-             .openCode, .cursor, .grokBuild, .antigravity: false
-        }
-    }
-
     /// The caller supplies only the current attempt's allocated range, not canonical history.
     /// `rangeIsComplete` is mutation-owned proof: contiguous keys alone cannot prove that a bulk
     /// replacement/rekey did not discard activity. Empty ranges use endKey == startKey - 1.

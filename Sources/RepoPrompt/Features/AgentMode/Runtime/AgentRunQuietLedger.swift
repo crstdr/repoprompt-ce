@@ -14,29 +14,6 @@ struct AgentRunQuietFacts: Equatable, Hashable {
     static let zero = AgentRunQuietFacts(settledThrough: 0, ordinaryThrough: 0)!
 }
 
-/// Shared only by the existing wake attempt and callback-capable producer wrappers. No claim/cache
-/// identity or dispatch authority: final ARC release merely schedules exact-source cleanup.
-/// The immutable payload and Swift's weak-reference storage can be released from any executor.
-final class AgentQuietMarkerProducerLifetime: @unchecked Sendable {
-    private let wakeID: UUID
-    private let binding: AgentSessionRestorationBindingToken
-    private weak var session: AgentTabSession?
-
-    @MainActor
-    init(wakeID: UUID, binding: AgentSessionRestorationBindingToken, session: AgentTabSession) {
-        self.wakeID = wakeID
-        self.binding = binding
-        self.session = session
-    }
-
-    deinit {
-        Task { @MainActor [weak session, binding, wakeID] in
-            guard let session, session.currentRestorationBindingToken == binding else { return }
-            session.retireQuietUnmaterializedWake(wakeID)
-        }
-    }
-}
-
 /// Owned by one live source binding. The existing lifecycle facade remains the attempt authority;
 /// this value never looks up a session, repairs history, publishes, persists, or starts work.
 @MainActor
@@ -79,7 +56,7 @@ struct AgentRunQuietLedger {
     func candidateStartKey(owner: AgentRunOwnership) -> Int? {
         guard let current = attempt, current.owner == owner, current.seal == nil,
               current.routineWakeID != nil, !current.hasOccurrence, current.rangeIsComplete,
-              facts != nil, AgentQuietCheckInClassifier.supports(current.provider)
+              facts != nil, AgentSessionLinkPrompts.supportsQuietCheckIn(current.provider)
         else { return nil }
         return current.startKey
     }
@@ -143,7 +120,7 @@ struct AgentRunQuietLedger {
             // Same-owner/same-wake reentry is idempotent. An acquired replay onto any other owner
             // cannot borrow the prior owner's origin, even when its frozen claim still qualifies.
             if current.routineWakeID != wakeID { noteOccurrence(owner: owner) }
-        } else if routineQuietCheckIn, AgentQuietCheckInClassifier.supports(current.provider) {
+        } else if routineQuietCheckIn, AgentSessionLinkPrompts.supportsQuietCheckIn(current.provider) {
             markRoutineWake(owner: owner, wakeID: wakeID)
         } else {
             noteOccurrence(owner: owner)
@@ -178,7 +155,7 @@ struct AgentRunQuietLedger {
         if facts != nil, current.serial != nil,
            classifiesQuietCheckIn, terminalState == .completed, !hasSuccessor,
            !current.hasOccurrence, current.rangeIsComplete,
-           AgentQuietCheckInClassifier.supports(current.provider),
+           AgentSessionLinkPrompts.supportsQuietCheckIn(current.provider),
            let wakeID = current.routineWakeID,
            case let .quiet(hiddenIDs) = AgentQuietCheckInClassifier.classify(
                rows: rows,
