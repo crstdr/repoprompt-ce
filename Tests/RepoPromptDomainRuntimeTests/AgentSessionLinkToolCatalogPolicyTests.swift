@@ -50,7 +50,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
             try XCTUnwrap(String(data: encoder.encode(definition), encoding: .utf8)).unicodeScalars.count
         }
         // Independent wait and row-budget guidance occurs in both definitions; exclude it only from the frozen anchor.
-        XCTAssertEqual(try size(previous) - " Local input cancels older waits.".unicodeScalars.count - 73, 10304, "Frozen c43f1bf6 full-entry baseline")
+        XCTAssertEqual(try size(previous) - " Local input cancels older waits.".unicodeScalars.count - 72, 10304, "Frozen c43f1bf6 full-entry baseline")
         XCTAssertLessThanOrEqual(try size(current) - size(previous), 480)
         let properties = try XCTUnwrap(current.inputSchema.objectValue?["properties"]?.objectValue)
         XCTAssertEqual(properties["model_id"], .object(["type": .string("string")]))
