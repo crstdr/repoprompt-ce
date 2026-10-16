@@ -9404,7 +9404,19 @@ final class AgentSessionLinkTransportLocalInputFixture {
         self.viewModel = viewModel
         self.observer = observer
         func candidate(_ endpoint: DomainAgentSessionLinkEndpointIdentity, name: String) -> AgentSessionLinkEndpointCandidate {
-            .init(
+            let readiness: AgentSessionRestorationReadiness
+            if let generation = endpoint.persistentBindingGeneration {
+                let token = AgentSessionRestorationBindingToken(
+                    bindingIdentity: AgentPersistentSessionBindingIdentity(
+                        tabID: endpoint.tabID, sessionID: endpoint.sessionID, generation: generation
+                    ),
+                    bindingTransitionGeneration: endpoint.bindingTransitionGeneration
+                )
+                readiness = .authoritative(token, .persistedPayloadApplied)
+            } else {
+                readiness = .unbound
+            }
+            return .init(
                 windowID: endpoint.windowID,
                 workspaceID: endpoint.workspaceID,
                 tabID: endpoint.tabID,
@@ -9420,7 +9432,8 @@ final class AgentSessionLinkTransportLocalInputFixture {
                 roleAllowsOutboundMonitoring: true,
                 displayName: name,
                 providerDisplayName: "Fake",
-                locationLabel: nil
+                locationLabel: nil,
+                restorationReadiness: readiness
             )
         }
         target = candidate(.init(

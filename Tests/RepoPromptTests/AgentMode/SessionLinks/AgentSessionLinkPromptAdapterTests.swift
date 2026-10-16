@@ -2211,7 +2211,19 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         let observerEndpoint = try XCTUnwrap(observer.viewModel.agentSessionLinkObserverEndpoint(tabID: observer.tabID))
         let host = AgentSessionLinkRuntimeBridgeTests.FakeEndpointHost()
         func candidate(_ endpoint: DomainAgentSessionLinkEndpointIdentity, provider: String) -> AgentSessionLinkEndpointCandidate {
-            .init(
+            let readiness: AgentSessionRestorationReadiness
+            if let generation = endpoint.persistentBindingGeneration {
+                let token = AgentSessionRestorationBindingToken(
+                    bindingIdentity: AgentPersistentSessionBindingIdentity(
+                        tabID: endpoint.tabID, sessionID: endpoint.sessionID, generation: generation
+                    ),
+                    bindingTransitionGeneration: endpoint.bindingTransitionGeneration
+                )
+                readiness = .authoritative(token, .persistedPayloadApplied)
+            } else {
+                readiness = .unbound
+            }
+            return .init(
                 windowID: endpoint.windowID,
                 workspaceID: endpoint.workspaceID,
                 tabID: endpoint.tabID,
@@ -2227,7 +2239,8 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                 roleAllowsOutboundMonitoring: true,
                 displayName: provider,
                 providerDisplayName: provider,
-                locationLabel: nil
+                locationLabel: nil,
+                restorationReadiness: readiness
             )
         }
         host.candidates = [candidate(observerEndpoint, provider: "Claude Code"), candidate(targetEndpoint, provider: "Codex CLI")]

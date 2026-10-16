@@ -815,6 +815,7 @@ extension AgentComposerSubmissionAttemptTests {
         let session = viewModel.session(for: tabID)
         _ = viewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: session)
         session.hasLoadedPersistedState = true
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
         session.installLocalInputSeed(.init())
         session.selectedAgent = .claudeCode
         session.installRunID(UUID())
@@ -846,6 +847,7 @@ extension AgentComposerSubmissionAttemptTests {
         let session = viewModel.session(for: tabID)
         _ = viewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: session)
         session.hasLoadedPersistedState = true
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
         session.installLocalInputSeed(.init())
         session.selectedAgent = .claudeCode
         session.installRunID(UUID())

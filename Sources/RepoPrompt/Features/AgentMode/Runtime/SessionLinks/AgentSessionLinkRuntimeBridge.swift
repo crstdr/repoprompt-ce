@@ -163,9 +163,6 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
     /// Exact bounded retained-input lookup. Metadata-only lifecycle calls never copy text.
     func agentSessionLinkLocalInputSnapshot(for endpoint: DomainAgentSessionLinkEndpointIdentity, includeRecords: Bool) -> AgentSessionLinkRetainedLocalInputIndex.Snapshot?
 
-        nil
-    }
-
     var preparedSessionRuntimes: (any PreparedAgentSessionRuntimeRegistry)? { get }
     /// All live compose-tab/session bindings across every non-closing window.
     func agentSessionLinkCandidates(includeLocation: Bool) -> [AgentSessionLinkEndpointCandidate]

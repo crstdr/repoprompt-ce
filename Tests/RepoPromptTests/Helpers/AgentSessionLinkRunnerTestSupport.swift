@@ -341,7 +341,10 @@ final class AgentSessionLinkRunnerHarness {
         let session = host.session(for: tabID)
         session.selectedAgent = agent
         session.hasLoadedPersistedState = true
-        _ = try XCTUnwrap(host.test_ensureSessionBoundToTab(session))
+        _ = try XCTUnwrap(host.test_installPersistentSessionBinding(
+            sessionID: UUID(), on: session, updateWorkspaceMetadata: true
+        ))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
         return session
     }
 
