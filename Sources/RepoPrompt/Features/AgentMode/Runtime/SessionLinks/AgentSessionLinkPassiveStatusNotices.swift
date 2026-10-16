@@ -143,6 +143,11 @@ struct AgentSessionLinkPassiveStatusNotices {
         }
 
         var isRoutineWakeEligible: Bool {
+            routineWakeBasis != nil
+        }
+
+        /// The admission decision and its diagnostic attribution share this exact calculation.
+        var routineWakeBasis: AgentSessionLinkAutoWakeDiagnostics.RoutineBasis? {
             let freshIdle = toStatus == .idle && runFacts != nil
             let unpaid = ordinaryThrough.map { ordinary in
                 deliveredThroughAtSnapshot.map { ordinary > $0 } ?? false
@@ -151,9 +156,18 @@ struct AgentSessionLinkPassiveStatusNotices {
                runFacts.settledThrough > openingSettledThrough,
                let deliveredThroughAtSnapshot, runFacts.ordinaryThrough <= deliveredThroughAtSnapshot
             {
-                return false
+                return nil
             }
-            return isStatusEdge || (freshIdle && unpaid)
+            if isStatusEdge { return .statusEdge }
+            return freshIdle && unpaid ? .ordinaryCoverage : nil
+        }
+
+        func recordAdmission(observer: UUID, wake: UUID, manual: Bool, cutoff: UInt64?) {
+            guard let basis = manual ? .manual : routineWakeBasis else { return }
+            AgentSessionLinkAutoWakeDiagnostics.record(.admission(
+                observer: observer, source: targetSessionID, wake: wake, basis: basis,
+                facts: runFacts, cutoff: cutoff, delivered: deliveredThroughAtSnapshot
+            ))
         }
 
         fileprivate static func isStatusEdge(from: Status, to: Status) -> Bool {

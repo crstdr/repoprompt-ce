@@ -6622,3 +6622,37 @@ extension AgentSessionLinkAutoWakeTests {
         observer.viewModel.cancelAgentSessionLinkAutoWake(for: reserved.observerEndpoint, reason: .settingDisabled)
     }
 }
+
+extension AgentSessionLinkAutoWakeTests {
+    func testAdmissionDiagnosticsReplayNativeRingWithReceiptCutoff() async throws {
+        let recorder = QuietCheckInDiagnosticRecorder()
+        try await AgentSessionLinkAutoWakeDiagnostics.$testObserver.withValue({ recorder.record($0) }) {
+            try await testEClaudeCodexRingDrainsAtMostTwoRealNativeFakeWakesAndDoesNotEchoQuietClosures()
+        }
+        typealias Basis = AgentSessionLinkAutoWakeDiagnostics.RoutineBasis
+        let admissions = recorder.events.compactMap { event -> (basis: Basis, facts: AgentRunQuietFacts?, cutoff: UInt64?, delivered: UInt64?)? in
+            if case let .admission(_, _, _, basis, facts, cutoff, delivered) = event {
+                return (basis, facts, cutoff, delivered)
+            }
+            return nil
+        }
+        // The ring coalesces its seed status edges to idle->idle: it admits unpaid ordinary
+        // coverage, not a fresh status edge. Assert the actual native path's typed proof.
+        XCTAssertEqual(admissions.map(\.basis), [.ordinaryCoverage, .ordinaryCoverage])
+        XCTAssertEqual(admissions.map(\.facts), [.init(settledThrough: 1, ordinaryThrough: 1), .init(settledThrough: 2, ordinaryThrough: 1)])
+        XCTAssertEqual(admissions.map(\.cutoff), [1, 2])
+        XCTAssertEqual(admissions.map(\.delivered), [0, 0])
+    }
+
+    func testCancellationDiagnosticsReplayPreparingTombstoneReason() throws {
+        let recorder = QuietCheckInDiagnosticRecorder()
+        try AgentSessionLinkAutoWakeDiagnostics.$testObserver.withValue({ recorder.record($0) }) {
+            try testPreparingCancellationKeepsFinalizerAndSettlesWithoutConsumingLane()
+        }
+        let cancellations = recorder.events.filter {
+            if case .cancellation(_, _, .preparingDispatch, .settingDisabled) = $0 { return true }
+            return false
+        }
+        XCTAssertEqual(cancellations.count, 1)
+    }
+}
