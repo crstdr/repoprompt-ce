@@ -4085,6 +4085,14 @@ final class CodexNativeSessionController {
             return turn?["status"] as? String != "completed"
         case "codex/event/agent_message":
             return Self.notificationItemID(from: params, includeTopLevelIDFallback: false) == nil
+        case "thread/settings/updated":
+            // v0.160.1 publishes an opaque configuration snapshot, not turn activity.
+            return Self.nonEmptyString(params["threadId"] as? String) == nil
+                || !(params["threadSettings"] is [String: Any])
+        case "thread/name/updated":
+            // A name is optional/nullable in the canonical protocol envelope.
+            return Self.nonEmptyString(params["threadId"] as? String) == nil
+                || !(params["threadName"] == nil || params["threadName"] is NSNull || params["threadName"] is String)
         case "turn/moderationMetadata":
             // v0.160.1 protocol metadata is arbitrary JSON, not semantic turn activity.
             // Require the canonical envelope; malformed ingress must remain fail-visible.
