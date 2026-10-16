@@ -4068,7 +4068,7 @@ final class CodexNativeSessionController {
         case "rawResponse/completed":
             guard Self.turnScope(threadID: Self.notificationThreadID(from: params), turnID: Self.notificationTurnID(from: params)) != nil,
                   Self.firstString(in: params, keys: ["responseId"]) != nil,
-                  params["usageMetadata"] is NSNull || params["usageMetadata"] is [String: Any]
+                  params["usageMetadata"] == nil || params["usageMetadata"] is NSNull || params["usageMetadata"] is [String: Any]
             else { return true }
             if params["usage"] is NSNull { return false }
             guard let usage = params["usage"] as? [String: Any] else { return true }

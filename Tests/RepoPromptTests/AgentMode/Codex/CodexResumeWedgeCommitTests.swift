@@ -2647,6 +2647,15 @@ extension CodexResumeWedgeCommitTests {
             "unrepresented-assistant",
             "unrepresented-reasoning",
             "bad-raw-response",
+            "missing-usage-metadata",
+            "missing-usage-metadata-context",
+            "missing-usage-metadata-goal",
+            "missing-usage-metadata-hook",
+            "missing-usage-metadata-mixed",
+            "missing-usage-metadata-misaligned",
+            "malformed-usage-metadata",
+            "missing-assistant-id",
+            "missing-reasoning-id",
             "bad-summary-part",
             "foreign-thread",
             "foreign-turn",
@@ -2680,6 +2689,21 @@ extension CodexResumeWedgeCommitTests {
                     }
                     var extra: (String, [String: CodexJSONValue])?
                     switch scenario {
+                    case "missing-usage-metadata-context": annotate(["agents_md.instructions"])
+                    case "missing-usage-metadata-goal": annotate(["user.goal"])
+                    case "missing-usage-metadata-hook": annotate(["hooks.additional_context"])
+                    case "missing-usage-metadata-mixed":
+                        annotate(["user.text", "agents_md.instructions"])
+                        raw["content"] = .array([
+                            .object(["type": .string("input_text"), "text": .string("Same text")]),
+                            .object(["type": .string("input_text"), "text": .string("Same text")])
+                        ])
+                    case "missing-usage-metadata-misaligned": annotate(["user.text", "user.text"])
+                    case "missing-assistant-id", "missing-reasoning-id":
+                        extra = ("rawResponseItem/completed", ["item": .object(scenario == "missing-assistant-id" ? [
+                            "type": .string("message"), "role": .string("assistant"),
+                            "content": .array([.object(["type": .string("output_text"), "text": .string("[ack]")])])
+                        ] : ["type": .string("reasoning"), "summary": .array([]), "encrypted_content": .null])])
                     case "image":
                         annotate(["user.image"])
                         raw["content"] = .array([.object(["type": .string("input_image"), "image_url": .string("data:image/png;base64,AA==")])])
@@ -2719,6 +2743,10 @@ extension CodexResumeWedgeCommitTests {
                     default: break
                     }
                     events[2].1["item"] = .object(raw)
+                    if scenario.hasPrefix("missing-usage-metadata") || scenario == "malformed-usage-metadata" {
+                        let responseIndex = try XCTUnwrap(events.firstIndex { $0.0 == "rawResponse/completed" })
+                        events[responseIndex].1["usageMetadata"] = scenario == "malformed-usage-metadata" ? .string("invalid") : nil
+                    }
                     if var extra {
                         extra.1["threadId"] = .string(scenario == "foreign-thread" ? "other-thread" : Self.oldThreadID)
                         extra.1["turnId"] = .string(scenario == "foreign-turn" ? "other-turn" : "plain-turn")
@@ -2741,7 +2769,7 @@ extension CodexResumeWedgeCommitTests {
                         if case let .livenessActivity(activity) = event, activity.kind == .warning { warnings.append(activity.method) }
                         await f.coordinator.test_handleCodexNativeEvent(event, session: f.session, sourceController: current)
                     }
-                    let quiet = ["plain", "replacement", "image", "audio", "foreign-thread", "foreign-turn", "stale-controller", "legacy-neutral"].contains(scenario)
+                    let quiet = ["plain", "replacement", "image", "audio", "missing-usage-metadata", "foreign-thread", "foreign-turn", "stale-controller", "legacy-neutral"].contains(scenario)
                     XCTAssertEqual(f.session.runState, .completed, label)
                     XCTAssertEqual(f.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: quiet ? 0 : 1), label)
                     XCTAssertEqual(f.session.quietLedger.hiddenSourceIDs.contains(wakeID), quiet, "\(label): silence must retain the exact wake mask too")
