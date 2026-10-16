@@ -31,7 +31,8 @@ extension AgentSessionLinkPassiveStatusNotices {
     }
 
     /// Paired with the existing authoritative lifecycle reconciliation, with metadata only.
-    /// Nil snapshots establish an unresolved baseline, never a lazy zero catch-up frontier.
+    /// A nil snapshot is unknown, not absent: it never moves a same-target frontier. Only a
+    /// missing or rebound frontier gets the unresolved baseline — a nil epoch never catches up.
     mutating func reconcileLocalInputSources(_ sources: [LocalInputSource]) {
         guard isDeliverable else { localInputFrontiers.removeAll()
             return
@@ -40,10 +41,20 @@ extension AgentSessionLinkPassiveStatusNotices {
         localInputFrontiers = localInputFrontiers.filter { references.contains($0.key) }
         for source in sources {
             let existing = localInputFrontiers[source.reference]
-            if existing?.target != source.target || existing?.indexEpoch != source.snapshot?.epoch || existing == nil {
+            guard let snapshot = source.snapshot else {
+                // A nil snapshot is unknown, not absent: it never moves a frontier that still
+                // names this target. Only a missing or rebound frontier gets the baseline.
+                if existing?.target != source.target {
+                    localInputFrontiers[source.reference] = LocalInputFrontier(
+                        target: source.target, indexEpoch: nil, consumedThrough: 0
+                    )
+                }
+                continue
+            }
+            if existing?.target != source.target || existing?.indexEpoch != snapshot.epoch || existing == nil {
                 localInputFrontiers[source.reference] = LocalInputFrontier(
-                    target: source.target, indexEpoch: source.snapshot?.epoch,
-                    consumedThrough: source.snapshot?.producedThrough ?? 0
+                    target: source.target, indexEpoch: snapshot.epoch,
+                    consumedThrough: snapshot.producedThrough
                 )
             }
         }
@@ -52,7 +63,9 @@ extension AgentSessionLinkPassiveStatusNotices {
     mutating func localInputOffer(for source: LocalInputSource) -> LocalInputOffer? {
         guard isDeliverable else { return nil }
         guard let snapshot = source.snapshot else {
-            localInputFrontiers[source.reference] = LocalInputFrontier(target: source.target, indexEpoch: nil, consumedThrough: 0)
+            if localInputFrontiers[source.reference]?.target != source.target {
+                localInputFrontiers[source.reference] = LocalInputFrontier(target: source.target, indexEpoch: nil, consumedThrough: 0)
+            }
             return nil
         }
         guard let frontier = localInputFrontiers[source.reference],
