@@ -3561,11 +3561,7 @@ final class CodexNativeSessionController {
         // early returns. Reuse the existing scoped non-rendering liveness channel; no history or
         // extra event registry. The coordinator applies its current controller/turn acceptance.
         if hasUnrepresentedQuietActivity(method: notification.method, params: params) {
-            await emit(.livenessActivity(.init(
-                kind: .warning, method: notification.method,
-                threadID: Self.notificationThreadID(from: params), turnID: notifiedTurnID,
-                itemID: Self.notificationItemID(from: params), activeFlags: [], message: nil
-            )))
+            await emitUnrepresentedQuietActivity(method: notification.method, params: params)
         }
         switch notification.method {
         case "turn/started", "codex/event/turn_started":
@@ -3863,7 +3859,10 @@ final class CodexNativeSessionController {
             {
                 let emitted = markToolEventEmitted(key: "result:\(dedupKey)")
                 Self.logCodexDebug("[CodexNativeController] fileChangeOutputDelta invocationID=\(invocationID?.uuidString ?? "nil") emitted=\(emitted) result=\(Self.debugPreview(resultJSON))")
-                guard emitted else { break }
+                guard emitted else {
+                    await emitUnrepresentedQuietActivity(method: notification.method, params: params)
+                    break
+                }
                 await emit(.toolResult(
                     name: name,
                     invocationID: invocationID,
@@ -3871,6 +3870,8 @@ final class CodexNativeSessionController {
                     resultJSON: resultJSON,
                     isError: isError
                 ))
+            } else {
+                await emitUnrepresentedQuietActivity(method: notification.method, params: params)
             }
         case "codex/event/exec_command_begin":
             if let beginEvent = parseExecCommandBeginEvent(params: params) {
@@ -3924,6 +3925,7 @@ final class CodexNativeSessionController {
         case "item/commandExecution/outputDelta":
             let itemID = commandExecutionItemID(from: params)
             guard shouldAcceptCommandExecutionEvent(itemID: itemID, family: .normalized) else {
+                await emitUnrepresentedQuietActivity(method: notification.method, params: params)
                 break
             }
             if let update = parseCommandExecutionRunningUpdateFromNotification(
@@ -3932,6 +3934,8 @@ final class CodexNativeSessionController {
             ) {
                 Self.logCodexDebug("[CodexNativeController] runningUpdate method=\(notification.method) invocationID=\(update.invocationID?.uuidString ?? "nil") processID=\(update.processID ?? "nil") outputChars=\(update.appendedOutput?.count ?? 0)")
                 await emit(.commandExecutionRunning(update))
+            } else {
+                await emitUnrepresentedQuietActivity(method: notification.method, params: params)
             }
         case "item/commandExecution/terminalInteraction":
             let itemID = commandExecutionItemID(from: params)
@@ -4033,6 +4037,14 @@ final class CodexNativeSessionController {
         }
     }
 
+    private func emitUnrepresentedQuietActivity(method: String, params: [String: Any]) async {
+        await emit(.livenessActivity(.init(
+            kind: .warning, method: method,
+            threadID: Self.notificationThreadID(from: params), turnID: Self.notificationTurnID(from: params),
+            itemID: Self.notificationItemID(from: params), activeFlags: [], message: nil
+        )))
+    }
+
     private func hasUnrepresentedQuietActivity(method: String, params: [String: Any]) -> Bool {
         if Self.isItemLifecycleNotificationMethod(method) {
             guard let item = Self.canonicalItem(from: params),
@@ -4071,6 +4083,12 @@ final class CodexNativeSessionController {
         case "account/updated":
             return !(params["authMode"] is NSNull || params["authMode"] is String)
                 || !(params["planType"] is NSNull || params["planType"] is String)
+        case "item/commandExecution/outputDelta", "item/fileChange/outputDelta":
+            // Their handlers preserve uncertainty on parse/dedup failure using the actual result.
+            // In particular, never invoke the stateful file-change parser a second time here.
+            return false
+        case "item/mcpToolCall/progress", "item/plan/delta", "turn/diff/updated":
+            return Self.parseLivenessActivity(method: method, params: params) == nil
         case "codex/event/mcp_tool_call_begin", "codex/event/mcp_tool_call_end":
             // A valid tool event already reaches typed activity before UI suppression. Only a
             // malformed envelope needs the uncertainty fallback; preserve the existing first event.

@@ -2753,3 +2753,104 @@ extension CodexResumeWedgeCommitTests {
         }
     }
 }
+
+extension CodexResumeWedgeCommitTests {
+    private func makeQuietToolProgressFixture() async throws -> (Fixture, CodexNativeSessionController, AgentRunOwnership) {
+        let f = makeFixture([])
+        f.viewModel.test_initializeRunService()
+        let runID = UUID()
+        f.session.installRunID(runID)
+        let controller = CodexNativeSessionController(client: CodexAppServerClient(), runID: runID, tabID: f.session.tabID, windowID: -1, workspacePaths: .uniform(nil))
+        f.session.codexController = controller
+        f.session.codexConversationID = Self.oldThreadID
+        await controller.test_installThreadState(threadID: Self.oldThreadID, authoritativeTurnID: "progress-turn", routingTurnID: "progress-turn")
+        await f.coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "progress-turn"), session: f.session, sourceController: controller)
+        let owner = try XCTUnwrap(f.session.activeRunOwnership)
+        f.session.quietLedger.markRoutineWake(owner: owner, wakeID: UUID())
+        return (f, controller, owner)
+    }
+
+    func testThousandNativeCommandOutputDeltasRecordExactlyOneAcceptedProgressEach() async throws {
+        let (f, controller, owner) = try await makeQuietToolProgressFixture()
+        defer { f.session.saveDebounceTask?.cancel() }
+        let sequenceBefore = try XCTUnwrap(f.session.runLifecycle.liveness?.lastAcceptedSequence)
+        let itemID = UUID().uuidString
+        let expectedOutput = (0 ..< 1000).map { "ordinary output \($0)" }
+        for output in expectedOutput {
+            await controller.test_handleNotification(method: "item/commandExecution/outputDelta", params: [
+                "threadId": .string(Self.oldThreadID), "turnId": .string("progress-turn"),
+                "itemId": .string(itemID), "delta": .string(output)
+            ])
+        }
+        await controller.shutdown()
+        var output: [String] = []
+        var warnings = 0
+        var eventCount = 0
+        for await event in controller.events {
+            eventCount += 1
+            if case let .commandExecutionRunning(update) = event { output.append(update.appendedOutput ?? "") }
+            if case let .livenessActivity(activity) = event, activity.kind == .warning { warnings += 1 }
+            await f.coordinator.test_handleCodexNativeEvent(event, session: f.session, sourceController: controller)
+        }
+        XCTAssertEqual(output, expectedOutput, "Every real notification retains exactly its typed output update")
+        XCTAssertEqual(eventCount, 1000, "One typed semantic event, not an extra uncertainty event per chunk")
+        XCTAssertEqual(warnings, 0)
+        XCTAssertEqual(f.session.runLifecycle.liveness?.lastAcceptedSequence, sequenceBefore + 1000, "Exactly 1000 accepted recordRunProgress calls through the actual coordinator")
+        XCTAssertNil(f.session.quietLedger.candidateStartKey(owner: owner))
+        XCTAssertTrue(f.session.quietLedger.hiddenSourceIDs.isEmpty)
+    }
+
+    func testNativeToolProgressSingleActivityPreservesMalformedUnknownAndSourceFences() async throws {
+        let itemID = UUID().uuidString
+        let cases: [(String, [String: CodexJSONValue], Bool)] = [
+            ("item/commandExecution/outputDelta", ["itemId": .string(itemID), "delta": .string("output")], false),
+            ("item/fileChange/outputDelta", ["itemId": .string("patch"), "delta": .string("+line")], false),
+            ("item/mcpToolCall/progress", ["itemId": .string("mcp"), "message": .string("running")], false),
+            ("item/plan/delta", ["itemId": .string("plan"), "delta": .string("step")], false),
+            ("turn/diff/updated", ["diff": .string("+line")], false),
+            ("item/commandExecution/outputDelta", ["delta": .number(42)], true),
+            ("item/fileChange/outputDelta", ["delta": .number(42)], true),
+            ("future/activity", [:], true)
+        ]
+        for (method, payload, uncertain) in cases {
+            for scope in ["current", "foreign-thread", "foreign-turn", "stale-controller"] {
+                let label = "\(method) uncertain=\(uncertain) \(scope)"
+                let (f, controller, _) = try await makeQuietToolProgressFixture()
+                defer { f.session.saveDebounceTask?.cancel() }
+                let source: CodexNativeSessionController
+                if scope == "stale-controller" {
+                    source = try CodexNativeSessionController(client: CodexAppServerClient(), runID: XCTUnwrap(f.session.runID), tabID: f.session.tabID, windowID: -1, workspacePaths: .uniform(nil))
+                    await source.test_installThreadState(threadID: Self.oldThreadID, authoritativeTurnID: "progress-turn", routingTurnID: "progress-turn")
+                } else { source = controller }
+                var params = payload
+                params["threadId"] = .string(scope == "foreign-thread" ? "foreign" : Self.oldThreadID)
+                params["turnId"] = .string(scope == "foreign-turn" ? "foreign" : "progress-turn")
+                let sequenceBefore = try XCTUnwrap(f.session.runLifecycle.liveness?.lastAcceptedSequence)
+                await source.test_handleNotification(method: method, params: params)
+                await source.shutdown()
+                var eventCount = 0
+                var warnings = 0
+                for await event in source.events {
+                    eventCount += 1
+                    if case let .livenessActivity(activity) = event, activity.kind == .warning { warnings += 1 }
+                    await f.coordinator.test_handleCodexNativeEvent(event, session: f.session, sourceController: source)
+                }
+                if scope == "current" {
+                    XCTAssertEqual(eventCount, 1, label)
+                    XCTAssertEqual(warnings, uncertain ? 1 : 0, label)
+                }
+                // Existing typed output events carry no turn scope after parsing. Preserve
+                // their established foreign-turn ordinary behavior; do not change routing policy.
+                let accepted = scope == "current" || (
+                    scope == "foreign-turn" && !uncertain
+                        && ["item/commandExecution/outputDelta", "item/fileChange/outputDelta"].contains(method)
+                )
+                XCTAssertEqual(f.session.runLifecycle.liveness?.lastAcceptedSequence, sequenceBefore + (accepted ? 1 : 0), label)
+                await f.coordinator.test_handleCodexNativeEvent(.turnCompleted(turnID: "progress-turn", status: .completed), session: f.session, sourceController: controller)
+                XCTAssertEqual(f.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: accepted ? 1 : 0), label)
+                XCTAssertEqual(f.session.quietLedger.hiddenSourceIDs.isEmpty, accepted, label)
+                if scope == "stale-controller" { await controller.shutdown() }
+            }
+        }
+    }
+}
