@@ -2174,8 +2174,6 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         )
     }
 
-    // Paired warm decision diagnostics only; correctness does not depend on machine timings.
-
     /// Overflow is a whole-queue count, never attributed to the lane that produced it.
     ///
     /// Regression: "some lane is selected" was enough for overflow to reserve a wake, so dropped

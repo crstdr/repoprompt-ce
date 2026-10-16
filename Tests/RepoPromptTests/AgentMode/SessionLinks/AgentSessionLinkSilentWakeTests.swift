@@ -304,6 +304,96 @@ extension AgentSessionLinkRuntimeBridgeTests {
         await vm.test_claudeCoordinator.shutdownClaudeSession(session)
     }
 
+    func testNativeClaudeStaleActiveRecoveryKeepsEmptyAndAckWakeOrdinary() async throws {
+        for reply in ["", "[ack]"] {
+            let fixture = try await makeNativeWakeFixture(agent: .claudeCode)
+            let session = fixture.session
+            addTeardownBlock { @MainActor in await fixture.vm.test_claudeCoordinator.shutdownClaudeSession(session) }
+            let initialFacts = try XCTUnwrap(session.quietLedger.facts)
+            let claim = try XCTUnwrap(fixture.vm.agentSessionLinkPromptClaim(for: session, dispatchID: .autoWake(wakeID: fixture.wake.wakeID)))
+            XCTAssertTrue(claim.routineQuietCheckIn, "Freeze idle-route qualification before beginning the attempt")
+            defer {
+                session.agentTask?.cancel()
+                fixture.bridge.freezeForTermination()
+                withExtendedLifetime((fixture.workspace, fixture.observerWorkspace)) {}
+            }
+            let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() }, sessionLinkHost: fixture.vm)
+            harness.nativeTranscriptHost = fixture.vm
+            var replyConsumed = false
+            harness.onNativeStreamResult = { result, session, runID, attemptID in
+                await fixture.vm.test_handleStreamResult(result, session: session, runID: runID, runAttemptID: attemptID)
+                if result.type == "final_content", result.text == reply,
+                   session === fixture.session, runID == session.runID, attemptID == session.activeRunAttemptID
+                { replyConsumed = true }
+            }
+            harness.onTerminalPublication = { _, target in target.oversight.pendingAutoWake?.task?.cancel() }
+            let runner = ClaudeIntegratedAgentModeRunner(claudeCoordinator: fixture.vm.test_claudeCoordinator, hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier())
+            await runner.startRun(tabID: fixture.tabID, session: session, initialUserMessage: "", initialMessageForRun: "", attachments: [], makeLease: { harness.makeLease(runID: $0, tabID: fixture.tabID) })
+            try await AsyncTestWait.waitUntil("routine Claude attempt accepted") { !session.claudeExpectedTurnIDs.isEmpty && session.claudeSteeringAbandonment != nil }
+            let owner = try XCTUnwrap(session.activeRunOwnership)
+            XCTAssertNotNil(session.quietLedger.candidateStartKey(owner: owner), "This starts as a real routine wake, not an ordinary user turn")
+            let wakeRows = session.quietLedger.hostMarkerIDs
+            XCTAssertFalse(wakeRows.isEmpty)
+            await fixture.claude.emit(.stream(.init(type: "final_content", text: reply)))
+            try await AsyncTestWait.waitUntil("empty or ACK reply consumed") { replyConsumed }
+            XCTAssertNotNil(session.quietLedger.candidateStartKey(owner: owner), "The consumed reply must not pre-emptively make the turn ordinary")
+            // Model the stale-active state at the probe boundary: no outstanding completion,
+            // a live idle provider, and no user/tool ingress to make the run ordinary first.
+            session.claudeExpectedTurnIDs.removeAll()
+            await fixture.claude.setTurnInFlight(false)
+            XCTAssertTrue(try ClaudeIntegratedAgentModeRunner.staleActiveRecoveryFencesAreClear(session: session, coordinator: fixture.vm.test_claudeCoordinator, ownership: owner, runID: XCTUnwrap(session.runID)))
+            XCTAssertNotNil(session.quietLedger.candidateStartKey(owner: owner), "The stale boundary must still be quiet-eligible before recovery")
+            publishClaudeSuccessorWake(fixture)
+            try await AsyncTestWait.waitUntil("refused wake recovers stale-active attempt") { session.runState == .failed }
+            XCTAssertTrue(session.items.contains { $0.kind == .error && $0.text == "Claude Code stopped reporting this run's outcome, so RepoPrompt closed it as failed. The conversation is intact; send a message to continue." }, "The specific stale-active recovery branch must have committed")
+            XCTAssertNotNil(session.claudeController, "Recovery retains the live controller")
+            XCTAssertEqual(session.lastTerminalCommitRevision?.ownership, owner)
+            XCTAssertEqual(session.lastTerminalCommitRevision?.terminalState, .failed, "Recovery cannot fabricate successful completion")
+            XCTAssertEqual(session.quietLedger.facts, .init(settledThrough: initialFacts.settledThrough + 1, ordinaryThrough: initialFacts.settledThrough + 1), reply)
+            XCTAssertTrue(wakeRows.isDisjoint(with: session.quietLedger.hiddenSourceIDs), "Recovery must keep wake provenance visible")
+            XCTAssertTrue(wakeRows.isSubset(of: session.liveItemIDs))
+            XCTAssertGreaterThan(session.transcriptCanonicalVisibleRowCount, 0)
+        }
+    }
+
+    func testNativeCodexLateIngressAndBulkReplacementKeepIndependentContracts() async throws {
+        let fixture = try await makeNativeWakeFixture(agent: .codexExec)
+        let session = fixture.session
+        defer {
+            fixture.bridge.freezeForTermination()
+            withExtendedLifetime((fixture.workspace, fixture.observerWorkspace)) {}
+        }
+        let coordinator = fixture.vm.test_codexCoordinator
+        addTeardownBlock { @MainActor in await coordinator.shutdownCodexSession(session) }
+        _ = session.beginRunAttempt(source: "test.native.late-ingress")
+        let outcome = await coordinator.sendCodexNativeMessage(session: session, text: "", attachments: [])
+        XCTAssertEqual(outcome, .sent)
+        await coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "late-ingress"), session: session, sourceController: fixture.controller)
+        let invocation = UUID()
+        await coordinator.test_handleCodexNativeEvent(.toolCall(name: "bash", invocationID: invocation, argsJSON: "{}"), session: session, sourceController: fixture.controller)
+        await coordinator.test_handleCodexNativeEvent(.toolResult(name: "bash", invocationID: invocation, argsJSON: "{}", resultJSON: #"{"status":"failed","exit_code":1,"output":"Early"}"#, isError: true), session: session, sourceController: fixture.controller)
+        await coordinator.test_handleCodexNativeEvent(.turnCompleted(turnID: "late-ingress", status: .completed, failure: nil), session: session, sourceController: fixture.controller)
+        XCTAssertFalse(session.runState.isActive)
+        let revision = session.sourceItemsRevision
+        let unownedPoll = UUID()
+        let unownedOutput = "UnownedCommandSentinel"
+        await coordinator.test_handleCodexNativeEvent(.assistantDelta("Late stale text"), session: session, sourceController: fixture.controller)
+        await coordinator.test_handleCodexNativeEvent(.toolCall(name: "poll", invocationID: unownedPoll, argsJSON: "{}"), session: session, sourceController: fixture.controller)
+        await coordinator.test_handleCodexNativeEvent(.commandExecutionRunning(.init(invocationID: UUID(), processID: "unknown", appendedOutput: unownedOutput)), session: session, sourceController: fixture.controller)
+        XCTAssertEqual(session.sourceItemsRevision, revision, "Inactive unowned output remains rejected at native ingress")
+        await coordinator.test_handleCodexNativeEvent(.commandExecutionRunning(.init(invocationID: invocation, processID: nil, appendedOutput: "AcceptedLate")), session: session, sourceController: fixture.controller)
+        try await AsyncTestWait.waitUntil("correlated late command output materialized") {
+            session.items.contains { $0.toolInvocationID == invocation && (($0.toolResultJSON?.contains("AcceptedLate") ?? false) || (session.ephemeralToolResultPayloadByItemID[$0.id]?.contains("AcceptedLate") ?? false)) }
+        }
+        XCTAssertGreaterThan(session.sourceItemsRevision, revision, "Correlated late output must actually be retained")
+        XCTAssertFalse(session.items.contains { $0.text.contains("Late stale text") || $0.toolInvocationID == unownedPoll }, "Unowned ingress must remain absent after the accepted-output synchronization point")
+        XCTAssertFalse(session.items.contains { ($0.toolResultJSON ?? "").contains(unownedOutput) })
+        XCTAssertFalse(session.ephemeralToolResultPayloadByItemID.values.contains { $0.contains(unownedOutput) })
+        let row = AgentChatItem.system("Host repair", sequenceIndex: session.nextSequenceIndex)
+        session.replaceItems([row, row])
+        XCTAssertEqual(session.items.map(\.id), [row.id], "Bulk replacement deduplicates repeated item IDs")
+    }
+
     private enum ClaudeRecoveryBlocker { case turnInFlight, sendInFlight, codex }
 
     func testNativeClaudeRecoveryRefusesBusyTurnSendAndCodex() async throws {

@@ -541,8 +541,6 @@ final class ClaudeIntegratedAgentModeRunner {
                     await quotaService.observe(ClaudeCompatibleProviderRuntimeBridge.quotaObservation(from: info), lease: quotaLease, observedAt: Date())
                 }
             case let .runtimeInit(status):
-                // Actual runtime initialization is unknown provenance. Warm startOrResume
-                // no-ops emit no init event; a restarted process must never inherit silence.
                 // Persist provider session ID as soon as it becomes available from
                 // runtime init events (initialize response or system/init stream).
                 if let newSessionID = status.sessionID,

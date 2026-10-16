@@ -390,8 +390,6 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
         XCTAssertFalse(rendered.fragment.contains("effective deselection or unlink admits no exception"))
     }
 
-    // The quiet-reply line belongs to a routine status/overflow wake's own dispatch only.
-
     func testAttentionOnlyReminderRetainsCompactTrustAndActionBounds() {
         let queueEpoch = UUID()
         let rendered = AgentSessionLinkPrompts.rendered(

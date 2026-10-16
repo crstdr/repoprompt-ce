@@ -1417,13 +1417,7 @@ final class AgentTabSession: ObservableObject {
         pendingCodexComputerUseActivation != nil
     }
 
-    var claudeController: (any NativeAgentRuntimeControlling)? {
-        didSet {
-            if let controller = claudeController,
-               oldValue.map { ObjectIdentifier($0) } != ObjectIdentifier(controller)
-            {}
-        }
-    }
+    var claudeController: (any NativeAgentRuntimeControlling)?
 
     var acpController: ACPAgentSessionController?
 

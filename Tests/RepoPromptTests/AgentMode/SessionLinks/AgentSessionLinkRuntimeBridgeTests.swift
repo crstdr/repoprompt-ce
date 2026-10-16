@@ -1125,8 +1125,6 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         return DomainAgentSessionLinkReference(linkID: item.linkID, generation: item.generation)
     }
 
-    // Timings are diagnostics, not CI thresholds. Structural work bounds are the regression gate.
-
     func testOverseenProviderPermissionRemainsManualUntilExplicitResponse() async throws {
         let tabID = UUID()
         let controller = ApprovalRecordingCodexController()
