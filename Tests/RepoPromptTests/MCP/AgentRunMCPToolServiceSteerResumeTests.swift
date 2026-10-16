@@ -14,6 +14,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         session.isMCPOriginated = false
         session.selectedAgent = .codexExec
         session.installRunID(UUID())
+        _ = session.beginRunAttempt(source: "scope-decision-fixture")
         session.runState = .running
         viewModel.storeDraftText(for: session.tabID, "Keep my draft")
         let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, windows: { [window] }, notifyCatalogChanged: { _ in })
