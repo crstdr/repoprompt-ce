@@ -454,6 +454,58 @@
             XCTAssertEqual(noticeEntries.first?.role, "summary")
         }
 
+        /// `get_session` renders at most 20 entries per turn. A structurally compacted turn
+        /// carrying the normalized maximum of 20 recovery diagnostics plus a summary must not
+        /// emit a 21st entry: the diagnostics loop and the summary branch share the activity
+        /// loop's count cap and `entries_omitted` accounting.
+        func testGetSessionCapsCompactedDiagnosticsAndSummaryAtPerTurnEntryLimit() async throws {
+            var transcript = recoveryTranscript(includeTools: false)
+            transcript.turns[0].retentionTier = .summary
+            var compacted = AgentTranscriptCompactor.compact(transcript)
+            var turn = try XCTUnwrap(compacted.turns.first)
+            turn.responseSpans[0].activities = []
+            turn.conclusionActivityID = nil
+            var summary = try XCTUnwrap(turn.summary)
+            summary.compactConclusionText = "Compacted conclusion."
+            summary.recoveryDiagnostics = (0 ..< AgentTranscriptRecoveryDiagnostic.maximumPerTurn).map { index in
+                AgentTranscriptRecoveryDiagnostic(
+                    sequenceIndex: index,
+                    reason: "resumeFrameTooLarge",
+                    outcome: AgentTranscriptRecoveryDiagnostic.freshThreadStartedOutcome,
+                    text: noticeText
+                )
+            }
+            turn.summary = summary
+            compacted.turns[0] = turn
+            XCTAssertTrue(turn.isStructurallyCompacted)
+            XCTAssertEqual(turn.summary?.normalizedRecoveryDiagnostics.count, 20)
+
+            let sessionID = UUID()
+            let scanner = try seededScanner(sessionID: sessionID, transcript: compacted)
+
+            let reply = try await HistoryMCPToolService.execute(
+                args: [
+                    "op": .string("get_session"),
+                    "session_id": .string(sessionID.uuidString),
+                    "turn_start": .int(0),
+                    "turn_end": .int(0)
+                ],
+                scanner: scanner
+            )
+            guard case let .getSession(getSession) = reply else {
+                return XCTFail("Expected get_session reply, got \(reply)")
+            }
+            let rendered = try XCTUnwrap(getSession.turns.first)
+            XCTAssertEqual(rendered.entries.count, 20)
+            XCTAssertEqual(
+                rendered.entries.filter { $0.text.contains("too large to load") }.count,
+                20,
+                "All normalized diagnostics still render; the summary takes the single omission"
+            )
+            XCTAssertEqual(rendered.entriesOmitted, 1)
+            XCTAssertTrue(rendered.truncated)
+        }
+
         // MARK: - Helpers
 
         private func makeDiagnostic() -> AgentTranscriptRecoveryDiagnostic {

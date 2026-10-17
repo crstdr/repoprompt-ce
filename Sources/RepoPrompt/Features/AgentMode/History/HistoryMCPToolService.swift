@@ -1603,6 +1603,11 @@ enum HistoryMCPToolService {
         if turn.retentionTier != .full, roles.contains("summary") {
             let diagnostics = turn.summary?.normalizedRecoveryDiagnostics ?? []
             for diagnostic in diagnostics where remainingChars > 0 {
+                if entries.count >= maxGetSessionEntriesPerTurn {
+                    entriesOmitted += 1
+                    turnTruncated = true
+                    continue
+                }
                 appendGetSessionEntry(
                     role: "summary",
                     text: diagnostic.text,
@@ -1615,14 +1620,19 @@ enum HistoryMCPToolService {
         }
 
         if turn.isStructurallyCompacted, roles.contains("summary"), let summaryText = historySummaryText(turn.summary), remainingChars > 0 {
-            appendGetSessionEntry(
-                role: "summary",
-                text: summaryText,
-                perEntryMaxChars: 2000,
-                entries: &entries,
-                remainingChars: &remainingChars,
-                turnTruncated: &turnTruncated
-            )
+            if entries.count >= maxGetSessionEntriesPerTurn {
+                entriesOmitted += 1
+                turnTruncated = true
+            } else {
+                appendGetSessionEntry(
+                    role: "summary",
+                    text: summaryText,
+                    perEntryMaxChars: 2000,
+                    entries: &entries,
+                    remainingChars: &remainingChars,
+                    turnTruncated: &turnTruncated
+                )
+            }
         }
 
         for (activityIndex, activity) in turn.allActivities.enumerated() {
