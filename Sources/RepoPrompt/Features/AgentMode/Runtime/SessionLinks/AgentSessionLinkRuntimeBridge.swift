@@ -28,6 +28,7 @@ enum AgentSessionLinkModelOutcome {
     case accepted(AgentSessionLinkModelReceipt)
     case blocked(AgentSessionLinkSendFailure)
     case invalid(String)
+    case refused(code: String, detail: String, alternatives: [String])
 }
 
 extension AgentSessionLinkEndpointHost {
@@ -1511,6 +1512,8 @@ final class AgentSessionLinkRuntimeBridge {
         var test_afterLaneCreationClaim: (@MainActor () async -> Void)?
         /// Parks bootstrap after route success, before its terminal no-link authority sample.
         var test_afterBootstrapRouteValidation: (@MainActor () async -> Void)?
+        var test_afterTargetedLink: (@MainActor () async -> Void)?
+        var test_afterTargetedDelivery: (@MainActor () async -> Void)?
         var test_beforeIntentBootstrap: (@MainActor () -> Void)?
         /// Signals a linked-basis creation waiting for an exact bootstrap establishment to settle.
         var test_beforeLaneCreationBootstrapSettlement: (@MainActor () -> Void)?
@@ -3194,9 +3197,9 @@ final class AgentSessionLinkRuntimeBridge {
                 endpoint: childEndpoint,
                 candidates: candidates
             ) != nil,
-                case let .success(target) = AgentSessionLinkEndpointResolver.resolve(
-                    sessionID: frozen.sessionID,
-                    candidates: candidates
+                case let .success(target) = resolveAddCandidate(
+                    sessionID: frozen.sessionID, expectedEndpoint: nil,
+                    candidates: candidates, observerSessionID: childEndpoint.sessionID
                 ),
                 target.domainEndpoint == expectedTargetEndpoint
             else {
@@ -3283,25 +3286,43 @@ final class AgentSessionLinkRuntimeBridge {
     /// callers may select one presented incarnation from that ambiguous set, but only when the full
     /// endpoint identity still exists exactly once and remains target-eligible. A same-UUID
     /// replacement therefore reports rebinding instead of being silently adopted.
+    /// Re-sampled at each endpoint/commit fence, including after full access is switched off.
+    /// This is eligibility only; the ordinary scope/link authority still authorizes every effect.
+    func targetResolveFailure(
+        for candidate: AgentSessionLinkEndpointCandidate, observerSessionID: UUID?
+    ) -> AgentSessionLinkResolveFailure? {
+        guard let observerSessionID else {
+            return AgentSessionLinkEndpointEligibility.targetResolveFailure(for: candidate)
+        }
+        let approved = delegationScopes.isGlobalAutoApproveEnabled() || delegationScopes.liveScopes(grantedTo: observerSessionID).contains {
+            $0.grant.kind == .session(targetSessionID: candidate.sessionID)
+                && delegationScopes.linkConsent.permits(scopeID: $0.id, observer: observerSessionID, target: candidate.sessionID, at: Date())
+        }
+        return AgentSessionLinkEndpointEligibility.targetResolveFailure(
+            for: candidate, observerSessionID: observerSessionID, permitsChildTarget: approved
+        )
+    }
+
     private func resolveAddCandidate(
         sessionID: UUID,
         expectedEndpoint: DomainAgentSessionLinkEndpointIdentity?,
-        candidates: [AgentSessionLinkEndpointCandidate]
+        candidates: [AgentSessionLinkEndpointCandidate],
+        observerSessionID: UUID? = nil
     ) -> Result<AgentSessionLinkEndpointCandidate, AgentSessionLinkResolveFailure> {
-        guard let expectedEndpoint else {
-            return AgentSessionLinkEndpointResolver.resolve(
-                sessionID: sessionID,
-                candidates: candidates
-            )
+        let matches = candidates.filter { $0.sessionID == sessionID }
+        guard !matches.isEmpty else { return .failure(.notFound) }
+        let match: AgentSessionLinkEndpointCandidate
+        if let expectedEndpoint {
+            guard expectedEndpoint.sessionID == sessionID else { return .failure(.rebinding) }
+            let exact = matches.filter { $0.domainEndpoint == expectedEndpoint }
+            guard !exact.isEmpty else { return .failure(.rebinding) }
+            guard exact.count == 1 else { return .failure(.ambiguous) }
+            match = exact[0]
+        } else {
+            guard matches.count == 1 else { return .failure(.ambiguous) }
+            match = matches[0]
         }
-        guard expectedEndpoint.sessionID == sessionID else { return .failure(.rebinding) }
-        let sessionMatches = candidates.filter { $0.sessionID == sessionID }
-        guard !sessionMatches.isEmpty else { return .failure(.notFound) }
-        let exactMatches = sessionMatches.filter { $0.domainEndpoint == expectedEndpoint }
-        guard !exactMatches.isEmpty else { return .failure(.rebinding) }
-        guard exactMatches.count == 1 else { return .failure(.ambiguous) }
-        let match = exactMatches[0]
-        if let failure = AgentSessionLinkEndpointEligibility.targetResolveFailure(for: match) {
+        if let failure = targetResolveFailure(for: match, observerSessionID: observerSessionID) {
             return .failure(failure)
         }
         return .success(match)
@@ -3336,7 +3357,8 @@ final class AgentSessionLinkRuntimeBridge {
         switch resolveAddCandidate(
             sessionID: pair.targetSessionID,
             expectedEndpoint: expectedEndpoints.target,
-            candidates: candidates
+            candidates: candidates,
+            observerSessionID: pair.observerSessionID
         ) {
         case let .success(resolved):
             target = resolved
@@ -3434,7 +3456,8 @@ final class AgentSessionLinkRuntimeBridge {
         switch resolveAddCandidate(
             sessionID: targetSessionID,
             expectedEndpoint: expectedEndpoints.target,
-            candidates: candidates
+            candidates: candidates,
+            observerSessionID: observerSessionID
         ) {
         case let .success(resolved):
             target = resolved
@@ -3922,7 +3945,8 @@ final class AgentSessionLinkRuntimeBridge {
             case let .success(target) = resolveAddCandidate(
                 sessionID: pair.targetSessionID,
                 expectedEndpoint: expectations.target,
-                candidates: candidates
+                candidates: candidates,
+                observerSessionID: pair.observerSessionID
             ),
             AgentSessionLinkEndpointEligibility.addDisabledReason(
                 observer.eligibilityInput,
@@ -5688,7 +5712,7 @@ final class AgentSessionLinkRuntimeBridge {
             observer.eligibilityInput,
             roleAllowsOutboundMonitoring: observer.roleAllowsOutboundMonitoring
         ) == .eligible
-            && AgentSessionLinkEndpointEligibility.targetResolveFailure(for: target) == nil
+            && targetResolveFailure(for: target, observerSessionID: observerEndpoint.sessionID) == nil
     }
 
     /// Rebuild terminal-wait survivors without releasing a row or successor cursor through a
@@ -5724,7 +5748,7 @@ final class AgentSessionLinkRuntimeBridge {
                       roleAllowsOutboundMonitoring: observer.roleAllowsOutboundMonitoring
                   ) == .eligible,
                   let target = candidates.first(where: { $0.domainEndpoint == lease.target }),
-                  AgentSessionLinkEndpointEligibility.targetResolveFailure(for: target) == nil
+                  targetResolveFailure(for: target, observerSessionID: lease.observer.sessionID) == nil
             else { return nil }
             return state
         }
@@ -5764,7 +5788,7 @@ final class AgentSessionLinkRuntimeBridge {
         var inspections: [UUID: AgentSessionLinkPendingInteractionInspection] = [:]
         for lease in leases {
             guard let candidate = candidates.first(where: { $0.domainEndpoint == lease.target }),
-                  AgentSessionLinkEndpointEligibility.targetResolveFailure(for: candidate) == nil,
+                  targetResolveFailure(for: candidate, observerSessionID: lease.observer.sessionID) == nil,
                   let observer = candidates.first(where: { $0.domainEndpoint == lease.observer }),
                   AgentSessionLinkEndpointEligibility.observerOperationEligibility(
                       observer.eligibilityInput,
@@ -6614,8 +6638,11 @@ final class AgentSessionLinkRuntimeBridge {
         }
         guard let liveTarget, let liveObserver else { return nil }
 
-        guard await revalidateObserverCapability(liveObserver) else { return nil }
-        return liveTarget
+        guard await revalidateObserverCapability(liveObserver), self.host === host,
+              let current = host.agentSessionLinkCandidate(for: liveTarget.domainEndpoint, includeLocation: false),
+              targetResolveFailure(for: current, observerSessionID: lease.observer.sessionID) == nil
+        else { return nil }
+        return current
     }
 
     /// Re-checks one live observer's capability, revoking its outbound grants on permanent loss.
@@ -6694,16 +6721,28 @@ final class AgentSessionLinkRuntimeBridge {
 
     /// Authoritative outbound inventory for a targetless `list`.
     ///
-    /// `list` names no target, so it is authorized against the caller's own grant set and exists only
-    /// while at least one outbound link remains.
+    /// Linked observers list their own grant set. An explicitly activated eligible caller may also
+    /// inspect its own empty set; activation never supplies authority over a target.
     func inventory(
         forObserverEndpoint observerEndpoint: DomainAgentSessionLinkEndpointIdentity
     ) async -> Result<DomainAgentSessionLinkInventory, AuthorizationFailure> {
         guard await revalidateObserver(endpoint: observerEndpoint) else {
             return .failure(.denied)
         }
-        return await authority.authorizeInventory(observerEndpoint: observerEndpoint)
-            .mapError(AuthorizationFailure.init)
+        let result = await authority.authorizeInventory(observerEndpoint: observerEndpoint)
+        if case .failure(.noActiveLink) = result,
+           let activation = overseerBootstrapState(for: observerEndpoint)?.activation,
+           activation.endpoint == observerEndpoint
+        {
+            // Activation admits discovery of the caller's own empty set, never any target action.
+            // Keep the domain's link-only authorization unchanged for unactivated inbound callers.
+            let inventory = await authority.links(forObserverEndpoint: observerEndpoint)
+            guard await revalidateObserver(endpoint: observerEndpoint),
+                  overseerBootstrapState(for: observerEndpoint)?.activation == activation,
+                  !isFrozenForTermination else { return .failure(.denied) }
+            return .success(inventory)
+        }
+        return result.mapError(AuthorizationFailure.init)
     }
 
     func setWaitingOn(
@@ -7198,6 +7237,7 @@ final class AgentSessionLinkRuntimeBridge {
               let target = host.agentSessionLinkModelCandidate(for: lease.target),
               observer.domainEndpoint == lease.observer, target.domainEndpoint == lease.target,
               !observer.isClosing, !target.isClosing,
+              targetResolveFailure(for: target, observerSessionID: lease.observer.sessionID) == nil,
               !observer.isDeletionInProgress, !target.isDeletionInProgress,
               AgentSessionLinkEndpointEligibility.observerOperationEligibility(
                   observer.eligibilityInput,
@@ -8472,12 +8512,16 @@ final class AgentSessionLinkRuntimeBridge {
             var receipt = AgentSessionLaneCreateReceipt.refused(.destinationUnavailable)
             receipt.destinationFailure = failure
             receipt.refusalStage = "host_allocation"
+            if case let .creationRejected(detail) = failure { receipt.refusalDetail = detail }
             return receipt
         } catch {
             var receipt = AgentSessionLaneCreateReceipt.refused(.destinationUnavailable)
             let type = String(describing: Swift.type(of: error)).filter { $0.isLetter || $0.isNumber || $0 == "_" || $0 == "." }
             receipt.destinationFailure = .hostError(String(type.prefix(120)))
             receipt.refusalStage = "host_allocation"
+            // The type alone is not actionable. Only agent-facing invalid-params text is
+            // forwarded; internal error text stays private.
+            receipt.refusalDetail = Self.laneHostAgentFacingDetail(error)
             return receipt
         }
         let sessionID: UUID
@@ -8754,9 +8798,9 @@ final class AgentSessionLinkRuntimeBridge {
         if existingOutboundTargetIDs.contains(targetSessionID) {
             return .failure(.alreadyMonitoring)
         }
-        return AgentSessionLinkEndpointResolver.resolve(
-            sessionID: targetSessionID,
-            candidates: host.agentSessionLinkCandidates()
+        return resolveAddCandidate(
+            sessionID: targetSessionID, expectedEndpoint: nil,
+            candidates: host.agentSessionLinkCandidates(), observerSessionID: observerSessionID
         )
     }
 
@@ -8939,6 +8983,10 @@ final class AgentSessionLinkRuntimeBridge {
 /// handles — is what guarantees automatic restoration cannot bypass the shared establishment path,
 /// the pair retirement barrier, or expected-token removal.
 extension AgentSessionLinkRuntimeBridge: AgentSessionOversightLaunchCoordinatorDelegate {
+    func launchCoordinatorTargetFailure(for candidate: AgentSessionLinkEndpointCandidate, observerSessionID: UUID) -> AgentSessionLinkResolveFailure? {
+        targetResolveFailure(for: candidate, observerSessionID: observerSessionID)
+    }
+
     var launchCoordinatorHost: AgentSessionLinkEndpointHost? {
         host
     }

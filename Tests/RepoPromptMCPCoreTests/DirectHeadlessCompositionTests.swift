@@ -24,6 +24,18 @@ final class DirectHeadlessCompositionTests: XCTestCase {
         XCTAssertEqual(output, "tool-ok")
     }
 
+    func testOverseerDescriptionsTeachBothModesWithoutRequiringRedundantCards() throws {
+        // agent_session_link keeps its frozen, budgeted contract; the scope playbook lives on the
+        // tools that request and exercise scopes.
+        for name in [MCPWindowToolName.becomeOverseer, MCPWindowToolName.sessionAdmin, MCPWindowToolName.agentManage] {
+            let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: name))
+            XCTAssertTrue(definition.description.contains("Overseer full access"), name)
+            XCTAssertTrue(definition.description.contains("ON"), name)
+            XCTAssertTrue(definition.description.contains("OFF"), name)
+            XCTAssertTrue(definition.description.contains("standing consent"), name)
+        }
+    }
+
     func testCanonicalDefinitionsMatchReadableGeneratedReviewSnapshot() throws {
         let root = try RepoRoot.url()
         let snapshotURL = root.appendingPathComponent("docs/spec/mcp-domain-canonical-tool-definitions.generated.json")
