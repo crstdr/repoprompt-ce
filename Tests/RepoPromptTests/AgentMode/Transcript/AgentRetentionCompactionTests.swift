@@ -454,17 +454,24 @@
             XCTAssertEqual(noticeEntries.first?.role, "summary")
         }
 
-        /// `get_session` renders at most 20 entries per turn. A structurally compacted turn
-        /// carrying the normalized maximum of 20 recovery diagnostics plus a summary must not
-        /// emit a 21st entry: the diagnostics loop and the summary branch share the activity
-        /// loop's count cap and `entries_omitted` accounting.
+        /// Recovery diagnostics must not displace the conclusion within the per-turn cap.
         func testGetSessionCapsCompactedDiagnosticsAndSummaryAtPerTurnEntryLimit() async throws {
+            try await assertGetSessionPreservesConclusionAtEntryLimit(structurallyCompacted: true)
+        }
+
+        func testGetSessionCapsDemotedDiagnosticsAndConclusionAtPerTurnEntryLimit() async throws {
+            try await assertGetSessionPreservesConclusionAtEntryLimit(structurallyCompacted: false)
+        }
+
+        private func assertGetSessionPreservesConclusionAtEntryLimit(structurallyCompacted: Bool) async throws {
             var transcript = recoveryTranscript(includeTools: false)
             transcript.turns[0].retentionTier = .summary
             var compacted = AgentTranscriptCompactor.compact(transcript)
             var turn = try XCTUnwrap(compacted.turns.first)
-            turn.responseSpans[0].activities = []
-            turn.conclusionActivityID = nil
+            if structurallyCompacted {
+                turn.responseSpans[0].activities = []
+                turn.conclusionActivityID = nil
+            }
             var summary = try XCTUnwrap(turn.summary)
             summary.compactConclusionText = "Compacted conclusion."
             summary.recoveryDiagnostics = (0 ..< AgentTranscriptRecoveryDiagnostic.maximumPerTurn).map { index in
@@ -477,7 +484,7 @@
             }
             turn.summary = summary
             compacted.turns[0] = turn
-            XCTAssertTrue(turn.isStructurallyCompacted)
+            XCTAssertEqual(turn.isStructurallyCompacted, structurallyCompacted)
             XCTAssertEqual(turn.summary?.normalizedRecoveryDiagnostics.count, 20)
 
             let sessionID = UUID()
@@ -499,9 +506,10 @@
             XCTAssertEqual(rendered.entries.count, 20)
             XCTAssertEqual(
                 rendered.entries.count(where: { $0.text.contains("too large to load") }),
-                20,
-                "All normalized diagnostics still render; the summary takes the single omission"
+                19
             )
+            XCTAssertEqual(rendered.entries.last?.role, structurallyCompacted ? "summary" : "assistant")
+            XCTAssertEqual(rendered.entries.last?.text, structurallyCompacted ? "Compacted conclusion." : "Done.")
             XCTAssertEqual(rendered.entriesOmitted, 1)
             XCTAssertTrue(rendered.truncated)
         }
