@@ -498,7 +498,7 @@
             let rendered = try XCTUnwrap(getSession.turns.first)
             XCTAssertEqual(rendered.entries.count, 20)
             XCTAssertEqual(
-                rendered.entries.filter { $0.text.contains("too large to load") }.count,
+                rendered.entries.count(where: { $0.text.contains("too large to load") }),
                 20,
                 "All normalized diagnostics still render; the summary takes the single omission"
             )
