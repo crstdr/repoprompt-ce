@@ -488,7 +488,7 @@ enum AgentSessionLinkPrompts {
             )
         }
         if offersQuietReply, attentionRequests.isEmpty {
-            guidance.append("Nothing needed? Reply [ack].")
+            guidance.append("Nothing needed? Call self_noop and end without text.")
         }
         var body = """
         <\(statusChangeEnvelopeTag) revision="\(revision)" \

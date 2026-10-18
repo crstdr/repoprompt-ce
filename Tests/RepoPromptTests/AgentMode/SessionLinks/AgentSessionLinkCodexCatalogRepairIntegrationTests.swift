@@ -295,12 +295,15 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 let inboundNames = try await manager.debugListToolNames(for: connectionID)
                 XCTAssertTrue(inboundNames.contains(MCPWindowToolName.agentSessionLink))
                 XCTAssertTrue(inboundNames.contains(MCPWindowToolName.sessionAdmin))
+                XCTAssertFalse(inboundNames.contains(MCPWindowToolName.selfNoop))
                 await manager.debugSetSessionLinkCatalogEndpointsForTesting(anyActive: [endpoint], outbound: [endpoint])
                 let outboundNames = try await manager.debugListToolNames(for: connectionID)
                 XCTAssertTrue(outboundNames.contains(MCPWindowToolName.sessionAdmin))
+                XCTAssertTrue(outboundNames.contains(MCPWindowToolName.selfNoop))
                 await manager.debugSetSessionLinkCatalogEndpointsForTesting(anyActive: [], outbound: [])
                 let noLinkNames = try await manager.debugListToolNames(for: connectionID)
                 XCTAssertTrue(noLinkNames.contains(MCPWindowToolName.sessionAdmin))
+                XCTAssertFalse(noLinkNames.contains(MCPWindowToolName.selfNoop))
 
                 let scopes = AgentSessionLinkRuntimeBridge.shared.delegationScopes
                 let request = try scopes.requestScope(

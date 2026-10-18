@@ -4,6 +4,51 @@ import MCP
 import XCTest
 
 final class AgentSelfToolCatalogPolicyTests: XCTestCase {
+    func testSelfNoopTrialHasNoArgumentsOrAdditionalAgentFacingText() async throws {
+        let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: MCPWindowToolName.selfNoop))
+        XCTAssertEqual(definition.description, "Quietly close a routine wake that needs nothing.")
+        XCTAssertEqual(definition.inputSchema, .object([
+            "type": .string("object"), "additionalProperties": .bool(false), "properties": .object([:])
+        ]))
+        XCTAssertEqual(definition.annotations, .init())
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let runtime = MCPDomainRuntime(configuration: .init(
+            mode: .standalone, profileIdentifier: "self-noop-trial-test",
+            storageDirectory: directory, eventDirectory: directory, temporaryDirectory: directory,
+            externalReloadInterval: nil
+        ))
+        try await runtime.start()
+        _ = try await runtime.toolRegistry.register(
+            registrationID: MCPDomainToolRegistrationID(), scope: .window(id: 1),
+            bindings: [AgentSelfNoopTool.binding]
+        )
+        let name = MCPWindowToolName.selfNoop
+        let policy = MCPDomainClientPolicySnapshot(
+            restrictedToolNames: [name], additionalToolNames: [name], role: .explore,
+            allowsAgentExternalControlTools: false, hasExactAgentSessionLinkGrant: true
+        )
+        let catalog = await runtime.domainHost.advertisedCatalog(.init(
+            isGloballyEnabled: true, disabledToolNames: [], policy: policy
+        ))
+        XCTAssertEqual(catalog.definitions, [definition])
+        try await runtime.domainHost.evaluateEarlyCallPolicy(toolName: name, policy: policy)
+        let admission = try await runtime.domainHost.evaluatePreAdmissionCallPolicy(toolName: name, policy: policy)
+        XCTAssertEqual(admission.admissionClass, .control)
+        for profile in MCPClientToolPolicyProfile.allCases {
+            XCTAssertFalse(MCPClientToolPolicyCatalog.resolvedToolNames(for: profile).contains(MCPWindowToolName.selfNoop))
+        }
+    }
+
+    func testSelfNoopTrialAlwaysReturnsDoneWithoutCallingAnOwner() async throws {
+        let expected = Value.object(["result": .string("done")])
+        // The production binding has no dependencies, captured session, or mutable state.
+        // Repetition and extraneous input cannot schedule work or alter the response.
+        for args: [String: Value] in [[:], [:], ["op": .string("compact"), "session_id": .string(UUID().uuidString)]] {
+            let result = try await AgentSelfNoopTool.binding(args)
+            XCTAssertEqual(result, expected)
+        }
+    }
+
     func testCanonicalSelfToolHasOnlyTwoOperationsAndNoTargetSelectors() throws {
         let name = "self_compact"
         XCTAssertEqual(MCPDomainCanonicalToolDefinitions.definitions.filter { $0.name == name }.count, 1)

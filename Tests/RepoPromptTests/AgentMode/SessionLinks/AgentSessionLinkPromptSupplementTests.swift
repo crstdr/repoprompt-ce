@@ -4600,7 +4600,7 @@ extension AgentSessionLinkPromptClaimStoreTests {
             let routine = try XCTUnwrap(store.claim(dispatchID: dispatch, epoch: epoch, inventory: live, passiveNotices: batch, routineQuietCheckIn: true, render: render))
             let supports = provider == .codexExec || provider == .claudeCode
             XCTAssertEqual(routine.routineQuietCheckIn, supports)
-            XCTAssertEqual(routine.fragment.contains("Nothing needed? Reply [ack]."), provider == .claudeCode)
+            XCTAssertEqual(routine.fragment.contains("Nothing needed? Call self_noop and end without text."), provider == .claudeCode)
             if provider != .claudeCode { XCTAssertEqual(routine.fragment, ordinary.fragment) }
             XCTAssertEqual(renderedBits, supports ? [false, true] : [false])
             XCTAssertEqual(Set([ordinary, routine]).count, supports ? 2 : 1)
@@ -4647,7 +4647,7 @@ extension AgentSessionLinkPromptClaimStoreTests {
 
 extension AgentSessionLinkPromptClaimStoreTests {
     func testQuietCopyWholeEnvelopesAcrossProvidersBasesGuidanceAndBudgetFreezeRenderedReceipts() throws {
-        let literal = "Nothing needed? Reply [ack]."
+        let literal = "Nothing needed? Call self_noop and end without text."
         let modes = ["routine", "overflow", "attention", "manual", "periodic", "natural", "task", "piggyback", "waiting"]
         for provider in AgentSessionLinkPromptProviderContext.allCases {
             for reminder in [false, true] {

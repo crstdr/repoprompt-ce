@@ -3254,6 +3254,7 @@ actor ServerNetworkManager {
         var additionalGrants: Set<String> {
             var grants: Set<String> = []
             if hasAnyActiveLink || hasActivatedOverseer { grants.insert(MCPWindowToolName.agentSessionLink) }
+            if hasActiveOutboundLink { grants.insert(MCPWindowToolName.selfNoop) }
             if canListBecomeOverseer { grants.insert(MCPWindowToolName.becomeOverseer) }
             if isSessionAdminEligible { grants.insert(MCPWindowToolName.sessionAdmin) }
             return grants
