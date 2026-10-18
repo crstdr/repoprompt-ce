@@ -93,8 +93,8 @@ package extension MCPDomainHost {
     ///
     /// Being the target of an oversight link grants no outbound observer authority, but it does make
     /// `agent_session_link` reachable for self-scoped and inverse operations. The operation service
-    /// still authorizes those directions independently. The stateless self_noop trial uses only
-    /// its server-derived outbound-link grant. No other tool or profile restriction inherits this exception.
+    /// still authorizes those directions independently. No other tool, static additional grant, or
+    /// profile restriction inherits this exception.
     private static func oversightReachabilityOverridesProfilePolicy(
         toolName: String,
         policy: MCPDomainClientPolicySnapshot
@@ -104,7 +104,6 @@ package extension MCPDomainHost {
                 && (policy.hasExactAgentSessionLinkGrant || policy.hasActivatedOverseer)
         )
             || (toolName == MCPWindowToolName.becomeOverseer && policy.canBecomeOverseer)
-            || (toolName == MCPWindowToolName.selfNoop && policy.additionalToolNames.contains(toolName))
     }
 
     /// Capabilities whose role advertisement policy is also enforced at `tools/call` admission.

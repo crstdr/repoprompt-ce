@@ -5454,7 +5454,7 @@ extension AgentSessionLinkAutoWakeTests {
             try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
             let claim = try reserveQuietWake(fixture)
             XCTAssertTrue(claim.routineQuietCheckIn)
-            XCTAssertTrue(claim.fragment.contains("Nothing needed? Call self_noop and end without text."))
+            XCTAssertEqual(claim.fragment.contains("Nothing needed? Reply [ack]."), provider == .claudeCode)
             let owner = try beginAndAcquireQuietWake(fixture, claim: claim)
             XCTAssertTrue(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(for: fixture.session, dispatchID: claim.dispatchID))
             fixture.session.sealQuietCheckIn(owner: owner, terminalState: .completed, normal: true, hasSuccessor: false)
@@ -5803,7 +5803,7 @@ extension AgentSessionLinkAutoWakeTests {
                 for: fixture.session, dispatchID: .autoWake(wakeID: wakeID)
             ))
             XCTAssertFalse(claim.routineQuietCheckIn)
-            XCTAssertFalse(claim.fragment.contains("Nothing needed? Call self_noop and end without text."))
+            XCTAssertFalse(claim.fragment.contains("Nothing needed? Reply [ack]."))
             XCTAssertFalse(
                 try XCTUnwrap(claim.passive).receipt.deliveredStatuses.isEmpty,
                 "negative control carries real pending content, not an absent claim"
@@ -6384,7 +6384,7 @@ extension AgentSessionLinkAutoWakeTests {
                         )
                         let sent = await fixture.nativeController.sentMessages
                         let physical = try XCTUnwrap(sent.last)
-                        XCTAssertEqual(physical.contains("Nothing needed? Call self_noop and end without text."), routine)
+                        XCTAssertEqual(physical.contains("Nothing needed? Reply [ack]."), routine)
                         XCTAssertTrue(physical.contains(claim.fragment), "measure the physical provider bytes, not only a render handed to the test")
                         texts.append(physical)
                         fragmentBytes.append(claim.fragment.utf8.count)
@@ -6613,8 +6613,8 @@ extension AgentSessionLinkAutoWakeTests {
         let claudeMessages = await a.nativeController.sentMessages
         XCTAssertEqual(claudeMessages.count, 1)
         XCTAssertEqual(codex.startedTurns.count, 1)
-        XCTAssertTrue(try XCTUnwrap(claudeMessages.first).contains("Nothing needed? Call self_noop and end without text."))
-        XCTAssertTrue(try XCTUnwrap(codex.startedTurns.first).contains("Nothing needed? Call self_noop and end without text."))
+        XCTAssertTrue(try XCTUnwrap(claudeMessages.first).contains("Nothing needed? Reply [ack]."))
+        XCTAssertFalse(try XCTUnwrap(codex.startedTurns.first).contains("Nothing needed? Reply [ack]."))
         for _ in 0 ..< 16 {
             await bridge.test_refreshStatus(sessionIDs: [a.sessionID, b.sessionID])
         }

@@ -331,7 +331,6 @@ package enum MCPDomainStandaloneToolInstaller {
             binding(MCPWindowToolName.agentSelf) { _ in
                 throw MCPError.invalidParams("self_compact is not available for this session.")
             },
-            AgentSelfNoopTool.binding,
             binding(MCPWindowToolName.shareThoughts, backends.agent.shareThoughts),
             binding(MCPWindowToolName.setStatus, backends.agent.publishStatus),
             binding(MCPWindowToolName.waitForNextInstruction, backends.agent.waitForInstruction)

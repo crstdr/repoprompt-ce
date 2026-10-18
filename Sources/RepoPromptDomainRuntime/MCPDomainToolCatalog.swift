@@ -35,7 +35,6 @@ package enum MCPWindowToolName {
     package static let sessionAdmin = "session_admin"
     package static let becomeOverseer = "become_overseer"
     package static let agentSelf = "self_compact"
-    package static let selfNoop = "self_noop"
     package static let history = "history"
     package static let shareThoughts = "share_thoughts"
     package static let setStatus = "set_status"
@@ -328,7 +327,6 @@ package enum MCPDomainToolCatalog {
             operations: ["context", "compact"],
             normalization: .trimmedLowercased
         )),
-        .init(name: MCPWindowToolName.selfNoop, scope: .window, capability: .agentSessionLinkControl, admissionClass: .control),
         .init(name: MCPWindowToolName.shareThoughts, scope: .window, capability: .agentReasoningControl, admissionClass: .control),
         .init(name: MCPWindowToolName.setStatus, scope: .window, capability: .statusPublication, admissionClass: .control),
         .init(name: MCPWindowToolName.waitForNextInstruction, scope: .window, capability: .agentReasoningControl, admissionClass: .control),

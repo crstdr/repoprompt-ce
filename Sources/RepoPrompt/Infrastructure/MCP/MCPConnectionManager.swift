@@ -3254,7 +3254,6 @@ actor ServerNetworkManager {
         var additionalGrants: Set<String> {
             var grants: Set<String> = []
             if hasAnyActiveLink || hasActivatedOverseer { grants.insert(MCPWindowToolName.agentSessionLink) }
-            if hasActiveOutboundLink { grants.insert(MCPWindowToolName.selfNoop) }
             if canListBecomeOverseer { grants.insert(MCPWindowToolName.becomeOverseer) }
             if isSessionAdminEligible { grants.insert(MCPWindowToolName.sessionAdmin) }
             return grants
@@ -13778,7 +13777,11 @@ actor ServerNetworkManager {
                 let effectivePolicy = initialPolicy
                 // Recomputed live rather than read from the installed policy: a `list_changed`
                 // notification can lag a grant change in either direction, so stale advertisement
-                let liveSessionLinkGrant = AgentSessionLinkCatalogSurface.toolNames.contains(toolName)
+                let liveSessionLinkGrant = (
+                    toolName == MCPWindowToolName.agentSessionLink
+                        || toolName == MCPWindowToolName.becomeOverseer
+                        || toolName == MCPWindowToolName.sessionAdmin
+                )
                     ? await liveSessionLinkGrantSnapshot(connectionID: connectionID, modelOnly: isMemoryOnlyModelCall)
                     : nil
                 guard await isCurrentToolPolicyAdmission(policyAdmissionToken) else {
@@ -13805,7 +13808,9 @@ actor ServerNetworkManager {
                         return policyChangedResult()
                     }
                 } catch MCPDomainCallPolicyDenial.missingAdditionalGrant
-                    where AgentSessionLinkCatalogSurface.toolNames.contains(toolName)
+                    where toolName == MCPWindowToolName.agentSessionLink
+                    || toolName == MCPWindowToolName.becomeOverseer
+                    || toolName == MCPWindowToolName.sessionAdmin
                 {
                     #if DEBUG
                         await debugPolicyDiagnostic("toolsCallRejected", connectionID: connectionID, policy: effectivePolicy, extra: [
@@ -13881,7 +13886,11 @@ actor ServerNetworkManager {
                 // Rebuild with a fresh exact link fact. The early grant check and this role/profile
                 // gate are separated by routing work, so carrying the earlier answer would let a
                 // revocation stale-authorize this exception.
-                let liveSessionLinkGrant = AgentSessionLinkCatalogSurface.toolNames.contains(toolName)
+                let liveSessionLinkGrant = (
+                    toolName == MCPWindowToolName.agentSessionLink
+                        || toolName == MCPWindowToolName.becomeOverseer
+                        || toolName == MCPWindowToolName.sessionAdmin
+                )
                     ? await liveSessionLinkGrantSnapshot(connectionID: connectionID, modelOnly: isMemoryOnlyModelCall)
                     : nil
                 guard await isCurrentToolPolicyAdmission(policyAdmissionToken) else {

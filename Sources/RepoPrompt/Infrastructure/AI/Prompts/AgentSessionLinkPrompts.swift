@@ -257,6 +257,7 @@ enum AgentSessionLinkPrompts {
 
         let offersQuietReply = request.routineQuietCheckIn
             && AgentSessionLinkPrompts.supportsQuietCheckIn(request.providerContext)
+            && request.providerContext != .codexExec
         let omitsDuplicateAutonomy = request.membershipKind == .inventory
             && request.laneGuidanceMode == .full
         var fragments: [String] = []
@@ -487,7 +488,7 @@ enum AgentSessionLinkPrompts {
             )
         }
         if offersQuietReply, attentionRequests.isEmpty {
-            guidance.append("Nothing needed? Call self_noop and end without text.")
+            guidance.append("Nothing needed? Reply [ack].")
         }
         var body = """
         <\(statusChangeEnvelopeTag) revision="\(revision)" \
