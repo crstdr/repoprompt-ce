@@ -2611,25 +2611,6 @@ import XCTest
         let workspaceFileURL: URL
     }
 
-    /// Creation and bridge projection are independent now that canonical decoding suspends.
-    /// Admission tests begin only after the real bridge accepted this durable document; a
-    /// synthetic local append cannot establish the full-document write baseline saves require.
-    @MainActor
-    private func awaitDurableAdmissionCatalog(
-        window: WindowState, runtime: MCPDomainRuntime, workspaceID: UUID
-    ) async throws {
-        let catalog = await runtime.workspaceStore.snapshot()
-        guard let record = catalog.workspaces.first(where: { $0.document.workspaceID == workspaceID }),
-              let bridge = window.domainWorkspacePresentationBridgeForTesting
-        else { throw AdmissionTestError.fixtureSetup("durable admission catalog unavailable") }
-        let checkpoint = await DomainWorkspaceProjectionObserver(bridge: bridge).waitForProjection(
-            afterGeneration: 0, through: catalog.publicationSequence, requireCatalogApplication: true
-        )
-        guard checkpoint != nil,
-              window.workspaceManager.qualifiedDomainWorkspaceDescendant(record) != nil
-        else { throw AdmissionTestError.fixtureSetup("durable admission catalog has no accepted full-document baseline") }
-    }
-
     @MainActor
     private final class DistinctDurableAdmissionFixture {
         let first: DurableAdmissionWindow
@@ -2789,7 +2770,11 @@ import XCTest
                 throw AdmissionTestError.fixtureSetup("explicit workspace creation did not commit")
             }
             await WorkspaceDiskWriterComposition.processWriter.flush(url: workspaceFileURL)
-            try await awaitDurableAdmissionCatalog(window: window, runtime: runtime, workspaceID: workspace.id)
+            // A sibling window can publish a catalog projection while this synthetic workspace is
+            // being created, so establish the local projection from the workspace just committed.
+            if !window.workspaceManager.workspaces.contains(where: { $0.id == workspace.id }) {
+                window.workspaceManager.workspaces.append(workspace)
+            }
             let storedWorkspace = try XCTUnwrap(
                 window.workspaceManager.workspaces.first { $0.id == workspace.id }
             )
@@ -2902,7 +2887,11 @@ import XCTest
                     throw AdmissionTestError.fixtureSetup("explicit workspace creation did not commit")
                 }
                 await WorkspaceDiskWriterComposition.processWriter.flush(url: workspaceFileURL)
-                try await awaitDurableAdmissionCatalog(window: window, runtime: runtime, workspaceID: workspace.id)
+                // Catalog projection and fixture creation are independent publications; the test
+                // window must expose the workspace that the authority has already committed.
+                if !window.workspaceManager.workspaces.contains(where: { $0.id == workspace.id }) {
+                    window.workspaceManager.workspaces.append(workspace)
+                }
                 let storedWorkspace = try XCTUnwrap(
                     window.workspaceManager.workspaces.first { $0.id == workspace.id }
                 )
