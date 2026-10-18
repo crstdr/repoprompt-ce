@@ -257,7 +257,6 @@ enum AgentSessionLinkPrompts {
 
         let offersQuietReply = request.routineQuietCheckIn
             && AgentSessionLinkPrompts.supportsQuietCheckIn(request.providerContext)
-            && request.providerContext != .codexExec
         let omitsDuplicateAutonomy = request.membershipKind == .inventory
             && request.laneGuidanceMode == .full
         var fragments: [String] = []

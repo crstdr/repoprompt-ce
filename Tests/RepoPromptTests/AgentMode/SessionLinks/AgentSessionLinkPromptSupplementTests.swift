@@ -4600,8 +4600,8 @@ extension AgentSessionLinkPromptClaimStoreTests {
             let routine = try XCTUnwrap(store.claim(dispatchID: dispatch, epoch: epoch, inventory: live, passiveNotices: batch, routineQuietCheckIn: true, render: render))
             let supports = provider == .codexExec || provider == .claudeCode
             XCTAssertEqual(routine.routineQuietCheckIn, supports)
-            XCTAssertEqual(routine.fragment.contains("Nothing needed? Call self_noop and end without text."), provider == .claudeCode)
-            if provider != .claudeCode { XCTAssertEqual(routine.fragment, ordinary.fragment) }
+            XCTAssertEqual(routine.fragment.contains("Nothing needed? Call self_noop and end without text."), supports)
+            if !supports { XCTAssertEqual(routine.fragment, ordinary.fragment) }
             XCTAssertEqual(renderedBits, supports ? [false, true] : [false])
             XCTAssertEqual(Set([ordinary, routine]).count, supports ? 2 : 1)
             let retry = store.claim(dispatchID: dispatch, epoch: epoch, inventory: live, passiveNotices: batch, routineQuietCheckIn: true, render: render)
@@ -4735,7 +4735,7 @@ extension AgentSessionLinkPromptClaimStoreTests {
                         }
                         let before = try makeClaim(offersQuiet: false)
                         let after = try makeClaim(offersQuiet: basis == "routine" || basis == "overflow" || basis == "attention")
-                        let qualifies = provider == .claudeCode && (basis == "routine" || basis == "overflow")
+                        let qualifies = (provider == .claudeCode || provider == .codexExec) && (basis == "routine" || basis == "overflow")
                         XCTAssertEqual(
                             after.fragment.components(separatedBy: literal).count - 1,
                             qualifies ? 1 : 0,

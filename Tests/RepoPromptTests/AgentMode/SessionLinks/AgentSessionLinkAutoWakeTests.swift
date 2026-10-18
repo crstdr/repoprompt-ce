@@ -5454,7 +5454,7 @@ extension AgentSessionLinkAutoWakeTests {
             try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
             let claim = try reserveQuietWake(fixture)
             XCTAssertTrue(claim.routineQuietCheckIn)
-            XCTAssertEqual(claim.fragment.contains("Nothing needed? Call self_noop and end without text."), provider == .claudeCode)
+            XCTAssertTrue(claim.fragment.contains("Nothing needed? Call self_noop and end without text."))
             let owner = try beginAndAcquireQuietWake(fixture, claim: claim)
             XCTAssertTrue(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(for: fixture.session, dispatchID: claim.dispatchID))
             fixture.session.sealQuietCheckIn(owner: owner, terminalState: .completed, normal: true, hasSuccessor: false)
@@ -6614,7 +6614,7 @@ extension AgentSessionLinkAutoWakeTests {
         XCTAssertEqual(claudeMessages.count, 1)
         XCTAssertEqual(codex.startedTurns.count, 1)
         XCTAssertTrue(try XCTUnwrap(claudeMessages.first).contains("Nothing needed? Call self_noop and end without text."))
-        XCTAssertFalse(try XCTUnwrap(codex.startedTurns.first).contains("Nothing needed? Call self_noop and end without text."))
+        XCTAssertTrue(try XCTUnwrap(codex.startedTurns.first).contains("Nothing needed? Call self_noop and end without text."))
         for _ in 0 ..< 16 {
             await bridge.test_refreshStatus(sessionIDs: [a.sessionID, b.sessionID])
         }
