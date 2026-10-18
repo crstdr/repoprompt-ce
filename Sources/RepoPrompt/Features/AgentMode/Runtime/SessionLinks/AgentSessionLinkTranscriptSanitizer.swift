@@ -122,12 +122,15 @@ struct AgentSessionLinkTranscriptItem: Equatable {
     func withTextTruncated(
         toRemainingBudget remainingBudget: Int,
         minimumTextBytes: Int,
+        maxOutputBytes: Int,
         wasByteCapped: Bool = false
     ) -> Self {
         guard let text else { return self }
         let allowance = max(minimumTextBytes, remainingBudget - nonTextUTF8Cost)
         guard wasByteCapped || text.utf8.count > allowance else { return self }
-        let marker = AgentSessionLinkTranscriptBudget.clippedRowMarker
+        let marker = maxOutputBytes >= AgentSessionLinkTranscriptBudget.maximumMaxOutputBytes
+            ? AgentSessionLinkTranscriptBudget.maximumBudgetClippedRowMarker
+            : AgentSessionLinkTranscriptBudget.clippedRowMarker
         let clipped = AgentSessionLinkTranscriptBudget.truncatedRowText(
             text, maxBytes: allowance - marker.utf8.count
         ) + marker
@@ -240,6 +243,8 @@ enum AgentSessionLinkTranscriptBudget {
     /// progress while stating, visibly, that something was dropped.
     static let oversizedTextMarker = "[text omitted: exceeds byte budget]"
     static let clippedRowMarker = "\n[row clipped; re-read with max_items: 1 and larger max_output_bytes]"
+
+    static let maximumBudgetClippedRowMarker = "\n[row clipped; exceeds maximum page budget (\(maximumMaxOutputBytes) bytes)]"
 
     static func clampedMaxItems(_ requested: Int?) -> Int {
         guard let requested else { return defaultMaxItems }
@@ -779,6 +784,7 @@ enum AgentSessionLinkTranscriptSanitizer {
                     emitted = item.withTextTruncated(
                         toRemainingBudget: maxOutputBytes - usedBytes,
                         minimumTextBytes: AgentSessionLinkTranscriptBudget.firstItemMinimumTextBytes,
+                        maxOutputBytes: maxOutputBytes,
                         wasByteCapped: sanitized.wasByteCapped
                     )
                     cost = emitted.utf8Cost

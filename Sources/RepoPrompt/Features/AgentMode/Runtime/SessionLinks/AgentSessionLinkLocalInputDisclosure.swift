@@ -14,22 +14,6 @@ extension AgentSessionLinkPassiveStatusNotices {
         var consumedThrough: UInt64
     }
 
-    struct LocalInputRange: Hashable {
-        let queueEpoch: UUID
-        let reference: DomainAgentSessionLinkReference
-        let target: DomainAgentSessionLinkEndpointIdentity
-        let indexEpoch: UUID
-        let capturedFrontier: UInt64
-        let throughOrdinal: UInt64
-    }
-
-    struct LocalInputOffer: Hashable {
-        let range: LocalInputRange
-        let totalCount: UInt64
-        /// Settlement order, oldest first; at most the newest four nonempty records.
-        let candidates: [AgentSessionLinkRetainedLocalInputIndex.Record]
-    }
-
     /// Paired with the existing authoritative lifecycle reconciliation, with metadata only.
     /// A nil snapshot is unknown, not absent: it never moves a same-target frontier. Only a
     /// missing or rebound frontier gets the unresolved baseline — a nil epoch never catches up.
@@ -112,17 +96,4 @@ extension AgentSessionLinkPassiveStatusNotices {
         }
         return true
     }
-}
-
-struct AgentSessionLinkLocalInputDecoration: Hashable {
-    struct Requirement: Hashable {
-        let offer: AgentSessionLinkPassiveStatusNotices.LocalInputOffer
-        /// Only physically rendered records need content proof; omissions still require exact Read.
-        let renderedRecords: [AgentSessionLinkRetainedLocalInputIndex.Record]
-    }
-
-    let fragment: String
-    /// Row markup only; the separately bounded guidance line is not charged here.
-    let markupDeltaBytes: Int
-    let requirements: [Requirement]
 }
