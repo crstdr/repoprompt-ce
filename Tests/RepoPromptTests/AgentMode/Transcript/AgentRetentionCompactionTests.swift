@@ -454,6 +454,66 @@
             XCTAssertEqual(noticeEntries.first?.role, "summary")
         }
 
+        /// Recovery diagnostics must not displace the conclusion within the per-turn cap.
+        func testGetSessionCapsCompactedDiagnosticsAndSummaryAtPerTurnEntryLimit() async throws {
+            try await assertGetSessionPreservesConclusionAtEntryLimit(structurallyCompacted: true)
+        }
+
+        func testGetSessionCapsDemotedDiagnosticsAndConclusionAtPerTurnEntryLimit() async throws {
+            try await assertGetSessionPreservesConclusionAtEntryLimit(structurallyCompacted: false)
+        }
+
+        private func assertGetSessionPreservesConclusionAtEntryLimit(structurallyCompacted: Bool) async throws {
+            var transcript = recoveryTranscript(includeTools: false)
+            transcript.turns[0].retentionTier = .summary
+            var compacted = AgentTranscriptCompactor.compact(transcript)
+            var turn = try XCTUnwrap(compacted.turns.first)
+            if structurallyCompacted {
+                turn.responseSpans[0].activities = []
+                turn.conclusionActivityID = nil
+            }
+            var summary = try XCTUnwrap(turn.summary)
+            summary.compactConclusionText = "Compacted conclusion."
+            summary.recoveryDiagnostics = (0 ..< AgentTranscriptRecoveryDiagnostic.maximumPerTurn).map { index in
+                AgentTranscriptRecoveryDiagnostic(
+                    sequenceIndex: index,
+                    reason: "resumeFrameTooLarge",
+                    outcome: AgentTranscriptRecoveryDiagnostic.freshThreadStartedOutcome,
+                    text: noticeText
+                )
+            }
+            turn.summary = summary
+            compacted.turns[0] = turn
+            XCTAssertEqual(turn.isStructurallyCompacted, structurallyCompacted)
+            XCTAssertEqual(turn.summary?.normalizedRecoveryDiagnostics.count, 20)
+
+            let sessionID = UUID()
+            let scanner = try seededScanner(sessionID: sessionID, transcript: compacted)
+
+            let reply = try await HistoryMCPToolService.execute(
+                args: [
+                    "op": .string("get_session"),
+                    "session_id": .string(sessionID.uuidString),
+                    "turn_start": .int(0),
+                    "turn_end": .int(0)
+                ],
+                scanner: scanner
+            )
+            guard case let .getSession(getSession) = reply else {
+                return XCTFail("Expected get_session reply, got \(reply)")
+            }
+            let rendered = try XCTUnwrap(getSession.turns.first)
+            XCTAssertEqual(rendered.entries.count, 20)
+            XCTAssertEqual(
+                rendered.entries.count(where: { $0.text.contains("too large to load") }),
+                19
+            )
+            XCTAssertEqual(rendered.entries.last?.role, structurallyCompacted ? "summary" : "assistant")
+            XCTAssertEqual(rendered.entries.last?.text, structurallyCompacted ? "Compacted conclusion." : "Done.")
+            XCTAssertEqual(rendered.entriesOmitted, 1)
+            XCTAssertTrue(rendered.truncated)
+        }
+
         // MARK: - Helpers
 
         private func makeDiagnostic() -> AgentTranscriptRecoveryDiagnostic {
