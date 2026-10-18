@@ -1722,3 +1722,34 @@ enum AgentSessionLinkPromptComposer {
         return "\(providerText)\n\n\(trimmedFragment)"
     }
 }
+
+extension AgentSessionLinkPassiveStatusNotices {
+    struct LocalInputRange: Hashable {
+        let queueEpoch: UUID
+        let reference: DomainAgentSessionLinkReference
+        let target: DomainAgentSessionLinkEndpointIdentity
+        let indexEpoch: UUID
+        let capturedFrontier: UInt64
+        let throughOrdinal: UInt64
+    }
+
+    struct LocalInputOffer: Hashable {
+        let range: LocalInputRange
+        let totalCount: UInt64
+        /// Settlement order, oldest first; at most the newest four nonempty records.
+        let candidates: [AgentSessionLinkRetainedLocalInputIndex.Record]
+    }
+}
+
+struct AgentSessionLinkLocalInputDecoration: Hashable {
+    struct Requirement: Hashable {
+        let offer: AgentSessionLinkPassiveStatusNotices.LocalInputOffer
+        /// Only physically rendered records need content proof; omissions still require exact Read.
+        let renderedRecords: [AgentSessionLinkRetainedLocalInputIndex.Record]
+    }
+
+    let fragment: String
+    /// Row markup only; the separately bounded guidance line is not charged here.
+    let markupDeltaBytes: Int
+    let requirements: [Requirement]
+}
