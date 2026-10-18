@@ -87,9 +87,7 @@ enum WindowStateCompositionFactory {
         loadStoredAPISettingsDataOnInit: Bool = true,
         codexModelPollingService: CodexModelPollingService = .shared,
         modelRouterRuntime injectedModelRouterRuntime: AgentTaskRouterRuntime? = nil,
-        agentModeViewModelFactory: AgentModeViewModelFactory? = nil,
-        sessionRuntimeWorkspace: WorkspaceModel? = nil,
-        borrowedAPISettingsViewModel: APISettingsViewModel? = nil
+        agentModeViewModelFactory: AgentModeViewModelFactory? = nil
     ) -> WindowStateComposition {
         WorkspaceContextStartupInstrumentation.install(AppWorkspaceStartupEventRecorder())
         WorkspaceExternalReadWorkHooks.install(AppWorkspaceExternalReadWorkRecorder())
@@ -135,7 +133,7 @@ enum WindowStateCompositionFactory {
             ?? AIQueriesService(keyManager: keyManager)
 
         // 3) API Settings
-        let apiSettingsViewModel = borrowedAPISettingsViewModel ?? APISettingsViewModel(
+        let apiSettingsViewModel = APISettingsViewModel(
             aiQueriesService: aiQueriesService,
             keyManager: keyManager,
             loadStoredDataOnInit: loadStoredAPISettingsDataOnInit,
@@ -153,22 +151,16 @@ enum WindowStateCompositionFactory {
             windowID: windowID,
             settingsManager: settingsManager,
             storedPromptPersistence: storedPromptPersistence,
-            // The borrowed API owner is already live. A second prompt's startup refresh reloads
-            // stored connection flags over it; it must not reset the canonical live connection.
-            refreshAvailableModelsOnInit: sessionRuntimeWorkspace == nil,
             perfRecorder: AppAgentModePerfRecorder()
         )
 
         // 7) Create the workspace manager with construction-time runtime persistence ownership.
-        // A nonvisual runtime shares MCP routing, but never owns or projects the visible workspace
-        // document. Its one-carrier snapshot is read-only placement, not a second workspace writer.
-        let domainWorkspaceClient = sessionRuntimeWorkspace == nil ? domainRuntime.map {
+        let domainWorkspaceClient = domainRuntime.map {
             DomainWorkspaceAuthorityClient(store: $0.workspaceStore, windowID: windowID)
-        } : nil
+        }
         let workspaceManager = WorkspaceManagerViewModel(
             fileManager: workspaceFilesViewModel,
             promptViewModel: promptManager,
-            sessionRuntimeWorkspace: sessionRuntimeWorkspace,
             workspaceSearchService: workspaceSearchService,
             domainWorkspaceAuthorityClient: domainWorkspaceClient,
             switchTimingPolicy: workspaceSwitchTimingPolicy,
@@ -187,8 +179,7 @@ enum WindowStateCompositionFactory {
             // Weak captures: the Bridge already holds the manager weakly; no retain cycle or new owner.
             workspaceManager.installDomainCatalogRefresh(
                 request: { [weak bridge] isRetry in bridge?.requestCatalogRefresh(isRetry: isRetry) },
-                cancel: { [weak bridge] in bridge?.cancelCatalogRefresh() },
-                awaitRefresh: { [weak bridge] in await bridge?.refreshForAgentAdmission() ?? false }
+                cancel: { [weak bridge] in bridge?.cancelCatalogRefresh() }
             )
         }
         domainWorkspacePresentationBridge?.start()
@@ -285,7 +276,6 @@ enum WindowStateCompositionFactory {
                   let registered = WindowStatesManager.shared.window(withID: windowID) else { return nil }
             return registered.agentModeViewModel === agentModeViewModel
         }
-        agentModeViewModel.preparedSessionRuntimes = WindowStatesManager.shared
         workspaceFilesViewModel.setSessionWorktreeBindingStatesProvider { [weak agentModeViewModel] sessionIDs in
             agentModeViewModel?.worktreeBindingStates(forAgentSessionIDs: sessionIDs) ?? [:]
         }

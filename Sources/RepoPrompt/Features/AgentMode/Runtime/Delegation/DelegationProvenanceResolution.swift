@@ -34,8 +34,6 @@ struct DelegationProvenanceSnapshot {
 
     func hasCompletePlacement(for scope: DomainDelegationScopeGrant) -> Bool {
         switch scope.kind {
-        case let .session(target):
-            placementConflicts[target] == nil && placementConflicts[scope.granteeSessionID] == nil
         case let .workspace(workspaceID):
             !placementConflicts.values.contains { $0.isEmpty || $0.contains(workspaceID) }
         case .tree, .allSessions:
@@ -52,7 +50,7 @@ struct DelegationProvenanceSnapshot {
 struct OpenWindowsDelegationProvenanceSource: DelegationProvenanceSource {
     private let windows: @MainActor () -> [WindowState]
 
-    init(windows: @escaping @MainActor () -> [WindowState] = { WindowStatesManager.shared.sessionRuntimeWindows }) {
+    init(windows: @escaping @MainActor () -> [WindowState] = { WindowStatesManager.shared.allWindows }) {
         self.windows = windows
     }
 
@@ -87,15 +85,9 @@ struct OpenWindowsDelegationProvenanceSource: DelegationProvenanceSource {
 
     private func capture(sessionIDs: Set<UUID>?, includeRuntime: Bool) -> DelegationProvenanceSnapshot {
         let windows = windows().filter { !$0.isClosing }
-        let carriers = AgentSessionCarrierResolver.capture(
-            windows: windows, sessionIDs: sessionIDs, includeRuntimeOwners: includeRuntime
-        )
+        let carriers = AgentSessionCarrierResolver.capture(windows: windows, sessionIDs: sessionIDs)
         let ids = sessionIDs ?? carriers.sessionIDs
-        // The carrier capture already took each window's binding census for runtime owners; reuse its
-        // states so one read builds one census per window.
-        let runtime = includeRuntime ? windows.map {
-            carriers.runtimeStatesByWindow[ObjectIdentifier($0)] ?? $0.agentModeViewModel.authoritativeLiveSessionStates(for: ids)
-        } : []
+        let runtime = includeRuntime ? windows.map { $0.agentModeViewModel.authoritativeLiveSessionStates(for: ids) } : []
         var result = DelegationProvenanceSnapshot(records: [:], states: [:])
         for id in ids {
             let metadata = carriers.metadata[id] ?? []
@@ -122,8 +114,7 @@ struct OpenWindowsDelegationProvenanceSource: DelegationProvenanceSource {
                 createdByOverseerSessionID: placementConflict ? nil : agreed?.entry.createdByOverseerSessionID,
                 organizationalParentID: placementConflict ? nil : agreed?.entry.organizationalParentID,
                 delegationScopeID: placementConflict ? nil : agreed?.entry.delegationScopeID,
-                isLive: isLive, worktreeCount: boundWorktrees.count, boundWorktreeIDs: boundWorktrees,
-                runState: runState, hasUniqueRuntimeOwner: carriers.uniqueRuntimeOwners[id] != nil
+                isLive: isLive, worktreeCount: boundWorktrees.count, boundWorktreeIDs: boundWorktrees, runState: runState
             )
         }
         return result

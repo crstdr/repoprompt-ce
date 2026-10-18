@@ -183,52 +183,6 @@ struct AgentPillLabelWidthCap: Layout {
     }
 }
 
-/// Shared geometry keeps the routing controls balanced with and without feedback.
-/// Reserving the same slot for symbols and spinners prevents busy-state label jumps.
-private struct AgentRoutingPillLabel: View {
-    let systemImage: String
-    let isBusy: Bool
-    let title: String?
-    var directionImage: String?
-    let fontPreset: FontScalePreset
-
-    var body: some View {
-        let height = AgentPillMetrics.height()
-        let iconSlot = ButtonScale.metric(16)
-        let inset = (height - iconSlot) / 2
-        HStack(alignment: .center, spacing: ButtonScale.metric(4)) {
-            ZStack {
-                if isBusy {
-                    ProgressView().controlSize(.mini)
-                } else {
-                    Image(systemName: systemImage)
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
-                        .imageScale(.large)
-                }
-            }
-            .frame(width: iconSlot, height: iconSlot)
-
-            if let title {
-                HStack(spacing: ButtonScale.metric(2)) {
-                    AgentPillLabelWidthCap(maxWidth: ButtonScale.metric(140)) {
-                        Text(title)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                    }
-                    if let directionImage {
-                        Image(systemName: directionImage)
-                            .imageScale(.small)
-                    }
-                }
-            }
-        }
-        .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .semibold))
-        .padding(.leading, inset)
-        .padding(.trailing, title == nil ? inset : inset + ButtonScale.metric(3))
-        .frame(width: title == nil ? height : nil, height: height)
-    }
-}
-
 // MARK: - Model Router Pill
 
 struct AgentModelRouterPill: View {
@@ -263,6 +217,7 @@ struct AgentModelRouterPill: View {
 
     var body: some View {
         let cornerRadius = AgentPillMetrics.cornerRadius()
+        let size = AgentPillMetrics.height()
         Button {
             if !props.isAvailable, !props.isOn {
                 onOpenSettings()
@@ -270,13 +225,25 @@ struct AgentModelRouterPill: View {
                 onToggle()
             }
         } label: {
-            AgentRoutingPillLabel(
-                systemImage: "arrow.triangle.branch",
-                isBusy: props.isRouting,
-                title: routedModelDisplayName,
-                fontPreset: fontScale.preset
-            )
+            HStack(spacing: 5) {
+                if props.isRouting {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Image(systemName: "arrow.triangle.branch")
+                        .font(fontScale.preset.swiftUIFont(sizeAtNormal: 14, weight: .semibold))
+                }
+                if let routedModelDisplayName {
+                    AgentPillLabelWidthCap(maxWidth: 140) {
+                        Text(routedModelDisplayName)
+                            .font(fontScale.preset.swiftUIFont(sizeAtNormal: 10, weight: .semibold))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                }
+            }
             .foregroundStyle(props.isOn ? Color.accentColor : .secondary)
+            .frame(minWidth: size, minHeight: size)
+            .padding(.horizontal, routedModelDisplayName == nil ? 0 : 7)
             .background(props.isOn ? Color.accentColor.opacity(0.12) : Color.clear)
             .background(.ultraThinMaterial)
             .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
@@ -326,6 +293,7 @@ struct AgentAutoEffortPill: View {
 
     var body: some View {
         let cornerRadius = AgentPillMetrics.cornerRadius()
+        let size = AgentPillMetrics.height()
         Button {
             if !props.isAvailable, !props.isOn {
                 onOpenSettings()
@@ -335,20 +303,26 @@ struct AgentAutoEffortPill: View {
                 showingEnableConfirmation = true
             }
         } label: {
-            AgentRoutingPillLabel(
-                systemImage: "gauge.open.with.lines.needle.33percent",
-                isBusy: props.isJudging && props.isOn,
-                title: feedback?.effortRaw.uppercased(),
-                directionImage: feedback.flatMap {
-                    switch $0.direction {
-                    case .up: "arrow.up"
-                    case .down: "arrow.down"
-                    default: nil
+            HStack(spacing: 5) {
+                if props.isJudging, props.isOn {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Image(systemName: "gauge.open.with.lines.needle.33percent")
+                        .font(fontScale.preset.swiftUIFont(sizeAtNormal: 14, weight: .regular))
+                        .offset(y: -1)
+                }
+                if let feedback {
+                    Text(feedback.effortRaw.uppercased())
+                        .font(fontScale.preset.swiftUIFont(sizeAtNormal: 10, weight: .semibold))
+                    if feedback.direction == .up || feedback.direction == .down {
+                        Image(systemName: feedback.direction == .up ? "arrow.up" : "arrow.down")
+                            .font(fontScale.preset.swiftUIFont(sizeAtNormal: 10, weight: .bold))
                     }
-                },
-                fontPreset: fontScale.preset
-            )
+                }
+            }
             .foregroundStyle(props.isOn ? Color.accentColor : .secondary)
+            .frame(minWidth: size, minHeight: size)
+            .padding(.horizontal, feedback == nil ? 0 : 7)
             .background(props.isOn ? Color.accentColor.opacity(0.12) : Color.clear)
             .background(.ultraThinMaterial)
             .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))

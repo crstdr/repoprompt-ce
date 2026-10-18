@@ -40,12 +40,6 @@ private actor CatalogAuthorityGate {
         }
     }
 
-    func waitUntilEntered(timeout: TimeInterval) async throws {
-        try await AsyncTestWait.waitUntil("catalog authority gate", timeout: timeout) {
-            await self.entered
-        }
-    }
-
     func open() {
         isOpen = true
         let waiters = openWaiters
@@ -2222,19 +2216,8 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         let targetEndpoint = try XCTUnwrap(target.viewModel.agentSessionLinkObserverEndpoint(tabID: target.tabID))
         let observerEndpoint = try XCTUnwrap(observer.viewModel.agentSessionLinkObserverEndpoint(tabID: observer.tabID))
         let host = AgentSessionLinkRuntimeBridgeTests.FakeEndpointHost()
-        func candidate(_ endpoint: DomainAgentSessionLinkEndpointIdentity, provider: String) -> AgentSessionLinkEndpointCandidate {
-            let readiness: AgentSessionRestorationReadiness
-            if let generation = endpoint.persistentBindingGeneration {
-                let token = AgentSessionRestorationBindingToken(
-                    bindingIdentity: AgentPersistentSessionBindingIdentity(
-                        tabID: endpoint.tabID, sessionID: endpoint.sessionID, generation: generation
-                    ),
-                    bindingTransitionGeneration: endpoint.bindingTransitionGeneration
-                )
-                readiness = .authoritative(token, .persistedPayloadApplied)
-            } else {
-                readiness = .unbound
-            }
+        func candidate(_ endpoint: DomainAgentSessionLinkEndpointIdentity, provider: String) throws -> AgentSessionLinkEndpointCandidate {
+            let bindingGeneration = try XCTUnwrap(endpoint.persistentBindingGeneration)
             return .init(
                 windowID: endpoint.windowID,
                 workspaceID: endpoint.workspaceID,
@@ -2252,10 +2235,19 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                 displayName: provider,
                 providerDisplayName: provider,
                 locationLabel: nil,
-                restorationReadiness: readiness
+                restorationReadiness: .authoritative(
+                    AgentSessionRestorationBindingToken(
+                        bindingIdentity: AgentPersistentSessionBindingIdentity(
+                            tabID: endpoint.tabID, sessionID: endpoint.sessionID,
+                            generation: bindingGeneration
+                        ),
+                        bindingTransitionGeneration: endpoint.bindingTransitionGeneration
+                    ),
+                    .persistedPayloadApplied
+                )
             )
         }
-        host.candidates = [candidate(observerEndpoint, provider: "Claude Code"), candidate(targetEndpoint, provider: "Codex CLI")]
+        host.candidates = try [candidate(observerEndpoint, provider: "Claude Code"), candidate(targetEndpoint, provider: "Codex CLI")]
         host.promptViewModel = observer.viewModel
         host.localInputSnapshotOverride = { endpoint, includeRecords in
             guard endpoint == targetEndpoint else { return nil }
@@ -3536,6 +3528,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         let input = try await AgentSessionLinkTransportLocalInputFixture.install(on: fixture.viewModel, session: fixture.session)
         addTeardownBlock { @MainActor in await input.cleanup() }
         await input.correction("WAITING-AUTHORITY-CORRECTION")
+        fixture.session.beginRunAttempt(source: "test.localInput.authority.waiting")
         let waiting = Task { @MainActor in try await fixture.viewModel.waitForNextUserInstruction(tabID: fixture.tabID) }
         try await AsyncTestWait.waitUntil("positive Read waiting continuation") {
             await MainActor.run { fixture.session.instructionContinuation != nil }
@@ -3641,16 +3634,6 @@ private actor MonitorRemovalConnection: MCPServerConnection {
 actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
     private var configuration = SessionLinkNativeConfigurationFixture()
     private(set) var sentMessages: [String] = []
-    private var lastSentTurnID: UUID?
-
-    func completeLastTurn(text: String? = nil, status: NativeAgentRuntimeTurnStatus = .completed) {
-        guard let lastSentTurnID else { return }
-        _ = events // Buffer an immediate reply even if the real runner has not subscribed yet.
-        if let text { continuation?.yield(.stream(.init(type: "content", text: text))) }
-        continuation?.yield(.turnCompleted(turnID: lastSentTurnID, status: status))
-        self.lastSentTurnID = nil
-    }
-
     private(set) var shutdownCount = 0
     private(set) var startOrResumeExistingSessionIDs: [String?] = []
     private var rejectResume = false
@@ -3797,27 +3780,27 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
         sentMessages.append(text)
         if let sendCompletionGate { await sendCompletionGate.enterAndWait() }
         await sendSuspension?()
-        if failSendAfterRecord { throw NativeAgentRuntimeControllerError.processNotRunning }
-        let turnID = UUID()
-        lastSentTurnID = turnID
+        if failSendAfterRecord {
+            throw NativeAgentRuntimeControllerError.processNotRunning
+        }
         if finishEventsAfterSend {
             _ = events
             continuation?.finish()
         }
-        return turnID
+        return UUID()
     }
 
     func sendUserMessage(_ text: String) async throws -> UUID {
         sentMessages.append(text)
         await sendSuspension?()
-        if failSendAfterRecord { throw NativeAgentRuntimeControllerError.processNotRunning }
-        let turnID = UUID()
-        lastSentTurnID = turnID
+        if failSendAfterRecord {
+            throw NativeAgentRuntimeControllerError.processNotRunning
+        }
         if finishEventsAfterSend {
             _ = events
             continuation?.finish()
         }
-        return turnID
+        return UUID()
     }
 
     func interruptTurn(reason _: String) async -> NativeAgentRuntimeInterruptOutcome {
@@ -4321,73 +4304,6 @@ extension AgentSessionLinkCodexPromptAdapterTests {
 }
 
 extension AgentSessionLinkCodexPromptAdapterTests {
-    func testOrdinaryManagedAuthReplayLeavesNewQuietWakeForItsOwnDispatch() async throws {
-        let replayGate = CatalogAuthorityGate()
-        let fixture = try makeFixture(configureReplacement: { $0.setStartGate(replayGate, fail: false) })
-        addTeardownBlock { await replayGate.open() }
-        await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
-        let seed = fixture.session.beginRunAttempt(source: "test.auth.ordinary.seed")
-        _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "ordinary auth turn", attachments: [])
-        let acceptedText = try XCTUnwrap(fixture.startedTurns.last)
-        XCTAssertFalse(try XCTUnwrap(fixture.session.codexPendingAuthRetryTurn?.monitoringDispatchID).isAutoWakeFamily)
-        XCTAssertTrue(fixture.session.endRunAttempt(ifCurrent: seed, source: "test.auth.seed.end"))
-        fixture.session.runState = .completed
-
-        // A new wake is parked behind recovery, not adopted by the accepted-baseline replay.
-        let wakeID = try prepareAutoWake(fixture)
-        let claim = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptClaim(for: fixture.session, dispatchID: .autoWake(wakeID: wakeID)))
-        XCTAssertTrue(claim.routineQuietCheckIn)
-        fixture.session.oversight.pendingAutoWake?.phase = .awaitingSettlement
-        let replayOwner = fixture.session.beginRunAttempt(source: "test.auth.ordinary.replay")
-        fixture.session.runState = .running
-        let replay = Task { @MainActor in
-            await fixture.coordinator.test_handleCodexNativeEvent(
-                .errorNotification(.init(message: "external auth is active", willRetry: false, threadID: nil, turnID: nil, itemID: nil)),
-                session: fixture.session, sourceController: fixture.controller
-            )
-        }
-        try await replayGate.waitUntilEntered(timeout: 3)
-        let replacement = try XCTUnwrap(fixture.session.codexController as? MonitorFakeCodexController)
-        XCTAssertFalse(replacement === fixture.controller)
-        XCTAssertEqual(replacement.startedTurns, [acceptedText])
-        XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.wakeID, wakeID)
-        XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.phase, .awaitingSettlement)
-        XCTAssertFalse(fixture.session.liveItemIDs.contains(wakeID), "recovery must not accept the new wake")
-        XCTAssertNil(fixture.session.quietLedger.candidateStartKey(owner: replayOwner), "application-managed replay remains ordinary")
-        await replayGate.open()
-        await replay.value
-        XCTAssertTrue(fixture.session.endRunAttempt(ifCurrent: replayOwner, source: "test.auth.replay.end"))
-        fixture.session.runState = .completed
-        XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.wakeID, wakeID, "the wake is still owed after replay")
-
-        // Its own physical dispatch, not auth replay, retains the producer across slot retirement.
-        fixture.session.oversight.pendingAutoWake?.phase = .preparingDispatch
-        let wakeGate = CatalogAuthorityGate()
-        replacement.setStartGate(wakeGate, fail: false)
-        addTeardownBlock { await wakeGate.open() }
-        let owner = fixture.session.beginRunAttempt(source: "test.auth.fresh-wake")
-        let producer = Task { @MainActor in
-            await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "", attachments: [])
-        }
-        try await wakeGate.waitUntilEntered(timeout: 3)
-        XCTAssertEqual(replacement.startedTurns, [acceptedText, AgentSessionLinkPromptComposer.decorated("", with: claim)])
-        fixture.session.sealQuietCheckIn(owner: owner, terminalState: .completed, normal: true, hasSuccessor: false)
-        XCTAssertTrue(fixture.session.endRunAttempt(ifCurrent: owner, source: "test.auth.fresh-wake.sealed"))
-        fixture.session.runState = .completed
-        weak var cohort = fixture.session.oversight.pendingAutoWake?.quietMarkerProducerLifetime
-        fixture.viewModel.agentSessionLinkRecordPhysicalDispatchFailure(for: fixture.session, dispatchID: claim.dispatchID)
-        XCTAssertNil(fixture.session.oversight.pendingAutoWake)
-        XCTAssertNotNil(cohort, "the wake's own producer must outlive its retired reservation")
-        await Task { @MainActor in }.value
-        XCTAssertTrue(fixture.session.quietLedger.hiddenSourceIDs.contains(wakeID))
-        await wakeGate.open()
-        _ = await producer.value
-        XCTAssertTrue(fixture.session.liveItemIDs.contains(wakeID))
-        XCTAssertTrue(fixture.session.quietLedger.hostMarkerIDs.contains(wakeID))
-        XCTAssertTrue(fixture.session.quietLedger.hiddenSourceIDs.contains(wakeID))
-        XCTAssertEqual(fixture.session.items.count(where: { $0.id == wakeID }), 1)
-    }
-
     func testOrdinaryManagedAuthReplayRefusesFreshQuietClaimAndLeavesInputAndReceiptOwed() async throws {
         let fixture = try makeFixture()
         await fixture.inventory.publishCodex(revision: 1, targetCount: 1)

@@ -63,7 +63,6 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
             guard case var .object(object) = value else { return value }
             object["selection"] = self.value
             if !recordsComplete {
-                object.removeValue(forKey: AgentSessionAdminRendering.stateSatisfiedKey)
                 // False means completeness is unproven, not that a specific omitted match is known.
                 // Never manufacture a positive selection proof from record coverage alone.
                 object["selection_complete"] = .bool(false)
@@ -158,28 +157,35 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
         register(AgentSessionOrganizeOperationHandler(
             backend: backend,
             isLeaseCurrent: isLeaseCurrent,
-            holdsControl: holdsControl,
-            holdsObserve: { [weak self] scope in self?.chainHolds(.observe, scope: scope) ?? false },
-            isGroupOrderLeaseCurrent: isReadLeaseCurrent
+            holdsControl: holdsControl
         ))
         register(AgentSessionReleaseOperationHandler(
             backend: backend,
             links: links,
             isLeaseCurrent: isLeaseCurrent,
-            // Release reaches a counterpart only when permitted (`scopeMembership`), never by placement alone.
-            isMember: { sessionID, scope in context.permitsMember(sessionID, ofChainFrom: scope) },
+            isMember: { [weak self] sessionID, scope in self?.isMember(sessionID, of: scope) ?? false },
             holdsControl: holdsControl
         ))
     }
 
-    /// `OverseerAuthorizationEngine.holdsControl`.
+    /// The scope is still the live generation it was and its whole chain holds `control`. Used when a
+    /// target admitted as idle is found running before a stop or stash.
     func holdsControl(_ scope: DomainDelegationScopeRecord) -> Bool {
-        scopes.authorization.holdsControl(scope)
+        guard let live = scopes.record(id: scope.id), live.isActive, live.generation == scope.generation else {
+            return false
+        }
+        return chainHolds(.control, scope: live)
     }
 
-    /// `OverseerAuthorizationEngine.scopeChainHolds`.
     private func chainHolds(_ capability: DomainDelegationScopeCapability, scope: DomainDelegationScopeRecord) -> Bool {
-        scopes.authorization.scopeChainHolds(capability, scope: scope)
+        let chain = scopes.scopeChain(from: scope.id)
+        return !chain.isEmpty && chain.allSatisfy { record in
+            guard record.isActive, record.grant.capabilities.contains(capability) else { return false }
+            if case .allSessions = record.grant.kind {
+                return DomainDelegationScopeCapability.allSessionsPermitted.contains(capability)
+            }
+            return true
+        }
     }
 
     // MARK: - AgentSessionAdministrationService
@@ -216,7 +222,7 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
         // goes straight to the core, which owns every denial.
         guard handlers[request.operation] != nil,
               let callerSessionID = request.caller.agentSessionID,
-              let scope = scopes.authorization.scopeForAdministrationShaping(request)
+              let scope = selectScope(request, callerSessionID: callerSessionID)
         else { return try await core.perform(request) }
         // Cards left behind on a tab that no longer shows the caller can never be presented again;
         // release their pending slots before the call may need a new card.
@@ -258,11 +264,7 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
         if !request.operation.isScopeLevel {
             // A filter enumerates sessions, so it needs a live scope holding `observe` and the
             // operation's own capability before anything is resolved.
-            let groupDiscovery = request.operation == .adminReorderGroups
-                && (request.arguments["order"] == nil || request.arguments["expected_order"] == nil)
-            if request.arguments["filter"] != nil || groupDiscovery,
-               let denial = filterDenial(request.operation, scope: scope)
-            {
+            if request.arguments["filter"] != nil, let denial = filterDenial(request.operation, scope: scope) {
                 return .denied(denial, sessionID: nil)
             }
             let shapingChain = scopes.scopeChain(from: scope.id)
@@ -271,7 +273,7 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
                     selectionCoverage = resolved.coverage
                     guard !resolved.sessionIDs.isEmpty else {
                         let value: Value = if resolved.coverage?.recordsComplete == false {
-                            AgentSessionInventoryReadFailure.incomplete(.noMatchesWhileInventoryIncomplete).value
+                            AgentSessionInventoryReadFailure.incomplete.value
                         } else {
                             .object([
                                 "result": .string("no_matching_sessions"),
@@ -468,16 +470,7 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
                 result = .object(["result": .string("not_applied")])
             }
         } catch {
-            result = .object(SessionAdminReply.diagnostic(
-                code: "operation_failed", sessionIDs: pending.request.targetSessionIDs,
-                fields: [
-                    "result": .string("not_applied"), "subreason": .string("handler_threw"),
-                    "detail": .string(error.localizedDescription + " The handler returned no completion receipt. Inspect the targets and confirmation status before retrying."),
-                    "next_call": .object(["tool": .string("session_admin"), "arguments": .object([
-                        "op": .string("confirmation_status"), "confirmation_id": .string(confirmationID.uuidString)
-                    ])])
-                ]
-            ))
+            result = .object(["result": .string("failed"), "detail": .string(error.localizedDescription)])
         }
         recordApplied(pending.coverage?.adding(to: result) ?? result, confirmationID: confirmationID)
         prunePendingApplies()
@@ -612,6 +605,17 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
             || object[AgentSessionAdminRendering.committedChangesKey] == .bool(true)
     }
 
+    private func selectScope(_ request: AgentSessionAdministrationRequest, callerSessionID: UUID) -> DomainDelegationScopeRecord? {
+        if let scopeID = request.scopeID {
+            guard let record = scopes.record(id: scopeID), record.isActive, record.grant.granteeSessionID == callerSessionID else {
+                return nil
+            }
+            return record
+        }
+        let live = scopes.liveScopes(grantedTo: callerSessionID)
+        return live.count == 1 ? live[0] : nil
+    }
+
     func isMember(_ sessionID: UUID, of scope: DomainDelegationScopeRecord) -> Bool {
         let chain = scopes.scopeChain(from: scope.id)
         return !chain.isEmpty && chain.allSatisfy { projector.membershipProof(for: sessionID, in: $0.grant) != nil }
@@ -635,7 +639,7 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
             // Link/role/orphan predicates rely on the complete endpoint census. An incomplete
             // read cannot turn an unknown edge into has_links:false and widen a mutation.
             if !full.isComplete, filter.hasLinks != nil || filter.role != nil || filter.orphaned != nil {
-                throw AgentSessionInventoryReadFailure.incomplete(.filterNeedsCompleteCensus)
+                throw AgentSessionInventoryReadFailure.incomplete
             }
             // Filters see only the scope-restricted view, so link/role/orphan predicates can never
             // react to sessions outside the scope.
@@ -646,18 +650,16 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
                     .map(\.sessionID)
             ))
             if filter.requiresOrganizationState || filter.query != nil {
-                guard full.unresolvedSessionCount == 0,
-                      snapshot.records.values.allSatisfy(\.organizationStateIsKnown)
-                else {
+                guard snapshot.records.values.allSatisfy(\.organizationStateIsKnown) else {
                     // History rows do not contain sidebar state. Treating their defaults as
                     // unpinned/unarchived/ungrouped would produce a false empty or partial batch.
-                    throw AgentSessionInventoryReadFailure.incomplete(.organizationStateUnknown)
+                    throw AgentSessionInventoryReadFailure.incomplete
                 }
             }
             if filter.orphaned != nil,
                !snapshot.records.keys.allSatisfy({ snapshot.orphanStatusIsComplete(for: $0) })
             {
-                throw AgentSessionInventoryReadFailure.incomplete(.orphanStatusUnknown)
+                throw AgentSessionInventoryReadFailure.incomplete
             }
             let now = Date()
             let excludeCaller = request.operation.deniesScopeSelfTarget

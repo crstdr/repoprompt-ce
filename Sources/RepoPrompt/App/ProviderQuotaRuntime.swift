@@ -40,22 +40,13 @@ final class ProviderQuotaRuntime {
         managedAuthTransitions: @escaping @Sendable () async -> AsyncStream<CodexManagedAuthTransition> = {
             await CodexManagedAuthRecoveryService.shared.authTransitions()
         },
-        settingsStore: GlobalSettingsStore = .shared,
-        claudeSourceFactory: (
-            @escaping @Sendable () async -> String?,
-            @escaping @Sendable () async -> String?
-        ) -> ClaudeCLIUsageSource = { readConsent, setupConsent in
-            ClaudeCLIUsageSource(consentProvider: readConsent, setupConsentProvider: setupConsent)
-        }
+        settingsStore: GlobalSettingsStore = .shared
     ) {
         self.settingsStore = settingsStore
         let codex = CodexProviderQuotaService(clientFactory: codexClientFactory, accountIDProvider: accountIDProvider)
-        let source = claudeSourceFactory({
+        let source = ClaudeCLIUsageSource(consentProvider: {
             let grant = await settingsStore.claudeCLIUsageGrant()
             return grant?.isReady == true && grant?.applies(toProfileID: ClaudeUsageCredentialProfile.current().id) == true ? grant?.credentialProfileID : nil
-        }, {
-            let grant = await settingsStore.claudeCLIUsageGrant()
-            return grant?.applies(toProfileID: ClaudeUsageCredentialProfile.current().id) == true ? grant?.credentialProfileID : nil
         })
         claudeSource = source
         let claude = ProviderAccountQuotaService(periodicReads: false, cachedRead: { await source.cachedSnapshot() }, read: { context in try await source.read(context) })

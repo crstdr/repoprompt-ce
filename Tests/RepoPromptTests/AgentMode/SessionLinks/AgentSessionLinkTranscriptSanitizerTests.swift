@@ -412,38 +412,6 @@ final class AgentSessionLinkTranscriptSanitizerTests: XCTestCase {
         }
     }
 
-    func testMaximumBudgetClippingDoesNotSuggestAnImpossibleRetry() throws {
-        let text = String(repeating: "x", count: 20000)
-        let row = AgentChatItem.assistant(text, sequenceIndex: 0)
-        for direction in AgentSessionLinkReadDirectionInput.allCases {
-            let page = AgentSessionLinkTranscriptSanitizer.page(
-                rows: [row], anchor: nil, direction: direction, maxItems: 1,
-                maxOutputBytes: AgentSessionLinkTranscriptBudget.clampedMaxOutputBytes(30000),
-                homeDirectory: home
-            )
-            let returned = try XCTUnwrap(page.items.first?.text)
-            let marker = AgentSessionLinkTranscriptBudget.maximumBudgetClippedRowMarker
-            XCTAssertTrue(returned.hasSuffix(marker))
-            let item = try XCTUnwrap(page.items.first)
-            let keptBytes = 20000 - AgentSessionLinkTranscriptBudget.pageEnvelopeBytes
-                - item.nonTextUTF8Cost - marker.utf8.count
-            XCTAssertEqual(returned, String(text.prefix(keptBytes)) + marker)
-            XCTAssertFalse(returned.contains("re-read"))
-            XCTAssertFalse(returned.contains("larger max_output_bytes"))
-            XCTAssertTrue(page.truncated)
-            XCTAssertFalse(page.hasMore, "Omitted row text is not available through the successor cursor")
-            XCTAssertEqual(page.nextAnchor?.itemID, row.id.uuidString)
-            XCTAssertEqual(page.outputUTF8Bytes, 20000)
-            let next = AgentSessionLinkTranscriptSanitizer.page(
-                rows: [row], anchor: page.nextAnchor, direction: direction, maxItems: 1,
-                maxOutputBytes: 20000, homeDirectory: home
-            )
-            XCTAssertTrue(next.items.isEmpty)
-            XCTAssertFalse(next.truncated)
-            XCTAssertFalse(next.hasMore)
-        }
-    }
-
     func testLongSecondRowWaitsForNextPageWithoutBeingConsumed() {
         for size in [10000, 20000] {
             let text = String(repeating: "x", count: size)
@@ -470,7 +438,7 @@ final class AgentSessionLinkTranscriptSanitizerTests: XCTestCase {
             if size == 10000 {
                 XCTAssertEqual(next.items.first?.text, text)
             } else {
-                XCTAssertTrue(next.items.first?.text?.hasSuffix(AgentSessionLinkTranscriptBudget.maximumBudgetClippedRowMarker) == true)
+                XCTAssertTrue(next.items.first?.text?.hasSuffix(AgentSessionLinkTranscriptBudget.clippedRowMarker) == true)
                 XCTAssertEqual(next.outputUTF8Bytes, 20000)
             }
         }

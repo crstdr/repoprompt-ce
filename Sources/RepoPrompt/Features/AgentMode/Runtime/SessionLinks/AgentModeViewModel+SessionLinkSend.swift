@@ -300,22 +300,12 @@ extension AgentModeViewModel {
             return .blocked(.persistenceFailed)
         }
 
-        return await startPersistedNoncomposerTurn(
-            session: liveSession, tabID: tabID, claim: claim, savedItemID: userItem.id,
-            acceptedAt: Date(), providerMessage: providerMessage, stopFence: stopFence,
-            dispatchIsCurrent: dispatchIsCurrent
-        )
-    }
-
-    /// Retry dispatch of an already accepted row without appending or saving the input again.
-    /// The caller still owns an empty composer claim and the exact identity/Stop/readiness fence.
-    func startPersistedNoncomposerTurn(
-        session liveSession: TabSession, tabID: UUID, claim: AgentComposerSubmitClaim,
-        savedItemID: UUID, acceptedAt: Date, providerMessage: String,
-        stopFence: AgentRunStartStopFence, dispatchIsCurrent: @MainActor () -> Bool
-    ) async -> AgentSessionLinkSendTransactionOutcome {
+        // Past this point the message is durably the target's. Every later failure reports a
+        // delivery state rather than rolling back, so a retry with the same key can never deliver
+        // the row twice.
+        let acceptedAt = Date()
         let persistedOnly = AgentSessionLinkSendDelivery(
-            targetItemID: savedItemID,
+            targetItemID: userItem.id,
             acceptedAt: acceptedAt,
             deliveryState: .persisted,
             resultingRunState: liveSession.runState.rawValue
@@ -360,7 +350,7 @@ extension AgentModeViewModel {
             : providerMessage
         // The row was durable before dispatch. Mark the exact provider text only after the final
         // dispatch admission, so a persisted-only row cannot masquerade as an interrupted prompt.
-        if let index = liveSession.items.firstIndex(where: { $0.id == savedItemID }) {
+        if let index = liveSession.items.firstIndex(where: { $0.id == userItem.id }) {
             var dispatchedRow = liveSession.items[index]
             dispatchedRow.dispatchedProviderText = dispatchedProviderMessage
             liveSession.replaceItem(at: index, with: dispatchedRow)
@@ -380,7 +370,7 @@ extension AgentModeViewModel {
         releaseComposerSubmitClaim(claim)
         if startRecorder.outcome.didStart {
             agentSessionLinkClearWaitingOnAfterAcceptedTurn(liveSession)
-        } else if let index = liveSession.items.firstIndex(where: { $0.id == savedItemID }) {
+        } else if let index = liveSession.items.firstIndex(where: { $0.id == userItem.id }) {
             var undispatchedRow = liveSession.items[index]
             undispatchedRow.dispatchedProviderText = nil
             liveSession.replaceItem(at: index, with: undispatchedRow)
@@ -389,7 +379,7 @@ extension AgentModeViewModel {
 
         let resultingRunState = sessions[tabID]?.runState ?? liveSession.runState
         return .delivered(AgentSessionLinkSendDelivery(
-            targetItemID: savedItemID,
+            targetItemID: userItem.id,
             acceptedAt: acceptedAt,
             deliveryState: startRecorder.outcome.didStart ? .runStarted : .runStartFailed,
             resultingRunState: resultingRunState.rawValue

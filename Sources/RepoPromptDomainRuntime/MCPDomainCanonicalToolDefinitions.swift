@@ -1139,7 +1139,7 @@ package enum MCPDomainCanonicalToolDefinitions {
             description: definition.description + """
 
 
-            **Agent Mode discovery**: `list_sessions` returns only matching direct child sessions, never a workspace-wide count. Zero children does not mean the current workspace is empty. The result provides the exact current `workspace_id`. For workspace-wide discovery, call `become_overseer` if needed. \(MCPDomainSessionAdminToolDefinition.overseerPlaybook) With full access OFF and no covering grant, request `kind=workspace`, that workspace UUID, and `observe` plus needed mutation capabilities; after consent use `session_admin inventory`. Discovery and session IDs grant no authority. Unresolved routing returns no workspace identity or session count.
+            **Agent Mode discovery**: `list_sessions` returns only matching direct child sessions, never a workspace-wide count. Zero children does not mean the current workspace is empty. The result provides the exact current `workspace_id`. For workspace-wide discovery, use `become_overseer` if needed, then on the next turn use `session_admin request_scope` with `kind=workspace`, that workspace UUID, and capabilities including `observe` plus the needed mutation capabilities. After the user approves the scope card, use `session_admin inventory`. Discovery and session IDs grant no authority. Unresolved routing returns no workspace identity or session count.
 
             **Deletion**: `cleanup_sessions` is administrative/human control only. Agent Mode sessions may retire or archive targets under user-approved scopes; they cannot delete persisted sessions, including their own children.
             """,
@@ -1151,16 +1151,9 @@ package enum MCPDomainCanonicalToolDefinitions {
 
     private static let becomeOverseerDefinition = MCPDomainToolDefinition(
         name: MCPWindowToolName.becomeOverseer,
-        description: "Enable oversight with no arguments, or oversee one saved target using session_id and optional message. \(MCPDomainSessionAdminToolDefinition.overseerPlaybook) An exact-target request needs observe + control + restructure together: existing consent is reused; otherwise one target-scoped approval covers only you and that target, not descendants or unrelated sessions. After consent the app prepares the target without focusing it or starting its provider, links it and dispatches your optional message automatically. No filler user turn, target-tab visit or mid-turn catalog refresh is needed. Target text and arguments grant nothing; exact routing, revocation and readiness remain fences. Reuse idempotency_key only for the same target/task.",
-        inputSchema: .object([
-            "type": .string("object"), "additionalProperties": .bool(false),
-            "properties": .object([
-                "session_id": .object(["type": .string("string"), "description": .string("Exact target session UUID. Uses covering consent or requests one target-scoped approval, then continues automatically, even when other oversight tools are not yet in this provider turn's catalog.")]),
-                "message": .object(["type": .string("string"), "description": .string("Optional task to deliver after consent and link. Requires session_id; 1–32768 bytes.")]),
-                "idempotency_key": .object(["type": .string("string"), "description": .string("Optional key for pending requests. Identical requester/target/tasks also reuse their running or recently finished continuation (30 seconds), even with a different key. Later repeats start a fresh task using live exact-target consent when available.")])
-            ])
-        ]),
-        annotations: .init(readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false)
+        description: "Enable oversight tool discovery for this Agent Mode session, normally on the next turn. Grants no authority. To list or organize this workspace, then request a user-approved workspace scope with observe plus the needed mutation capabilities through session_admin request_scope, and use inventory after approval.",
+        inputSchema: .object(["type": .string("object"), "properties": .object([:])]),
+        annotations: .init(readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false)
     )
 
     private static let agentSelfDefinition = MCPDomainToolDefinition(
@@ -1331,7 +1324,7 @@ package enum MCPDomainCanonicalToolDefinitions {
             if !description.contains(routerDescription) {
                 description += "\n\n\(routerDescription)"
             }
-            let residentDescription = " For resident app-owned top-level sessions, use steer with wait=false, poll, and agent_manage.get_log without capture. For an unrelated target under a Manage link, steer forwards only op, session_id, message, idempotency_key, and literal wait=false to agent_session_link steer; all other arguments are refused without delivery."
+            let residentDescription = " For resident app-owned top-level sessions, use steer with wait=false, poll, and agent_manage.get_log without capture."
             if !description.contains(residentDescription) {
                 description += residentDescription
             }
@@ -2072,7 +2065,7 @@ package enum MCPDomainCanonicalToolDefinitions {
                     ["tail", "start"]
                 ),
                 "max_items": integerSchema("[list, read] Item limit: list 32 default, read 30; max 100."),
-                "max_output_bytes": integerSchema("[read] Approximate pre-JSON UTF-8 page limit; default 8000, max 20000. Rows use the page budget; budget-clipped rows carry a clip marker."),
+                "max_output_bytes": integerSchema("[read] Approximate pre-JSON UTF-8 page limit; default 8000, max 20000. Rows use the page budget; budget-clipped rows carry a retry marker."),
                 "message": stringSchema("[send, steer] Attributed message, max 16000 UTF-8 bytes."),
                 "idempotency_key": stringSchema("[send, cancel_pending_send, steer, compact] New per message or compaction; reuse only for the same retry. Max 200 UTF-8 bytes."),
                 "delivery": enumStringSchema(
@@ -2249,18 +2242,9 @@ package enum MCPDomainCanonicalToolDefinitions {
 
     /// Description-only projection; preserve the frozen model-selection and earlier migration shapes.
     private enum AgentSessionLinkOverseerActivationGuidance {
-        static let previousDescription = AgentSessionLinkModelSelectionMigration.description.replacingOccurrences(
-            of: "- `create_lane`: under a direct link, create your top-level lane; unique `idempotency_key`.",
-            with: "- `create_lane`: direct link or overseer opt-in; make your lane; unique `idempotency_key`."
-        )
-
-        static func isPrevious(_ definition: MCPDomainToolDefinition) -> Bool {
-            definition.description == previousDescription && definition.inputSchema == AgentSessionLinkModelSelectionMigration.inputSchema
-        }
-
         static let description = AgentSessionLinkModelSelectionMigration.description.replacingOccurrences(
             of: "- `create_lane`: under a direct link, create your top-level lane; unique `idempotency_key`.",
-            with: "- `create_lane`: direct link or overseer opt-in; make your managed lane; unique `idempotency_key`. Its first message assigns the lane's job, without asking the user to repeat it. No unrelated authority is inherited: approvals, sandbox/permission changes, destructive or out-of-workspace actions still need their own user approval."
+            with: "- `create_lane`: direct link or overseer opt-in; make your lane; unique `idempotency_key`."
         )
 
         static func isCurrent(_ definition: MCPDomainToolDefinition) -> Bool {
@@ -2268,49 +2252,9 @@ package enum MCPDomainCanonicalToolDefinitions {
         }
 
         static func applying(to definition: MCPDomainToolDefinition) -> MCPDomainToolDefinition {
-            precondition(AgentSessionLinkModelSelectionMigration.isCurrent(definition) || isPrevious(definition))
+            precondition(AgentSessionLinkModelSelectionMigration.isCurrent(definition))
             return MCPDomainToolDefinition(
                 name: definition.name, description: description, inputSchema: definition.inputSchema,
-                annotations: definition.annotations, isEnabledByDefault: definition.isEnabledByDefault
-            )
-        }
-    }
-
-    /// Extend the served wait contract without changing the historical schema migration anchors.
-    private enum AgentSessionLinkWaitCursorMigration {
-        static let description = AgentSessionLinkOverseerActivationGuidance.description.replacingOccurrences(
-            of: "- `wait`: wait on returned cursor(s) for change, idle, or sendable; managed-only pending interactions may be returned. A multi-target result omits targets that became unavailable while waiting and lists them in `unavailable_session_ids`; refresh `list` before using them.",
-            with: "- `wait`: pass returned `wait_cursor` strings in `cursors`, without session IDs. Wait for change, idle, or sendable; managed prompts may appear. Unavailable targets are omitted and named in `unavailable_session_ids`; refresh `list` before using them."
-        )
-
-        static let inputSchema: Value = {
-            guard case var .object(schema) = AgentSessionLinkModelSelectionMigration.inputSchema,
-                  case var .object(properties)? = schema["properties"],
-                  case var .object(cursors)? = properties["cursors"],
-                  let previousItems = cursors["items"],
-                  case let .string(summary)? = schema["description"]
-            else { preconditionFailure("agent_session_link cursor migration requires the prior wait schema") }
-            cursors["description"] = .string("[wait] Returned wait_cursor strings and/or {session_id, cursor} records; max 32, no duplicate targets. No separate IDs required.")
-            cursors["items"] = .object([
-                "anyOf": .array([.object(["type": .string("string")]), previousItems])
-            ])
-            properties["cursors"] = .object(cursors)
-            schema["properties"] = .object(properties)
-            schema["description"] = .string(summary.replacingOccurrences(
-                of: "wait: exactly one of session_id/session_ids; cursor? or cursors?; until?; timeout_seconds? Local input cancels older waits.",
-                with: "wait: cursors alone, or session_id/session_ids with cursor(s)?; until?; timeout_seconds? Local input cancels older waits."
-            ))
-            return .object(schema)
-        }()
-
-        static func isCurrent(_ definition: MCPDomainToolDefinition) -> Bool {
-            definition.description == description && definition.inputSchema == inputSchema
-        }
-
-        static func applying(to definition: MCPDomainToolDefinition) -> MCPDomainToolDefinition {
-            precondition(AgentSessionLinkOverseerActivationGuidance.isCurrent(definition))
-            return MCPDomainToolDefinition(
-                name: definition.name, description: description, inputSchema: inputSchema,
                 annotations: definition.annotations, isEnabledByDefault: definition.isEnabledByDefault
             )
         }
@@ -2524,15 +2468,8 @@ package enum MCPDomainCanonicalToolDefinitions {
     private static func canonicalizeAgentSessionLink(
         _ definition: MCPDomainToolDefinition
     ) -> MCPDomainToolDefinition {
-        if AgentSessionLinkWaitCursorMigration.isCurrent(definition) { return definition }
-        return AgentSessionLinkWaitCursorMigration.applying(to: canonicalizeAgentSessionLinkBeforeWaitCursors(definition))
-    }
-
-    private static func canonicalizeAgentSessionLinkBeforeWaitCursors(
-        _ definition: MCPDomainToolDefinition
-    ) -> MCPDomainToolDefinition {
         if AgentSessionLinkOverseerActivationGuidance.isCurrent(definition) { return definition }
-        if AgentSessionLinkModelSelectionMigration.isCurrent(definition) || AgentSessionLinkOverseerActivationGuidance.isPrevious(definition) {
+        if AgentSessionLinkModelSelectionMigration.isCurrent(definition) {
             return AgentSessionLinkOverseerActivationGuidance.applying(to: definition)
         }
         precondition(!agentSessionLinkModelSelectionIsPartial(definition), "Partial agent_session_link model selection contract")
@@ -2542,9 +2479,7 @@ package enum MCPDomainCanonicalToolDefinitions {
     }
 
     private static func agentSessionLinkModelSelectionIsPartial(_ definition: MCPDomainToolDefinition) -> Bool {
-        !AgentSessionLinkWaitCursorMigration.isCurrent(definition)
-            && !AgentSessionLinkOverseerActivationGuidance.isCurrent(definition)
-            && !AgentSessionLinkOverseerActivationGuidance.isPrevious(definition)
+        !AgentSessionLinkOverseerActivationGuidance.isCurrent(definition)
             && !AgentSessionLinkModelSelectionMigration.isCurrent(definition)
             && (
                 definition.description.contains("set_model")
@@ -2946,13 +2881,9 @@ package enum MCPDomainCanonicalToolDefinitions {
         canonicalizeAgentSessionLinkBeforeModelSelection(test_agentSessionLinkLegacyCurrentDefinition())
     }
 
-        package static func test_agentSessionLinkPreviousCursorDefinition() -> MCPDomainToolDefinition {
-            canonicalizeAgentSessionLinkBeforeWaitCursors(test_agentSessionLinkLegacyCurrentDefinition())
-        }
-
-        package static func test_agentSessionLinkModelSelectionIsPartial(_ definition: MCPDomainToolDefinition) -> Bool {
-            agentSessionLinkModelSelectionIsPartial(definition)
-        }
+    package static func test_agentSessionLinkModelSelectionIsPartial(_ definition: MCPDomainToolDefinition) -> Bool {
+        agentSessionLinkModelSelectionIsPartial(definition)
+    }
 
     package static func test_agentSessionLinkPreviousCompactDefinition() -> MCPDomainToolDefinition {
         applyAgentSessionLinkTokenEfficiency(test_agentSessionLinkLegacyCurrentDefinition())

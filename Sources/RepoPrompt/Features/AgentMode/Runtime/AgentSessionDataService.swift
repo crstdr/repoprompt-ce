@@ -1141,9 +1141,7 @@ actor AgentSessionDataService {
     }
 
     func metadataRecordForSessionID(_ id: UUID, for workspace: WorkspaceModel) async throws -> AgentSessionMetadataRecord? {
-        // Exact metadata lookup is a read, including for a workspace with no sessions directory.
-        // Oversight uses it before consent; it must not create folders or normalize saved state.
-        let folder = resolvedWorkspaceFolderURL(for: workspace).appendingPathComponent("AgentSessions")
+        let folder = try ensureAgentSessionsFolder(for: workspace)
         let fileURL = agentSessionFileURL(id: id, in: folder)
         guard FileManager.default.fileExists(atPath: fileURL.path) else {
             return nil
@@ -1851,9 +1849,6 @@ actor AgentSessionDataService {
         #endif
         await diskWriter.waitUntilIdle(for: fileURL)
         do {
-            if let fence = Self.destructiveCommitFence.get(), await !fence() {
-                throw AgentSessionDestructiveCommitRefused()
-            }
             if FileManager.default.fileExists(atPath: fileURL.path) {
                 try FileManager.default.removeItem(at: fileURL)
             }

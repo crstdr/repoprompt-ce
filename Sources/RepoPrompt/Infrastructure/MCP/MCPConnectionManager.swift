@@ -3243,18 +3243,13 @@ actor ServerNetworkManager {
         let hasActiveOutboundLink: Bool
         /// Catalog reachability only; every scope operation re-authorizes at execution.
         var isSessionAdminEligible = false
-        /// Activation admission: the session is eligible to activate right now.
         let canBecomeOverseer: Bool
-        /// Catalog listing and early call admission. Wider than `canBecomeOverseer`: a session
-        /// that is only transiently ineligible keeps the tool so a call returns an actionable
-        /// reason instead of the agent silently lacking the tool. Never admits activation.
-        var canListBecomeOverseer = false
         let hasActivatedOverseer: Bool
 
         var additionalGrants: Set<String> {
             var grants: Set<String> = []
             if hasAnyActiveLink || hasActivatedOverseer { grants.insert(MCPWindowToolName.agentSessionLink) }
-            if canListBecomeOverseer { grants.insert(MCPWindowToolName.becomeOverseer) }
+            else if canBecomeOverseer { grants.insert(MCPWindowToolName.becomeOverseer) }
             if isSessionAdminEligible { grants.insert(MCPWindowToolName.sessionAdmin) }
             return grants
         }
@@ -3317,12 +3312,8 @@ actor ServerNetworkManager {
             )
         #endif
         let bootstrapState = await AgentSessionLinkRuntimeBridge.shared.overseerBootstrapState(for: routeToken.observerEndpoint)
-        // One main-actor read, before route revalidation: no new suspension after the fences below.
-        let (oversightEnabled, globalOverseer) = await MainActor.run {
-            (
-                ToolAvailabilityStore.shared.isEnabled(MCPWindowToolName.agentSessionLink),
-                OverseerAuthorizationEngine.current.listsFullOversightSurface
-            )
+        let oversightEnabled = await MainActor.run {
+            ToolAvailabilityStore.shared.isEnabled(MCPWindowToolName.agentSessionLink)
         }
         guard let revalidatedRouteToken = await (
             modelOnly
@@ -3346,33 +3337,18 @@ actor ServerNetworkManager {
         await AgentSessionLinkRuntimeBridge.shared.overseerBootstrapState(for: routeToken.observerEndpoint) == bootstrapState else {
             return nil
         }
-        // Global Overseer full access (read above) lists the full oversight surface for every eligible
-        // session from its first turn, as if activated; each operation still authorizes when it runs.
         let eligible = runState.taskLabelKind != .explore && bootstrapState != nil
-        let transientlyIneligible: Bool = if runState.taskLabelKind != .explore, bootstrapState == nil {
-            await AgentSessionLinkRuntimeBridge.shared
-                .overseerBootstrapRefusal(for: routeToken.observerEndpoint)?.isPermanent == false
-        } else {
-            false
-        }
-        let activated = eligible && (bootstrapState?.activation != nil || (globalOverseer && oversightEnabled))
+        let activated = eligible && bootstrapState?.activation != nil
         var snapshot = LiveSessionLinkGrantSnapshot(
             routeToken: routeToken,
             hasAnyActiveLink: hasAnyActiveLink,
             hasActiveOutboundLink: hasActiveOutboundLink,
-            // The targeted bootstrap remains reachable for another exact-target request. It
-            // requests consent; activation and existing links never grant scope authority.
-            canBecomeOverseer: isEnabledState && oversightEnabled && eligible,
+            canBecomeOverseer: isEnabledState && oversightEnabled && eligible && !activated && !hasAnyActiveLink,
             hasActivatedOverseer: activated
         )
         // Explicit incarnation-local overseer opt-in can request a scope, but grants no scope
         // authority. Keep durable scope eligibility independent of activation retirement.
-        snapshot.canListBecomeOverseer = isEnabledState && oversightEnabled && (eligible || transientlyIneligible)
-        // Every session that can become an overseer also sees session_admin from its first turn,
-        // so it can request a scope without waiting for a catalog refresh some providers (Codex)
-        // never perform mid-thread. Listing grants nothing: each op re-authorizes at execution.
-        snapshot.isSessionAdminEligible = snapshot.canListBecomeOverseer
-            || holdsLiveScope
+        snapshot.isSessionAdminEligible = holdsLiveScope
             || runState.allowsAgentExternalControlTools
             || hasActiveOutboundLink
             || (activated && oversightEnabled)
@@ -3489,7 +3465,7 @@ actor ServerNetworkManager {
             taskLabelKind: policy.taskLabelKind,
             allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools,
             hasExactAgentSessionLinkGrant: snapshot.hasAnyActiveLink,
-            canBecomeOverseer: snapshot.canListBecomeOverseer,
+            canBecomeOverseer: snapshot.canBecomeOverseer,
             hasActivatedOverseer: snapshot.hasActivatedOverseer
         )
         let catalog = await domainHost.advertisedCatalog(.init(
@@ -5309,13 +5285,6 @@ actor ServerNetworkManager {
     /// Use this at true end-of-scope boundaries (session deletion, tab/window close),
     /// not for normal observer lifecycle teardown.
     func cleanupRunRoutingState(for runID: UUID, windowID: Int? = nil) async {
-        // Retiring a route also retires its unconsumed/reserved bootstrap intent.
-        // Do this before the first actor hop: a late peer must not reinstall a terminal run.
-        pendingPolicyApplicationIDByRunID.removeValue(forKey: runID)
-        for key in Array(pendingPoliciesByClient.keys) {
-            pendingPoliciesByClient[key]?.removeAll { $0.runID == runID }
-            if pendingPoliciesByClient[key]?.isEmpty == true { pendingPoliciesByClient.removeValue(forKey: key) }
-        }
         await terminateRunCatalogObservation(runID: runID)
         runPolicyStateByRunID.removeValue(forKey: runID)
         admittedPolicyRunIDs.remove(runID)
@@ -11683,7 +11652,7 @@ actor ServerNetworkManager {
                 taskLabelKind: policy.taskLabelKind,
                 allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools,
                 hasExactAgentSessionLinkGrant: sessionLinkGrantSnapshot?.hasAnyActiveLink == true,
-                canBecomeOverseer: sessionLinkGrantSnapshot?.canListBecomeOverseer == true,
+                canBecomeOverseer: sessionLinkGrantSnapshot?.canBecomeOverseer == true,
                 hasActivatedOverseer: sessionLinkGrantSnapshot?.hasActivatedOverseer == true
             )
             let advertisement = await domainHost.advertisedCatalog(
@@ -12236,14 +12205,9 @@ actor ServerNetworkManager {
         requireRunRouting: Bool = true,
         expectedLifecycleGeneration: UInt64? = nil
     ) async -> PendingPolicyApplicationOutcome {
-        let initialSessionKey = connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID]
-        let initialRunID = runIDByConnectionID[connectionID]
-            ?? preferredLiveRunAffinity(for: clientName, sessionKey: initialSessionKey)?.runID
-        if let reservedEntry = oldestPendingPolicyEntry(for: clientName, where: {
-            $0.reservationConnectionID != nil
-                && (initialRunID == nil || $0.runID == initialRunID)
-                && canConsumePendingPolicy($0, clientName: clientName, clientPid: clientPid)
-        }) {
+        if let reservedEntry = oldestReservedPendingPolicyEntry(for: clientName),
+           canConsumePendingPolicy(reservedEntry.policy, clientName: clientName, clientPid: clientPid)
+        {
             mcpPolicyLog(
                 "pending policy route installation already reserved client=\(clientName) connection=\(connectionID) reservedConnection=\(reservedEntry.policy.reservationConnectionID?.uuidString ?? "nil") runID=\(reservedEntry.policy.runID?.uuidString ?? "nil")"
             )
@@ -12362,44 +12326,16 @@ actor ServerNetworkManager {
             #endif
         }
 
-        // A PID proves ancestry, not which run a shared provider process is serving.
-        // Prefer the exact connection/token binding before selecting a pending policy;
-        // never assign an unbound peer to an arbitrary run by FIFO.
-        let boundRunID = await runIDForConnection(connectionID)
-        let sessionKey = connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID]
-        let liveAffinity = preferredLiveRunAffinity(for: clientName, sessionKey: sessionKey)
-        if let boundRunID, let liveAffinity, boundRunID != liveAffinity.runID {
-            return .rejected(runID: boundRunID, reason: "session_token_bound_to_other_run")
-        }
-        let exactRunID = boundRunID ?? liveAffinity?.runID
         let hasPIDGatedPolicy = hasPIDGatedPendingPolicy(for: clientName)
-        let eligible: (ClientConnectionPolicy) -> Bool = { policy in
-            policy.reservationConnectionID == nil
-                && (!hasPIDGatedPolicy || policy.requiresExpectedAgentPID)
-                && self.canConsumePendingPolicy(policy, clientName: clientName, clientPid: clientPid)
-                && (exactRunID == nil || policy.runID == exactRunID)
-        }
-        if exactRunID == nil,
-           let first = oldestPendingPolicyEntry(for: clientName, where: eligible),
-           first.policy.purpose == .agentModeRun, let firstRunID = first.policy.runID,
-           oldestPendingPolicyEntry(for: clientName, where: {
-               eligible($0) && $0.runID != nil && $0.runID != firstRunID
-           }) != nil || admittedPolicyRunIDs.contains(where: { otherRunID in
-               otherRunID != firstRunID
-                   && runPolicyStateByRunID[otherRunID]?.purpose == .agentModeRun
-                   && clientPid.map {
-                       isExpectedAgentDescendant(clientName: clientName, clientPid: $0, runID: otherRunID) == true
-                   } == true
-           })
-        {
-            return .rejected(runID: nil, reason: "ambiguous_run_policy")
-        }
-        let matchedQueueEntry = oldestPendingPolicyEntry(for: clientName, where: eligible)
-        guard let matchedQueueEntry else {
-            if liveAffinity != nil {
-                await applyRoutingFallback(clientName: clientName, connectionID: connectionID, clientPid: clientPid)
-                return .fallback
+        let matchedQueueEntry = if hasPIDGatedPolicy {
+            oldestPIDGatedPendingPolicyEntry(for: clientName, matching: clientPid ?? -1)
+        } else {
+            oldestPendingPolicyEntry(for: clientName) { policy in
+                policy.reservationConnectionID == nil
+                    && canConsumePendingPolicy(policy, clientName: clientName, clientPid: clientPid)
             }
+        }
+        guard let matchedQueueEntry else {
             #if DEBUG
                 debugPolicyDiagnostic("pendingPolicyMiss", connectionID: connectionID, extra: [
                     "clientName": clientName,
@@ -12424,6 +12360,8 @@ actor ServerNetworkManager {
             await applyRoutingFallback(clientName: clientName, connectionID: connectionID, clientPid: clientPid)
             return .fallback
         }
+        let sessionKey = connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID]
+        let liveAffinity = preferredLiveRunAffinity(for: clientName, sessionKey: sessionKey)
         var queue = pendingPoliciesByClient[matchedQueueEntry.key] ?? []
         mcpRoutingLog("Applying FIFO policy client=\(clientName) matchedKey=\(matchedQueueEntry.key) connectionID=\(connectionID) queueLength=\(queue.count) policyWindow=\(matchedQueueEntry.policy.windowID)")
         let policy: ClientConnectionPolicy
@@ -13282,7 +13220,7 @@ actor ServerNetworkManager {
                 taskLabelKind: policy.taskLabelKind,
                 allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools,
                 hasExactAgentSessionLinkGrant: sessionLinkGrantSnapshot?.hasAnyActiveLink == true,
-                canBecomeOverseer: sessionLinkGrantSnapshot?.canListBecomeOverseer == true,
+                canBecomeOverseer: sessionLinkGrantSnapshot?.canBecomeOverseer == true,
                 hasActivatedOverseer: sessionLinkGrantSnapshot?.hasActivatedOverseer == true
             )
             // The domain host owns canonical filtering; this app shell retains only
@@ -13796,7 +13734,7 @@ actor ServerNetworkManager {
                     taskLabelKind: effectivePolicy.taskLabelKind,
                     allowsAgentExternalControlTools: effectivePolicy.allowsAgentExternalControlTools,
                     hasExactAgentSessionLinkGrant: liveSessionLinkGrant?.hasAnyActiveLink == true,
-                    canBecomeOverseer: liveSessionLinkGrant?.canListBecomeOverseer == true,
+                    canBecomeOverseer: liveSessionLinkGrant?.canBecomeOverseer == true,
                     hasActivatedOverseer: liveSessionLinkGrant?.hasActivatedOverseer == true
                 )
                 do {
@@ -13904,7 +13842,7 @@ actor ServerNetworkManager {
                     taskLabelKind: policy.taskLabelKind,
                     allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools,
                     hasExactAgentSessionLinkGrant: liveSessionLinkGrant?.hasAnyActiveLink == true,
-                    canBecomeOverseer: liveSessionLinkGrant?.canListBecomeOverseer == true,
+                    canBecomeOverseer: liveSessionLinkGrant?.canBecomeOverseer == true,
                     hasActivatedOverseer: liveSessionLinkGrant?.hasActivatedOverseer == true
                 )
                 preAdmissionDecision = try await domainHost.evaluatePreAdmissionCallPolicy(

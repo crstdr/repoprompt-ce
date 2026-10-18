@@ -6,21 +6,17 @@ package struct DomainDelegationScopeGrantRequest: Hashable, Sendable {
     package let kind: DomainDelegationScopeKind
     package let capabilities: Set<DomainDelegationScopeCapability>
     package let guardrails: DomainDelegationScopeGuardrails
-    /// Global auto-approve only. See `DomainDelegationScopeGrant.unrestricted`.
-    package let unrestricted: Bool
 
     package init(
         granteeSessionID: UUID,
         kind: DomainDelegationScopeKind,
         capabilities: Set<DomainDelegationScopeCapability>,
-        guardrails: DomainDelegationScopeGuardrails,
-        unrestricted: Bool = false
+        guardrails: DomainDelegationScopeGuardrails
     ) {
         self.granteeSessionID = granteeSessionID
         self.kind = kind
         self.capabilities = capabilities
         self.guardrails = guardrails
-        self.unrestricted = unrestricted
     }
 }
 
@@ -233,11 +229,10 @@ package struct DomainDelegationScopeAuthority: Sendable {
         kind: DomainDelegationScopeKind,
         capabilities: Set<DomainDelegationScopeCapability>,
         guardrails: DomainDelegationScopeGuardrails,
-        now: Date,
-        unrestricted: Bool = false
+        now: Date
     ) -> DomainDelegationScopeDenial? {
         guard !capabilities.isEmpty else { return .capabilitiesEmpty }
-        if case .allSessions = kind, !unrestricted {
+        if case .allSessions = kind {
             let forbidden = capabilities.subtracting(DomainDelegationScopeCapability.allSessionsPermitted)
             if let first = DomainDelegationScopeCapability.allCases.first(where: forbidden.contains) {
                 return .capabilityNotPermittedForKind(first)
@@ -263,8 +258,7 @@ package struct DomainDelegationScopeAuthority: Sendable {
             kind: request.kind,
             capabilities: request.capabilities,
             guardrails: request.guardrails,
-            now: now,
-            unrestricted: request.unrestricted
+            now: now
         ) {
             return .failure(denial)
         }
@@ -276,8 +270,7 @@ package struct DomainDelegationScopeAuthority: Sendable {
             capabilities: request.capabilities,
             guardrails: request.guardrails,
             origin: .user,
-            grantedAt: now,
-            unrestricted: request.unrestricted
+            grantedAt: now
         )
         return .success(install(grant, state: .active))
     }
@@ -396,7 +389,6 @@ package struct DomainDelegationScopeAuthority: Sendable {
             .filter { record in
                 guard record.isActive else { return false }
                 if record.grant.granteeSessionID == sessionID { return true }
-                if case let .session(target) = record.grant.kind { return target == sessionID }
                 if case let .tree(rootSessionID) = record.grant.kind { return rootSessionID == sessionID }
                 return false
             }
@@ -451,8 +443,7 @@ package struct DomainDelegationScopeAuthority: Sendable {
                     kind: grant.kind,
                     capabilities: grant.capabilities,
                     guardrails: grant.guardrails,
-                    now: now,
-                    unrestricted: grant.unrestricted
+                    now: now
                 ) == nil else { continue }
                 installed.append(install(grant, state: .active))
                 progressed = true
@@ -595,12 +586,9 @@ package struct DomainDelegationScopeAuthority: Sendable {
     package static func confirmationRequirement(
         operation: DomainAgentSessionTargetOperation,
         itemCount: Int,
-        guardrails: DomainDelegationScopeGuardrails,
-        unrestricted: Bool = false
+        guardrails: DomainDelegationScopeGuardrails
     ) -> DomainDelegationScopeConfirmationReason? {
-        // Global auto-approve means no cards at all, including bulk and always-carded operations.
-        guard !unrestricted else { return nil }
-        return switch operation.scopeConfirmationClass {
+        switch operation.scopeConfirmationClass {
         case .none:
             nil
         case .alwaysCarded:
@@ -772,8 +760,7 @@ package struct DomainDelegationScopeAuthority: Sendable {
                   let reason = Self.confirmationRequirement(
                       operation: operation,
                       itemCount: admitted.count,
-                      guardrails: live.grant.guardrails,
-                      unrestricted: live.grant.unrestricted
+                      guardrails: live.grant.guardrails
                   )
         {
             return .confirmationRequired(reason, items)
@@ -834,7 +821,7 @@ package struct DomainDelegationScopeAuthority: Sendable {
         in grant: DomainDelegationScopeGrant
     ) -> Bool {
         guard grant.capabilities.contains(capability) else { return false }
-        if case .allSessions = grant.kind, !grant.unrestricted {
+        if case .allSessions = grant.kind {
             return DomainDelegationScopeCapability.allSessionsPermitted.contains(capability)
         }
         return true
@@ -849,8 +836,6 @@ package struct DomainDelegationScopeAuthority: Sendable {
     ) -> Bool {
         guard proof.scopeID == grant.id, proof.targetSessionID == targetSessionID else { return false }
         switch (grant.kind, proof.basis) {
-        case let (.session(target), .exactSession):
-            return targetSessionID == target || targetSessionID == grant.granteeSessionID
         case let (.tree(rootSessionID), .treePath(path)):
             return path.first == targetSessionID
                 && path.last == rootSessionID

@@ -1998,8 +1998,9 @@ final class AgentSidebarRowInvalidationTests: XCTestCase {
         XCTAssertEqual(headers.first, "Yesterday", "The day-change notification must relabel the headers")
     }
 
-    /// Continuity diagnostics do not replace live eligibility or recorded relationship facts.
-    /// A later readiness notification must not re-render every marked row for a save-only change.
+    /// The persistence presentation overlays `observerIneligibleReason` onto marked rows' summaries
+    /// without posting a sidebar invalidation, and closed rows never render it. Recorded facts must
+    /// not carry it, or the next unrelated notification re-renders every marked row for nothing.
     func testPersistencePresentationChangeDoesNotDriftRecordedRowFacts() async throws {
         let fixture = try await makeFixture()
         let observerID = try XCTUnwrap(fixture.tabs[0].activeAgentSessionID)
@@ -2013,8 +2014,11 @@ final class AgentSidebarRowInvalidationTests: XCTestCase {
         changedModelFields = []
 
         fixture.vm.agentSessionLinkApplyPersistencePresentation(.init(availability: .blocked("Saved links are read-only.")))
-        let summary = try XCTUnwrap(fixture.vm.agentSidebarOversightSummary(tabID: fixture.tabs[1].id, expectedSessionID: targetID))
-        XCTAssertNil(summary.observerIneligibleReason, "Continuity diagnostics must not veto the live relationship")
+        XCTAssertNotNil(
+            fixture.vm.agentSidebarOversightSummary(tabID: fixture.tabs[1].id, expectedSessionID: targetID)?
+                .observerIneligibleReason,
+            "Precondition: the live summary now carries the persistence blocker"
+        )
         NotificationCenter.default.post(name: .agentSessionLinkCandidatesDidChange, object: nil)
         await render(fixture, currentTabID: fixture.tabs[0].id)
 
@@ -2302,7 +2306,7 @@ final class AgentSidebarRowInvalidationTests: XCTestCase {
         XCTFail("""
         Fixture never settled: \((previous?.rows ?? []).count { $0 == "pending" }) rows pending; \
         probe endpoint=\(endpoint != nil) candidate=\(candidate != nil) \
-        failure=\(String(describing: candidate.flatMap { AgentSessionLinkEndpointEligibility.targetResolveFailure(for: $0) })) \
+        failure=\(String(describing: candidate.flatMap(AgentSessionLinkEndpointEligibility.targetResolveFailure(for:)))) \
         loaded=\(session.hasLoadedPersistedState) loadTask=\(session.persistedLoadTask != nil) \
         transition=\(session.bindingTransitionInProgress) active=\(String(describing: session.activeAgentSessionID == probeSessionID))
         """)

@@ -88,7 +88,7 @@ struct DomainWorkspaceAuthorityClient {
         _ workspace: WorkspaceModel,
         fileURL: URL
     ) async throws -> DomainWorkspaceSnapshot {
-        try await store.registerReadDocument(Self.document(for: workspace, fileURL: fileURL))
+        try await store.registerReadDocument(document(for: workspace, fileURL: fileURL))
     }
 
     func create(
@@ -97,7 +97,7 @@ struct DomainWorkspaceAuthorityClient {
         expectedCatalogRevision: UInt64? = nil,
         operationID: UUID = UUID()
     ) async throws -> DomainCommandOutcome {
-        let document = try Self.document(for: workspace, fileURL: fileURL)
+        let document = try document(for: workspace, fileURL: fileURL)
         let envelope = DomainWorkspaceCommandEnvelope(
             operationID: operationID,
             expectedCatalogRevision: expectedCatalogRevision,
@@ -124,7 +124,7 @@ struct DomainWorkspaceAuthorityClient {
         canonicalRootPath: String,
         operationID: UUID = UUID()
     ) async throws -> DomainCommandOutcome {
-        let document = try Self.document(for: workspace, fileURL: fileURL)
+        let document = try document(for: workspace, fileURL: fileURL)
         return await executeStable(.init(
             operationID: operationID,
             expectedWorkspaceRevision: 0,
@@ -142,7 +142,7 @@ struct DomainWorkspaceAuthorityClient {
         expectedWorkspaceRevision: UInt64?,
         operationID: UUID = UUID()
     ) async throws -> DomainCommandOutcome {
-        let document = try Self.document(for: workspace, fileURL: fileURL)
+        let document = try document(for: workspace, fileURL: fileURL)
         return await executeStable(.init(
             operationID: operationID,
             expectedWorkspaceRevision: expectedWorkspaceRevision,
@@ -159,16 +159,7 @@ struct DomainWorkspaceAuthorityClient {
         expectedWorkspaceRevision: UInt64,
         operationID: UUID = UUID()
     ) async throws -> DomainCommandOutcome {
-        let document = try await WorkspaceFileDecodeCache.shared.documentPreparation.document(for: workspace, fileURL: fileURL)
-        return try await replaceWorkingFailClosed(document, expectedWorkspaceRevision: expectedWorkspaceRevision, operationID: operationID)
-    }
-
-    func replaceWorkingFailClosed(
-        _ document: DomainWorkspaceDocument,
-        expectedWorkspaceRevision: UInt64,
-        operationID: UUID = UUID()
-    ) async throws -> DomainCommandOutcome {
-        try Task.checkCancellation()
+        let document = try document(for: workspace, fileURL: fileURL)
         return await executeStable(.init(
             operationID: operationID,
             expectedWorkspaceRevision: expectedWorkspaceRevision,
@@ -203,7 +194,7 @@ struct DomainWorkspaceAuthorityClient {
         expectedContentDigest: String?,
         operationIDs: DomainWorkspaceSaveOperationIDs = .init()
     ) async throws -> DomainWorkspacePhasedSaveOutcome {
-        let document = try Self.document(for: workspace, fileURL: fileURL)
+        let document = try document(for: workspace, fileURL: fileURL)
         var saveRevision = expectedWorkspaceRevision
         var workingOutcome: DomainCommandOutcome?
         if document.contentDigest != expectedContentDigest {
@@ -256,22 +247,7 @@ struct DomainWorkspaceAuthorityClient {
         expectedContentDigest: String,
         operationIDs: DomainWorkspaceSaveOperationIDs = .init()
     ) async throws -> DomainWorkspaceFailClosedSaveOutcome {
-        let document = try await WorkspaceFileDecodeCache.shared.documentPreparation.document(for: workspace, fileURL: fileURL)
-        return try await saveFailClosed(
-            document,
-            expectedWorkspaceRevision: expectedWorkspaceRevision,
-            expectedContentDigest: expectedContentDigest,
-            operationIDs: operationIDs
-        )
-    }
-
-    func saveFailClosed(
-        _ document: DomainWorkspaceDocument,
-        expectedWorkspaceRevision: UInt64,
-        expectedContentDigest: String,
-        operationIDs: DomainWorkspaceSaveOperationIDs = .init()
-    ) async throws -> DomainWorkspaceFailClosedSaveOutcome {
-        try Task.checkCancellation()
+        let document = try document(for: workspace, fileURL: fileURL)
         var saveRevision = expectedWorkspaceRevision
         var workingOutcome: DomainCommandOutcome?
         if document.contentDigest != expectedContentDigest {
@@ -298,7 +274,7 @@ struct DomainWorkspaceAuthorityClient {
             expectedWorkspaceRevision: saveRevision,
             conflictRecoveryPolicy: .failClosed,
             origin: .appPresentation(windowID: windowID),
-            command: .saveWorkspaceDocument(workspaceID: document.workspaceID)
+            command: .saveWorkspaceDocument(workspaceID: workspace.id)
         ))
         return DomainWorkspaceFailClosedSaveOutcome(
             working: workingOutcome,
@@ -326,7 +302,7 @@ struct DomainWorkspaceAuthorityClient {
         return await store.snapshot()
     }
 
-    static func document(for workspace: WorkspaceModel, fileURL: URL) throws -> DomainWorkspaceDocument {
+    private func document(for workspace: WorkspaceModel, fileURL: URL) throws -> DomainWorkspaceDocument {
         let bytes = try DomainWorkspaceModelEncoder.encode(workspace)
         return try DomainWorkspaceDocument.decode(documentBytes: bytes, fileURL: fileURL)
     }
@@ -456,16 +432,6 @@ final class DomainWorkspacePresentationBridge {
         }
     }
 
-    /// Admission joins the existing catalog owner before creating or re-submitting a provisional
-    /// binding. Reading a newer revision alone never qualifies a local whole-document write.
-    func refreshForAgentAdmission() async -> Bool {
-        guard let runID = subscriptionRunID, isCurrentRun(runID) else { return false }
-        requestCatalogRefresh(isRetry: false)
-        guard let task = catalogRefreshTask else { return false }
-        await task.value
-        return isCurrentRun(runID)
-    }
-
     /// Close/stop cancellation: never publishes an error. A task already inside runtime I/O may finish
     /// there; its result is discarded by the run/cancellation checks.
     func cancelCatalogRefresh() {
@@ -491,8 +457,6 @@ final class DomainWorkspacePresentationBridge {
     #if DEBUG
         /// Captured by each refresh before scheduling; never substitutes the authority result.
         var afterCatalogReloadForTesting: (@MainActor () async -> Void)?
-        /// Holds the real preparation/apply boundary, never substitutes decoded models.
-        var catalogPreparationDidFinishForTesting: (@MainActor (_ wasOnMainThread: Bool) async -> Void)?
 
         private var initialDefaultCreateOverride: (outcome: DomainCommandOutcome, observeCandidate: (WorkspaceModel) -> Void)?
 
@@ -693,27 +657,23 @@ final class DomainWorkspacePresentationBridge {
         attempt: DomainCatalogAttempt,
         runID: UUID
     ) async {
-        /// A manager reconciliation can cover the data without crediting this bridge's waiter/cache.
-        /// Give that handoff the same single refetch budget, never an invented checkpoint.
-        func needsCurrentSnapshot(
+        /// A covering accepted reconciliation (e.g. a newer retry/event/reload) needs nothing further.
+        func isUncoveredFreshnessRejection(
             _ rejection: DomainCatalogRejection?, _ snapshot: DomainWorkspaceCatalogSnapshot
         ) -> Bool {
             guard let rejection, [.stalePublication, .staleCatalogRevision, .reentrant, .superseded].contains(rejection)
             else { return false }
-            guard let manager = workspaceManager else { return false }
-            return !manager.coversDomainCatalog(snapshot)
-                || lastPublicationSequence < snapshot.publicationSequence
-                || acceptedReconciliationGeneration != manager.domainCatalogReconciliationGeneration
+            return workspaceManager?.coversDomainCatalog(snapshot) == false
         }
-        var rejection = await project(snapshot, attempt: attempt, runID: runID)
+        var rejection = project(snapshot, attempt: attempt, runID: runID)
         var resolved = snapshot
-        if needsCurrentSnapshot(rejection, snapshot), let refetchAttempt = workspaceManager?.beginDomainCatalogAttempt() {
+        if isUncoveredFreshnessRejection(rejection, snapshot), let refetchAttempt = workspaceManager?.beginDomainCatalogAttempt() {
             let refetched = await client.snapshot()
             guard isCurrentRun(runID) else { return }
-            rejection = await project(refetched, attempt: refetchAttempt, runID: runID, allowCoveredMetadata: true)
+            rejection = project(refetched, attempt: refetchAttempt, runID: runID)
             resolved = refetched
             // Budget exhausted: a visible, retryable failure rather than permanent loading.
-            if needsCurrentSnapshot(rejection, refetched), workspaceManager?.coversDomainCatalog(refetched) == false {
+            if isUncoveredFreshnessRejection(rejection, refetched) {
                 workspaceManager?.reportDomainCatalogFailure(
                     .catalogChangedDuringRefresh, snapshot: refetched, attempt: refetchAttempt
                 )
@@ -780,9 +740,8 @@ final class DomainWorkspacePresentationBridge {
     private func project(
         _ snapshot: DomainWorkspaceCatalogSnapshot,
         attempt: DomainCatalogAttempt,
-        runID: UUID,
-        allowCoveredMetadata: Bool = false
-    ) async -> DomainCatalogRejection? {
+        runID: UUID
+    ) -> DomainCatalogRejection? {
         guard isCurrentRun(runID), let manager = workspaceManager else { return nil }
         if let rejection = manager.catalogReadRejection(snapshot, attempt: attempt) { return rejection }
         guard snapshot.isBootstrapped else {
@@ -804,39 +763,22 @@ final class DomainWorkspacePresentationBridge {
         let baselineGeneration = acceptedReconciliationGeneration
             .flatMap { $0 == manager.domainCatalogReconciliationGeneration ? $0 : nil }
         var cacheIsTrusted = baselineGeneration != nil && !manager.requiresFullCatalogReconciliation
-        let cachedMetadataIsQualified = baselineGeneration != nil
-            && Set(projectedModels.keys) == Set(nextDigests.keys) && projectedDigests == nextDigests
-            && records.allSatisfy { record in
-                guard let generation = manager.adoptedFullDocumentGeneration(
-                    workspaceID: record.document.workspaceID, contentDigest: record.document.contentDigest
-                ) else { return false }
-                return projectedAdoptionGenerations[record.document.workspaceID] == generation
-            }
-        // A real full reconciliation may have won while our CPU preparation was suspended.
-        // Its qualified descendants already contain these exact canonical documents. Adopt that
-        // owner's metadata baseline instead of decoding/adopting them again or stranding waiters.
-        let coveredMetadataIsQualified = allowCoveredMetadata && baselineGeneration == nil
-            && manager.domainCatalogReconciliationGeneration > 0
-            && !manager.requiresFullCatalogReconciliation
-            && manager.coversDomainCatalog(snapshot)
-            && records.allSatisfy { record in
-                manager.qualifiedDomainWorkspaceDescendant(record) != nil
-            }
-        let metadataGeneration = cachedMetadataIsQualified ? baselineGeneration
-            : (coveredMetadataIsQualified ? manager.domainCatalogReconciliationGeneration : nil)
-        if let metadataGeneration {
+        if let baselineGeneration, Set(projectedModels.keys) == Set(nextDigests.keys), projectedDigests == nextDigests,
+           records.allSatisfy({ record in
+               guard let generation = manager.adoptedFullDocumentGeneration(
+                   workspaceID: record.document.workspaceID, contentDigest: record.document.contentDigest
+               ) else { return false }
+               return projectedAdoptionGenerations[record.document.workspaceID] == generation
+           })
+        {
             switch manager.applyDomainWorkspaceCatalog(
                 snapshot,
-                projection: .metadata(baselineGeneration: metadataGeneration),
+                projection: .metadata(baselineGeneration: baselineGeneration),
                 preferredActiveWorkspaceID: nil,
                 rootMapPolicy: .snapshotMetadata,
                 attempt: attempt
             ) {
             case let .accepted(receipt):
-                guard isCurrentRun(runID) else { return nil }
-                if coveredMetadataIsQualified {
-                    cacheAcceptedModels(records, availableModelIDs: Set(nextDigests.keys))
-                }
                 commitAccepted(receipt, digests: nextDigests, runID: runID)
                 return nil
             case .rejected(.fullProjectionRequired):
@@ -846,11 +788,9 @@ final class DomainWorkspacePresentationBridge {
             }
         }
 
-        // Capture provenance, not manager references, before yielding for CPU work. Cached local
-        // descendants are re-read only after that witness and the authority floors are revalidated.
-        let preparationWitness = manager.catalogPreparationWitness
-        var reusableIDs: Set<UUID> = []
-        var recordsToDecode: [DomainWorkspaceSnapshot] = []
+        // Decode failures degrade only their authoritative member. Keep all-record digests below:
+        // missing model keys force the next snapshot to retry even an unchanged failed document.
+        var nextModels: [UUID: WorkspaceModel] = [:]
         var failedIDs: Set<UUID> = []
         for record in records {
             let workspaceID = record.document.workspaceID
@@ -858,49 +798,18 @@ final class DomainWorkspacePresentationBridge {
                let generation = manager.adoptedFullDocumentGeneration(workspaceID: workspaceID, contentDigest: record.document.contentDigest),
                projectedAdoptionGenerations[workspaceID] == generation,
                projectedModels[workspaceID] != nil,
-               manager.workspace(withID: workspaceID) != nil
+               let current = manager.workspace(withID: workspaceID)
             {
-                reusableIDs.insert(workspaceID)
+                // The generation proves a shared canonical ancestor, not that the cached model
+                // contains edits made since its last projection. Preserve the current descendant.
+                nextModels[workspaceID] = current
             } else {
                 do {
-                    try manager.checkDomainWorkspaceCatalogRecordDecoding(record)
-                    recordsToDecode.append(record)
+                    nextModels[workspaceID] = try manager.decodeDomainWorkspaceCatalogRecord(record)
                 } catch {
                     failedIDs.insert(workspaceID)
                 }
             }
-        }
-        var nextModels: [UUID: WorkspaceModel] = [:]
-        if !recordsToDecode.isEmpty {
-            do {
-                let prepared = try await WorkspaceFileDecodeCache.shared.documentPreparation.decode(recordsToDecode)
-                #if DEBUG
-                    await catalogPreparationDidFinishForTesting?(prepared.wasOnMainThread)
-                #endif
-                guard isCurrentRun(runID) else { return .cancelled }
-                if let rejection = manager.catalogReadRejection(snapshot, attempt: attempt) { return rejection }
-                guard manager.catalogPreparationWitness == preparationWitness else {
-                    #if DEBUG
-                        AgentModePerfDiagnostics.increment("workspace.prepare.projectionDiscarded")
-                    #endif
-                    return .superseded
-                }
-                nextModels = prepared.models
-                failedIDs.formUnion(prepared.failedIDs)
-                // A point read may have adopted this exact document before this bridge had a cache.
-                // Keep its current local descendant, but only after a successful canonical decode
-                // and the unchanged preparation witness. A failed decode is never rescued here.
-                for record in recordsToDecode where nextModels[record.document.workspaceID] != nil {
-                    if let descendant = manager.qualifiedDomainWorkspaceDescendant(record) {
-                        nextModels[record.document.workspaceID] = descendant
-                    }
-                }
-            } catch {
-                return .cancelled
-            }
-        }
-        for workspaceID in reusableIDs {
-            nextModels[workspaceID] = manager.workspace(withID: workspaceID)
         }
         // Presentation-only availability, never a write to authoritative membership. The existing
         // incomplete-catalog warning carries the failed IDs and keeps valid rows usable. The manager
@@ -924,18 +833,11 @@ final class DomainWorkspacePresentationBridge {
         // Accepted chooser publication can synchronously adopt another model for the same digest.
         // Read each model and its witness together after those callbacks; never stamp an older
         // pre-application overlay with a newly observed owner generation.
-        cacheAcceptedModels(records, availableModelIDs: Set(nextModels.keys))
-        commitAccepted(receipt, digests: nextDigests, runID: runID)
-        return nil
-    }
-
-    private func cacheAcceptedModels(_ records: [DomainWorkspaceSnapshot], availableModelIDs: Set<UUID>) {
-        guard let manager = workspaceManager else { return }
         var acceptedModels: [UUID: WorkspaceModel] = [:]
         var acceptedGenerations: [UUID: UInt64] = [:]
         for record in records {
             let workspaceID = record.document.workspaceID
-            guard availableModelIDs.contains(workspaceID),
+            guard nextModels[workspaceID] != nil,
                   let generation = manager.adoptedFullDocumentGeneration(workspaceID: workspaceID, contentDigest: record.document.contentDigest),
                   let model = manager.workspace(withID: workspaceID)
             else { continue }
@@ -944,6 +846,8 @@ final class DomainWorkspacePresentationBridge {
         }
         projectedModels = acceptedModels
         projectedAdoptionGenerations = acceptedGenerations
+        commitAccepted(receipt, digests: nextDigests, runID: runID)
+        return nil
     }
 
     private func commitAccepted(

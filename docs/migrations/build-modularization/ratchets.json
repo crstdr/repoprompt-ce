@@ -1,5 +1,5 @@
 {
-  "description": "Fork sync 2026-10-15: upstream e310a32ee429baeb0f182eac85077978d8c83a10 baseline/enforcement plus measured positive fork-only deltas through fork main 54eee9d43 (#165): app_shared_accessor_uses +10, app_target_swift_files +6, app_target_swift_lines +2994, app_wrong_way_file_edges +12, first_party_swift_lines +3317, tests_sleep_calls +1, tests_testable_import_app_files +5. Existing upstream drift is not absorbed. Fork sync 2026-10-18: app_files_over_2000_lines 47->48 for combined AgentManageMCPToolService.swift (2005 lines); all other ceilings unchanged, per explicit fork sync decision.",
+  "description": "Fork sync 2026-10-15: upstream e310a32ee429baeb0f182eac85077978d8c83a10 baseline/enforcement plus measured positive fork-only deltas through fork main 54eee9d43 (#165): app_shared_accessor_uses +10, app_target_swift_files +6, app_target_swift_lines +2994, app_wrong_way_file_edges +12, first_party_swift_lines +3317, tests_sleep_calls +1, tests_testable_import_app_files +5. Existing upstream drift is not absorbed.",
   "ratcheted": [
     "app_files_over_5000_lines",
     "app_files_over_2000_lines",
@@ -17,7 +17,7 @@
   ],
   "metrics": {
     "app_components": 69,
-    "app_files_over_2000_lines": 48,
+    "app_files_over_2000_lines": 47,
     "app_files_over_5000_lines": 16,
     "app_largest_cycle_components": 64,
     "app_share_permille": 868,

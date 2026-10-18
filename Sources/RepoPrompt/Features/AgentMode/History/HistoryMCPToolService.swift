@@ -1602,16 +1602,7 @@ enum HistoryMCPToolService {
         // a demoted turn that still retains its conclusion exposes the notice too.
         if turn.retentionTier != .full, roles.contains("summary") {
             let diagnostics = turn.summary?.normalizedRecoveryDiagnostics ?? []
-            let rendersConclusion = turn.isStructurallyCompacted
-                ? historySummaryText(turn.summary) != nil
-                : roles.contains("assistant") && turn.conclusionActivityID != nil
-            let diagnosticEntryLimit = maxGetSessionEntriesPerTurn - (rendersConclusion ? 1 : 0)
             for diagnostic in diagnostics where remainingChars > 0 {
-                if entries.count >= diagnosticEntryLimit {
-                    entriesOmitted += 1
-                    turnTruncated = true
-                    continue
-                }
                 appendGetSessionEntry(
                     role: "summary",
                     text: diagnostic.text,
@@ -1624,19 +1615,14 @@ enum HistoryMCPToolService {
         }
 
         if turn.isStructurallyCompacted, roles.contains("summary"), let summaryText = historySummaryText(turn.summary), remainingChars > 0 {
-            if entries.count >= maxGetSessionEntriesPerTurn {
-                entriesOmitted += 1
-                turnTruncated = true
-            } else {
-                appendGetSessionEntry(
-                    role: "summary",
-                    text: summaryText,
-                    perEntryMaxChars: 2000,
-                    entries: &entries,
-                    remainingChars: &remainingChars,
-                    turnTruncated: &turnTruncated
-                )
-            }
+            appendGetSessionEntry(
+                role: "summary",
+                text: summaryText,
+                perEntryMaxChars: 2000,
+                entries: &entries,
+                remainingChars: &remainingChars,
+                turnTruncated: &turnTruncated
+            )
         }
 
         for (activityIndex, activity) in turn.allActivities.enumerated() {

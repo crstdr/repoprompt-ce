@@ -117,7 +117,7 @@ final class AppDomainRuntimeComposition: Sendable {
         ).first ?? FileManager.default.temporaryDirectory
         let root = applicationSupport.appendingPathComponent("RepoPrompt CE", isDirectory: true)
         let defaults = UserDefaults.standard
-        let customStoragePath = WorkspaceStoragePreference.customStoragePath(defaults: defaults)
+        let customStoragePath = defaults.string(forKey: "GlobalCustomStorageURL")
         var legacyRuntimeDefaults = Self.collectLegacyRuntimeDefaults(from: defaults)
         if let customStoragePath,
            let bytes = try? JSONEncoder().encode(customStoragePath)
