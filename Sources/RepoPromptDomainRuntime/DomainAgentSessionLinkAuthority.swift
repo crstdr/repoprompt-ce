@@ -1021,6 +1021,23 @@ package actor DomainAgentSessionLinkAuthority {
         return nil
     }
 
+    /// One all-or-none actor transition at optional provider disclosure. Reuses the exact operation
+    /// authorizer and Read-cursor lease validator; allocates no cursor and mutates no authority state.
+    package func validateReadDisclosures(_ requirements: [DomainAgentSessionReadDisclosureRequirement]) -> Bool {
+        guard !isDraining, !isShutDown else { return false }
+        return requirements.allSatisfy { requirement in
+            guard case let .success(lease) = authorize(
+                operation: .monitorRead, observerEndpoint: requirement.observer,
+                targetSessionID: requirement.target.sessionID
+            ), lease.linkID == requirement.reference.linkID,
+            lease.linkGeneration == requirement.reference.generation,
+            lease.target == requirement.target,
+            lease.capability == .read,
+            validate(lease: lease) == nil else { return false }
+            return true
+        }
+    }
+
     /// Fences an observer-local batch before pending prompt disclosure. Every observation lease
     /// must still be exact; only grants with Manage may reveal a prompt body. A revoked member
     /// denies the whole batch rather than releasing a surviving sibling's prompt.

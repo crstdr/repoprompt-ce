@@ -105,12 +105,34 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
             }
             return order
         case .adminReorderGroups:
-            let (workspaceID, order) = try groupReorderArguments(request.arguments)
+            guard let workspaceID = try AgentSessionAdminArguments.uuid(request.arguments, "workspace") else {
+                throw AgentSessionAdminArguments.invalid("reorder_groups requires workspace (workspace UUID).")
+            }
             guard let entries = backend.groupEntries(workspaceID: workspaceID) else {
                 throw AgentSessionAdminEarlyResult(value: Self.workspaceNotLoaded(workspaceID))
             }
+            let current = DomainAgentSessionSidebarGroup.orderedGroups(entries.map { ($0.group, $0.order) })
+            /// Both refusals list the groups that exist and the exact call shape that reorders them.
+            func refusal(_ code: String, _ detail: String) -> AgentSessionAdminEarlyResult {
+                AgentSessionAdminEarlyResult(value: .object(SessionAdminReply.diagnostic(code: code, fields: [
+                    "result": .string(code),
+                    "affected": .object(["workspace_id": .string(workspaceID.uuidString)]),
+                    "current_groups": .array(current.map(Value.string)),
+                    "detail": .string(detail),
+                    // Not runnable as-is: only the caller knows the order it wants.
+                    "next_step": .string("Call session_admin reorder_groups with workspace \(workspaceID.uuidString), expected_order set to current_groups exactly, and order set to those same names in the order you want.")
+                ]).filter { $0.key != "next_call" }))
+            }
+            guard request.arguments["order"] != nil else {
+                throw refusal("order_required", "reorder_groups needs order: the group names in their new order. current_groups is the present order; pass it as expected_order.")
+            }
+            let (_, order) = try groupReorderArguments(request.arguments)
             let named = Set(order)
-            return entries.filter { named.contains($0.group) }.map(\.sessionID)
+            let members = entries.filter { named.contains($0.group) }.map(\.sessionID)
+            if members.isEmpty {
+                throw refusal("groups_not_found", "None of the named groups has a session in this workspace (a group exists only while a session carries it). Reorder groups from current_groups, using that list as expected_order.")
+            }
+            return members
         default:
             return nil
         }
@@ -317,7 +339,7 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
         if case let .failure(error) = DomainAgentSessionOrdering.permute(
             current: current, expected: expected, desired: order, describe: \.uuidString
         ) {
-            return Self.orderingFailure(error)
+            return Self.orderingFailure(error, operation: context.batch.request.operation.adminOperationName, arguments: args, scopeID: context.batch.scope.id)
         }
         // Only the named pins are ever written (see `DomainAgentSessionPinRanks`): they swap their own
         // explicit ranks, or, lacking distinct ones, move to the end of the ranked block in order.
@@ -390,16 +412,17 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
         // mirrored on each of them.
         let affected = entries.filter { Set(order).contains($0.group) }.map(\.sessionID)
         guard Set(affected).isSubset(of: Set(context.targets)) else {
-            return .object([
+            return .object(SessionAdminReply.diagnostic(code: "groups_outside_scope", fields: [
                 "result": .string("groups_outside_scope"),
-                "detail": .string("Every session in the reordered groups must be in your scope; reorder only groups you fully cover.")
-            ])
+                "affected": .object(["workspace_id": .string(workspaceID.uuidString)]),
+                "detail": .string("Every session in the reordered groups must be in your scope; reorder only groups you fully cover, or ask the user for authority covering the workspace.")
+            ]))
         }
         let current = DomainAgentSessionSidebarGroup.orderedGroups(entries.map { ($0.group, $0.order) })
         if case let .failure(error) = DomainAgentSessionOrdering.permute(
             current: current, expected: expected, desired: order, describe: { $0 }
         ) {
-            return Self.orderingFailure(error)
+            return Self.orderingFailure(error, operation: context.batch.request.operation.adminOperationName, arguments: args, scopeID: context.batch.scope.id)
         }
         // The named groups' values are redistributed among them; only their carriers are written.
         let values = DomainAgentSessionSidebarGroup.redistributedOrders(
@@ -726,36 +749,45 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
             "detail": .string("Only sessions in a workspace an open window shows can be organized. Ask the user to open it.")
         ]
         if let workspaceID { object["workspace_id"] = .string(workspaceID.uuidString) }
-        return .object(object)
+        return .object(SessionAdminReply.diagnostic(code: "workspace_not_loaded", fields: object))
     }
 
-    static func orderingFailure(_ error: DomainAgentSessionOrderingError) -> Value {
+    static func orderingFailure(
+        _ error: DomainAgentSessionOrderingError, operation: String, arguments: [String: Value], scopeID: UUID
+    ) -> Value {
+        var fields: [String: Value] = [:]
+        var next = arguments
+        next["op"] = .string(operation)
+        next["scope_id"] = .string(scopeID.uuidString)
+        let code: String
         switch error {
         case let .expectedOrderMismatch(current):
-            .object([
-                "result": .string("order_conflict"),
-                "current_order": .array(current.map(Value.string)),
-                "detail": .string("expected_order is stale. Retry with current_order as expected_order.")
-            ])
+            code = "order_conflict"
+            fields["subreason"] = .string("expected_order_mismatch")
+            fields["current_order"] = .array(current.map(Value.string))
+            fields["detail"] = .string("expected_order is stale. Inspect current_order, then use next_call if the desired ordering is still appropriate.")
+            next["expected_order"] = .array(current.map(Value.string))
+            fields["next_call"] = .object(["tool": .string("session_admin"), "arguments": .object(next)])
         case .orderSetMismatch:
-            .object([
-                "result": .string("invalid_order"),
-                "detail": .string("order and expected_order must name the same items, each once.")
-            ])
+            code = "invalid_order"
+            fields["subreason"] = .string("order_set_mismatch")
+            fields["detail"] = .string("order and expected_order must name the same items, each once. Inspect current session/group state and correct both arrays.")
         case .unknownItem:
-            .object([
-                "result": .string("invalid_order"),
-                "detail": .string("order names an item that is not currently in the ordered set.")
-            ])
+            code = "invalid_order"
+            fields["subreason"] = .string("unknown_order_item")
+            fields["detail"] = .string("order names an item not currently in the ordered set. Inspect current session/group state and remove or correct that item.")
         }
+        fields["result"] = .string(code)
+        if let workspace = arguments["workspace"] { fields["affected"] = .object(["workspace_id": workspace]) }
+        return .object(SessionAdminReply.diagnostic(code: code, fields: fields))
     }
 
     static func scopeNoLongerCurrent(_ operation: DomainAgentSessionTargetOperation) -> Value {
-        .object([
+        .object(SessionAdminReply.diagnostic(code: "scope_no_longer_current", fields: [
             "result": .string("scope_no_longer_current"),
             "op": .string(operation.adminOperationName),
-            "detail": .string("The scope changed before the mutation; nothing was applied.")
-        ])
+            "detail": .string("The scope changed before the mutation; nothing was applied. Inspect scope_status before another mutation.")
+        ]))
     }
 }
 

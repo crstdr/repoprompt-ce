@@ -704,6 +704,15 @@ struct AgentSessionLinkOutboundPromptClaim: Hashable {
     /// Inventory wording actually rendered; nil for closing notices and passive-only claims.
     let inventoryGuidanceRevision: UInt64?
     let fragment: String
+    var localInput: AgentSessionLinkLocalInputDecoration?
+
+    /// Internal recovery is baseline-only even when the original handoff disclosed optional data.
+    var baselineOnly: Self {
+        var copy = self
+        copy.localInput = nil
+        return copy
+    }
+
     /// The exact observer incarnation this claim was rendered for. Acceptance never transfers its
     /// inventory or passive receipt to a successor incarnation.
     var observerEndpoint: DomainAgentSessionLinkEndpointIdentity?
@@ -1122,6 +1131,7 @@ final class AgentSessionLinkOutboundPromptClaimStore {
         locationLabelsByReference: [DomainAgentSessionLinkReference: String] = [:],
         allowsClaimlessAutoWake: Bool = false,
         routineQuietCheckIn: Bool = false,
+        decorateLocalInputs: (AgentSessionLinkPromptRenderResult) -> AgentSessionLinkLocalInputDecoration? = { _ in nil },
         inventoryGuidanceRevision: UInt64 = AgentSessionLinkPrompts.currentInventoryGuidanceRevision,
         render: (AgentSessionLinkPromptRenderRequest) -> AgentSessionLinkPromptRenderResult
     ) -> AgentSessionLinkPromptClaimOutcome {
@@ -1265,7 +1275,7 @@ final class AgentSessionLinkOutboundPromptClaimStore {
             )
         }
 
-        let claim = AgentSessionLinkOutboundPromptClaim(
+        var claim = AgentSessionLinkOutboundPromptClaim(
             observerSessionID: observerSessionID,
             dispatchID: dispatchID,
             epochToken: state.epochToken,
@@ -1284,11 +1294,16 @@ final class AgentSessionLinkOutboundPromptClaimStore {
             observerEndpoint: epoch.endpoint,
             routineQuietCheckIn: effectiveRoutineQuietCheckIn
         )
+        claim.localInput = decorateLocalInputs(rendered)
         state.setPending(claim)
         // Recorded at hand-off, not at dispatch: the store never learns whether the caller's transport
         // succeeded, so this is the only point where the possibility is knowable at all.
         state.recordPossibleDelivery(of: claim)
         return .claimed(claim)
+    }
+
+    func isPending(_ claim: AgentSessionLinkOutboundPromptClaim) -> Bool {
+        states[claim.observerSessionID]?.pending[claim.dispatchID] == claim
     }
 
     /// Optional-returning form for the dispatches that cannot fail closed.
@@ -1706,4 +1721,35 @@ enum AgentSessionLinkPromptComposer {
         }
         return "\(providerText)\n\n\(trimmedFragment)"
     }
+}
+
+extension AgentSessionLinkPassiveStatusNotices {
+    struct LocalInputRange: Hashable {
+        let queueEpoch: UUID
+        let reference: DomainAgentSessionLinkReference
+        let target: DomainAgentSessionLinkEndpointIdentity
+        let indexEpoch: UUID
+        let capturedFrontier: UInt64
+        let throughOrdinal: UInt64
+    }
+
+    struct LocalInputOffer: Hashable {
+        let range: LocalInputRange
+        let totalCount: UInt64
+        /// Settlement order, oldest first; at most the newest four nonempty records.
+        let candidates: [AgentSessionLinkRetainedLocalInputIndex.Record]
+    }
+}
+
+struct AgentSessionLinkLocalInputDecoration: Hashable {
+    struct Requirement: Hashable {
+        let offer: AgentSessionLinkPassiveStatusNotices.LocalInputOffer
+        /// Only physically rendered records need content proof; omissions still require exact Read.
+        let renderedRecords: [AgentSessionLinkRetainedLocalInputIndex.Record]
+    }
+
+    let fragment: String
+    /// Row markup only; the separately bounded guidance line is not charged here.
+    let markupDeltaBytes: Int
+    let requirements: [Requirement]
 }

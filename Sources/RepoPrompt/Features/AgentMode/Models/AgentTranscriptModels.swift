@@ -98,6 +98,7 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
     public var sealsAssistantBoundary: Bool
     /// Defensive: canonical user rows travel as request anchors, but this carrier reconstructs any
     /// `itemKind` field-by-field, so a user row routed through it must not lose its provenance.
+    public var userInputOrigin: AgentUserInputOrigin?
     public var crossSessionAttribution: AgentCrossSessionAttribution?
     /// Local-display lane labels for an accepted `.system` lane-update row.
     ///
@@ -124,6 +125,7 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
         reasoning: String? = nil,
         isSubstantiveAssistant: Bool = false,
         sealsAssistantBoundary: Bool = false,
+        userInputOrigin: AgentUserInputOrigin? = nil,
         crossSessionAttribution: AgentCrossSessionAttribution? = nil,
         laneUpdateDisplayAttribution: AgentLaneUpdateDisplayAttribution? = nil
     ) {
@@ -143,6 +145,7 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
         self.reasoning = reasoning
         self.isSubstantiveAssistant = isSubstantiveAssistant
         self.sealsAssistantBoundary = sealsAssistantBoundary
+        self.userInputOrigin = userInputOrigin
         self.crossSessionAttribution = crossSessionAttribution
         self.laneUpdateDisplayAttribution = laneUpdateDisplayAttribution?.validated
     }
@@ -164,6 +167,7 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
         reasoning = item.reasoning
         isSubstantiveAssistant = Self.defaultIsSubstantiveAssistant(for: item)
         self.sealsAssistantBoundary = sealsAssistantBoundary
+        userInputOrigin = item.userInputOrigin
         crossSessionAttribution = item.crossSessionAttribution
         laneUpdateDisplayAttribution = item.laneUpdateDisplayAttribution?.validated
     }
@@ -187,11 +191,42 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
             workflow: workflow,
             codexGoalMode: codexGoalMode,
             isLocalControlPlaneEcho: isLocalControlPlaneEcho ?? false,
+            userInputOrigin: userInputOrigin,
             crossSessionAttribution: crossSessionAttribution,
             // Synthesized decoding cannot reject a malformed nested value without failing the whole
             // activity, so the drop happens here instead.
             laneUpdateDisplayAttribution: laneUpdateDisplayAttribution?.validated
         )
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, timestamp, sequenceIndex, role, itemKind, text, attachments, taggedFileAttachments
+        case workflow, codexGoalMode, isLocalControlPlaneEcho, isStreaming, toolExecution, reasoning
+        case isSubstantiveAssistant, sealsAssistantBoundary, userInputOrigin, crossSessionAttribution
+        case laneUpdateDisplayAttribution
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        timestamp = try c.decode(Date.self, forKey: .timestamp)
+        sequenceIndex = try c.decode(Int.self, forKey: .sequenceIndex)
+        role = try c.decode(AgentTranscriptActivityRole.self, forKey: .role)
+        itemKind = try c.decode(AgentChatItemKind.self, forKey: .itemKind)
+        text = try c.decode(String.self, forKey: .text)
+        attachments = try c.decode([AgentImageAttachment].self, forKey: .attachments)
+        taggedFileAttachments = try c.decode([AgentTaggedFileAttachment].self, forKey: .taggedFileAttachments)
+        workflow = try c.decodeIfPresent(AgentWorkflowDefinition.self, forKey: .workflow)
+        codexGoalMode = try c.decodeIfPresent(AgentCodexGoalModeMetadata.self, forKey: .codexGoalMode)
+        isLocalControlPlaneEcho = try c.decodeIfPresent(Bool.self, forKey: .isLocalControlPlaneEcho)
+        isStreaming = try c.decode(Bool.self, forKey: .isStreaming)
+        toolExecution = try c.decodeIfPresent(AgentTranscriptToolExecution.self, forKey: .toolExecution)
+        reasoning = try c.decodeIfPresent(String.self, forKey: .reasoning)
+        isSubstantiveAssistant = try c.decode(Bool.self, forKey: .isSubstantiveAssistant)
+        sealsAssistantBoundary = try c.decode(Bool.self, forKey: .sealsAssistantBoundary)
+        userInputOrigin = AgentUserInputOrigin(rawValue: (try? c.decode(String.self, forKey: .userInputOrigin)) ?? "")
+        crossSessionAttribution = try c.decodeIfPresent(AgentCrossSessionAttribution.self, forKey: .crossSessionAttribution)
+        laneUpdateDisplayAttribution = try c.decodeIfPresent(AgentLaneUpdateDisplayAttribution.self, forKey: .laneUpdateDisplayAttribution)?.validated
     }
 
     private static func defaultRole(for item: AgentChatItem) -> AgentTranscriptActivityRole {
@@ -260,6 +295,7 @@ public struct AgentTranscriptRequestAnchor: Codable, Identifiable, Sendable, Equ
     /// Archived, condensed, and summary projections rebuild their user row from this anchor rather
     /// than retaining the original `AgentChatItem`, so omitting it here would silently drop the
     /// attribution badge as soon as a turn left the full retention tier.
+    public var userInputOrigin: AgentUserInputOrigin?
     public var crossSessionAttribution: AgentCrossSessionAttribution?
 
     public init(from item: AgentChatItem) {
@@ -272,6 +308,7 @@ public struct AgentTranscriptRequestAnchor: Codable, Identifiable, Sendable, Equ
         workflow = item.workflow
         codexGoalMode = item.codexGoalMode
         isLocalControlPlaneEcho = item.isLocalControlPlaneEcho ? true : nil
+        userInputOrigin = item.userInputOrigin
         crossSessionAttribution = item.crossSessionAttribution
     }
 
@@ -287,8 +324,31 @@ public struct AgentTranscriptRequestAnchor: Codable, Identifiable, Sendable, Equ
             workflow: workflow,
             codexGoalMode: codexGoalMode,
             isLocalControlPlaneEcho: isLocalControlPlaneEcho ?? false,
+            userInputOrigin: userInputOrigin,
             crossSessionAttribution: crossSessionAttribution
         )
+    }
+}
+
+extension AgentTranscriptRequestAnchor {
+    private enum CodingKeys: String, CodingKey {
+        case id, timestamp, sequenceIndex, text, attachments, taggedFileAttachments
+        case workflow, codexGoalMode, isLocalControlPlaneEcho, userInputOrigin, crossSessionAttribution
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        timestamp = try c.decode(Date.self, forKey: .timestamp)
+        sequenceIndex = try c.decode(Int.self, forKey: .sequenceIndex)
+        text = try c.decode(String.self, forKey: .text)
+        attachments = try c.decode([AgentImageAttachment].self, forKey: .attachments)
+        taggedFileAttachments = try c.decode([AgentTaggedFileAttachment].self, forKey: .taggedFileAttachments)
+        workflow = try c.decodeIfPresent(AgentWorkflowDefinition.self, forKey: .workflow)
+        codexGoalMode = try c.decodeIfPresent(AgentCodexGoalModeMetadata.self, forKey: .codexGoalMode)
+        isLocalControlPlaneEcho = try c.decodeIfPresent(Bool.self, forKey: .isLocalControlPlaneEcho)
+        userInputOrigin = AgentUserInputOrigin(rawValue: (try? c.decode(String.self, forKey: .userInputOrigin)) ?? "")
+        crossSessionAttribution = try c.decodeIfPresent(AgentCrossSessionAttribution.self, forKey: .crossSessionAttribution)
     }
 }
 

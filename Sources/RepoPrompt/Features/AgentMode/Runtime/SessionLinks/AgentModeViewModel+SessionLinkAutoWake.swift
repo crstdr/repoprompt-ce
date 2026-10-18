@@ -647,7 +647,7 @@ extension AgentModeViewModel {
                     return
                 }
             case .waitingContinuation:
-                agentSessionLinkResumeWaitingContinuationForAutoWake(
+                await agentSessionLinkResumeWaitingContinuationForAutoWake(
                     claim: reservedClaim,
                     wakeID: wakeID,
                     endpoint: endpoint
@@ -1289,12 +1289,24 @@ extension AgentModeViewModel {
         claim: AgentSessionLinkOutboundPromptClaim,
         wakeID: UUID,
         endpoint: DomainAgentSessionLinkEndpointIdentity
-    ) {
+    ) async {
         guard let session = agentSessionLinkAutoWakeSession(for: endpoint),
               session.oversight.pendingAutoWake?.wakeID == wakeID,
               agentSessionLinkAutoWakeRoute(session) == .waitingContinuation
         else {
             return
+        }
+        let proof = await agentSessionLinkProveProviderInput(for: session, claim: claim)
+        if claim.localInput != nil {
+            guard agentSessionLinkAutoWakeSession(for: endpoint) === session,
+                  session.oversight.pendingAutoWake?.wakeID == wakeID,
+                  agentSessionLinkAutoWakeRoute(session) == .waitingContinuation else { return }
+            guard !Task.isCancelled else {
+                // Retire preparation through its existing owner. A bare return leaves the
+                // cancelled task waiting for a physical attempt that must never happen.
+                cancelAgentSessionLinkAutoWake(for: endpoint, reason: .eligibilityLost)
+                return
+            }
         }
         guard agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: claim.dispatchID) else {
             return
@@ -1302,6 +1314,8 @@ extension AgentModeViewModel {
         // The continuation is also a physical acceptance boundary. Carry the note first, just as
         // native/ACP provider sends do; never consume either receipt before the resume succeeds.
         let carry = AgentSelfCompactParkedPrefix.prepare(claim.fragment, session: session) {}
+        // markAttempted moves the note out of parked state; freeze its existing prefix first.
+        let undecoratedPrefix = carry.dispatchID.flatMap { _ in session.selfCompactState.parkedNote?.frame } ?? ""
         if let noteID = carry.dispatchID {
             guard AgentSelfCompactParkedPrefix.markAttempted(noteID, session: session) else { return }
         }
@@ -1309,7 +1323,9 @@ extension AgentModeViewModel {
             session: session,
             providerText: carry.text,
             claim: claim,
-            origin: .laneUpdateAutoWake(wakeID: wakeID)
+            origin: .laneUpdateAutoWake(wakeID: wakeID),
+            inputProof: proof,
+            undecoratedProviderText: undecoratedPrefix
         )
         if let noteID = carry.dispatchID {
             if accepted {

@@ -273,7 +273,7 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
                     selectionCoverage = resolved.coverage
                     guard !resolved.sessionIDs.isEmpty else {
                         let value: Value = if resolved.coverage?.recordsComplete == false {
-                            AgentSessionInventoryReadFailure.incomplete.value
+                            AgentSessionInventoryReadFailure.incomplete(.noMatchesWhileInventoryIncomplete).value
                         } else {
                             .object([
                                 "result": .string("no_matching_sessions"),
@@ -470,7 +470,16 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
                 result = .object(["result": .string("not_applied")])
             }
         } catch {
-            result = .object(["result": .string("failed"), "detail": .string(error.localizedDescription)])
+            result = .object(SessionAdminReply.diagnostic(
+                code: "operation_failed", sessionIDs: pending.request.targetSessionIDs,
+                fields: [
+                    "result": .string("not_applied"), "subreason": .string("handler_threw"),
+                    "detail": .string(error.localizedDescription + " The handler returned no completion receipt. Inspect the targets and confirmation status before retrying."),
+                    "next_call": .object(["tool": .string("session_admin"), "arguments": .object([
+                        "op": .string("confirmation_status"), "confirmation_id": .string(confirmationID.uuidString)
+                    ])])
+                ]
+            ))
         }
         recordApplied(pending.coverage?.adding(to: result) ?? result, confirmationID: confirmationID)
         prunePendingApplies()
@@ -639,7 +648,7 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
             // Link/role/orphan predicates rely on the complete endpoint census. An incomplete
             // read cannot turn an unknown edge into has_links:false and widen a mutation.
             if !full.isComplete, filter.hasLinks != nil || filter.role != nil || filter.orphaned != nil {
-                throw AgentSessionInventoryReadFailure.incomplete
+                throw AgentSessionInventoryReadFailure.incomplete(.filterNeedsCompleteCensus)
             }
             // Filters see only the scope-restricted view, so link/role/orphan predicates can never
             // react to sessions outside the scope.
@@ -650,16 +659,18 @@ final class AgentSessionAdministrationFrontDoor: AgentSessionAdministrationServi
                     .map(\.sessionID)
             ))
             if filter.requiresOrganizationState || filter.query != nil {
-                guard snapshot.records.values.allSatisfy(\.organizationStateIsKnown) else {
+                guard full.unresolvedSessionCount == 0,
+                      snapshot.records.values.allSatisfy(\.organizationStateIsKnown)
+                else {
                     // History rows do not contain sidebar state. Treating their defaults as
                     // unpinned/unarchived/ungrouped would produce a false empty or partial batch.
-                    throw AgentSessionInventoryReadFailure.incomplete
+                    throw AgentSessionInventoryReadFailure.incomplete(.organizationStateUnknown)
                 }
             }
             if filter.orphaned != nil,
                !snapshot.records.keys.allSatisfy({ snapshot.orphanStatusIsComplete(for: $0) })
             {
-                throw AgentSessionInventoryReadFailure.incomplete
+                throw AgentSessionInventoryReadFailure.incomplete(.orphanStatusUnknown)
             }
             let now = Date()
             let excludeCaller = request.operation.deniesScopeSelfTarget

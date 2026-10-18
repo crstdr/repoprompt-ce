@@ -85,11 +85,13 @@ final class ClaudeIntegratedAgentModeRunner {
         autoEffortSelection: AutoEffortTurnSelection? = nil,
         providerControlCommand: AgentProviderControlCommand? = nil,
         selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,
-        stopFence: AgentRunStartStopFence? = nil
+        stopFence: AgentRunStartStopFence? = nil,
+        localComposerCandidate: UUID? = nil
     ) async {
         let dedicatedNoteID = selfCompactDispatchID.flatMap { $0.stage == .note ? $0 : nil }
         var handedToRunTask = false
         defer {
+            if !handedToRunTask { session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained) }
             if let dedicatedNoteID, !handedToRunTask {
                 AgentSelfCompactParkedPrefix.reparkUnattemptedDedicatedNote(dedicatedNoteID, session: session) {
                     hooks.persistence.scheduleSave(session)
@@ -162,6 +164,7 @@ final class ClaudeIntegratedAgentModeRunner {
         session.agentTask = Task { [weak self, weak session, hooks] in
             guard let session else { return }
             defer {
+                session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained)
                 if let dedicatedNoteID {
                     AgentSelfCompactParkedPrefix.reparkUnattemptedDedicatedNote(dedicatedNoteID, session: session) {
                         hooks.persistence.scheduleSave(session)
@@ -206,6 +209,7 @@ final class ClaudeIntegratedAgentModeRunner {
                         providerControlCommand: providerControlCommand,
                         selfCompactDispatchID: selfCompactDispatchID
                     )
+                    if sendOutcome == .sent { session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained) }
                     if let dedicatedNoteID, sendOutcome != .sent {
                         AgentSelfCompactParkedPrefix.reparkUnattemptedDedicatedNote(dedicatedNoteID, session: session) {
                             self.hooks.persistence.scheduleSave(session)

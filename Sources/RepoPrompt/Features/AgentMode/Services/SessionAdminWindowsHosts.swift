@@ -74,10 +74,67 @@ struct SavedOversightSessionLocation {
 
 @MainActor
 final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
-    private let bridge: () -> AgentSessionLinkRuntimeBridge
+    /// Outcome of preparing a saved or never-visited session without opening its tab.
+    enum ForkPreparation: Equatable {
+        case ready, missing, ambiguous, changed, unreadable
+    }
 
-    init(bridge: @escaping () -> AgentSessionLinkRuntimeBridge = { AgentSessionLinkRuntimeBridge.shared }) {
+    typealias Preparation = @MainActor (UUID, @escaping @MainActor () -> Bool) async -> ForkPreparation
+
+    private let bridge: () -> AgentSessionLinkRuntimeBridge
+    private let preparation: Preparation?
+
+    /// Production preparation: the targeted-oversight path (point read, no tab focus, no provider run).
+    static let savedTargetPreparation: Preparation = { target, isStillAuthorized in
+        switch await WindowStatesManager.shared.prepareSavedOversightTarget(target, isStillAuthorized: isStillAuthorized) {
+        case .success: .ready
+        case .failure(.missing): .missing
+        case .failure(.ambiguous): .ambiguous
+        case .failure(.changed): .changed
+        case .failure(.unreadable): .unreadable
+        }
+    }
+
+    init(
+        bridge: @escaping () -> AgentSessionLinkRuntimeBridge = { AgentSessionLinkRuntimeBridge.shared },
+        preparation: Preparation? = SessionAdminWindowsStructureHost.savedTargetPreparation
+    ) {
         self.bridge = bridge
+        self.preparation = preparation
+    }
+
+    /// Prepares a saved or never-visited target (no tab focus, no provider run). nil when the
+    /// target is live or ready; otherwise the refusal to report.
+    private func prepareIfUnloaded(
+        _ sessionID: UUID, isStillAuthorized: @escaping @MainActor () -> Bool
+    ) async -> SessionAdminLifecycleOutcome? {
+        guard SessionAdminWindows.liveSession(sessionID) == nil, let preparation else { return nil }
+        let outcome = await preparation(sessionID, isStillAuthorized)
+        guard isStillAuthorized() else { return .blocked("Delegated authority ended while preparing the target.") }
+        return outcome == .ready ? nil : .invalid(Self.preparationDetail(outcome))
+    }
+
+    static func preparationRefusal(_ reason: ForkPreparation) -> SessionAdminHostError {
+        let code = switch reason {
+        case .ready, .changed: "target_changed"
+        case .missing: "target_missing"
+        case .ambiguous: "target_ambiguous"
+        case .unreadable: "target_unreadable"
+        }
+        let next: Value? = reason == .missing
+            ? .object(["tool": .string("session_admin"), "arguments": .object(["op": .string("inventory")])])
+            : nil
+        return .refused(code: code, detail: preparationDetail(reason), nextCall: next)
+    }
+
+    static func preparationDetail(_ reason: ForkPreparation) -> String {
+        switch reason {
+        case .ready: "The source session is ready."
+        case .missing: "The source session was not found in any loaded workspace. Check its ID with session_admin inventory."
+        case .ambiguous: "The source session is open in more than one place. Close the duplicate tab, then retry."
+        case .changed: "The source session moved or changed while being prepared. Retry fork."
+        case .unreadable: "The source session's saved transcript could not be read, so it cannot be forked."
+        }
     }
 
     func commitOrganizationalPlacement(
@@ -161,7 +218,9 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
             }
             if case .added = outcome { return .linked }
             return .alreadyLinked
-        case .failed, .rejected:
+        case let .failed(failure):
+            return .refused(failure)
+        case .rejected:
             let message = outcome.failureMessage ?? "The link could not be created."
             // `.revoked` promises nothing was left behind; a compensation that could not be written
             // left a row queued for **Retry saving**, so it is reported as the failure it is.
@@ -198,6 +257,7 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         modelID: String,
         isStillAuthorized: @escaping @MainActor () -> Bool
     ) async -> SessionAdminLifecycleOutcome {
+        if let refusal = await prepareIfUnloaded(sessionID, isStillAuthorized: isStillAuthorized) { return refusal }
         let windows = WindowStatesManager.shared
         guard let candidate = windows.agentSessionLinkCandidates(forSessionIDs: [sessionID], includeLocation: false)[sessionID]?.only,
               let modelCandidate = windows.agentSessionLinkModelCandidate(for: candidate.domainEndpoint)
@@ -222,6 +282,8 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
             return .applied(changed: receipt.changed, fields: fields)
         case let .blocked(failure):
             return .blocked(failure.rawValue)
+        case let .refused(_, detail, _):
+            return .invalid(detail)
         case let .invalid(message):
             return .invalid(message)
         }
@@ -232,6 +294,7 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
         effort: String,
         isStillAuthorized: @escaping @MainActor () -> Bool
     ) async -> SessionAdminLifecycleOutcome {
+        if let refusal = await prepareIfUnloaded(sessionID, isStillAuthorized: isStillAuthorized) { return refusal }
         guard let viewModel = SessionAdminWindows.owningViewModel(for: sessionID) else {
             return .blocked("The target session is not live.")
         }
@@ -241,6 +304,14 @@ final class SessionAdminWindowsStructureHost: SessionAdminStructureHost {
     func fork(
         sessionID: UUID, upToItemID: UUID?, isStillAuthorized: @escaping @MainActor () -> Bool
     ) async throws -> UUID {
+        // A saved or never-visited source is prepared the same way targeted oversight prepares
+        // one: point read, no tab focus, no provider run. Authority is re-checked throughout.
+        if SessionAdminWindows.liveSession(sessionID) == nil, let preparation {
+            let outcome = await preparation(sessionID, isStillAuthorized)
+            guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
+            guard outcome == .ready else { throw Self.preparationRefusal(outcome) }
+        }
+        guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
         guard let viewModel = SessionAdminWindows.owningViewModel(for: sessionID) else {
             throw SessionAdminHostError.sessionUnavailable
         }
@@ -274,6 +345,15 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         let roots: [WorkspaceRootRef]
         let repos: [GitRepoDescriptor]
         let repo: GitRepoDescriptor
+    }
+
+    /// A saved or never-visited target is prepared (no tab focus, no provider run) before an
+    /// on-behalf worktree change, instead of being refused as unavailable.
+    private func prepareIfUnloaded(_ sessionID: UUID, isStillAuthorized: @escaping @MainActor () -> Bool) async throws {
+        guard SessionAdminWindows.liveSession(sessionID) == nil else { return }
+        let outcome = await SessionAdminWindowsStructureHost.savedTargetPreparation(sessionID, isStillAuthorized)
+        guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
+        guard outcome == .ready else { throw SessionAdminWindowsStructureHost.preparationRefusal(outcome) }
     }
 
     /// Repositories and roots come from the target's own workspace, never the caller's routing.
@@ -330,6 +410,7 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         baseRef: String?,
         isStillAuthorized: @escaping @MainActor () -> Bool
     ) async throws -> SessionAdminWorktreeInfo {
+        try await prepareIfUnloaded(sessionID, isStillAuthorized: isStillAuthorized)
         let context = try await targetContext(sessionID, repoRoot: repoRoot)
         let authorize: @MainActor () throws -> Void = {
             guard isStillAuthorized(),
@@ -342,6 +423,15 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         try authorize()
         let existing = try await vcsService.listGitWorktrees(at: context.repo.rootURL)
         let mainRoot = existing.first(where: \.isMain)?.path ?? context.repo.rootPath
+        if let branch, let holder = existing.first(where: { $0.branch.map(Self.shortBranch) == Self.shortBranch(branch) }) {
+            throw SessionAdminHostError.refused(
+                code: "branch_exists",
+                detail: Self.branchExistsDetail(branch, checkedOutAt: holder.path),
+                nextCall: .object(["tool": .string("session_admin"), "arguments": .object([
+                    "op": .string("worktree_bind"), "session_id": .string(sessionID.uuidString), "worktree": .string(holder.path)
+                ])])
+            )
+        }
         // On-behalf creation is app-managed only: no explicit or external destination.
         let plan = try GitWorktreeDefaultPathPlanner.plan(GitWorktreeDefaultPathPlanner.Request(
             mainWorktreeRoot: URL(fileURLWithPath: mainRoot),
@@ -377,9 +467,16 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         let controller = DomainMutationCommitController(physicalMutationGuard: { physicalGuard }, willCommit: {})
         let vcsService = vcsService
         let repoURL = context.repo.rootURL
-        let result = try await MCPDomainMutationCommitContext.controllerTaskLocal.withValue(controller) {
-            try await vcsService.createGitWorktreeWithResult(
-                request: plan.createRequest, at: repoURL, beforeCommit: { try await authorize() }
+        let result: GitWorktreeCreateResult
+        do {
+            result = try await MCPDomainMutationCommitContext.controllerTaskLocal.withValue(controller) {
+                try await vcsService.createGitWorktreeWithResult(
+                    request: plan.createRequest, at: repoURL, beforeCommit: { try await authorize() }
+                )
+            }
+        } catch let error where branch != nil && String(describing: error).contains("already exists") {
+            throw SessionAdminHostError.refused(
+                code: "branch_exists", detail: Self.branchExistsDetail(branch ?? "", checkedOutAt: nil), nextCall: nil
             )
         }
         let created = result.descriptor
@@ -393,6 +490,17 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         )
     }
 
+    static func shortBranch(_ name: String) -> String {
+        name.hasPrefix("refs/heads/") ? String(name.dropFirst("refs/heads/".count)) : name
+    }
+
+    static func branchExistsDetail(_ branch: String, checkedOutAt path: String?) -> String {
+        if let path {
+            return "Branch '\(branch)' already exists and is checked out at \(path). Bind that worktree with worktree_bind {worktree: \"\(path)\"}, or pass a new branch name. Nothing was created."
+        }
+        return "Branch '\(branch)' already exists. Pass a new branch name, or omit branch to get a generated one. Nothing was created."
+    }
+
     // MARK: - Bind / unbind
 
     func bindWorktree(
@@ -403,6 +511,7 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         admitBindings: @escaping @MainActor (Set<String>) throws -> Void,
         bindingsCommitted: @escaping @MainActor (Set<String>) -> Void
     ) async throws -> SessionAdminWorktreeInfo {
+        try await prepareIfUnloaded(sessionID, isStillAuthorized: isStillAuthorized)
         let context = try await targetContext(sessionID, repoRoot: repoRoot)
         guard isIdle(context.viewModel, context.session) else { throw SessionAdminHostError.notIdle }
         let worktree: GitWorktreeDescriptor

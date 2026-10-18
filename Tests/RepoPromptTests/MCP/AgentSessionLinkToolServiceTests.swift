@@ -271,6 +271,8 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
     }
 
     func testSetModelWireRequiresExactIDAndReportsNextTurnOnly() async throws {
+        XCTAssertEqual(try AgentSessionLinkMCPToolService.parseModelID(.string("explore"), allowRoleLabels: true), "explore")
+        XCTAssertThrowsError(try AgentSessionLinkMCPToolService.parseModelID(.string("explore")), "Explicit create_lane model IDs must stay exact")
         let fixture = try await makeReadReleaseFixture()
         defer { fixture.tearDown() }
         let args: [String: Value] = [
@@ -291,7 +293,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 XCTFail("Accepted \(extra)")
             } catch let error as MCPError { guard case .invalidParams = error else { return XCTFail("\(error)") } }
         }
-        for invalidID: Value? in [nil, .null, .bool(true), .string(""), .string("pair"), .string("unknown:model")] {
+        for invalidID: Value? in [nil, .null, .bool(true), .string(""), .string("unknown-role"), .string("unknown:model")] {
             var invalid = args
             invalid["model_id"] = invalidID
             do { _ = try await fixture.service.execute(args: invalid)
@@ -1105,6 +1107,10 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         let result = try await service.execute(args: [:])
         XCTAssertEqual(result, .string(BecomeOverseerMCPToolService.nextTurnResult))
         XCTAssertNotNil(fixture.host.activations[endpoint])
+        let listing = try await fixture.routedService(from: endpoint).execute(args: ["op": .string("list")])
+        XCTAssertEqual(listing.objectValue?["items"], .array([]))
+        XCTAssertEqual(listing.objectValue?["has_more"], .bool(false))
+
         let noInventedLink = await fixture.authority.hasActiveLink(endpoint: endpoint)
         XCTAssertFalse(noInventedLink)
         let noInventory = await fixture.authority.links(forObserver: endpoint.sessionID)
@@ -1121,6 +1127,36 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         service.isEnabled = { true }
         let devin = try await service.execute(args: [:])
         XCTAssertEqual(devin, .string(BecomeOverseerMCPToolService.devinResult))
+    }
+
+    func testBootstrapGuidanceResamplesFullAccessWithoutChangingAuthorization() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let original = OverseerGlobalAutoApprove.isEnabled
+        defer { OverseerGlobalAutoApprove.isEnabled = original }
+        var fullAccess = false
+        OverseerGlobalAutoApprove.isEnabled = { fullAccess }
+        let endpoint = fixture.target.domainEndpoint
+        let service = BecomeOverseerMCPToolService(
+            captureRequestMetadata: { .init(connectionID: UUID(), clientName: "mode-guidance", windowID: endpoint.windowID) },
+            resolveObserverEndpoint: { _ in endpoint }, isEnabled: { true }, bridge: fixture.bridge,
+            prepareActivationCommit: { _, _ in .init(commitIfCurrent: { $0() }, invalidate: {}) }
+        )
+        for enabled in [false, true, false] {
+            fullAccess = enabled
+            let result = try await service.execute(args: [:])
+            let guidance = try XCTUnwrap(result.stringValue)
+            XCTAssertTrue(guidance.contains(enabled ? "Overseer full access: ON" : "Overseer full access: OFF"))
+            if enabled {
+                XCTAssertTrue(guidance.contains("just call the operation"))
+                XCTAssertFalse(guidance.contains("request_scope"))
+                XCTAssertFalse(guidance.contains("approval card"))
+            } else {
+                XCTAssertTrue(guidance.contains("when no current grant covers"))
+                XCTAssertTrue(guidance.contains("standing consent"))
+                XCTAssertTrue(guidance.contains("request_scope"))
+            }
+        }
     }
 
     func testNoArgumentBootstrapAllowsInboundOnlyDiscoveryButGrantsNoAuthority() async throws {
@@ -1506,6 +1542,20 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         ))
     }
 
+    func testWaitCursorsAloneNameTheirTargets() throws {
+        let first = UUID(), second = UUID()
+        let parsed = try AgentSessionLinkMCPToolService.parseTargets(["cursors": .array([
+            .object(["session_id": .string(first.uuidString), "cursor": .string("c1")]),
+            .object(["session_id": .string(second.uuidString), "cursor": .string("c2")])
+        ])])
+        XCTAssertEqual(parsed.sessionIDs, [first, second])
+        XCTAssertThrowsError(try AgentSessionLinkMCPToolService.parseTargets(["cursors": .array([.object(["cursor": .string("c")])])]))
+        XCTAssertThrowsError(try AgentSessionLinkMCPToolService.parseTargets(["cursors": .array([.string("opaque")])])) { error in
+            XCTAssertTrue(String(describing: error).contains("{session_id, cursor}"), String(describing: error))
+        }
+        XCTAssertThrowsError(try AgentSessionLinkMCPToolService.parseTargets([:]))
+    }
+
     func testCreateLaneUsesResolvedCallerOnceAndReportsHostAndSelectorFailures() async throws {
         try await withActivatedLaneFixture { fixture in
             var windowReads = 0
@@ -1531,6 +1581,15 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             XCTAssertEqual(hostError["subreason"], .string("host_error:MCPError"))
             XCTAssertEqual(hostError["stage"], .string("host_allocation"))
             XCTAssertFalse(String(describing: hostError).contains("PRIVATE_HOST_DETAIL"))
+            fixture.host.laneCreationError = MCPError.invalidParams("Open the destination workspace, then retry.")
+            let agentFacing = try await Self.executeObject(fixture.service, args: ["op": .string("create_lane"), "idempotency_key": .string("host-invalid-params")])
+            XCTAssertEqual(agentFacing["subreason"], .string("host_error:MCPError"))
+            XCTAssertEqual(agentFacing["detail"], .string("Open the destination workspace, then retry."))
+            fixture.host.laneCreationError = AgentSessionLaneDestinationFailure.creationRejected("binding was not durably accepted")
+            let rejected = try await Self.executeObject(fixture.service, args: ["op": .string("create_lane"), "idempotency_key": .string("rejected")])
+            XCTAssertEqual(rejected["subreason"], .string("lane_creation_rejected"))
+            XCTAssertEqual(rejected["detail"], .string("binding was not durably accepted"))
+            XCTAssertEqual(rejected["retryable"], .bool(true))
             fixture.host.laneCreationError = AgentSessionLaneDestinationFailure.destinationChanged
             let changed = try await Self.executeObject(fixture.service, args: ["op": .string("create_lane"), "idempotency_key": .string("changed")])
             XCTAssertEqual(changed["subreason"], .string("destination_changed"))

@@ -595,6 +595,9 @@ struct AgentSessionLinkPassiveStatusNotices {
         deliveredRunThrough[reference]?.through
     }
 
+    /// Disclosure-only frontiers. Never included in snapshots, receipts, revisions or wake identity.
+    var localInputFrontiers: [DomainAgentSessionLinkReference: LocalInputFrontier] = [:]
+
     private var nextChangeSequence: UInt64 = 0
     private var nextAttentionSequence: UInt64 = 0
     private var lastObservedStatus: [DomainAgentSessionLinkReference: Observation] = [:]
@@ -671,6 +674,7 @@ struct AgentSessionLinkPassiveStatusNotices {
             return
         }
 
+        localInputFrontiers.removeAll()
         isEnabled = true
         isDeliverable = deliverable
         self.linkSetRevision = linkSetRevision
@@ -691,6 +695,7 @@ struct AgentSessionLinkPassiveStatusNotices {
             || !pendingAttentionByReference.isEmpty
             || overflowProduced != overflowAcknowledged
 
+        localInputFrontiers.removeAll()
         isEnabled = false
         isDeliverable = false
         self.linkSetRevision = linkSetRevision
@@ -737,6 +742,7 @@ struct AgentSessionLinkPassiveStatusNotices {
                 || !pendingAttentionByReference.isEmpty
                 || overflowProduced != overflowAcknowledged
             self.linkSetRevision = linkSetRevision
+            localInputFrontiers.removeAll()
             isDeliverable = deliverable
             lastObservedStatus = newBaselines
             resetDeliveredPositions(samples)

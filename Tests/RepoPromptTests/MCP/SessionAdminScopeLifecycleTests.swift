@@ -45,6 +45,63 @@ private final class ScopeBlockedWriter: @unchecked Sendable {
 /// and the shared administration core's single authority check and batch cards.
 @MainActor
 final class SessionAdminScopeLifecycleTests: XCTestCase {
+    func testTwoTargetedTasksShareGlobalConsentButOnlyOneGrantNotice() async throws {
+        var global = true
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
+        runtime.isGlobalAutoApproveEnabled = { global }
+        let caller = UUID()
+        var notices: [String] = []
+        var continued: [UUID] = []
+        runtime.test_scopeDecision = { _, text in notices.append(text) }
+        for target in [UUID(), UUID()] {
+            let request = try runtime.requestScope(
+                requesterSessionID: caller, requesterTabID: nil, kind: .session(targetSessionID: target),
+                capabilities: [.observe, .control, .restructure], guardrails: .init(),
+                reason: "task", idempotencyKey: UUID().uuidString, reusePendingOnly: true
+            ).get()
+            XCTAssertTrue(runtime.installOverseeContinuation(requestID: request.id) { scope in
+                XCTAssertTrue(runtime.linkConsent.permits(scopeID: scope.id, observer: caller, target: target, at: Date()))
+                continued.append(request.id)
+                runtime.notifyOverseeContinuation(sessionID: caller, tabID: UUID(), requestID: request.id, result: "task_delivered")
+            })
+            XCTAssertTrue(runtime.approveWithStandingConsent(requestID: request.id))
+        }
+        try await AsyncTestWait.waitUntil("both tasks continue") { continued.count == 2 }
+        XCTAssertEqual(notices.count { $0.contains("decision: granted;") }, 1)
+        XCTAssertEqual(notices.count { $0.contains("decision: task_delivered;") }, 2)
+        let scope = try XCTUnwrap(runtime.allLiveScopes().first)
+        XCTAssertFalse(runtime.linkConsent.permits(scopeID: scope.id, observer: UUID(), target: UUID(), at: Date()))
+        global = false
+        runtime.reconcileGlobalAutoApprove()
+        XCTAssertFalse(runtime.linkConsent.permits(scopeID: scope.id, observer: caller, target: UUID(), at: Date()))
+        runtime.freezeForTermination()
+    }
+
+    func testCancellingInitialOutcomeWaitDoesNotReplaceTheTaskReceipt() async throws {
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
+        let request = try runtime.requestScope(
+            requesterSessionID: UUID(),
+            requesterTabID: nil,
+            kind: .session(targetSessionID: UUID()),
+            capabilities: [.observe, .control, .restructure],
+            guardrails: .init(),
+            reason: "task",
+            idempotencyKey: "wait"
+        ).get()
+        runtime.beginOverseeInitialOutcome(requestID: request.id)
+        let waiter = Task { @MainActor in await runtime.waitForOverseeInitialOutcome(requestID: request.id) }
+        await Task.yield()
+        waiter.cancel()
+        let interrupted = await waiter.value
+        XCTAssertEqual(interrupted.objectValue?["code"], .string("continuation_pending"))
+        XCTAssertNil(runtime.overseeInitialOutcome(requestID: request.id))
+        let committed: Value = .object(["result": .string("applied"), "code": .string("task_delivered")])
+        runtime.completeOverseeInitialOutcome(requestID: request.id, value: committed)
+        let outcome = await runtime.waitForOverseeInitialOutcome(requestID: request.id)
+        XCTAssertEqual(outcome, committed)
+        runtime.freezeForTermination()
+    }
+
     func testTargetedRequestReusesOnlyPendingAndContinuesFreshGrantedDeniedAndCancelledRequests() async throws {
         for terminal in ["granted", "denied", "cancelled"] {
             let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
@@ -129,19 +186,35 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
                 reusePendingOnly: true
             ).get()
         }
-        let original = try request()
-        XCTAssertTrue(runtime.installOverseeContinuation(requestID: original.id) { _ in
-            runtime.notifyOverseeContinuation(
-                sessionID: caller,
-                tabID: UUID(),
-                requestID: original.id,
-                result: "oversee target=\(target.uuidString); link_refused: target_binding_changed"
-            )
-        })
-        _ = try runtime.approve(requestID: original.id).get()
-        try await AsyncTestWait.waitUntil("refused continuation settles") { runtime.test_activeOverseeContinuationCount == 0 }
-        XCTAssertNotEqual(try request().id, original.id)
+        // The producer's current format ("link_refused; result=not_applied; …") carries a typed
+        // delivered-nothing flag; retention follows that flag, never the notice text.
+        for deliveredNothing in [true, false] {
+            let original = try request()
+            XCTAssertTrue(runtime.installOverseeContinuation(requestID: original.id) { _ in
+                runtime.notifyOverseeContinuation(
+                    sessionID: caller,
+                    tabID: UUID(),
+                    requestID: original.id,
+                    result: "oversee target=\(target.uuidString); link_refused; result=\(deliveredNothing ? "not_applied" : "partial"); subreason=target_binding_changed",
+                    deliveredNothing: deliveredNothing
+                )
+            })
+            _ = try runtime.approve(requestID: original.id).get()
+            try await AsyncTestWait.waitUntil("continuation settles") { runtime.test_activeOverseeContinuationCount == 0 }
+            if deliveredNothing {
+                XCTAssertNotEqual(try request().id, original.id, "a corrected retry starts fresh")
+            } else {
+                XCTAssertEqual(try request().id, original.id, "a task with effects is not re-run by a quick retry")
+            }
+        }
         runtime.freezeForTermination()
+    }
+
+    func testTypedLinkRefusalSurvivesContinuationFormatting() {
+        let outcome = AgentSessionAdministrationOutcome.completed(.object(["items": .array([.object([
+            "result": .string("not_applied"), "code": .string("link_refused"), "subreason": .string("child_session")
+        ])])]))
+        XCTAssertEqual(AgentSessionLinkRuntimeBridge.overseeLinkRefusalCode(outcome), "child_session")
     }
 
     func testOverseeRefusalNoticesContainOnlyCodesAndCardReasonIsBounded() {
@@ -391,6 +464,62 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         XCTAssertEqual(try fixture.runtime.approve(requestID: global.id, grantAllForSession: true).get().grant.capabilities, DomainDelegationScopeCapability.allSessionsPermitted)
     }
 
+    func testRequestScopeReportsActualFullAccessGrantAndOffModeCardStillWorks() async throws {
+        let fixture = Fixture()
+        let caller = UUID(), target = UUID()
+        fixture.endpoint = fixture.makeEndpoint(session: caller)
+        var enabled = true
+        fixture.runtime.isGlobalAutoApproveEnabled = { enabled }
+        let args: [String: Value] = [
+            "op": .string("request_scope"), "kind": .string("session"),
+            "session_id": .string(target.uuidString),
+            "capabilities": .array([.string("observe"), .string("control")])
+        ]
+        let granted = try await fixture.call(args)
+        XCTAssertEqual(granted["result"], .string("granted"))
+        let scope = try XCTUnwrap(granted["scope"]?.objectValue)
+        let record = try XCTUnwrap(fixture.runtime.allLiveScopes().first { $0.grant.unrestricted })
+        XCTAssertEqual(granted["scope_id"], .string(record.id.uuidString))
+        XCTAssertEqual(scope["scope_id"], granted["scope_id"])
+        XCTAssertEqual(scope["kind"], .string("all_sessions"))
+        XCTAssertEqual(scope["unrestricted"], .bool(true))
+        XCTAssertEqual(scope["capabilities"], .array(DomainDelegationScopeCapability.allCases.map { .string($0.rawValue) }))
+        XCTAssertTrue(granted["guidance"]?.stringValue?.contains("Overseer full access") == true)
+        XCTAssertFalse(granted["guidance"]?.stringValue?.contains("standing approval for this session") == true)
+        for key in ["kind", "capabilities", "guardrails"] {
+            XCTAssertEqual(granted[key], scope[key], "Legacy receipt fields must describe the actual covering grant")
+        }
+        XCTAssertEqual(granted["requested_scope"]?.objectValue?["kind"], .string("session"))
+        XCTAssertEqual(granted["requested_scope"]?.objectValue?["capabilities"], args["capabilities"])
+        enabled = false
+        fixture.runtime.reconcileGlobalAutoApprove()
+        let pending = try await fixture.call(args)
+        XCTAssertEqual(pending["result"], .string("pending_user_approval"))
+        let requestID = try XCTUnwrap(pending["request_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+        let ordinary = try fixture.runtime.approve(requestID: requestID).get()
+        let status = try await fixture.call(["op": .string("scope_status"), "request_id": .string(requestID.uuidString)])
+        XCTAssertEqual(status["scope"]?.objectValue?["scope_id"], .string(ordinary.id.uuidString))
+        XCTAssertFalse(ordinary.grant.unrestricted)
+    }
+
+    func testContinuityMetadataIsReservedForScopeStatus() async throws {
+        let fixture = Fixture()
+        fixture.runtime.isGlobalAutoApproveEnabled = { false }
+        fixture.endpoint = fixture.makeEndpoint(session: UUID())
+        let pending = try await fixture.call(["op": .string("request_scope"), "capabilities": .array([.string("observe")])])
+        let requestID = try XCTUnwrap(pending["request_id"])
+        let status = try await fixture.call(["op": .string("scope_status"), "request_id": requestID])
+        XCTAssertNotNil(status["continuity_save_state"])
+        XCTAssertNotNil(status["continuity_durable"])
+        let released = try await fixture.call(["op": .string("release_scope"), "request_id": requestID])
+        for result in [pending, released] {
+            XCTAssertNotNil(result["authority_available"])
+            for key in ["continuity_save_state", "continuity_durable", "continuity_detail", "continuity_operation_id", "unsettled_scope_ids"] {
+                XCTAssertNil(result[key], key)
+            }
+        }
+    }
+
     func testGrantAllForSessionAndGlobalSettingApproveLaterRequestsWithoutAnotherCard() async throws {
         let fixture = Fixture()
         let overseer = UUID()
@@ -455,6 +584,128 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         fixture.runtime.endSessionWideApproval(sessionID: overseer)
         let afterStop = try await fixture.call(["op": .string("request_scope"), "capabilities": .array([.string("observe")])])
         XCTAssertEqual(afterStop["result"], .string("pending_user_approval"))
+    }
+
+    func testScopeValueSerializesRestrictedAndUnrestrictedGrantsWithoutDuplicateKeys() throws {
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
+        let grantee = UUID()
+        let request = try runtime.requestScope(
+            requesterSessionID: grantee, requesterTabID: nil, kind: .tree(rootSessionID: grantee),
+            capabilities: [.observe], guardrails: .init(bulkConfirmationThreshold: 5), reason: nil, idempotencyKey: nil
+        ).get()
+        let restricted = try runtime.approve(requestID: request.id).get()
+        runtime.isGlobalAutoApproveEnabled = { true }
+        let unrestricted = try XCTUnwrap(runtime.ensureGlobalAutoApproveScope(for: grantee))
+        let restrictedValue = try XCTUnwrap(SessionAdminMCPToolService.scopeValue(restricted, now: Date()).objectValue)
+        XCTAssertEqual(restrictedValue["unrestricted"], .bool(false))
+        XCTAssertEqual(restrictedValue["guardrails"]?.objectValue?["bulk_confirmation_threshold"], .int(5))
+        let unrestrictedValue = try XCTUnwrap(SessionAdminMCPToolService.scopeValue(unrestricted, now: Date()).objectValue)
+        XCTAssertEqual(unrestrictedValue["unrestricted"], .bool(true))
+        XCTAssertNil(unrestrictedValue["guardrails"]?.objectValue?["bulk_confirmation_threshold"])
+    }
+
+    func testForkPreparesUnloadedSourceAndReportsPreparationFailures() async throws {
+        let source = UUID()
+        var prepared: [UUID] = []
+        for (failure, authorized, expected) in [
+            (SessionAdminWindowsStructureHost.ForkPreparation.missing, true, "not found"),
+            (.ambiguous, true, "more than one place"),
+            (.unreadable, true, "could not be read"),
+            (.changed, true, "Retry fork")
+        ] {
+            let host = SessionAdminWindowsStructureHost(preparation: { target, _ in
+                prepared.append(target)
+                return failure
+            })
+            do {
+                _ = try await host.fork(sessionID: source, upToItemID: nil, isStillAuthorized: { authorized })
+                XCTFail("fork must refuse when preparation fails (\(failure))")
+            } catch let SessionAdminHostError.refused(code, detail, _) {
+                XCTAssertTrue(code.hasPrefix("target_"), code)
+                XCTAssertTrue(detail.contains(expected), detail)
+            }
+        }
+        XCTAssertEqual(prepared, Array(repeating: source, count: 4), "an unloaded source is prepared, never refused outright")
+        var modelPrepared = 0
+        let modelHost = SessionAdminWindowsStructureHost(preparation: { _, _ in modelPrepared += 1
+            return .missing
+        })
+        let model = await modelHost.setModel(sessionID: source, modelID: "explore", isStillAuthorized: { true })
+        XCTAssertEqual(modelPrepared, 1, "set_model prepares an unloaded target instead of refusing it as not live")
+        guard case let .invalid(detail) = model else { return XCTFail("expected the preparation refusal, got \(model)") }
+        XCTAssertTrue(detail.contains("not found"), detail)
+        let revoked = SessionAdminWindowsStructureHost(preparation: { _, _ in .changed })
+        do {
+            _ = try await revoked.fork(sessionID: source, upToItemID: nil, isStillAuthorized: { false })
+            XCTFail("revoked authority must not fork")
+        } catch SessionAdminHostError.authorityEnded {}
+    }
+
+    func testCreateLaneReportsAppRefusalDetailWithoutDestinationHint() throws {
+        var receipt = AgentSessionLaneCreateReceipt.refused(.destinationUnavailable)
+        receipt.destinationFailure = .creationRejected("The Agent session could not be started because its workspace binding was not durably accepted (reason=workspace_persistence_rejected).")
+        receipt.refusalDetail = "The Agent session could not be started because its workspace binding was not durably accepted (reason=workspace_persistence_rejected)."
+        receipt.refusalStage = "host_allocation"
+        let value = try XCTUnwrap(AgentSessionLaneMCPToolService.render(receipt).objectValue)
+        XCTAssertEqual(value["subreason"], .string("lane_creation_rejected"))
+        XCTAssertEqual(value["retryable"], .bool(true))
+        XCTAssertTrue(value["detail"]?.stringValue?.contains("workspace_persistence_rejected") == true)
+        XCTAssertFalse(value["hint"]?.stringValue?.contains("No unambiguous active destination") == true)
+    }
+
+    func testTargetlessHiddenDenialsAreStructuredNotARouteError() throws {
+        for (denial, code) in [
+            (DomainDelegationScopeDenial.selfTarget, "self_target"),
+            (.generationStale, "scope_changed"),
+            (.operationNotScopeAuthorizable, "operation_not_scope_authorizable"),
+            (.membershipProofMissing, "not_authorized"),
+            (.unknownScope, "not_authorized")
+        ] {
+            let value = try XCTUnwrap(SessionAdminMCPToolService.deniedValue(denial, sessionID: nil).objectValue)
+            XCTAssertEqual(value["result"], .string("denied"))
+            XCTAssertEqual(value["code"], .string(code))
+            XCTAssertFalse(value["detail"]?.stringValue?.contains("exact route") ?? true)
+            XCTAssertEqual(value["next_call"]?.objectValue?["tool"], .string("session_admin"))
+        }
+    }
+
+    func testExistingBranchRefusalNamesTheWorktreeAndNextStep() {
+        XCTAssertEqual(SessionAdminWindowsWorktreeHost.shortBranch("refs/heads/e2e/1392"), "e2e/1392")
+        let held = SessionAdminWindowsWorktreeHost.branchExistsDetail("e2e/1392", checkedOutAt: "/tmp/wt")
+        XCTAssertTrue(held.contains("/tmp/wt") && held.contains("worktree_bind"), held)
+        let bare = SessionAdminWindowsWorktreeHost.branchExistsDetail("e2e/1392", checkedOutAt: nil)
+        XCTAssertTrue(bare.contains("new branch name"), bare)
+    }
+
+    func testHostErrorsRenderAsStructuredRefusalsNotBareEnumNames() throws {
+        let target = UUID()
+        let cases: [(SessionAdminHostError, String, Bool)] = [
+            (.sessionUnavailable, "session_unavailable", false),
+            (.notIdle, "target_busy", true),
+            (.authorityEnded, "scope_revoked", false),
+            (.usageEvidenceUnavailable, "usage_evidence_unavailable", false),
+            (.guardrailExceeded(limit: 1, current: 1), "guardrail_exceeded", false),
+            (.invalid("bad"), "invalid_request", false)
+        ]
+        for (error, code, retryable) in cases {
+            let value = try XCTUnwrap(error.refusalValue(op: "fork", targets: [target]).objectValue)
+            XCTAssertEqual(value["result"], .string("not_applied"), code)
+            XCTAssertEqual(value["code"], .string(code))
+            XCTAssertEqual(value["retryable"], .bool(retryable), code)
+            XCTAssertEqual(value["affected"], .array([.string(target.uuidString)]))
+            XCTAssertNotNil(value["next_call"]?.objectValue?["tool"], code)
+            XCTAssertNotEqual(value["detail"]?.stringValue, String(describing: error), "detail is the readable message")
+        }
+        let branch = try XCTUnwrap(SessionAdminHostError.refused(
+            code: "branch_exists", detail: "exists",
+            nextCall: .object(["tool": .string("session_admin"), "arguments": .object(["op": .string("worktree_bind")])])
+        ).refusalValue(op: "worktree_create", targets: [target]).objectValue)
+        XCTAssertEqual(branch["code"], .string("branch_exists"))
+        XCTAssertEqual(branch["next_call"]?.objectValue?["arguments"]?.objectValue?["op"], .string("worktree_bind"))
+        let invalid = try XCTUnwrap(SessionAdminHostError.invalid("bad").refusalValue(op: "fork", targets: [target]).objectValue)
+        XCTAssertEqual(invalid["next_call"]?.objectValue?["arguments"]?.objectValue?["op"], .string("get"), "not a generic scope_status")
+        let unavailable = try XCTUnwrap(SessionAdminHostError.sessionUnavailable.refusalValue(op: "fork", targets: [target]).objectValue)
+        XCTAssertEqual(unavailable["next_call"]?.objectValue?["tool"], .string("become_overseer"))
     }
 
     func testRequestScopeAcceptsSessionKindWithItsSessionID() async throws {
@@ -660,7 +911,10 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         let locations = OverseerContinuityRepository.production()
         XCTAssertEqual(locations.databaseURL.deletingLastPathComponent().deletingLastPathComponent(), locations.legacyDirectory)
         #if DEBUG
-            XCTAssertEqual(locations.legacyDirectory.lastPathComponent, "RepoPrompt CE Debug")
+            // A test process is isolated from the user's real overseer state, never the app's path.
+            XCTAssertTrue(locations.legacyDirectory.lastPathComponent.hasPrefix("RepoPromptCE-XCTest-Overseer-"))
+            XCTAssertTrue(locations.databaseURL.path.hasPrefix(FileManager.default.temporaryDirectory.path))
+            XCTAssertFalse(locations.databaseURL.path.contains("RepoPrompt CE Debug"))
         #else
             XCTAssertEqual(locations.legacyDirectory.lastPathComponent, "RepoPrompt CE")
         #endif
@@ -700,10 +954,10 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
             fixture.source.add(target, parent: caller)
             let handler = RecordingHandler([.adminRename])
             fixture.core.register(handler)
-            do {
-                _ = try await fixture.call(["op": .string("rename"), "session_id": .string(target.uuidString), "name": .string("Unapproved")])
-                XCTFail("Storage failure cannot invent authority before the user approves")
-            } catch {}
+            let unapproved = try? await fixture.call(["op": .string("rename"), "session_id": .string(target.uuidString), "name": .string("Unapproved")])
+            if let unapproved {
+                XCTAssertEqual(unapproved["result"], .string("denied"), "Storage failure cannot invent authority before the user approves")
+            }
             XCTAssertTrue(handler.batches.isEmpty)
             let requested = try await fixture.call(["op": .string("request_scope"), "capabilities": .array([.string("observe"), .string("organize")])])
             XCTAssertEqual(requested["authority_available"], .bool(true))
@@ -824,16 +1078,18 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         defer { block.release.signal() }
         runtime.freezeForTermination()
         let enteredSettlement = expectation(description: "termination settlement started")
-        let start = ContinuousClock.now
         let settling = Task { @MainActor in
             enteredSettlement.fulfill()
-            return await runtime.settleForTermination(timeout: 0.25)
+            // Time the settlement call itself, not XCTest's expectation scheduling around it.
+            let start = ContinuousClock.now
+            let settled = await runtime.settleForTermination(timeout: 0.25)
+            return (settled, start.duration(to: .now))
         }
         await fulfillment(of: [enteredSettlement], timeout: 3)
         runtime.revokeAll(involving: first.grant.granteeSessionID)
-        let settled = await settling.value
+        let (settled, elapsed) = await settling.value
         XCTAssertFalse(settled)
-        XCTAssertLessThan(start.duration(to: .now), .seconds(1), "Do not structurally join a blocked writer past the deadline")
+        XCTAssertLessThan(elapsed, .seconds(1), "Do not structurally join a blocked writer past the deadline")
         let after = UUID()
         runtime.revokeAll(involving: after)
         block.release.signal()
@@ -1342,11 +1598,11 @@ final class SessionAdminScopeLifecycleTests: XCTestCase {
         // No-scope failure remains distinct and tells the caller how to request authority.
         fixture.endpoint = fixture.makeEndpoint(session: UUID())
         do {
-            _ = try await fixture.call(args)
-            XCTFail("a scope is required")
-        } catch {
-            let message = String(describing: error)
-            XCTAssertTrue(message.contains("session_admin is not available for this session"))
+            let refused = try await fixture.call(args)
+            let message = String(describing: refused)
+            XCTAssertEqual(refused["result"], .string("denied"), "a scope is required")
+            XCTAssertEqual(refused["code"], .string("not_authorized"))
+            XCTAssertFalse(message.contains("exact route"), "the caller is resolved; a route error would be false")
             XCTAssertTrue(message.contains("request_scope"))
             XCTAssertFalse(message.contains(target.uuidString))
         }
@@ -1645,6 +1901,160 @@ private extension Array {
 /// release card), lease re-checks after suspension, and placement persistence.
 @MainActor
 final class SessionAdminStructureTests: XCTestCase {
+    func testBatchResultsReflectEffectsAndFailuresAcrossReceiptFamilies() throws {
+        let id = UUID(), other = UUID()
+        for op in ["link", "worktree_bind", "worktree_release", "set_model", "reparent"] {
+            let failed = SessionAdminItemResult(sessionID: id, result: "not_applied", code: "bind_failed")
+            let changed = SessionAdminItemResult(sessionID: other, result: "applied")
+            let unchanged = SessionAdminItemResult(sessionID: id, result: "unchanged")
+            XCTAssertEqual(SessionAdminReply.batch(op: op, items: [failed]).objectValue?["result"], .string("not_applied"))
+            XCTAssertEqual(SessionAdminReply.batch(op: op, items: [changed, failed]).objectValue?["result"], .string("partial"))
+            XCTAssertEqual(SessionAdminReply.batch(op: op, items: [unchanged]).objectValue?["result"], .string("not_applied"))
+            XCTAssertEqual(SessionAdminReply.batch(op: op, items: [changed]).objectValue?["result"], .string("applied"))
+            XCTAssertEqual(SessionAdminReply.batch(op: op, items: [failed], preview: true).objectValue?["result"], .string("preview"))
+            let failure = try XCTUnwrap(failed.value.objectValue)
+            for key in ["code", "subreason", "detail", "affected", "next_call", "retryable"] {
+                XCTAssertNotNil(failure[key], key)
+            }
+        }
+        for status in [AgentSessionAdminItemResult.Status.unchanged, .failed, .skipped] {
+            XCTAssertEqual(AgentSessionAdminRendering.mutationValue(
+                operation: .adminSetGroup, items: [.init(sessionID: id, status: status)], itemsRequiringControl: []
+            ).objectValue?["result"], .string("not_applied"))
+        }
+        XCTAssertEqual(AgentSessionAdminRendering.mutationValue(
+            operation: .adminArchive, items: [.init(sessionID: id, status: .failed)], itemsRequiringControl: [],
+            extra: [AgentSessionAdminRendering.committedChangesKey: .bool(true)]
+        ).objectValue?["result"], .string("partial"))
+    }
+
+    func testWorktreeFrontDoorUsesFullAccessSettingAndReplaysPartialCreation() async throws {
+        // Override in memory; tests must never write the user's real setting.
+        let previousFullAccess = OverseerGlobalAutoApprove.isEnabled
+        defer { OverseerGlobalAutoApprove.isEnabled = previousFullAccess }
+        for enabled in [false, true] {
+            OverseerGlobalAutoApprove.isEnabled = { enabled }
+            let fixture = Fixture()
+            let caller = UUID(), target = UUID(), tab = UUID()
+            fixture.provenance.add(caller, parent: nil)
+            fixture.provenance.add(target, parent: caller)
+            if !enabled { try fixture.grant(caller) }
+            typealias Organizing = SessionAdminOrganizingOperationTests
+            let organizer = Organizing.FakeOrganizer(), links = Organizing.FakeLinks()
+            let inventoryProvenance = SessionAdminScopeLifecycleTests.FakeProvenance()
+            defer { withExtendedLifetime((organizer, links, inventoryProvenance)) {} }
+            let door = AgentSessionAdministrationFrontDoor(
+                core: fixture.core, scopes: fixture.runtime, projector: fixture.projector,
+                inventory: Organizing.FakeInventory(organizer: organizer, provenance: inventoryProvenance, links: links, now: Date()),
+                liveBoundSession: { $0 == tab ? caller : nil }
+            )
+            door.registerStructureHandlers(
+                scopes: fixture.runtime, worktreeOwnership: fixture.ownership, projector: fixture.projector,
+                structureHost: fixture.structure, worktreeHost: fixture.worktrees
+            )
+            fixture.worktrees.bound[target] = [WorktreeHost.summary("existing")]
+            let release = AgentSessionAdministrationRequest(
+                operation: .adminWorktreeRelease, caller: .agentSession(caller), callerTabID: tab,
+                targetSessionIDs: [target], idempotencyKey: "release"
+            )
+            let outcome = try await door.perform(release)
+            if enabled {
+                guard case .completed = outcome else { return XCTFail("Full access must not raise a card") }
+                XCTAssertTrue(fixture.runtime.confirmations.confirmations.isEmpty)
+            } else {
+                guard case let .pendingConfirmation(card, _) = outcome else { return XCTFail("OFF must retain the release card") }
+                XCTAssertTrue(fixture.worktrees.unbindCalls.isEmpty)
+                await door.approveAndApply(confirmationID: card.id, presentedTabID: tab, presentedSessionID: caller)
+            }
+            XCTAssertEqual(fixture.worktrees.unbindCalls, [target])
+            fixture.provenance.censusConflicts = [UUID(): []]
+            let bind = AgentSessionAdministrationRequest(
+                operation: .adminWorktreeBind, caller: .agentSession(caller), callerTabID: tab,
+                targetSessionIDs: [target], arguments: ["worktree": .string("no-limit")]
+            )
+            guard case let .completed(binding) = try await door.perform(bind) else { return XCTFail("No limit requires no capacity census") }
+            XCTAssertEqual(binding.objectValue?["result"], .string("applied"))
+            if enabled {
+                guard case let .completed(inventory) = try await door.perform(.init(
+                    operation: .adminWorktreeInventory, caller: .agentSession(caller), callerTabID: tab
+                )) else { return XCTFail("Full access inventory requires no capacity census") }
+                XCTAssertNotNil(inventory.objectValue?["worktrees"])
+            }
+            fixture.provenance.censusConflicts = [:]
+            fixture.worktrees.idle[target] = false
+            let create = AgentSessionAdministrationRequest(
+                operation: .adminWorktreeCreate, caller: .agentSession(caller), callerTabID: tab,
+                targetSessionIDs: [target], idempotencyKey: "create-partial"
+            )
+            guard case let .completed(value) = try await door.perform(create) else { return XCTFail("Create completes") }
+            let result = try XCTUnwrap(value.objectValue)
+            XCTAssertEqual(result["result"], .string("partial"))
+            XCTAssertEqual(result["changed_count"], .int(1))
+            XCTAssertEqual(result["bound"], .bool(false))
+            XCTAssertNotNil(result["worktree"])
+            for key in ["code", "subreason", "detail", "affected", "next_call", "retryable"] {
+                XCTAssertNotNil(result[key], key)
+            }
+            guard case let .completed(replay) = try await door.perform(create) else { return XCTFail("Replay completes") }
+            XCTAssertEqual(replay.objectValue?["idempotent_replay"], .bool(true))
+            XCTAssertEqual(fixture.worktrees.created.count, 1)
+            fixture.worktrees.idle[target] = true
+            guard case let .completed(bound) = try await door.perform(.init(
+                operation: .adminWorktreeCreate, caller: .agentSession(caller), callerTabID: tab,
+                targetSessionIDs: [target], idempotencyKey: "create-bound"
+            )) else { return XCTFail("Create binds by default") }
+            XCTAssertEqual(bound.objectValue?["bound"], .bool(true))
+            XCTAssertEqual(fixture.worktrees.bound[target]?.first?.worktreeID, "wt-2")
+            guard case let .completed(unbound) = try await door.perform(.init(
+                operation: .adminWorktreeCreate, caller: .agentSession(caller), callerTabID: tab,
+                targetSessionIDs: [target], idempotencyKey: "create-unbound", arguments: ["bind": .bool(false)]
+            )) else { return XCTFail("Explicit unbound remains supported") }
+            XCTAssertEqual(unbound.objectValue?["bound"], .bool(false))
+            XCTAssertNotNil(unbound.objectValue?["next_call"])
+            if enabled {
+                let scope = try XCTUnwrap(fixture.runtime.allLiveScopes().first { $0.grant.unrestricted })
+                let status = try XCTUnwrap(SessionAdminMCPToolService.scopeValue(scope, now: Date()).objectValue)
+                XCTAssertEqual(status["unrestricted"], .bool(true))
+                XCTAssertNil(status["guardrails"]?.objectValue?["bulk_confirmation_threshold"])
+            }
+            // A global caller still cannot hide the restricted scopes its target's bindings count toward.
+            // Create restrictions with the setting OFF, then exercise the actual ON/OFF front door.
+            OverseerGlobalAutoApprove.isEnabled = { false }
+            let ancestor = UUID()
+            fixture.provenance.add(ancestor, parent: nil)
+            fixture.provenance.add(caller, parent: ancestor)
+            let limited = try fixture.grant(ancestor, guardrails: .init(maxWorktrees: 1))
+            let proof = try XCTUnwrap(fixture.projector.membershipProof(for: caller, in: limited.grant))
+            _ = try fixture.runtime.attenuate(
+                parentScopeID: limited.id, presentedGeneration: limited.generation, caller: .agentSession(ancestor),
+                newGranteeSessionID: caller, newGranteeMemberships: [proof], capabilities: [.observe, .worktree],
+                guardrails: .init(maxWorktrees: 1)
+            ).get()
+            OverseerGlobalAutoApprove.isEnabled = { enabled }
+            let originalID: UUID? = if enabled { nil }
+            else { try XCTUnwrap(fixture.runtime.liveScopes(grantedTo: caller).first { $0.grant.parentScopeID == nil }).id }
+            @MainActor func limitedBind() async throws -> [String: Value] {
+                guard case let .completed(value) = try await door.perform(.init(
+                    operation: .adminWorktreeBind, caller: .agentSession(caller), callerTabID: tab,
+                    scopeID: originalID, targetSessionIDs: [target], arguments: ["worktree": .string("over-limit")]
+                )) else { XCTFail("A restricted-overlap refusal must be structured")
+                    return [:]
+                }
+                return try XCTUnwrap(value.objectValue)
+            }
+            let limitedReply = try await limitedBind()
+            XCTAssertEqual(limitedReply["result"], .string("not_applied"))
+            XCTAssertEqual(items(limitedReply)[target.uuidString]?["code"], .string("scope_guardrail_exceeded"))
+            fixture.provenance.censusConflicts = [UUID(): []]
+            let unproven = try await limitedBind()
+            XCTAssertEqual(unproven["result"], .string("not_applied"))
+            let item = try XCTUnwrap(items(unproven)[target.uuidString])
+            XCTAssertEqual(item["subreason"], .string("usage_evidence_unavailable"))
+            XCTAssertEqual(item["retryable"], .bool(false))
+            XCTAssertNotNil(item["next_call"])
+        }
+    }
+
     fileprivate struct Pair: Hashable {
         let observer: UUID
         let target: UUID
@@ -1653,6 +2063,11 @@ final class SessionAdminStructureTests: XCTestCase {
     @MainActor
     final class Provenance: DelegationProvenanceSource {
         var sessions: [UUID: DelegationSessionProvenance] = [:]
+        var censusConflicts: [UUID: Set<UUID>] = [:]
+
+        func censusSnapshot() -> DelegationProvenanceSnapshot {
+            .init(records: sessions, states: sessions.mapValues { _ in .indexOnly }, placementConflicts: censusConflicts)
+        }
 
         func add(
             _ id: UUID,
@@ -2821,6 +3236,25 @@ final class SessionAdminStructureTests: XCTestCase {
         XCTAssertEqual(fixture.worktrees.unbindCalls, [member])
     }
 
+    func testWorktreeReleaseByWorktreeIDDerivesBoundSessionsAndExplainsUnboundOnes() throws {
+        let fixture = Fixture()
+        let overseer = UUID(), member = UUID()
+        fixture.worktrees.boundElsewhere["w1"] = [member]
+        func request(_ args: [String: Value]) -> AgentSessionAdministrationRequest {
+            .init(operation: .adminWorktreeRelease, caller: .agentSession(overseer), arguments: args)
+        }
+        XCTAssertEqual(try fixture.worktreeHandler.derivedTargets(for: request(["worktree_id": .string("w1")])), [member])
+        for (args, code) in [([String: Value](), "target_required"), (["worktree_id": .string("w-gone")], "worktree_not_bound")] {
+            do {
+                _ = try fixture.worktreeHandler.derivedTargets(for: request(args))
+                XCTFail("\(code) must be explained, not left to a target-less denial")
+            } catch let early as AgentSessionAdminEarlyResult {
+                XCTAssertEqual(early.value.objectValue?["code"], .string(code))
+                XCTAssertNotNil(early.value.objectValue?["detail"])
+            }
+        }
+    }
+
     func testWorktreeInventoryFlagsUnboundOwnedWorktrees() async throws {
         let fixture = Fixture()
         let overseer = UUID(), member = UUID()
@@ -3334,7 +3768,7 @@ final class SessionAdminStructureTests: XCTestCase {
         _ = try await fixture.value(.adminWorktreeBind, caller: overseer, targets: [member], args: ["worktree": .string("w-old")])
         XCTAssertNil(fixture.ownership.record(worktreeID: "w-old")?.releasedAt)
 
-        _ = try await fixture.value(.adminWorktreeCreate, caller: overseer, targets: [member])
+        _ = try await fixture.value(.adminWorktreeCreate, caller: overseer, targets: [member], args: ["bind": .bool(false)])
         fixture.ownership.markReleased([WorktreeHost.summary("wt-1")], bySessionID: overseer, at: Date())
         fixture.worktrees.boundElsewhere["wt-1"] = [elsewhere]
         let inventory = try await fixture.value(.adminWorktreeInventory, caller: overseer)
@@ -3916,6 +4350,9 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         var recordsComplete = true
         var endpointsComplete = true
         var omittedSessionIDs: Set<UUID> = []
+        var unresolvedSessions: [UUID: String] = [:]
+        var historyIssue: String?
+        var unknownOrganizationSessionIDs: Set<UUID> = []
         var readCount = 0
         let now: Date
 
@@ -3931,6 +4368,7 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
             let loaded = organizer.states.values.map { state in
                 DomainAgentSessionInventoryRecord(
                     sessionID: state.sessionID, name: state.name, workspaceID: state.workspaceID, isLoaded: true,
+                    organizationStateIsKnown: !unknownOrganizationSessionIDs.contains(state.sessionID),
                     isArchived: state.isArchived, isPinned: state.isPinned, pinnedOrder: state.pinnedOrder,
                     sidebarGroup: state.sidebarGroup, sidebarGroupOrder: state.sidebarGroupOrder,
                     runState: state.runState == .idle ? .idle : .running,
@@ -3945,7 +4383,8 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
             )
             return DomainAgentSessionInventorySnapshot(
                 records: (loaded + historyOnly).filter { !omittedSessionIDs.contains($0.sessionID) },
-                edges: edges, isComplete: endpointsComplete, recordsComplete: recordsComplete
+                edges: edges, isComplete: endpointsComplete, recordsComplete: recordsComplete,
+                unresolvedSessions: unresolvedSessions, historyIssue: historyIssue
             )
         }
     }
@@ -4210,6 +4649,10 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
             "expected_order": .array([.string("Beta"), .string("Alpha")])
         ])
         XCTAssertEqual(conflict["result"], .string("order_conflict"))
+        for key in ["code", "subreason", "detail", "next_call", "retryable"] {
+            XCTAssertNotNil(conflict[key], key)
+        }
+        XCTAssertEqual(conflict["retryable"], .bool(false))
         let applied = try await fixture.call([
             "op": .string("reorder_groups"), "workspace": .string(fixture.workspace.uuidString),
             "order": .array([.string("Beta"), .string("Alpha")]),
@@ -4525,6 +4968,114 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
 
     // MARK: - Filters and inventory
 
+    func testHistoryFailureWithoutUnresolvedSessionsReportsActionablePartialAndKeepsRows() async throws {
+        for (issue, retryable) in [("history_index_incomplete", false), ("history_lookup_failed", true)] {
+            let fixture = Fixture()
+            let a = fixture.member("A")
+            try fixture.grant(threshold: 25)
+            fixture.inventory.recordsComplete = false
+            fixture.inventory.historyIssue = issue
+            let inventory = try await fixture.call(["op": .string("inventory")])
+            XCTAssertEqual(inventory["result"], .string("partial"), issue)
+            XCTAssertEqual(inventory["code"], .string("inventory_incomplete"))
+            XCTAssertEqual(inventory["subreason"], .string(issue))
+            XCTAssertEqual(inventory["retryable"], .bool(retryable))
+            XCTAssertNotNil(inventory["next_step"]?.stringValue)
+            XCTAssertEqual(inventory["total_complete"], .bool(false))
+            let rows = try XCTUnwrap(inventory["sessions"]?.arrayValue).compactMap { $0.objectValue?["session_id"] }
+            XCTAssertTrue(rows.contains(.string(a.uuidString)), "healthy open sessions are still listed")
+        }
+    }
+
+    func testPartialInventoryPreservesFullAccessAndOrdinaryApprovalCards() async throws {
+        for fullAccess in [false, true] {
+            let fixture = Fixture()
+            let a = fixture.member("A"), b = fixture.member("B")
+            fixture.inventory.recordsComplete = false
+            fixture.inventory.endpointsComplete = false
+            fixture.inventory.unresolvedSessions = [UUID(): "replica_mismatch"]
+            fixture.runtime.isGlobalAutoApproveEnabled = { fullAccess }
+            if !fullAccess { try fixture.grant(threshold: 1) }
+            let inventory = try await fixture.call(["op": .string("inventory")])
+            XCTAssertEqual(inventory["result"], .string("partial"))
+            XCTAssertEqual(inventory["total_complete"], .bool(false))
+            let result = try await fixture.call([
+                "op": .string("set_pin"), "targets": ids([a, b]), "pinned": .bool(true),
+                "idempotency_key": .string("partial-explicit-pin")
+            ])
+            if fullAccess {
+                XCTAssertEqual(result["result"], .string("applied"))
+                XCTAssertTrue(fixture.runtime.confirmations.confirmations.isEmpty)
+            } else {
+                XCTAssertEqual(result["result"], .string("pending_confirmation"))
+                XCTAssertEqual(fixture.organizer.states[a]?.isPinned, false)
+                let id = try XCTUnwrap(result["confirmation_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+                await fixture.approveAndApply(id)
+                let applied = try await fixture.call(["op": .string("confirmation_status"), "confirmation_id": .string(id.uuidString)])
+                XCTAssertEqual(applied["result"], .string("applied"))
+            }
+            XCTAssertEqual(fixture.organizer.states[a]?.isPinned, true)
+            XCTAssertEqual(fixture.organizer.states[b]?.isPinned, true)
+        }
+    }
+
+    func testUnknownOrganizationFactsIndependentlyRefuseFilteredPreviewAndMutation() async throws {
+        let predicates: [[String: Value]] = [
+            ["pinned": .bool(false)], ["group": .null], ["archived": .bool(false)], ["query": .string("Known")]
+        ]
+        for predicate in predicates {
+            let fixture = Fixture()
+            let unknown = fixture.member("Known unknown sidebar")
+            let selectable = fixture.member("Known selectable sidebar")
+            fixture.inventory.unknownOrganizationSessionIDs = [unknown]
+            fixture.inventory.recordsComplete = false
+            fixture.inventory.endpointsComplete = false
+            XCTAssertTrue(fixture.inventory.unresolvedSessions.isEmpty, "Do not let unresolved-binding rejection mask the knowledge guard")
+            try fixture.grant()
+            for preview in [true, false] {
+                let result = try await fixture.call([
+                    "op": .string("set_pin"), "filter": .object(predicate),
+                    "pinned": .bool(true), "preview": .bool(preview)
+                ])
+                XCTAssertEqual(result["code"], .string("inventory_incomplete"))
+                XCTAssertEqual(result["subreason"], .string("organization_state_unknown"))
+                XCTAssertEqual(result["retryable"], .bool(false))
+                XCTAssertNil(result["items"])
+                XCTAssertEqual(fixture.organizer.states[unknown]?.isPinned, false)
+                XCTAssertEqual(fixture.organizer.states[selectable]?.isPinned, false, "A known matching row must not turn an unknown selection into a writable subset")
+                XCTAssertTrue(fixture.runtime.confirmations.confirmations.isEmpty)
+            }
+        }
+    }
+
+    func testPartialInventoryCannotWidenFilteredMutationsWithUnknownFacts() async throws {
+        let predicates: [[String: Value]] = [
+            ["has_links": .bool(false)], ["role": .string("overseer")],
+            ["orphaned": .bool(false)], ["pinned": .bool(false)],
+            ["group": .null], ["archived": .bool(false)], ["query": .string("Known")]
+        ]
+        for predicate in predicates {
+            let fixture = Fixture()
+            let target = fixture.member("Known", group: "Cleanup")
+            fixture.inventory.recordsComplete = false
+            fixture.inventory.endpointsComplete = false
+            fixture.inventory.unresolvedSessions = [target: "ambiguous_binding"]
+            try fixture.grant()
+            for preview in [true, false] {
+                let result = try await fixture.call([
+                    "op": .string("set_pin"), "filter": .object(predicate),
+                    "pinned": .bool(true), "preview": .bool(preview)
+                ])
+                XCTAssertEqual(result["code"], .string("inventory_incomplete"), "\(predicate)")
+                XCTAssertNotNil(result["subreason"])
+                XCTAssertEqual(result["retryable"], .bool(false))
+                XCTAssertNil(result["items"])
+                XCTAssertEqual(fixture.organizer.states[target]?.isPinned, false)
+                XCTAssertTrue(fixture.runtime.confirmations.confirmations.isEmpty)
+            }
+        }
+    }
+
     func testFilterResolvesOnlyLoadedMembersAndInventoryHidesNonMembers() async throws {
         let fixture = Fixture()
         let stale = fixture.member("Stale lane")
@@ -4630,7 +5181,8 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
             let result = try await fixture.call(args.merging(["preview": .bool(preview)]) { $1 })
             XCTAssertEqual(result["result"], .string("incomplete"))
             XCTAssertEqual(result["code"], .string("inventory_incomplete"))
-            XCTAssertEqual(result["retryable"], .bool(true))
+            XCTAssertEqual(result["retryable"], .bool(false))
+            XCTAssertEqual(result["subreason"], .string("no_matches_while_inventory_incomplete"))
             XCTAssertEqual(result["selection_complete"], .bool(false))
             XCTAssertNil(result["items"], "an incomplete zero is not a successful empty target set")
             XCTAssertNil(result["idempotent_replay"])
@@ -4740,7 +5292,7 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         let failed = try await fixture.call([
             "op": .string("confirmation_status"), "confirmation_id": .string(cardID.uuidString)
         ])
-        XCTAssertEqual(failed["applied_result"]?.objectValue?["result"], .string("failed"))
+        XCTAssertEqual(failed["applied_result"]?.objectValue?["result"], .string("not_applied"))
         XCTAssertEqual(failed["selection"], pending["selection"])
         fixture.inventory.recordsComplete = true
         fixture.inventory.endpointsComplete = true
@@ -4842,7 +5394,7 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
             let status = try await fixture.call(statusArgs)
             let applied = try XCTUnwrap(status["applied_result"]?.objectValue)
             let row = try XCTUnwrap(applied["items"]?.arrayValue?.single?.objectValue)
-            let expected: Value = .string(hasLink ? "applied" : "unchanged")
+            let expected: Value = .string(hasLink ? "applied" : "not_applied")
             XCTAssertEqual(status["confirmation_state"], .string("consumed"))
             XCTAssertEqual(status["result"], expected)
             XCTAssertEqual(applied["result"], expected)
@@ -4893,7 +5445,7 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
             ])
             let applied = try XCTUnwrap(status["applied_result"]?.objectValue)
             let row = try XCTUnwrap(applied["items"]?.arrayValue?.single?.objectValue)
-            let expected: Value = .string(hasLink ? "partial" : "failed")
+            let expected: Value = .string(hasLink ? "partial" : "not_applied")
             XCTAssertEqual(status["confirmation_state"], .string("consumed"))
             XCTAssertEqual(status["result"], expected)
             XCTAssertEqual(applied["result"], expected)
@@ -5009,7 +5561,7 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
             ])
             let applied = try XCTUnwrap(status["applied_result"]?.objectValue)
             let row = try XCTUnwrap(applied["items"]?.arrayValue?.single?.objectValue)
-            let expected: Value = .string(alreadyArchived ? "failed" : "partial")
+            let expected: Value = .string(alreadyArchived ? "not_applied" : "partial")
             XCTAssertEqual(status["confirmation_state"], .string("consumed"))
             XCTAssertEqual(status["result"], expected)
             XCTAssertEqual(applied["result"], expected)
@@ -5370,7 +5922,7 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
             "idempotency_key": .string("pin-noop")
         ]
         let noop = try await fixture.call(args)
-        XCTAssertEqual(noop["result"], .string("unchanged"))
+        XCTAssertEqual(noop["result"], .string("not_applied"))
         XCTAssertEqual(items(noop)[a.uuidString], "unchanged")
         fixture.organizer.states[a]?.isPinned = false
         let retry = try await fixture.call(args)
@@ -5710,10 +6262,89 @@ final class SessionAdminDeferredOutcomeTests: XCTestCase {
         XCTAssertEqual(outcome["result"], .string("not_applied"))
         XCTAssertEqual(outcome["code"], .string("bind_failed"))
         XCTAssertEqual(outcome["detail"], .string("test_bind_failure"))
+        // Full error contract on the deferred outcome, not just a code and free text.
+        // An unclassified failure (for example a missing worktree path) is not retryable unchanged.
+        XCTAssertEqual(outcome["subreason"], .string("bind_error"))
+        XCTAssertEqual(outcome["retryable"], .bool(false))
+        XCTAssertEqual(outcome["affected"], .array([.string(target.uuidString)]))
+        XCTAssertEqual(outcome["next_call"]?.objectValue?["arguments"]?.objectValue?["op"], .string("scope_status"))
         XCTAssertEqual(inventory["pending_binds"], .array([]))
         fixture.provenance.add(target, parent: nil, org: UUID())
         let restricted = try await fixture.value(.adminWorktreeInventory, caller: caller)
         XCTAssertEqual(restricted["deferred_outcomes"], .array([]), "A prior outcome must not disclose an out-of-scope target")
+    }
+
+    func testDeferredBindLimitRefusalIsPermanentAndPointsAtScopeStatus() async throws {
+        let fixture = SessionAdminStructureTests.Fixture()
+        let caller = UUID(), target = UUID()
+        fixture.provenance.add(caller, parent: nil)
+        fixture.provenance.add(target, parent: caller)
+        try fixture.grant(caller)
+        let host = Host(base: fixture.worktrees)
+        host.bindingError = SessionAdminHostError.guardrailExceeded(limit: 1, current: 1)
+        let handler = SessionAdminWorktreeHandler(
+            context: .init(scopes: fixture.runtime, projector: fixture.projector), host: host, ownership: fixture.ownership
+        )
+        fixture.core.register(handler)
+        fixture.worktrees.idle[target] = false
+        let queued = try await fixture.value(
+            .adminWorktreeBind,
+            caller: caller,
+            targets: [target],
+            args: ["worktree": .string("test-worktree"), "apply": .string("next_boundary")]
+        )
+        XCTAssertEqual(queued["items"]?.arrayValue?.first?.objectValue?["result"], .string("queued"))
+        fixture.worktrees.becomeIdle(target)
+        await handler.settleDeferredBinds()
+        XCTAssertNil(handler.pendingBinds[target])
+        let inventory = try await fixture.value(.adminWorktreeInventory, caller: caller)
+        let outcome = try XCTUnwrap(inventory["deferred_outcomes"]?.arrayValue?.first?.objectValue)
+        XCTAssertEqual(outcome["session_id"], .string(target.uuidString))
+        XCTAssertEqual(outcome["result"], .string("not_applied"))
+        XCTAssertEqual(outcome["code"], .string("bind_failed"))
+        // A configured limit is permanent: no unchanged retry, and recovery points at the scope.
+        XCTAssertEqual(outcome["subreason"], .string("worktree_limit_reached"))
+        XCTAssertEqual(outcome["retryable"], .bool(false))
+        XCTAssertEqual(outcome["next_call"]?.objectValue?["arguments"]?.objectValue?["op"], .string("scope_status"))
+        XCTAssertEqual(inventory["pending_binds"], .array([]))
+    }
+
+    func testDeferredBindIdleTimeoutIsRetryableWithCompleteBindCall() async throws {
+        let fixture = SessionAdminStructureTests.Fixture()
+        let caller = UUID(), target = UUID()
+        fixture.provenance.add(caller, parent: nil)
+        fixture.provenance.add(target, parent: caller)
+        try fixture.grant(caller)
+        let host = Host(base: fixture.worktrees)
+        host.bindingError = SessionAdminHostError.notIdle
+        let handler = SessionAdminWorktreeHandler(
+            context: .init(scopes: fixture.runtime, projector: fixture.projector), host: host, ownership: fixture.ownership
+        )
+        fixture.core.register(handler)
+        fixture.worktrees.idle[target] = false
+        let queued = try await fixture.value(
+            .adminWorktreeBind,
+            caller: caller,
+            targets: [target],
+            args: ["worktree": .string("test-worktree"), "apply": .string("next_boundary")]
+        )
+        XCTAssertEqual(queued["items"]?.arrayValue?.first?.objectValue?["result"], .string("queued"))
+        fixture.worktrees.becomeIdle(target)
+        await handler.settleDeferredBinds()
+        XCTAssertNil(handler.pendingBinds[target])
+        let inventory = try await fixture.value(.adminWorktreeInventory, caller: caller)
+        let outcome = try XCTUnwrap(inventory["deferred_outcomes"]?.arrayValue?.first?.objectValue)
+        XCTAssertEqual(outcome["session_id"], .string(target.uuidString))
+        XCTAssertEqual(outcome["result"], .string("not_applied"))
+        XCTAssertEqual(outcome["code"], .string("bind_failed"))
+        // The idle-boundary timeout is transient: retry the complete original bind call.
+        XCTAssertEqual(outcome["subreason"], .string("no_idle_boundary"))
+        XCTAssertEqual(outcome["retryable"], .bool(true))
+        let recovery = outcome["next_call"]?.objectValue?["arguments"]?.objectValue
+        XCTAssertEqual(recovery?["op"], .string("worktree_bind"))
+        XCTAssertEqual(recovery?["session_id"], .string(target.uuidString))
+        XCTAssertEqual(recovery?["worktree"], .string("test-worktree"))
+        XCTAssertEqual(inventory["pending_binds"], .array([]))
     }
 
     func testWorktreeInventoryRefusesRevocationAndMembershipChangeDuringPrunabilityAwait() async throws {
@@ -5744,6 +6375,7 @@ final class SessionAdminDeferredOutcomeTests: XCTestCase {
     private final class Host: SessionAdminWorktreeHost {
         let base: SessionAdminStructureTests.WorktreeHost
         var failBinding = false
+        var bindingError: Error?
         var onPrunability: (() -> Void)?
         init(base: SessionAdminStructureTests.WorktreeHost) {
             self.base = base
@@ -5764,6 +6396,7 @@ final class SessionAdminDeferredOutcomeTests: XCTestCase {
             admitBindings: @escaping @MainActor (Set<String>) throws -> Void,
             bindingsCommitted: @escaping @MainActor (Set<String>) -> Void
         ) async throws -> SessionAdminWorktreeInfo {
+            if let bindingError { throw bindingError }
             if failBinding { throw NSError(domain: "Test", code: 1, userInfo: [NSLocalizedDescriptionKey: "test_bind_failure"]) }
             return try await base.bindWorktree(
                 sessionID: sessionID, worktree: worktree, repoRoot: repoRoot, isStillAuthorized: isStillAuthorized,
@@ -6227,7 +6860,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
         )
         let value = try await handler.perform(batch)
         XCTAssertEqual(value.objectValue?["code"], .string("inventory_budget_exceeded"))
-        XCTAssertEqual(value.objectValue?["retryable"], .bool(true))
+        XCTAssertEqual(value.objectValue?["retryable"], .bool(false))
         source.afterRead = { _ = runtime.release(scopeID: scope.id, caller: .agentSession(caller)) }
         do {
             _ = try await handler.perform(batch)
@@ -6299,7 +6932,8 @@ final class SessionAdminInventoryReadTests: XCTestCase {
             arguments: ["filter": .object(["has_links": .bool(false)])]
         )) else { return XCTFail("incomplete census must return a typed refusal") }
         XCTAssertEqual(value.objectValue?["code"], .string("inventory_incomplete"))
-        XCTAssertEqual(value.objectValue?["retryable"], .bool(true))
+        XCTAssertEqual(value.objectValue?["subreason"], .string("filter_needs_complete_census"))
+        XCTAssertEqual(value.objectValue?["retryable"], .bool(false))
         XCTAssertFalse(handler.performed)
     }
 
@@ -6307,6 +6941,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
         let source: LiveAgentSessionInventorySource?
         let records: [DomainAgentSessionInventoryRecord]
         let edges: [DomainAgentSessionInventoryEdge]
+        var unresolvedSessions: [UUID: String] = [:]
 
         init(
             source: LiveAgentSessionInventorySource? = nil,
@@ -6318,7 +6953,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
         }
 
         func snapshot() async -> DomainAgentSessionInventorySnapshot {
-            .init(records: records, edges: edges, isComplete: false)
+            .init(records: records, edges: edges, isComplete: false, unresolvedSessions: unresolvedSessions)
         }
 
         func snapshot(read: AgentSessionInventoryRead) async throws -> DomainAgentSessionInventorySnapshot {
@@ -6328,7 +6963,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
             }
             return .init(
                 records: records.filter { read.sessionIDs?.contains($0.sessionID) ?? true },
-                edges: edges, isComplete: false
+                edges: edges, isComplete: false, unresolvedSessions: unresolvedSessions
             )
         }
     }
@@ -6421,7 +7056,8 @@ final class SessionAdminInventoryReadTests: XCTestCase {
         }
         guard case let .completed(value) = outcome else { return XCTFail("budget refusal must be a typed grantee-only outcome") }
         XCTAssertEqual(value.objectValue?["code"], .string("inventory_budget_exceeded"))
-        XCTAssertEqual(value.objectValue?["retryable"], .bool(true))
+        XCTAssertEqual(value.objectValue?["subreason"], .string("request_budget_exhausted"))
+        XCTAssertEqual(value.objectValue?["retryable"], .bool(false))
         XCTAssertFalse(handler.performed)
     }
 
@@ -6619,7 +7255,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 "window=\(window.windowID) closing=\(window.isClosing) activeID=\(String(describing: manager.activeWorkspaceID)) established=\(manager.hasEstablishedWorkspaceSelectionForTesting) expected=\(expected.id) catalog=\(catalog)"
             )
             XCTAssertEqual(current.id, expected.id, "fixture activation must still own its workspace")
-            guard current.id == expected.id else { throw AgentSessionInventoryReadFailure.incomplete }
+            guard current.id == expected.id else { throw AgentSessionInventoryReadFailure.incomplete(.sessionsChangedDuringRead) }
             current.composeTabs = expected.composeTabs
             current.stashedTabs = expected.stashedTabs
             current.activeComposeTabID = expected.activeComposeTabID
@@ -6775,6 +7411,106 @@ final class SessionAdminInventoryReadTests: XCTestCase {
         }
     }
 
+    func testTargetedChildLinkUsesGlobalOrApprovedExactConsentAndReturnsActualOutcome() async throws {
+        try await assertTargetedChildLink(global: true, ownChild: true)
+        try await assertTargetedChildLink(global: true, ownChild: false)
+        try await assertTargetedChildLink(global: false, ownChild: true)
+        try await assertTargetedChildLink(global: false, ownChild: false)
+    }
+
+    func testTargetedPostLinkRevocationReturnsPartialAndRetainsRetryReceipt() async throws {
+        try await assertTargetedChildLink(global: true, ownChild: true, revokeAfterLink: true)
+    }
+
+    func testFullAccessOffAfterLinkRevalidatesConsentBeforeDelivery() async throws {
+        try await assertTargetedChildLink(global: true, ownChild: false, revokeAfterLink: true, disableAfterLink: true)
+    }
+
+    private func assertTargetedChildLink(global: Bool, ownChild: Bool, revokeAfterLink: Bool = false, disableAfterLink: Bool = false) async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            let caller = UUID(), target = UUID()
+            let parent = ownChild ? caller : UUID()
+            var fullAccess = global
+            let observerFixture = try await LoadedWindowFixture.make(activeID: caller, parentID: nil)
+            let targetFixture = try await LoadedWindowFixture.make(activeID: target, parentID: parent)
+            addTeardownBlock { @MainActor in await targetFixture.cleanup()
+                await observerFixture.cleanup()
+            }
+            try observerFixture.installCarriers()
+            try targetFixture.installCarriers()
+            let bridge = AgentSessionLinkRuntimeBridge.shared
+            let previousGlobal = bridge.delegationScopes.isGlobalAutoApproveEnabled
+            bridge.delegationScopes.isGlobalAutoApproveEnabled = { fullAccess }
+            var decisions: [String] = []
+            bridge.delegationScopes.test_scopeDecision = { _, text in decisions.append(text) }
+            addTeardownBlock { @MainActor in
+                bridge.test_afterTargetedLink = nil
+                bridge.delegationScopes.test_scopeDecision = nil
+                for scope in bridge.delegationScopes.allLiveScopes() where scope.grant.granteeSessionID == caller {
+                    bridge.delegationScopes.revoke(scopeID: scope.id)
+                }
+                bridge.delegationScopes.isGlobalAutoApproveEnabled = previousGlobal
+            }
+            for (fixture, id, parent) in [(observerFixture, caller, UUID?.none), (targetFixture, target, Optional(parent))] {
+                let vm = fixture.window.agentModeViewModel
+                let tab = try XCTUnwrap(fixture.carriers?.composeTabs.first)
+                let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+                let payload = AgentSession(id: id, workspaceID: workspace.id, composeTabID: tab.id, name: "Targeted child", agentKind: "claudeCode", agentModel: "", parentSessionID: parent, isMCPOriginated: parent != nil)
+                _ = try await AgentSessionDataService.shared.saveAgentSession(payload, for: workspace)
+                let session = vm.session(for: tab.id)
+                _ = try XCTUnwrap(vm.test_installPersistentSessionBinding(sessionID: id, on: session, updateWorkspaceMetadata: true))
+                session.parentSessionID = parent
+                session.hasLoadedPersistedState = true
+                session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            }
+            let observerTab = try XCTUnwrap(observerFixture.carriers?.composeTabs.first)
+            let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(observerFixture.window.agentModeViewModel, tabID: observerTab.id)
+            if revokeAfterLink {
+                bridge.test_afterTargetedLink = {
+                    if disableAfterLink { fullAccess = false
+                        return
+                    }
+                    for scope in bridge.delegationScopes.allLiveScopes() where scope.grant.granteeSessionID == caller {
+                        bridge.delegationScopes.revoke(scopeID: scope.id)
+                    }
+                }
+            }
+            if !global, !ownChild {
+                let targetTab = try XCTUnwrap(targetFixture.carriers?.composeTabs.first)
+                let targetEndpoint = try AgentSessionLinkEndpointTestSupport.endpoint(targetFixture.window.agentModeViewModel, tabID: targetTab.id)
+                let refusal = await bridge.addDelegatedMonitorLink(
+                    observerEndpoint: endpoint,
+                    targetEndpoint: targetEndpoint,
+                    authorization: .init(isCurrent: { true })
+                )
+                XCTAssertEqual(refusal, .failed(.childSession), "OFF: another parent's child is not linkable without applicable consent")
+            }
+            let key = UUID().uuidString
+            let response = await bridge.requestTargetedOversight(observer: endpoint, targetSessionID: target, message: revokeAfterLink ? "must not dispatch" : nil, idempotencyKey: key)
+            if global {
+                XCTAssertEqual(response.objectValue?["result"], .string(revokeAfterLink ? "partial" : "applied"))
+                if revokeAfterLink {
+                    XCTAssertEqual(response.objectValue?["code"], .string("scope_revoked"))
+                    XCTAssertNotNil(response.objectValue?["link_id"]?.stringValue)
+                    XCTAssertEqual(response.objectValue?["retryable"], .bool(false))
+                    let replay = await bridge.requestTargetedOversight(observer: endpoint, targetSessionID: target, message: "must not dispatch", idempotencyKey: key)
+                    XCTAssertEqual(replay, response, "A retry inspects the existing receipt, never starts the task again")
+                }
+            } else {
+                XCTAssertEqual(response.objectValue?["result"], .string("approval_requested"))
+                let before = await bridge.delegationActiveLink(observerSessionID: caller, targetSessionID: target)
+                XCTAssertNil(before, "Neither parenthood nor a UUID bypasses the OFF-mode card")
+                let requestID = try XCTUnwrap(response.objectValue?["request_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+                _ = try bridge.delegationScopes.approve(requestID: requestID).get()
+                try await AsyncTestWait.waitUntil("approved child link outcome") { decisions.contains { $0.contains("linked;") || $0.contains("link_refused") } }
+            }
+            if !revokeAfterLink {
+                let link = await bridge.delegationActiveLink(observerSessionID: caller, targetSessionID: target)
+                XCTAssertNotNil(link)
+            }
+        }
+    }
+
     func testReducedTargetApprovalReportsTheMissingCapabilitiesWithoutDelivering() async throws {
         try await MCPSharedServerTestLease.shared.withLease { _ in
             let observerFixture = try await LoadedWindowFixture.make(activeID: UUID(), parentID: nil)
@@ -6898,6 +7634,10 @@ final class SessionAdminInventoryReadTests: XCTestCase {
         }
     }
 
+    func testTargetedPostDeliveryRevocationReportsAcceptedPartialWithoutDuplicateTask() async throws {
+        try await assertExactTargetFlow(placement: "historical", duringRun: "revoke-after-delivery")
+    }
+
     func testExactTargetApprovalContinuesColdSavedLinkAndManagedTaskWithoutUserTurn() async throws {
         try await assertExactTargetFlow(placement: "current")
     }
@@ -6987,9 +7727,15 @@ final class SessionAdminInventoryReadTests: XCTestCase {
     }
 
     private func assertExactTargetFlow(placement: String, retirement: String = "revoke", checksConnectionChanges: Bool = false, duringRun: String? = nil, longWatch: Bool = false, terminalStatus: NativeAgentRuntimeTurnStatus = .completed, reconnectBeforeActivation: Bool = false) async throws {
+        // This is the full-access OFF approval-card flow. Never inherit the machine's real setting.
+        let previousFullAccess = OverseerGlobalAutoApprove.isEnabled
+        OverseerGlobalAutoApprove.isEnabled = { false }
+        defer { OverseerGlobalAutoApprove.isEnabled = previousFullAccess }
         try await MCPSharedServerTestLease.shared.withLease { _ in
-            let requesterID = placement == "current" && !reconnectBeforeActivation ? UUID(uuidString: "EBDD3C4A-E6DE-4D9F-8FA3-5456B640BBE6")! : UUID()
-            let targetID = placement == "current" && !reconnectBeforeActivation ? UUID(uuidString: "7028330D-041A-432C-A6F6-F1C976FAD1AD")! : UUID()
+            // Fresh IDs: reusing a real session's UUID (the original T30 report) collides with the
+            // signed-in user's saved sessions and history on a developer machine.
+            let requesterID = UUID()
+            let targetID = UUID()
             let controller = MonitorFakeNativeController()
             var providerStarts = 0
             let observerController = MonitorFakeNativeController()
@@ -7300,10 +8046,32 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 await network.clearClientConnectionPolicy(for: AgentProviderKind.claudeMCPClientID, windowID: endpoint.windowID, runID: runID)
                 await network.cleanupRunRoutingState(for: runID, windowID: endpoint.windowID)
             }
+            if duringRun == "revoke-after-delivery" {
+                bridge.test_afterTargetedDelivery = {
+                    for scope in bridge.delegationScopes.allLiveScopes() where scope.grant.granteeSessionID == requesterID {
+                        bridge.delegationScopes.revoke(scopeID: scope.id)
+                    }
+                }
+                addTeardownBlock { @MainActor in bridge.test_afterTargetedDelivery = nil }
+            }
             let granted = try bridge.delegationScopes.approve(
                 requestID: requestID, presentedWindowID: endpoint.windowID,
                 presentedTabID: endpoint.tabID, presentedSessionID: requesterID
             ).get()
+            if duringRun == "revoke-after-delivery" {
+                try await AsyncTestWait.waitUntil("accepted delivery reports revoked authority", timeout: 15) { decisions.contains { $0.contains("delivery_accepted_scope_revoked") } }
+                let replay = try await executeOversee(args)
+                XCTAssertEqual(replay.objectValue?["result"], .string("partial"))
+                XCTAssertEqual(replay.objectValue?["code"], .string("delivery_accepted_scope_revoked"))
+                XCTAssertEqual(replay.objectValue?["retryable"], .bool(false))
+                // Revocation can cancel the accepted run before its provider starts.
+                XCTAssertLessThanOrEqual(providerStarts, 1, "the replay must not start the task again")
+                // Revocation right after acceptance may stop the run before the provider sends; the
+                // invariant is that the replay never sends the task a second time.
+                let sent = await controller.sentCount
+                XCTAssertLessThanOrEqual(sent, 1, "the replay must not deliver the task again")
+                return
+            }
             try await AsyncTestWait.waitUntil("one approval automatically prepares, links and dispatches", timeout: 15) {
                 decisions.contains { $0.contains("task_delivered") || $0.contains("refused") || $0.contains("failed") || $0.contains("not_dispatched") }
             }
@@ -7347,7 +8115,8 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 XCTAssertNil(observerVM.test_agentSessionLinkCurrentRunCatalogRouteToken)
             }
             let repeated = try await executeOversee(args)
-            XCTAssertEqual(repeated.objectValue?["result"], .string("continuing_approved_request"))
+            // A replay returns the retained outcome of the one delivered task, never a second task.
+            XCTAssertEqual(repeated.objectValue?["result"], .string("applied"))
             XCTAssertEqual(repeated.objectValue?["request_id"], .string(requestID.uuidString))
             XCTAssertEqual(providerStarts, 1, "The provider starts for the assigned task, never merely to link")
             XCTAssertEqual(targetFixture.window.promptManager.activeComposeTabID, selectedBefore)
@@ -7698,12 +8467,10 @@ final class SessionAdminInventoryReadTests: XCTestCase {
         _ source: LiveAgentSessionInventorySource, sessionIDs: Set<UUID>? = nil,
         file: StaticString = #filePath, line: UInt = #line
     ) async throws {
-        do {
-            _ = try await source.snapshot(read: .init(loadedOnly: true, sessionIDs: sessionIDs))
-            XCTFail("Conflicting carrier evidence must not produce a successful row", file: file, line: line)
-        } catch let failure as AgentSessionInventoryReadFailure {
-            XCTAssertEqual(failure, .incomplete, file: file, line: line)
-        }
+        let snapshot = try await source.snapshot(read: .init(loadedOnly: true, sessionIDs: sessionIDs))
+        XCTAssertFalse(snapshot.unresolvedSessions.isEmpty, file: file, line: line)
+        XCTAssertFalse(snapshot.recordsComplete, file: file, line: line)
+        XCTAssertTrue(Set(snapshot.records.keys).isDisjoint(with: snapshot.unresolvedSessions.keys), file: file, line: line)
     }
 
     func testExactGetAndCensusChooseTheSameCarrierBeforeFilteringRequestedIDs() async throws {
@@ -7790,7 +8557,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 fixture.window.agentModeViewModel.test_installLiveSession(live)
                 try await assertCarrierReadIncomplete(source, sessionIDs: [c])
                 let result = try await carrierGet(source, sessionID: c, workspaceID: workspace.id)
-                XCTAssertEqual(result["code"], .string("inventory_incomplete"))
+                XCTAssertEqual(result["code"], .string("ambiguous_binding"))
                 XCTAssertNil(result["session"])
                 XCTAssertNil(result["sessions"])
                 await fixture.cleanup()
@@ -8002,6 +8769,191 @@ final class SessionAdminInventoryReadTests: XCTestCase {
         }
     }
 
+    func testAmbiguousBindingOmitsOnlyThatSessionAndNeverFallsBackToHistory() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            try await withCarrierWindows(count: 1) { windows in
+                let target = UUID(), healthy = UUID()
+                let tabs = [
+                    ComposeTabState(name: "First binding", activeAgentSessionID: target),
+                    ComposeTabState(name: "Second binding", activeAgentSessionID: target),
+                    ComposeTabState(name: "Healthy", activeAgentSessionID: healthy)
+                ]
+                let workspace = WorkspaceModel(name: "Mixed carriers", repoPaths: [], ephemeralFlag: true, composeTabs: tabs)
+                installCarrierWindow(windows[0], workspace: workspace, entries: [:])
+                let scanner = Scanner()
+                await scanner.setWorkspaces([.init(
+                    workspaceDir: URL(fileURLWithPath: "/tmp/inventory-unresolved-history"),
+                    workspaceName: workspace.name, workspaceID: workspace.id,
+                    records: [directRecord(id: target, parent: nil, workspace: workspace.id)],
+                    indexReadFailed: false, indexSchemaVersion: nil
+                )])
+                let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { windows }, links: { ([], []) })
+                for loadedOnly in [true, false] {
+                    let snapshot = try await source.snapshot(read: .init(loadedOnly: loadedOnly))
+                    XCTAssertEqual(Set(snapshot.records.keys), [healthy])
+                    XCTAssertEqual(snapshot.unresolvedSessions, [target: "ambiguous_binding"])
+                    XCTAssertFalse(snapshot.isComplete)
+                    XCTAssertFalse(snapshot.recordsComplete)
+                    XCTAssertTrue(snapshot.knownSessionIDs.contains(target))
+                    XCTAssertFalse(snapshot.isMissing(target))
+                }
+            }
+        }
+    }
+
+    func testReplicaMetadataMismatchOmitsOnlyConflictingSession() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            try await withCarrierWindows(count: 2) { windows in
+                let target = UUID(), healthy = UUID()
+                let tab = ComposeTabState(name: "Replica", activeAgentSessionID: target)
+                let safe = ComposeTabState(name: "Healthy", activeAgentSessionID: healthy)
+                let workspace = WorkspaceModel(name: "Replicas", repoPaths: [], ephemeralFlag: true, composeTabs: [tab, safe])
+                for (index, window) in windows.enumerated() {
+                    installCarrierWindow(window, workspace: workspace, entries: [
+                        target: carrierEntry(target, tabID: tab.id, savedAt: Double(20 + index)),
+                        healthy: carrierEntry(healthy, tabID: safe.id)
+                    ])
+                }
+                for ordered in [windows, Array(windows.reversed())] {
+                    let source = LiveAgentSessionInventorySource(scanner: Scanner(), windows: { ordered }, links: { ([], []) })
+                    let snapshot = try await source.snapshot(read: .init(loadedOnly: true))
+                    XCTAssertEqual(Set(snapshot.records.keys), [healthy])
+                    XCTAssertEqual(snapshot.unresolvedSessions, [target: "replica_mismatch"])
+                    XCTAssertFalse(snapshot.recordsComplete)
+                }
+            }
+        }
+    }
+
+    func testLoadedCaptureRetriesOnceDiscardsInvalidatedRowsAndPropagatesCancellation() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            try await withCarrierWindows(count: 1) { windows in
+                for outcome in ["recover", "exhaust", "cancel", "budget"] {
+                    let target = UUID()
+                    let tab = ComposeTabState(name: "Invalidated row", activeAgentSessionID: target)
+                    var workspace = WorkspaceModel(name: "Capture", repoPaths: [], ephemeralFlag: true, composeTabs: [tab])
+                    installCarrierWindow(windows[0], workspace: workspace, entries: [:])
+                    var attempts = 0
+                    let clock = ProjectionClock(stopAt: 100)
+                    let source = LiveAgentSessionInventorySource(
+                        scanner: Scanner(), windows: { windows },
+                        loadedProjectionCheckpoint: {
+                            attempts += 1
+                            if outcome == "cancel" { throw CancellationError() }
+                            if outcome == "budget", attempts == 2 {
+                                for _ in 0 ..< 100 {
+                                    _ = clock.now()
+                                }
+                            }
+                            if attempts == 1 || outcome == "exhaust" {
+                                workspace.composeTabs[0].name = "Fresh capture"
+                                self.installCarrierWindow(windows[0], workspace: workspace, entries: [:])
+                                // Owner generations are the production capture's freshness fence.
+                                let owner = AgentModeViewModel.SessionIndexOwner(workspaceID: workspace.id, activationEpoch: UInt64(attempts + 1))
+                                windows[0].agentModeViewModel.test_installSessionIndexSnapshot(
+                                    [:], owner: owner, latestOwner: owner, activeWorkspace: workspace
+                                )
+                            }
+                        }, links: { ([], []) }
+                    )
+                    do {
+                        let snapshot = try await source.snapshot(read: .init(loadedOnly: true, budget: clock.budget()))
+                        XCTAssertEqual(outcome, "recover")
+                        XCTAssertEqual(snapshot.records[target]?.name, "Fresh capture", "invalidated rows must never escape")
+                    } catch let failure as AgentSessionInventoryReadFailure {
+                        if outcome == "budget" {
+                            XCTAssertEqual(failure, .budgetExceeded, "retry must not replace the invocation’s expired budget")
+                        } else {
+                            XCTAssertEqual(outcome, "exhaust")
+                            XCTAssertEqual(failure, .incomplete(.sessionsChangedDuringRead))
+                        }
+                    } catch is CancellationError {
+                        XCTAssertEqual(outcome, "cancel")
+                    }
+                    XCTAssertEqual(attempts, outcome == "cancel" ? 1 : 2, "exactly one internal retry, and none for cancellation")
+                }
+            }
+        }
+    }
+
+    func testUnresolvedDiagnosticsAreRenderedAndIDsRedactedAcrossInventoryTreeAndLinks() async throws {
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
+        let caller = UUID(), hidden = UUID(), workspace = UUID()
+        let source = LoadedProjectionSource(records: [
+            .init(sessionID: caller, name: "Root", workspaceID: workspace, isLoaded: true, lastActivityAt: Date())
+        ])
+        source.unresolvedSessions = [hidden: "ambiguous_binding"]
+        for kind in [DomainDelegationScopeKind.allSessions, .workspace(workspaceID: workspace)] {
+            let scope = try grant(runtime: runtime, caller: caller, kind: kind)
+            let handler = AgentSessionInventoryOperationHandler(
+                source: source, scopeChain: { runtime.scopeChain(from: $0) },
+                isScopeCurrent: { runtime.record(id: $0.id)?.generation == $0.generation },
+                isLeaseCurrent: { runtime.isCurrent($0) }
+            )
+            for operation in [DomainAgentSessionTargetOperation.adminInventory, .adminTree, .adminLinks] {
+                let value = try await handler.perform(.init(
+                    request: .init(operation: operation, caller: .agentSession(caller)),
+                    scope: scope, leases: [], bases: [], itemsRequiringControl: [], confirmation: nil
+                ))
+                let object = try XCTUnwrap(value.objectValue)
+                XCTAssertEqual(object["result"], .string("partial"))
+                XCTAssertEqual(object["total_complete"], .bool(false))
+                XCTAssertEqual(object["unresolved_session_count"], .int(1))
+                let items = try XCTUnwrap(object["unresolved_sessions"]?.arrayValue)
+                if kind == .allSessions {
+                    XCTAssertEqual(items.first?.objectValue?["session_id"], .string(hidden.uuidString))
+                    XCTAssertEqual(items.first?.objectValue?["code"], .string("ambiguous_binding"))
+                    XCTAssertNotNil(items.first?.objectValue?["next_step"])
+                } else {
+                    XCTAssertTrue(items.isEmpty)
+                    XCTAssertEqual(object["unresolved_sessions_redacted_count"], .int(1))
+                    XCTAssertFalse(String(describing: value).contains(hidden.uuidString))
+                }
+            }
+        }
+    }
+
+    func testUnresolvedGrantedTreeRootReturnsPartialInsteadOfAbortingDiscovery() async throws {
+        let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
+        let caller = UUID()
+        let scope = try grant(runtime: runtime, caller: caller, kind: .tree(rootSessionID: caller))
+        let source = LoadedProjectionSource(records: [])
+        source.unresolvedSessions = [caller: "ambiguous_binding"]
+        let handler = AgentSessionInventoryOperationHandler(
+            source: source, scopeChain: { runtime.scopeChain(from: $0) },
+            isScopeCurrent: { runtime.record(id: $0.id)?.generation == $0.generation },
+            isLeaseCurrent: { runtime.isCurrent($0) }
+        )
+        let result = try await handler.perform(.init(
+            request: .init(operation: .adminTree, caller: .agentSession(caller)),
+            scope: scope, leases: [], bases: [], itemsRequiringControl: [], confirmation: nil
+        ))
+        XCTAssertEqual(result.objectValue?["result"], .string("partial"))
+        XCTAssertEqual(result.objectValue?["tree"], .null)
+        XCTAssertEqual(result.objectValue?["unresolved_sessions"]?.arrayValue?.first?.objectValue?["session_id"], .string(caller.uuidString))
+    }
+
+    func testLoadedFilterSkipsHistoryButGlobalPredicatesStillRequireIt() async throws {
+        var filter = DomainAgentSessionInventoryFilter()
+        filter.loaded = true
+        let scanner = Scanner()
+        let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { [] }, links: { ([], []) })
+        let read = AgentSessionInventoryRead.scoped(chain: [], filter: filter)
+        XCTAssertTrue(read.loadedOnly)
+        _ = try await source.snapshot(read: read)
+        let scans = await scanner.capturedQueries()
+        XCTAssertTrue(scans.isEmpty)
+        filter.hasLinks = false
+        XCTAssertFalse(AgentSessionInventoryRead.scoped(chain: [], filter: filter).loadedOnly)
+        // Loaded rows obtain their creation dates from history, not sidebar carriers.
+        filter.hasLinks = nil
+        filter.createdBefore = Date(timeIntervalSince1970: 100)
+        XCTAssertFalse(AgentSessionInventoryRead.scoped(chain: [], filter: filter).loadedOnly)
+        filter.createdBefore = nil
+        filter.createdAfter = Date(timeIntervalSince1970: 100)
+        XCTAssertFalse(AgentSessionInventoryRead.scoped(chain: [], filter: filter).loadedOnly)
+    }
+
     func testCanonicalCarrierRuntimeJoinPreservesLiveEvidenceAcrossWindowOrders() async throws {
         try await MCPSharedServerTestLease.shared.withLease { _ in
             try await withCarrierWindows(count: 3) { windows in
@@ -8010,12 +8962,12 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 tab.lastModified = Date(timeIntervalSince1970: 20)
                 let workspace = WorkspaceModel(name: "Shared canonical workspace", repoPaths: [], ephemeralFlag: true, composeTabs: [tab])
                 typealias Observation = (live: AgentSessionRunState?, fallback: String?)
-                let cases: [(String, [Observation], DomainAgentSessionInventoryRunState?)] = [
+                let cases: [(String, [Observation], DomainAgentSessionInventoryRunState)] = [
                     ("absent then live", [(nil, nil), (.running, "idle")], .running),
                     ("equal live", [(.running, "idle"), (.running, "idle")], .running),
-                    ("different live", [(.running, "idle"), (.idle, "idle")], nil),
-                    ("different fallback", [(nil, "running"), (nil, "idle")], nil),
-                    ("live fallback live", [(.running, "idle"), (nil, "idle"), (.idle, "idle")], nil),
+                    ("different live", [(.running, "idle"), (.idle, "idle")], .unknown),
+                    ("different fallback", [(nil, "running"), (nil, "idle")], .unknown),
+                    ("live fallback live", [(.running, "idle"), (nil, "idle"), (.idle, "idle")], .unknown),
                     ("conflicting fallback plus live", [(nil, "idle"), (nil, "completed"), (.running, "idle")], .running)
                 ]
                 for (label, observations, expected) in cases {
@@ -8035,21 +8987,13 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                         let source = LiveAgentSessionInventorySource(scanner: scanner, windows: { ordered }, links: { ([], []) })
                         let selectors: [Set<UUID>?] = [Set([target]), nil]
                         for ids in selectors {
-                            if let expected {
-                                let snapshot = try await source.snapshot(read: .init(loadedOnly: true, sessionIDs: ids))
-                                XCTAssertEqual(Set(snapshot.records.keys), Set([target]), "\(label) \(order)")
-                                XCTAssertEqual(snapshot.records[target]?.runState, expected, "\(label) \(order)")
-                            } else {
-                                try await assertCarrierReadIncomplete(source, sessionIDs: ids)
-                            }
+                            let snapshot = try await source.snapshot(read: .init(loadedOnly: true, sessionIDs: ids))
+                            XCTAssertEqual(Set(snapshot.records.keys), Set([target]), "\(label) \(order)")
+                            XCTAssertEqual(snapshot.records[target]?.runState, expected, "\(label) \(order)")
+                            XCTAssertTrue(snapshot.unresolvedSessions.isEmpty, "Run-state disagreement is not a binding conflict")
                         }
                         let result = try await carrierGet(source, sessionID: target, workspaceID: workspace.id)
-                        if let expected {
-                            XCTAssertEqual(result["session"]?.objectValue?["state"], .string(expected.rawValue), label)
-                        } else {
-                            XCTAssertEqual(result["code"], .string("inventory_incomplete"), label)
-                            XCTAssertNil(result["session"], label)
-                        }
+                        XCTAssertEqual(result["session"]?.objectValue?["state"], .string(expected.rawValue), label)
                         let scans = await scanner.capturedQueries()
                         let direct = await scanner.capturedDirectQueries()
                         XCTAssertTrue(scans.isEmpty && direct.isEmpty)
@@ -8067,7 +9011,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                     try await assertCarrierReadIncomplete(source, sessionIDs: [target])
                     try await assertCarrierReadIncomplete(source)
                     let result = try await carrierGet(source, sessionID: target, workspaceID: workspace.id)
-                    XCTAssertEqual(result["code"], .string("inventory_incomplete"))
+                    XCTAssertEqual(result["code"], .string("ambiguous_binding"))
                     XCTAssertNil(result["session"])
                 }
 

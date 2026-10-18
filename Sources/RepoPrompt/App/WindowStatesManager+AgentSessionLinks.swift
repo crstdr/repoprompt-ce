@@ -870,6 +870,11 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost, PreparedAgentSessio
         return window.apiSettingsViewModel.agentAvailability
     }
 
+    func agentSessionLinkLocalInputSnapshot(for endpoint: DomainAgentSessionLinkEndpointIdentity, includeRecords: Bool) -> AgentSessionLinkRetainedLocalInputIndex.Snapshot? {
+        guard !isTerminating, let window = modelRoutingWindow(withID: endpoint.windowID), !window.isClosing else { return nil }
+        return window.agentModeViewModel.agentSessionLinkLocalInputSnapshot(for: endpoint, includeRecords: includeRecords)
+    }
+
     func agentSessionLinkModelCandidate(
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> AgentSessionLinkEndpointCandidate? {

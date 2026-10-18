@@ -90,6 +90,37 @@ defect in this subsystem.
 
 The lane board is derived data in the existing passive observation pipeline, not a fifth owner. The target view model combines its own run outcome, stamped failure reason, send-readiness blockers, and a current child-session census into the observation snapshot; the runtime bridge publishes that snapshot through link authority, and `poll`/`wait` render it. A board change can advance the existing `wait(until: "change")` cursor, but it creates no new status or attention edge for the passive reducer, changes no Auto-wake admission rule, and persists no board state.
 
+## Passive retained user-input excerpts
+
+Optional excerpts decorate only the status `<change>` rows already selected by the baseline
+renderer. They do not create status edges, attention, wakes, or a second passive queue. The target's
+bounded sixteen-record index is a retained-data projection, not a fifth oversight owner. Only an
+exact, positively identified local-composer row receives the optional persisted `localComposer`
+origin after its retained-versus-rollback decision; legacy, API, and text-only reconstructed rows
+remain unknown. Typed retained copies preserve provenance but are not fresh input events.
+
+The existing passive reducer owns process-local exact-link/index-epoch frontiers. New, restored,
+relinked, newly Read-authorized, or temporarily unavailable lanes baseline at the current high-water;
+there is no historical catch-up. Claims harvest only baseline-selected targets, freeze the newest
+four candidates per session, and retain both unchanged baseline and optional decorated fragments.
+The escaped markup delta, including truthful omission counts, is at most 4,096 bytes per dispatch;
+the conditional guidance is separately bounded to 50 repository-estimator tokens. Full sanitized
+messages at or below 600 Swift Characters use `user_input`; longer ones use `user_input_excerpt`
+with exact first-400/last-200 graphemes and true kept/full counts. Both slices intersect the existing
+Read byte-bounded prefix; no tail beyond Read is disclosed.
+
+Read authorization is batched at the final provider-input boundary, without minting a public cursor.
+After the authority await, existing route/Stop/ownership fences and synchronous claim, content, and
+captured-frontier checks must still pass. Missing or stale optional proof selects only the unchanged
+baseline, never a new wake refusal. Authorized handoff consumes the range synchronously immediately
+before provider invocation; ordinary membership/status/attention receipts still wait for their
+existing provider-acceptance signal. A transport failure after possible handoff deliberately loses
+optional input rather than exposing it twice. Accepted/auth/transport retry is baseline-only. This
+is at-most-once exposure within an observer incarnation, not durable or exactly-once delivery.
+MCP schemas/results, public observations/cursors, guidance revisions, settings, UI, attention,
+compaction, echo policy, and all wake admission decisions remain unchanged. Alpha/Delta dogfood is
+a separate user-performed gate, not an automated launch or readiness claim.
+
 ## Delegation scopes (amendment)
 
 A **delegation scope** is durable, user-granted authority for one overseer session to act on many
