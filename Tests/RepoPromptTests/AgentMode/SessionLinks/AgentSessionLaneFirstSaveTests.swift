@@ -354,7 +354,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
         try await exerciseActivatedFirstLaneFromAnotherWindow(toolbar: false)
     }
 
-    func testFirstLaneAwaitsFullDocumentAdoptionBeforeProvisionalBinding() async throws {
+    func testFirstLaneAwaitsFullDocumentAdoptionBeforeProvisionalBinding() throws {
         throw XCTSkip("depends on #1384, reverted in this diagnostic build")
     }
 
