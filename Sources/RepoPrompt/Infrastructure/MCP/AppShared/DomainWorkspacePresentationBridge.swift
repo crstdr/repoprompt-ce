@@ -3,6 +3,7 @@
 #endif
 import Foundation
 import RepoPromptDomainRuntime
+import RepoPromptShared
 
 struct DomainWorkspaceSaveOperationIDs {
     let working: UUID
@@ -47,6 +48,12 @@ private enum DomainWorkspaceModelEncoder {
 struct DomainWorkspaceAuthorityClient {
     let store: DomainWorkspaceStore
     let windowID: Int
+    var metadataPathPolicy: AppMetadataPathPolicy?
+
+    /// Admit through the same policy the runtime writer uses, before UI relocation mutates disk.
+    func admitStorageRoot(_ root: URL) throws {
+        try metadataPathPolicy?.admitWorkspaceRoot(root)
+    }
 
     /// The exact digest used by document submission, shared with presentation write receipts.
     static func documentDigest(for workspace: WorkspaceModel) throws -> String {
