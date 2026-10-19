@@ -3852,15 +3852,18 @@ final class MCPServerViewModel: ObservableObject {
             : nil
         // Capture the exact self caller at registration, before the tool body can suspend. Neither
         // request metadata nor a later live tab lookup may substitute a successor run attempt.
-        let selfCallOrigin: AgentSelfMCPCallOrigin? = if name == MCPWindowToolName.agentSelf,
-                                                         let context = resolvedContext?.snapshot,
-                                                         let runID = context.runID,
-                                                         indexedRunID == runID,
-                                                         let window = try? requireTargetWindow(),
-                                                         let endpoint = window.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: context.tabID),
-                                                         let session = window.agentModeViewModel.sessions[context.tabID],
-                                                         session.runID == runID,
-                                                         let ownership = session.activeRunOwnership
+        // `manage_worktree` uses the same proof to defer a session's own worktree switch to the
+        // terminal boundary of exactly this turn.
+        let selfCallOrigin: AgentSelfMCPCallOrigin? = if name == MCPWindowToolName.agentSelf
+            || name == MCPWindowToolName.manageWorktree,
+            let context = resolvedContext?.snapshot,
+            let runID = context.runID,
+            indexedRunID == runID,
+            let window = try? requireTargetWindow(),
+            let endpoint = window.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: context.tabID),
+            let session = window.agentModeViewModel.sessions[context.tabID],
+            session.runID == runID,
+            let ownership = session.activeRunOwnership
         {
             .init(endpoint: endpoint, runID: runID, runAttemptID: ownership.attemptID)
         } else {
