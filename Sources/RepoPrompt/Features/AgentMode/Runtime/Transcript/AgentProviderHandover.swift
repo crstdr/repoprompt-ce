@@ -203,7 +203,7 @@ enum AgentProviderHandover {
 
     // MARK: - Persistent turn projection
 
-    private static func isZeroEffectfulToolControlTurn(_ turn: AgentTranscriptTurn) -> Bool {
+    static func isZeroEffectfulToolControlTurn(_ turn: AgentTranscriptTurn) -> Bool {
         guard isSettled(turn), let request = turn.request,
               request.userInputOrigin == nil, request.crossSessionAttribution == nil,
               let limitText = request.text.components(separatedBy: "at most about ").last?

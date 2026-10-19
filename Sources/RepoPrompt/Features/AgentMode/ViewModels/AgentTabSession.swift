@@ -1121,6 +1121,45 @@ final class AgentTabSession: ObservableObject {
         }
     }
 
+    /// A transient rollback value, not another occupancy owner or persisted record. Callers restore
+    /// only under their exact mutation claim and only with definite pre-write evidence.
+    struct ProviderSwitchContextSnapshot {
+        let usage: ContextUsageSnapshot?
+        let codexUsage: AgentContextUsage?
+        let compactedAt: Date?
+        let count: ContextUsageVouch?
+        let window: ContextUsageVouch?
+        let confidence: ContextUsageSnapshotConfidence?
+        let pendingTokens: [Int]
+        let accumulator: AgentModeViewModel.NonCodexTurnTokenAccumulator?
+    }
+
+    func captureProviderSwitchContext() -> ProviderSwitchContextSnapshot {
+        .init(
+            usage: contextUsageSnapshot,
+            codexUsage: codexContextUsage,
+            compactedAt: contextCompactedAt,
+            count: vouchedContextCount,
+            window: vouchedContextWindow,
+            confidence: vouchedContextCountConfidence,
+            pendingTokens: pendingNonCodexUserInputTokenQueue,
+            accumulator: activeNonCodexTurnTokenAccumulator
+        )
+    }
+
+    func restoreProviderSwitchContext(_ snapshot: ProviderSwitchContextSnapshot) {
+        contextUsageSnapshot = snapshot.usage
+        codexContextUsage = snapshot.codexUsage
+        contextCompactedAt = snapshot.compactedAt
+        batchingContextVouchSignals {
+            vouchedContextCount = snapshot.count
+            vouchedContextWindow = snapshot.window
+            vouchedContextCountConfidence = snapshot.confidence
+        }
+        pendingNonCodexUserInputTokenQueue = snapshot.pendingTokens
+        activeNonCodexTurnTokenAccumulator = snapshot.accumulator
+    }
+
     var contextCompactedAt: Date? {
         didSet {
             // A compaction invalidates the count; the window is unchanged.

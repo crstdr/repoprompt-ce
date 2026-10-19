@@ -771,7 +771,7 @@ extension AgentModeViewModel {
     /// would otherwise take the ordinary-dispatch early return and turn a fenced lane update into an
     /// unfenced provider call with no claim, no provenance row, and no snooze/selection check.
     @discardableResult
-    func agentSessionLinkAcquirePhysicalDispatch(
+    func agentSessionLinkAcquireAutoWakePhysicalDispatch(
         for session: TabSession,
         dispatchID: AgentSessionLinkPromptDispatchID
     ) -> Bool {

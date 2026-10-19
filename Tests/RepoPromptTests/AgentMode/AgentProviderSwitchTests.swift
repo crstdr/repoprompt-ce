@@ -102,7 +102,7 @@
             XCTAssertTrue(AgentModeViewModel.providerSwitchNeedsReview(session, excluding: accepted.id), "Equal text cannot impersonate the exact current input")
             session.pendingHandoff.providerSwitchDelivery = .sending
             XCTAssertTrue(AgentModeViewModel.providerSwitchUnconfirmed(session))
-            XCTAssertFalse(AgentModeViewModel.providerSwitchNeedsReview(session))
+            XCTAssertTrue(AgentModeViewModel.providerSwitchNeedsReview(session), "Orphan sending Review must refresh genuinely later accepted input too")
             session.pendingHandoff.clearAfterSend()
             XCTAssertFalse(AgentModeViewModel.providerSwitchUnconfirmed(session))
             XCTAssertNil(session.pendingHandoff.providerSwitchDelivery)

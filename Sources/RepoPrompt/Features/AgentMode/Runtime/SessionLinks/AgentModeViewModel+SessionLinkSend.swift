@@ -136,7 +136,8 @@ extension AgentModeViewModel {
             envelope: envelope, workflow: request.workflow,
             includeBuiltInSessionCleanupGuidance: GlobalSettingsStore.shared.showBuiltInWorkflowCleanupGuidance()
         )
-        let dispatchedMessage = session.isCodexComputerUseArmed
+        let computerUseArmedAtAdmission = session.isCodexComputerUseArmed
+        let dispatchedMessage = computerUseArmedAtAdmission
             ? CodexComputerUseWorkflow.renderProviderPrompt(userInstructions: providerMessage) : providerMessage
         if case let .failure(failure) = await providerSwitchSendAdmission(session: session, input: dispatchedMessage, isCurrent: {
             stopFence.permitsStart(of: session) && liveness().permitsDelivery
@@ -175,6 +176,11 @@ extension AgentModeViewModel {
             return .blocked(commit.refusal)
         }
 
+        // The authorization hop cannot bless text composed under a different arming state.
+        guard session.isCodexComputerUseArmed == computerUseArmedAtAdmission else {
+            releaseComposerSubmitClaim(claim)
+            return .blocked(.endpointPostReadiness)
+        }
         let switchPreparation: ProviderSwitchSendPreparation?
         switch await providerSwitchSendAdmission(session: session, input: dispatchedMessage, isCurrent: {
             stopFence.permitsStart(of: session) && liveness().permitsDelivery && self.composerSubmitClaimIsCurrent(claim)
@@ -371,7 +377,11 @@ extension AgentModeViewModel {
         // Drift retains the durable delivery and withholds only the provider start: the row is
         // already the target's, so rolling it back here would contradict the linearization point and
         // make the same key deliverable twice.
-        guard liveSession.permitsBoundOperationAndSave, dispatchIsCurrent() else {
+        guard liveSession.permitsBoundOperationAndSave,
+              providerSwitchPreparation.map({ providerSwitchPreparationIsCurrent($0, session: liveSession) })
+              ?? (liveSession.pendingHandoff.providerSwitchDelivery == nil),
+              dispatchIsCurrent()
+        else {
             releaseComposerSubmitClaim(claim)
             return .delivered(persistedOnly)
         }
@@ -389,9 +399,12 @@ extension AgentModeViewModel {
         //    still receives the continuity it was staged for. Nothing focuses, activates, or
         //    switches the target window.
         // Local arming authorizes this tab's turns, including attributed remote input.
-        let dispatchedProviderMessage = liveSession.isCodexComputerUseArmed
-            ? CodexComputerUseWorkflow.renderProviderPrompt(userInstructions: providerMessage)
-            : providerMessage
+        let dispatchedProviderMessage = providerSwitchPreparation?.augmentedInput
+            ?? (
+                liveSession.isCodexComputerUseArmed
+                    ? CodexComputerUseWorkflow.renderProviderPrompt(userInstructions: providerMessage)
+                    : providerMessage
+            )
         // The row was durable before dispatch. Mark the exact provider text only after the final
         // dispatch admission, so a persisted-only row cannot masquerade as an interrupted prompt.
         if let index = liveSession.items.firstIndex(where: { $0.id == savedItemID }) {

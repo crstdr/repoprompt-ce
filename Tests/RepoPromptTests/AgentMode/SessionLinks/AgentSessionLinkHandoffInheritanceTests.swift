@@ -474,6 +474,717 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             }
         }
 
+        func testSwitchReviewRefreshesAcceptedUndispatchedInputAndNextCarrierConsumesItOnce() async throws {
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                try installSwitch(fixture)
+                let original = session.pendingHandoff
+                let preparation = try await switchPreparation(fixture)
+                let attributed = AgentChatItem.user(
+                    "accepted linked request, never executed",
+                    sequenceIndex: session.nextSequenceIndex,
+                    crossSessionAttribution: .init(sourceSessionID: UUID(), sourceName: "Observer", linkID: UUID())
+                )
+                session.appendItem(attributed)
+                let fence = AgentRunStartStopFence(session: session)
+                vm.test_setAgentSessionSaver { _, _, _ in
+                    session.stopState.invalidateScheduledStarts()
+                    return fixture.rootURL.appendingPathComponent("source.json")
+                }
+                let withheld = await vm.prepareProviderSwitchHandoverForSend(preparation.accepting(attributed.id), session: session, stopFence: fence)
+                XCTAssertNil(withheld)
+                XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .ready)
+                guard case .failure(.providerHandoverNeedsReview) = await vm.providerSwitchSendAdmission(session: session, input: "later input") else { return XCTFail("A later input cannot consume the old carrier") }
+                vm.test_setAgentSessionSaver { saved, _, _ in
+                    XCTAssertTrue(saved.pendingHandoffPayload?.contains("accepted linked request, never executed") == true)
+                    return fixture.rootURL.appendingPathComponent("source.json")
+                }
+                await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
+                let review = try XCTUnwrap(vm.providerSwitchPreview)
+                XCTAssertEqual(review.cutoff, attributed.id)
+                XCTAssertEqual(review.source.provider, "source")
+                vm.providerSwitchPreview?.selected = .history
+                let applied = await vm.applyProviderSwitch(review.id)
+                XCTAssertTrue(applied)
+                XCTAssertEqual(session.pendingHandoff.sourceItemID, attributed.id)
+                XCTAssertNotEqual(session.pendingHandoff.payload, original.payload)
+                XCTAssertNil(session.providerSessionID)
+                XCTAssertNil(session.codexConversationID)
+                let next = try await switchPreparation(fixture)
+                let inserted = await vm.prepareProviderSwitchHandoverForSend(next, session: session, stopFence: .init(session: session))
+                let user = try XCTUnwrap(inserted?.user)
+                XCTAssertEqual(user.components(separatedBy: "<repoprompt_provider_handover ").count - 1, 1)
+                XCTAssertTrue(user.contains("accepted linked request, never executed"))
+                XCTAssertTrue(user.hasSuffix("\n\nordinary input"))
+                XCTAssertNil(session.agentTask)
+            }
+        }
+
+        func testOrphanReviewCancelThenSwitchStartsFreshWithUncertainInputOnlyAsHistory() async throws {
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                try installSwitch(fixture)
+                session.pendingHandoff.providerSwitchDelivery = .sending
+                session.providerSessionID = "uncertain-native"
+                session.codexConversationID = "stale-other-family"
+                session.codexRolloutPath = "/retained/native.jsonl"
+                let uncertain = AgentChatItem.user("uncertain previous input", sequenceIndex: session.nextSequenceIndex)
+                session.appendItem(uncertain)
+                let slot = session.pendingHandoff
+                await vm.openProviderSwitchPreview(agent: session.selectedAgent, model: session.selectedModelRaw, tabID: session.tabID)
+                vm.cancelProviderSwitchPreview()
+                XCTAssertEqual(session.pendingHandoff, slot)
+                XCTAssertTrue(AgentModeViewModel.providerSwitchUnconfirmed(session))
+                await vm.openProviderSwitchPreview(agent: session.selectedAgent, model: session.selectedModelRaw, tabID: session.tabID)
+                let review = try XCTUnwrap(vm.providerSwitchPreview)
+                vm.providerSwitchPreview?.selected = .history
+                var retirements = 0
+                vm.test_providerSwitchRetirement = { outgoing in
+                    XCTAssertEqual(outgoing.providerSessionID, "uncertain-native")
+                    retirements += 1
+                }
+                var saves = 0
+                vm.test_setAgentSessionSaver { saved, _, _ in
+                    saves += 1
+                    XCTAssertNil(saved.providerSessionID)
+                    XCTAssertNil(saved.codexConversationID)
+                    XCTAssertNil(saved.codexRolloutPath)
+                    XCTAssertEqual(saved.pendingHandoffProviderSwitchDelivery, saves == 1 ? .ready : .sending)
+                    return fixture.rootURL.appendingPathComponent("fresh.json")
+                }
+                let applied = await vm.applyProviderSwitch(review.id)
+                XCTAssertTrue(applied)
+                XCTAssertEqual(retirements, 1)
+                XCTAssertEqual(session.pendingHandoff.sourceItemID, uncertain.id)
+                XCTAssertTrue(session.pendingHandoff.payload?.contains("<message role=\"user\">uncertain previous input</message>") == true)
+                let next = try await switchPreparation(fixture)
+                let payload = await vm.prepareProviderSwitchHandoverForSend(next, session: session, stopFence: .init(session: session))
+                XCTAssertTrue(payload?.user.hasSuffix("\n\nordinary input") == true)
+                XCTAssertFalse(payload?.user.hasSuffix("\n\nuncertain previous input") == true)
+                XCTAssertNil(session.agentTask)
+            }
+        }
+
+        func testSwitchApplyPreservesAllKindIdentityAndSavesCompleteTupleOnce() async throws {
+            for kind in ["standalone", "overseer", "linked"] {
+                try await withFixture { fixture in
+                    let vm = fixture.viewModel
+                    let session = fixture.sourceSession
+                    if kind == "linked" { session.parentSessionID = UUID()
+                        session.createdByOverseerSessionID = UUID()
+                        session.isMCPOriginated = true
+                    }
+                    session.organizationalParentID = UUID()
+                    session.delegationScopeID = UUID()
+                    let parent = session.parentSessionID
+                    let creator = session.createdByOverseerSessionID
+                    let organization = session.organizationalParentID
+                    let delegation = session.delegationScopeID
+                    let endpoint = vm.agentSessionLinkObserverEndpoint(tabID: session.tabID)
+                    let worktrees = session.worktreeBindings
+                    let merges = session.worktreeMergeOperations
+                    let usage = session.providerTokenUsageByTurn
+                    let audit = session.automationTurnAudit
+                    let binding = session.currentRestorationBindingToken
+                    session.providerSessionID = "source-native"
+                    session.codexConversationID = "old-codex"
+                    session.codexRolloutPath = "/unchanged-on-disk/rollout"
+                    session.codexModel = "old"
+                    session.codexReasoningEffort = "high"
+                    session.contextUsageSnapshot = .init(used: 123, window: 200_000, confidence: .exact, source: .claudeUsageEvent)
+                    var saves = 0
+                    vm.test_setAgentSessionSaver { saved, _, _ in
+                        saves += 1
+                        XCTAssertEqual(saved.pendingHandoffProviderSwitchDelivery, .ready)
+                        XCTAssertNotNil(saved.pendingHandoffPayload)
+                        XCTAssertNil(saved.providerSessionID)
+                        XCTAssertNil(saved.codexConversationID)
+                        return fixture.rootURL.appendingPathComponent("applied.json")
+                    }
+                    await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
+                    let preview = try XCTUnwrap(vm.providerSwitchPreview)
+                    let applied = await vm.applyProviderSwitch(preview.id)
+                    XCTAssertTrue(applied)
+                    XCTAssertEqual(saves, 1)
+                    XCTAssertEqual(session.currentRestorationBindingToken, binding)
+                    XCTAssertEqual(vm.agentSessionLinkObserverEndpoint(tabID: session.tabID), endpoint)
+                    XCTAssertEqual(session.parentSessionID, parent)
+                    XCTAssertEqual(session.createdByOverseerSessionID, creator)
+                    XCTAssertEqual(session.organizationalParentID, organization)
+                    XCTAssertEqual(session.delegationScopeID, delegation)
+                    XCTAssertEqual(session.worktreeBindings, worktrees)
+                    XCTAssertEqual(session.worktreeMergeOperations, merges)
+                    XCTAssertEqual(session.providerTokenUsageByTurn, usage)
+                    XCTAssertEqual(session.automationTurnAudit, audit)
+                    XCTAssertNil(session.contextUsageSnapshot)
+                    XCTAssertNil(session.vouchedContextCount)
+                    XCTAssertNil(session.codexRolloutPath)
+                    XCTAssertNil(session.codexModel)
+                    XCTAssertNil(session.codexReasoningEffort)
+                    let notices = session.items.filter { $0.recoveryDiagnostic?.reason == "providerSwitch" }
+                    XCTAssertEqual(notices.count, 1)
+                    XCTAssertEqual(notices[0].text, "Provider changed from \(preview.source.provider) / \(preview.source.model) to OpenCode / unknown-window; handover: Full history.")
+                    XCTAssertNil(session.agentTask)
+                }
+            }
+        }
+
+        func testSwitchRollbackRequiresPrewriteEvidenceAndRetirementCannotSaveEmptyContext() async throws {
+            enum Fault: Error { case possibleWrite }
+            for fault in ["prewrite", "possibleWrite"] {
+                try await withFixture { fixture in
+                    let vm = fixture.viewModel
+                    let session = fixture.sourceSession
+                    session.providerSessionID = "restore-source"
+                    session.codexConversationID = "restore-codex"
+                    session.codexRolloutPath = "/restore/path"
+                    session.codexModel = "restore-model"
+                    session.codexReasoningEffort = "high"
+                    session.contextUsageSnapshot = .init(used: 4321, window: 200_000, confidence: .exact, source: .claudeUsageEvent)
+                    session.noteLiveContextUsageReport(contextUsedTokens: 4321, promptTokens: nil, modelContextWindow: 200_000)
+                    let countVouch = session.vouchedContextCount
+                    let windowVouch = session.vouchedContextWindow
+                    let context = session.contextUsageSnapshot
+                    let rows = session.items.map(\.id)
+                    let workspaceID = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspaceID)
+                    var saves = 0
+                    vm.test_setAgentSessionSaver { _, _, _ in saves += 1
+                        throw Fault.possibleWrite
+                    }
+                    vm.test_providerSwitchRetirement = { outgoing in
+                        let result = await vm.flushSaveRequired(for: outgoing.tabID, workspaceID: workspaceID)
+                        guard case .failure = result else { return XCTFail("Retirement must gate all incidental saves") }
+                        XCTAssertEqual(outgoing.providerSessionID, "restore-source")
+                        XCTAssertEqual(saves, 0)
+                    }
+                    vm.test_providerSwitchBeforeSave = { outgoing in
+                        if fault == "prewrite" { outgoing.isInstallingHandoffWorktreeBindings = true }
+                    }
+                    defer { session.isInstallingHandoffWorktreeBindings = false }
+                    await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
+                    let id = try XCTUnwrap(vm.providerSwitchPreview?.id)
+                    let applied = await vm.applyProviderSwitch(id)
+                    XCTAssertFalse(applied)
+                    if fault == "prewrite" {
+                        XCTAssertEqual(saves, 0)
+                        XCTAssertEqual(session.providerSessionID, "restore-source")
+                        XCTAssertEqual(session.codexConversationID, "restore-codex")
+                        XCTAssertEqual(session.codexRolloutPath, "/restore/path")
+                        XCTAssertEqual(session.codexModel, "restore-model")
+                        XCTAssertEqual(session.codexReasoningEffort, "high")
+                        XCTAssertEqual(session.contextUsageSnapshot, context)
+                        XCTAssertEqual(session.vouchedContextCount, countVouch)
+                        XCTAssertEqual(session.vouchedContextWindow, windowVouch)
+                        XCTAssertNil(session.pendingHandoff.payload)
+                        XCTAssertEqual(session.items.map(\.id), rows)
+                    } else {
+                        XCTAssertEqual(saves, 1)
+                        XCTAssertEqual(session.selectedAgent, .openCode)
+                        XCTAssertNil(session.providerSessionID)
+                        XCTAssertNotNil(session.pendingHandoff.payload)
+                        XCTAssertEqual(session.items.count(where: { $0.recoveryDiagnostic?.reason == "providerSwitch" }), 1)
+                    }
+                }
+            }
+        }
+
+        func testSwitchBusyPreviewPendingPickerAndDiscardAreExplicitOnly() async throws {
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                let agent = session.selectedAgent
+                session.mcpFollowUpRunPending = true
+                await vm.openProviderSwitchPreview(agent: .openCode, model: "destination", tabID: session.tabID)
+                let busy = try XCTUnwrap(vm.providerSwitchPreview)
+                XCTAssertNotNil(vm.providerSwitchPreviewBlocker(busy))
+                let applied = await vm.applyProviderSwitch(busy.id)
+                XCTAssertFalse(applied)
+                XCTAssertEqual(session.selectedAgent, agent)
+                vm.cancelProviderSwitchPreview()
+                session.mcpFollowUpRunPending = false
+                XCTAssertTrue(vm.canSelectAgentInCurrentChat(.claudeCodeGLM), "Existing Claude-family continuity remains allowed")
+                try installSwitch(fixture)
+                XCTAssertTrue(vm.providerSwitchPickerRequiresPreview(agent, session: session))
+                XCTAssertTrue(vm.providerSwitchPickerRequiresPreview(.claudeCodeGLM, session: session))
+                let slot = session.pendingHandoff
+                await vm.openProviderSwitchPreview(agent: agent, model: session.selectedModelRaw, tabID: session.tabID)
+                XCTAssertNil(vm.providerSwitchPreview?.wordLimit)
+                let oldID = try XCTUnwrap(vm.providerSwitchPreview?.id)
+                await vm.generateProviderSwitchHandover(oldID)
+                XCTAssertEqual(session.pendingHandoff, slot)
+                vm.cancelProviderSwitchPreview()
+                XCTAssertEqual(session.pendingHandoff, slot)
+                let firstOpen = await vm.openProviderSwitchPreview(agent: agent, model: session.selectedModelRaw, tabID: session.tabID)
+                let replacementOpen = await vm.openProviderSwitchPreview(agent: agent, model: session.selectedModelRaw, tabID: session.tabID)
+                let staleDiscard = try await vm.applyProviderSwitch(XCTUnwrap(firstOpen), discard: true)
+                XCTAssertFalse(staleDiscard, "A banner click's captured ID cannot discard a newer preview")
+                XCTAssertEqual(session.pendingHandoff, slot)
+                vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("discard.json") }
+                let discarded = try await vm.applyProviderSwitch(XCTUnwrap(replacementOpen), discard: true)
+                XCTAssertTrue(discarded)
+                XCTAssertNil(session.pendingHandoff.payload)
+                XCTAssertEqual(session.items.last?.text, "Pending handover discarded; chat history unchanged.")
+                XCTAssertEqual(session.selectedAgent, agent)
+            }
+        }
+
+        func testCursorModelMenuVariantsStayTransientUntilSwitchAndRollbackWithTuple() async throws {
+            GlobalSettingsStore.installApplicationModelIdentityPolicy()
+            AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
+            defer { AgentACPModelRegistry.shared.test_reset(providerID: .cursor) }
+            let model = "grok-4.6"
+            let definition = ACPModelParameterDefinition(
+                kind: .thinking, configID: "effort", displayName: "Effort",
+                choices: [.init(rawValue: "low", displayName: "Low"), .init(rawValue: "high", displayName: "High")],
+                currentValueRaw: "low"
+            )
+            _ = AgentACPModelRegistry.shared.updateDiscoveredModels(.init(
+                options: [.init(rawValue: model, displayName: "Grok 4.6", description: nil, isDefault: false)],
+                currentModelRaw: model, modelParameterSets: [.init(baseModelRaw: model, parameters: [definition])]
+            ), for: .cursor)
+            let low = ACPModelParameterSelection(providerID: .cursor, baseModelRaw: model, kind: .thinking, configID: "effort", valueRaw: "low")
+            let high = ACPModelParameterSelection(providerID: .cursor, baseModelRaw: model, kind: .thinking, configID: "effort", valueRaw: "high")
+            for clear in [false, true] {
+                for prewrite in [false, true] {
+                    try await withFixture { fixture in
+                        let vm = fixture.viewModel
+                        let session = fixture.sourceSession
+                        try installSwitch(fixture)
+                        session.acpModelParameterSelections = [low]
+                        let sourceAgent = session.selectedAgent
+                        let sourceModel = session.selectedModelRaw
+                        let slot = session.pendingHandoff
+                        let intent: AgentModeViewModel.ProviderSwitchCursorParameterIntent = clear ? .clear(low.identity) : .select(high)
+                        XCTAssertTrue(vm.requestProviderSwitchSelection(agent: .cursor, model: model, tabID: session.tabID, cursorParameterIntent: intent))
+                        try await AsyncTestWait.waitUntil("Cursor variant Review prepared") { vm.providerSwitchPreview?.building == false }
+                        XCTAssertEqual(session.acpModelParameterSelections, [low])
+                        XCTAssertEqual(session.selectedAgent, sourceAgent)
+                        XCTAssertEqual(vm.providerSwitchPreview?.model, model)
+                        vm.cancelProviderSwitchPreview()
+                        XCTAssertEqual(session.pendingHandoff, slot)
+                        XCTAssertEqual(session.acpModelParameterSelections, [low], "Cancel never writes variant intent")
+                        await vm.openProviderSwitchPreview(agent: .cursor, model: model, tabID: session.tabID, cursorParameterIntent: intent)
+                        vm.providerSwitchPreview?.selected = .history
+                        let expected = clear ? [] : [high]
+                        var savedTuples: [AgentSession] = []
+                        let saveURL = fixture.rootURL.appendingPathComponent("cursor-variant.json")
+                        vm.test_setAgentSessionSaver { saved, _, _ in
+                            savedTuples.append(saved)
+                            return saveURL
+                        }
+                        // Teardown may save the restored source after a prewrite refusal. Retire
+                        // this assertion/capture boundary before fixture teardown can suspend.
+                        defer { vm.test_setAgentSessionSaver { _, _, _ in saveURL } }
+                        vm.test_providerSwitchBeforeSave = { if prewrite { $0.isInstallingHandoffWorktreeBindings = true } }
+                        defer { session.isInstallingHandoffWorktreeBindings = false }
+                        let applied = try await vm.applyProviderSwitch(XCTUnwrap(vm.providerSwitchPreview?.id))
+                        XCTAssertEqual(applied, !prewrite)
+                        XCTAssertEqual(savedTuples.count, prewrite ? 0 : 1)
+                        if !prewrite {
+                            let saved = try XCTUnwrap(savedTuples.first)
+                            XCTAssertEqual(saved.agentKind, AgentProviderKind.cursor.rawValue)
+                            XCTAssertEqual(saved.agentModel, model)
+                            XCTAssertEqual(saved.acpModelParameterSelections, expected)
+                        }
+                        XCTAssertEqual(session.acpModelParameterSelections, prewrite ? [low] : expected)
+                        if prewrite {
+                            XCTAssertEqual(session.selectedAgent, sourceAgent)
+                            XCTAssertEqual(session.selectedModelRaw, sourceModel)
+                            XCTAssertEqual(session.pendingHandoff, slot)
+                        } else {
+                            let ready = session.pendingHandoff
+                            vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("separate-parameter.json") }
+                            vm.selectACPModelParameter(low)
+                            XCTAssertEqual(session.acpModelParameterSelections, [low], "Separate ACP control keeps its existing immediate behavior")
+                            XCTAssertNil(vm.providerSwitchPreview)
+                            XCTAssertEqual(session.pendingHandoff, ready)
+                        }
+                    }
+                }
+            }
+        }
+
+        func testSourceGenerationCompletionNeverRetargetsReboundSession() async throws {
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("generation-drift.json") }
+                vm.test_providerSwitchGeneration = { outgoing, _, _ in
+                    outgoing.appendItem(.assistant("late source result", sequenceIndex: outgoing.nextSequenceIndex))
+                    outgoing.runState = .completed
+                    outgoing.testInstallPersistentSessionBinding(sessionID: UUID())
+                }
+                await vm.openProviderSwitchPreview(agent: .openCode, model: "destination", tabID: session.tabID)
+                let preview = try XCTUnwrap(vm.providerSwitchPreview)
+                await vm.generateProviderSwitchHandover(preview.id)
+                // The synchronous terminal guard must refuse before scheduling a rebuild.
+                XCTAssertFalse(vm.providerSwitchPreview?.generationFinished ?? true)
+                XCTAssertEqual(vm.providerSwitchPreview?.id, preview.id)
+                XCTAssertEqual(vm.providerSwitchPreview?.binding, preview.binding)
+                XCTAssertNil(vm.providerSwitchPreview?.choices.first { $0.mode == .summary }?.carrier)
+                XCTAssertNotNil(vm.providerSwitchPreviewBlocker(preview))
+                XCTAssertNil(session.pendingHandoff.payload)
+            }
+        }
+
+        func testSwitchSourceGenerationUsesOrdinaryUnauthoredTurnWithoutConsumingComposer() async throws {
+            for tools in [false, true] {
+                try await withFixture { fixture in
+                    let vm = fixture.viewModel
+                    let session = fixture.sourceSession
+                    session.draftText = "keep composer"
+                    session.selectedWorkflow = .init(customID: UUID(), displayName: "Keep workflow")
+                    let workflow = session.selectedWorkflow
+                    vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("generation.json") }
+                    vm.test_providerSwitchGeneration = { outgoing, rowID, request in
+                        guard let row = outgoing.items.first(where: { $0.id == rowID }) else { return XCTFail("Generation row missing") }
+                        XCTAssertEqual(row.text, request)
+                        XCTAssertNil(row.userInputOrigin)
+                        XCTAssertNil(row.crossSessionAttribution)
+                        if tools { outgoing.appendItem(.init(kind: .toolCall, text: "effect", toolName: "read_file", sequenceIndex: outgoing.nextSequenceIndex)) }
+                        outgoing.appendItem(.assistant("source-written summary", sequenceIndex: outgoing.nextSequenceIndex))
+                        outgoing.runState = .completed
+                    }
+                    await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
+                    let id = try XCTUnwrap(vm.providerSwitchPreview?.id)
+                    await vm.generateProviderSwitchHandover(id)
+                    try await AsyncTestWait.waitUntil("source generation has a measured preview") {
+                        vm.providerSwitchPreview?.id != id && vm.providerSwitchPreview?.building == false
+                    }
+                    let summary = try XCTUnwrap(vm.providerSwitchPreview?.choices.first { $0.mode == .summary })
+                    if tools { XCTAssertEqual(summary.unavailable, "the model used tools")
+                        XCTAssertNil(summary.carrier)
+                    } else { XCTAssertNil(summary.unavailable)
+                        XCTAssertNotNil(summary.carrier)
+                    }
+                    XCTAssertEqual(session.draftText, "keep composer")
+                    XCTAssertEqual(session.selectedWorkflow, workflow)
+                    XCTAssertNil(session.pendingHandoff.payload, "Generate must never auto-apply")
+                    XCTAssertFalse(session.items.contains { $0.recoveryDiagnostic?.reason == "providerSwitch" })
+                }
+            }
+        }
+
+        func testNativeCodexSharedPhysicalBoundaryConfirmsExactlyOnceForNativeAndFallback() async throws {
+            for dispatch in [AgentSessionLinkPromptDispatchID.codexNativeSend(UUID()), .codexFallback(queueID: UUID())] {
+                try await withFixture { fixture in
+                    let vm = fixture.viewModel
+                    let session = fixture.sourceSession
+                    session.selectedAgent = .codexExec
+                    session.selectedModelRaw = "unknown-window"
+                    try installSwitch(fixture)
+                    let preparation = try await switchPreparation(fixture)
+                    var saves: [AgentProviderSwitchDelivery?] = []
+                    vm.test_setAgentSessionSaver { saved, _, _ in
+                        saves.append(saved.pendingHandoffProviderSwitchDelivery)
+                        return fixture.rootURL.appendingPathComponent("native.json")
+                    }
+                    _ = await vm.prepareProviderSwitchHandoverForSend(preparation, session: session, stopFence: .init(session: session))
+                    XCTAssertEqual(saves, [.sending])
+                    XCTAssertTrue(vm.agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: dispatch))
+                    let context = AgentSessionLinkDispatchContext(session: session, dispatchID: dispatch)
+                    vm.acceptAgentSessionLinkDispatch(session: session, context: context, claim: nil)
+                    vm.acceptAgentSessionLinkDispatch(session: session, context: context, claim: nil)
+                    try await AsyncTestWait.waitUntil("native physical acceptance clear save") { saves.count == 2 }
+                    XCTAssertNil(session.pendingHandoff.providerSwitchDelivery)
+                    XCTAssertEqual(session.items.count(where: { $0.recoveryDiagnostic?.outcome == "sent" }), 1)
+                    guard case .success(nil) = await vm.providerSwitchSendAdmission(session: session, input: "next") else { return XCTFail("Positive native acceptance must not wedge the next input") }
+                }
+            }
+        }
+
+        func testResidentAndFirstIdleDelegationInputCarryReadySeedWithoutReviewingOwnRow() async throws {
+            for resident in [true, false] {
+                try await withFixture { fixture in
+                    let vm = fixture.viewModel
+                    let session = fixture.sourceSession
+                    session.selectedAgent = .openCode
+                    session.selectedModelRaw = "unknown-window"
+                    try installSwitch(fixture)
+                    session.draftText = "untouched draft"
+                    var starts: [String] = []
+                    vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("resident.json") }
+                    vm.test_providerSwitchStart = { _, user, _ in starts.append(user) }
+                    let rows = session.items.count
+                    if resident {
+                        let target = try XCTUnwrap(try vm.mcpResidentTarget(sessionID: XCTUnwrap(session.activeAgentSessionID), requiringLoadedState: true))
+                        let result = try await vm.mcpSubmitResidentTask(target, text: "resident assigned task", workflow: nil, windowIsAvailable: { true })
+                        XCTAssertEqual(result, .startedRun)
+                    } else {
+                        let result = try await vm.submitDelegationDecision(
+                            "first idle decision",
+                            tabID: session.tabID,
+                            expectedSessionID: XCTUnwrap(session.activeAgentSessionID),
+                            stopFence: .init(session: session)
+                        )
+                        XCTAssertEqual(result, .submitted)
+                    }
+                    XCTAssertEqual(starts.count, 1)
+                    XCTAssertTrue(starts[0].hasPrefix("<repoprompt_provider_handover "))
+                    XCTAssertTrue(starts[0].contains(resident ? "resident assigned task" : "first idle decision"))
+                    XCTAssertEqual(session.items.count, rows + 1)
+                    XCTAssertNotNil(session.items.last?.dispatchedProviderText)
+                    XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .sending)
+                    XCTAssertEqual(session.draftText, "untouched draft")
+                    XCTAssertNil(session.activeComposerSubmitAttempt)
+                }
+            }
+        }
+
+        func testSendComputerUseArmingDriftDuringAuthorizationRefusesBeforeAnyRow() async throws {
+            for initiallyArmed in [false, true] {
+                try await withFixture { fixture in
+                    let vm = fixture.viewModel
+                    let session = fixture.sourceSession
+                    session.selectedAgent = .codexExec
+                    session.selectedModelRaw = "unknown-window"
+                    try installSwitch(fixture)
+                    session.pendingCodexComputerUseActivation = initiallyArmed ? .init(id: UUID(), createdAt: Date()) : nil
+                    let endpoint = try XCTUnwrap(vm.agentSessionLinkObserverEndpoint(tabID: session.tabID))
+                    let candidate = try XCTUnwrap(vm.agentSessionLinkCandidate(tabID: session.tabID, sessionID: endpoint.sessionID, tabName: "Target", isWindowClosing: false))
+                    let request = AgentSessionLinkSendRequest(
+                        linkID: UUID(),
+                        linkGeneration: 1,
+                        observerEndpoint: endpoint,
+                        observerDisplayName: "Observer",
+                        message: "ordinary request",
+                        workflow: nil
+                    )
+                    let rows = session.items.map(\.id)
+                    var starts = 0
+                    var saves = 0
+                    vm.test_providerSwitchStart = { _, _, _ in starts += 1 }
+                    vm.test_setAgentSessionSaver { _, _, _ in saves += 1
+                        return fixture.rootURL.appendingPathComponent("no-write.json")
+                    }
+                    let outcome = await vm.agentSessionLinkPerformSend(
+                        to: candidate,
+                        request: request,
+                        liveness: { .init(observerEndpointIsLive: true, targetEndpointIsLive: true, targetWindowIsClosing: false) },
+                        commitAuthorization: {
+                            session.pendingCodexComputerUseActivation = initiallyArmed ? nil : .init(id: UUID(), createdAt: Date())
+                            return .committed
+                        }
+                    )
+                    XCTAssertEqual(outcome, .blocked(.endpointPostReadiness))
+                    XCTAssertEqual(session.items.map(\.id), rows)
+                    XCTAssertEqual(starts, 0)
+                    XCTAssertEqual(saves, 0)
+                    XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .ready)
+                    XCTAssertNil(session.activeComposerSubmitAttempt)
+                }
+            }
+        }
+
+        func testSwitchRetirementRechecksStopBindingAndExactOwnerWithoutOverwritingSuccessor() async throws {
+            for drift in ["stop", "binding", "owner"] {
+                try await withFixture { fixture in
+                    let vm = fixture.viewModel
+                    let session = fixture.sourceSession
+                    session.providerSessionID = "old-native"
+                    await vm.openProviderSwitchPreview(agent: .openCode, model: "destination", tabID: session.tabID)
+                    let id = try XCTUnwrap(vm.providerSwitchPreview?.id)
+                    let gate = AgentSessionLinkStopSignal<Void>()
+                    defer { gate.finish(()) }
+                    var retiring = false
+                    var saves = 0
+                    vm.test_providerSwitchRetirement = { _ in retiring = true
+                        await gate.value()
+                    }
+                    vm.test_setAgentSessionSaver { _, _, _ in saves += 1
+                        return fixture.rootURL.appendingPathComponent("unexpected.json")
+                    }
+                    let apply = Task { await vm.applyProviderSwitch(id) }
+                    try await AsyncTestWait.waitUntil("outgoing retirement gate") { retiring }
+                    let successor = AgentTabSession(tabID: session.tabID)
+                    successor.selectedModelRaw = "successor-selection"
+                    if drift == "stop" { session.stopState.invalidateScheduledStarts() }
+                    else if drift == "binding" { session.testInstallPersistentSessionBinding(sessionID: UUID()) }
+                    else { vm.test_replaceSessionForDeferredHydration(tabID: session.tabID, with: successor) }
+                    gate.finish(())
+                    let applied = await apply.value
+                    XCTAssertFalse(applied)
+                    XCTAssertEqual(saves, 0)
+                    XCTAssertFalse(session.items.contains { $0.recoveryDiagnostic?.reason == "providerSwitch" })
+                    XCTAssertNil(session.pendingHandoff.payload)
+                    if drift == "owner" {
+                        XCTAssertTrue(vm.sessions[session.tabID] === successor)
+                        XCTAssertEqual(successor.selectedModelRaw, "successor-selection")
+                    }
+                }
+            }
+        }
+
+        func testProviderSwitchScaleThreeHundredSavedChatsThreeWindowsTenLinks() async throws {
+            let clock = ContinuousClock()
+            let started = clock.now
+            let reads = ProviderSwitchScaleReads()
+            await AgentSessionDataService.shared.test_setAfterHydrationPrepareHook { id in await reads.record(id) }
+            var fixtures: [Fixture] = []
+            do {
+                for _ in 0 ..< 3 {
+                    try await fixtures.append(makeFixture())
+                }
+                // Each real window fixture owns an explicit private catalog. Reinstall those
+                // captured catalogs after construction notifications settle; this is not coverage
+                // of the still-open #1422 new-window canonical-selection change.
+                for fixture in fixtures {
+                    fixture.window.workspaceManager.workspaces = [fixture.workspace]
+                    fixture.window.workspaceManager.activeWorkspace = fixture.workspace
+                }
+                let first = fixtures[0]
+                let manager = first.window.workspaceManager
+                let workspaceID = try XCTUnwrap(manager.activeWorkspaceID)
+                let workspaceIndex = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == workspaceID })
+                var preparedIDs: [UUID] = []
+                var preparedTabs: [UUID] = []
+                for index in 0 ..< 297 {
+                    let id = UUID()
+                    let tab = UUID()
+                    let saved = AgentSession(
+                        id: id,
+                        workspaceID: workspaceID,
+                        composeTabID: tab,
+                        name: "Saved \(index)",
+                        items: [
+                            AgentChatItemPersist(from: .user("saved request \(index)", sequenceIndex: 0)),
+                            AgentChatItemPersist(from: .assistant("retained reply \(index)", sequenceIndex: 1))
+                        ],
+                        parentSessionID: index < 7 ? first.sourceSession.activeAgentSessionID : nil,
+                        createdByOverseerSessionID: index < 7 ? first.sourceSession.activeAgentSessionID : nil,
+                        isMCPOriginated: index < 7
+                    )
+                    _ = try await AgentSessionDataService.shared.saveAgentSession(saved, for: manager.workspaces[workspaceIndex])
+                    manager.workspaces[workspaceIndex].composeTabs.append(.init(id: tab, name: "Saved \(index)", activeAgentSessionID: id))
+                    if index < 7 { preparedIDs.append(id)
+                        preparedTabs.append(tab)
+                    }
+                }
+                for (id, tab) in zip(preparedIDs, preparedTabs) {
+                    let prepared = await first.viewModel.prepareSavedOversightSession(
+                        tabID: tab,
+                        sessionID: id,
+                        workspaceID: workspaceID,
+                        isStillAuthorized: { true }
+                    )
+                    XCTAssertTrue(prepared)
+                }
+                // An agreeing recovered catalog replica does not become a second payload writer.
+                fixtures[2].window.workspaceManager.workspaces.append(manager.workspaces[workspaceIndex])
+                let sourceID = try XCTUnwrap(first.sourceSession.activeAgentSessionID)
+                let replica = AgentSessionCarrierResolver.capture(windows: fixtures.map(\.window), sessionIDs: [sourceID], includeRuntimeOwners: true)
+                XCTAssertFalse(replica.ambiguousSessionIDs.contains(sourceID))
+                XCTAssertTrue(replica.uniqueRuntimeOwners[sourceID]?.session === first.sourceSession)
+                let host = WindowStatesManager.shared
+                let authority = DomainAgentSessionLinkAuthority(identity: .init(runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: Date()))
+                let bridge = AgentSessionLinkRuntimeBridge(authority: authority, host: host, toolAdvertisementInvalidator: { _ in })
+                bridge.attach(host: host)
+                defer { bridge.freezeForTermination()
+                    AgentSessionLinkRuntimeBridge.shared.attach(host: host)
+                }
+                let nodes = fixtures.map { ($0.viewModel, $0.sourceSession) }
+                    + preparedTabs.compactMap { tab in first.viewModel.sessions[tab].map { (first.viewModel, $0) } }
+                XCTAssertEqual(nodes.count, 10)
+                for node in nodes.prefix(2) {
+                    let endpoint = try XCTUnwrap(node.0.agentSessionLinkObserverEndpoint(tabID: node.1.tabID))
+                    let activation = await bridge.becomeOverseer(endpoint: endpoint, isEnabled: { true }, revalidateRoute: { true }, commitIfCurrent: { $0() })
+                    XCTAssertNotNil(activation)
+                }
+                for target in nodes.dropFirst() {
+                    let result = try await bridge.addMonitorLink(
+                        observerSessionID: sourceID,
+                        rawTargetSessionID: XCTUnwrap(target.1.activeAgentSessionID).uuidString
+                    )
+                    guard case .added = result else { XCTFail("Expected direct grant, got \(result)")
+                        throw CancellationError()
+                    }
+                }
+                let reverse = try await bridge.addMonitorLink(observerSessionID: XCTUnwrap(nodes[1].1.activeAgentSessionID), rawTargetSessionID: sourceID.uuidString)
+                guard case .added = reverse else { XCTFail("Expected independent reverse grant")
+                    throw CancellationError()
+                }
+                let grants = await authority.links(forObserver: sourceID)
+                let reverseGrants = try await authority.links(forObserver: XCTUnwrap(nodes[1].1.activeAgentSessionID))
+                XCTAssertEqual(grants.items.count + reverseGrants.items.count, 10)
+                let endpoints = nodes.map { $0.0.agentSessionLinkObserverEndpoint(tabID: $0.1.tabID) }
+                let parents = nodes.map(\.1.parentSessionID)
+                let worktrees = nodes.map(\.1.worktreeBindings)
+                let activations = nodes.prefix(2).map(\.1.oversight.overseerActivation)
+                var providerCalls = 0
+                for fixture in fixtures {
+                    fixture.viewModel.test_providerSwitchStart = { _, _, _ in providerCalls += 1 }
+                }
+                let target = nodes[3]
+                for node in [nodes[0], target] {
+                    await node.0.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: node.1.tabID)
+                    let id = try XCTUnwrap(node.0.providerSwitchPreview?.id)
+                    let applied = await node.0.applyProviderSwitch(id)
+                    XCTAssertTrue(applied)
+                }
+                // Simulate the durable possible-write fault, then restore through the ordinary exact
+                // saved-session loader, not a preview/seed ledger or a provider probe.
+                target.1.pendingHandoff.providerSwitchDelivery = .sending
+                target.1.appendItem(.user("uncertain input", sequenceIndex: target.1.nextSequenceIndex))
+                target.1.isDirty = true
+                let persisted = await target.0.flushSaveRequired(for: target.1.tabID, workspaceID: workspaceID)
+                guard case .success = persisted else { XCTFail("Uncertainty fixture must be durable")
+                    throw CancellationError()
+                }
+                target.1.hasLoadedPersistedState = false
+                let restored = await target.0.ensureSessionReady(tabID: target.1.tabID, reconnectActiveProviders: false)
+                XCTAssertTrue(restored === target.1)
+                guard case .failure(.providerSwitchUnconfirmed) = await target.0.providerSwitchSendAdmission(session: restored, input: "not replayed") else { XCTFail("Restore must block every new input")
+                    throw CancellationError()
+                }
+                await target.0.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: restored.tabID)
+                let orphan = restored.pendingHandoff
+                target.0.cancelProviderSwitchPreview()
+                XCTAssertEqual(restored.pendingHandoff, orphan)
+                await target.0.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: restored.tabID)
+                target.0.providerSwitchPreview?.selected = .history
+                let reviewed = try await target.0.applyProviderSwitch(XCTUnwrap(target.0.providerSwitchPreview?.id))
+                XCTAssertTrue(reviewed)
+                XCTAssertTrue(restored.pendingHandoff.payload?.contains("uncertain input") == true)
+                guard case .success(.some) = await target.0.providerSwitchSendAdmission(session: restored, input: "new ordinary input") else { XCTFail("Reviewed carrier should admit new input")
+                    throw CancellationError()
+                }
+                await first.viewModel.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: first.sourceTabID)
+                let discarded = try await first.viewModel.applyProviderSwitch(XCTUnwrap(first.viewModel.providerSwitchPreview?.id), discard: true)
+                XCTAssertTrue(discarded)
+                XCTAssertEqual(nodes.map { $0.0.agentSessionLinkObserverEndpoint(tabID: $0.1.tabID) }, endpoints)
+                XCTAssertEqual(nodes.map(\.1.parentSessionID), parents)
+                XCTAssertEqual(nodes.map(\.1.worktreeBindings), worktrees)
+                XCTAssertEqual(nodes.prefix(2).map(\.1.oversight.overseerActivation), activations)
+                let after = await authority.links(forObserver: sourceID)
+                let afterReverse = try await authority.links(forObserver: XCTUnwrap(nodes[1].1.activeAgentSessionID))
+                XCTAssertEqual(after.items.map(\.linkID), grants.items.map(\.linkID))
+                XCTAssertEqual(after.items.map(\.generation), grants.items.map(\.generation))
+                XCTAssertEqual(afterReverse.items.map(\.linkID), reverseGrants.items.map(\.linkID))
+                let expectedReadIDs = Set(nodes.compactMap(\.1.activeAgentSessionID))
+                let pointReads = await reads.snapshot()
+                XCTAssertTrue(Set(pointReads).isSubset(of: expectedReadIDs), "No unrelated saved transcript may hydrate")
+                XCTAssertEqual(Set(pointReads), expectedReadIDs)
+                XCTAssertEqual(providerCalls, 0)
+                XCTAssertTrue(nodes.allSatisfy { $0.1.agentTask == nil && $0.1.codexController == nil && $0.1.claudeController == nil && $0.1.acpController == nil })
+                XCTAssertEqual(first.viewModel.sessions.values.count(where: { $0.hasLoadedPersistedState && $0.activeAgentSessionID != nil }), 8)
+                let elapsed = started.duration(to: clock.now)
+                print("PROVIDER_SWITCH_SCALE saved=300 windows=3 links=10 prepared=7 pointReads=\(pointReads.count) providerCalls=\(providerCalls) elapsed=\(elapsed)")
+                XCTAssertLessThan(elapsed, .seconds(10))
+            } catch {
+                await AgentSessionDataService.shared.test_setAfterHydrationPrepareHook(nil)
+                for fixture in fixtures.reversed() {
+                    await cleanup(fixture)
+                }
+                throw error
+            }
+            await AgentSessionDataService.shared.test_setAfterHydrationPrepareHook(nil)
+            for fixture in fixtures.reversed() {
+                await cleanup(fixture)
+            }
+        }
+
         private func publishSwitchWake(_ fixture: Fixture, endpoint: DomainAgentSessionLinkEndpointIdentity) throws {
             let session = fixture.sourceSession
             let runID = try XCTUnwrap(session.runID)
@@ -619,7 +1330,8 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 rootURL: rootURL,
                 viewModel: viewModel,
                 sourceTabID: sourceTabID,
-                sourceSession: sourceSession
+                sourceSession: sourceSession,
+                workspace: window.workspaceManager.workspaces[workspaceIndex]
             )
         } catch {
             window.beginClose()
@@ -637,11 +1349,23 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
         try? FileManager.default.removeItem(at: fixture.rootURL)
     }
 
+    private actor ProviderSwitchScaleReads {
+        private var ids: [UUID] = []
+        func record(_ id: UUID) {
+            ids.append(id)
+        }
+
+        func snapshot() -> [UUID] {
+            ids
+        }
+    }
+
     private struct Fixture {
         let window: WindowState
         let rootURL: URL
         let viewModel: AgentModeViewModel
         let sourceTabID: UUID
         let sourceSession: AgentModeViewModel.TabSession
+        let workspace: WorkspaceModel
     }
 }

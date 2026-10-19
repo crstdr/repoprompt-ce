@@ -316,6 +316,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private static let lastUsedAgentKey = "agentMode.lastUsedAgent"
     private static let lastUsedModelsByAgentKey = "agentMode.lastUsedModelsByAgent"
 
+    @Published var providerSwitchPreview: ProviderSwitchPreview?
+    @Published var providerSwitchMutation: ProviderSwitchMutation?
+    #if DEBUG
+        var test_providerSwitchRetirement: (@MainActor (TabSession) async -> Void)?
+        var test_providerSwitchGeneration: (@MainActor (TabSession, UUID, String) async -> Void)?
+        var test_providerSwitchBeforeSave: (@MainActor (TabSession) -> Void)?
+        var test_providerSwitchStart: (@MainActor (TabSession, String, String) async -> Void)?
+    #endif
+
     /// Selected agent kind
     @Published var selectedAgent: AgentProviderKind = .claudeCode {
         didSet {
@@ -2471,8 +2480,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 guard let self else {
                     return !Self.dispatchRequiresLaneBatch(session, dispatchID)
                 }
-                return providerSwitchAcquirePhysicalDispatch(session: session, dispatchID: dispatchID)
-                    && agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: dispatchID)
+                return agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: dispatchID)
             },
             recordAgentSessionLinkPhysicalDispatchNotAttempted: { [weak self] session, dispatchID in
                 self?.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: dispatchID)
@@ -2489,7 +2497,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 return agentSessionLinkHandoffProviderInput(for: session, dispatchID: dispatchID, claim: claim, proof: proof)
             },
             acceptAgentSessionLinkPromptClaim: { [weak self] session, context, claim in
-                self?.providerSwitchRecordPhysicalAcceptance(session: session, context: context)
                 self?.acceptAgentSessionLinkDispatch(session: session, context: context, claim: claim)
             }
         )
@@ -3408,8 +3415,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     guard let self else {
                         return !Self.dispatchRequiresLaneBatch(session, dispatchID)
                     }
-                    return providerSwitchAcquirePhysicalDispatch(session: session, dispatchID: dispatchID)
-                        && agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: dispatchID)
+                    return agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: dispatchID)
                 },
                 recordAgentSessionLinkPhysicalDispatchNotAttempted: { [weak self] session, dispatchID in
                     self?.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: dispatchID)
@@ -3418,7 +3424,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     self?.agentSessionLinkRecordPhysicalDispatchFailure(for: session, dispatchID: dispatchID)
                 },
                 acceptAgentSessionLinkPrompt: { [weak self] session, context, claim in
-                    self?.providerSwitchRecordPhysicalAcceptance(session: session, context: context)
                     self?.acceptAgentSessionLinkDispatch(session: session, context: context, claim: claim)
                 },
                 proveAgentSessionLinkProviderInput: { [weak self] session, claim in
@@ -3481,6 +3486,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         publication: result,
                         teardownSettled: teardownSettled
                     )
+                    self?.providerSwitchGenerationSettled(session)
                     // Same post-publication seam: a session's own worktree switch applies only
                     // at its origin turn's settled terminal boundary.
                     self?.selfWorktreeRelocationTerminalSettled(
@@ -9747,7 +9753,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     }
 
-    private func requireIdleProviderForWorktreeBindingTransition(_ session: TabSession) async throws {
+    func requireIdleProviderForWorktreeBindingTransition(_ session: TabSession) async throws {
         let claudeController = session.claudeController
         let acpController = session.acpController
         let codexController = session.codexController
@@ -9906,6 +9912,42 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
             throw error
         }
+    }
+
+    /// Retire while the outgoing provider is still selected. Provider switching holds its ordinary
+    /// claim and save gate across these awaits; the caller clears/stages durable state synchronously.
+    func retireProviderContextForProviderSwitch(_ session: TabSession) async {
+        #if DEBUG
+            if let test_providerSwitchRetirement {
+                await test_providerSwitchRetirement(session)
+                return
+            }
+        #endif
+        // Detach every outgoing instance synchronously. The existing captured-handle retirement
+        // paths never look up a same-tab successor after suspension (unlike tab-terminal shutdown).
+        let provider = session.provider
+        session.provider = nil
+        let acp = session.acpController
+        session.acpController = nil
+        let codex = codexCoordinator.detachForWorkspaceSwitchFinalizeSync(session, runIDs: [])
+        let claude = claudeCoordinator.detachForWorkspaceSwitchFinalizeSync(session)
+        if let provider { await provider.dispose() }
+        if let acp { await acp.cancelPrompt()
+            await acp.shutdown()
+        }
+        if let codex { await codexCoordinator.retireDetachedControllerForWorkspaceSwitch(codex) }
+        if let claude { await claudeCoordinator.retireDetachedControllerForWorkspaceSwitch(claude, discardedSession: session) }
+    }
+
+    func clearProviderContextForProviderSwitch(_ session: TabSession) {
+        codexCoordinator.clearCodexSessionState(session)
+        session.providerSessionID = nil
+        session.providerCleanupHandle = nil
+        session.contextUsageSnapshot = nil
+        session.contextCompactedAt = nil
+        session.pendingNonCodexUserInputTokenQueue.removeAll()
+        session.activeNonCodexTurnTokenAccumulator = nil
+        AgentModeProcessRunIdentity.clearProcessRunID(for: session)
     }
 
     private func invalidateProviderContextForExecutionLocationChange(_ session: TabSession) async {
@@ -14250,6 +14292,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     func updateBindingsFromSession(_ session: TabSession) {
+        providerSwitchPreviewDidChange(session)
         #if DEBUG
             test_updateBindingsCallCount += 1
             let diagnosticsStartMS = perfRecorder.timestampMSIfEnabled()
@@ -17438,6 +17481,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         {
             return .deferred("The saved target is being deleted or has been deleted; its retired runtime cannot write it back.")
         }
+        if let mutation = providerSwitchMutation, mutation.session === session, !mutation.allowsSave {
+            return .deferred(AgentSessionLinkSendFailure.targetBusy.rawValue)
+        }
         var effectiveCreationSave = creationSave
         if let handle = creationSave?.handle {
             guard handle.session === session, freshSessionCreationIsCurrent(handle),
@@ -19415,7 +19461,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     && !deletion.isPermanentlyDeleted(sessionID: expectedSessionID)
                     && !deletion.isDeletionInProgress(sessionID: expectedSessionID)
                     && AgentSessionLinkDeliveryReadiness.failure(snapshot: Self.agentSessionLinkDeliveryReadinessSnapshot(
-                        session: session, endpointMatchesGrant: true, isClosing: false, ignoresComposerSubmissionInFlight: true
+                        session: session, endpointMatchesGrant: true, isClosing: false, ignoresComposerSubmissionInFlight: true,
+                        ignoresProviderSwitchStalenessAfterAcceptance: true
                     )) == nil
             }
             let outcome: AgentSessionLinkSendTransactionOutcome = if let persisted {
@@ -21627,6 +21674,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
         }
 
+        #if DEBUG
+            if providerSwitchPreparation != nil, let test_providerSwitchStart {
+                await test_providerSwitchStart(session, augmentedInitialMessage, initialMessageForRun)
+                startOutcome?.recordAccepted()
+                return nil
+            }
+        #endif
         candidateTransferred = true
         return await runService.startRun(
             tabID: tabID,
