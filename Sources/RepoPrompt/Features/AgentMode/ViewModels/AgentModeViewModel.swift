@@ -406,6 +406,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             guard selectedReasoningEffortRaw != oldValue, !isRestoringState else { return }
             defer {
                 syncComposerUIState()
+                syncStatusPillsUIState()
                 syncRunInteractionUIState()
             }
             guard let session = activeSession else { return }
@@ -679,6 +680,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         var test_beforeACPToolIdleWait: (@MainActor () async throws -> Void)?
         var test_beforeScheduledACPFollowUpStart: (@MainActor () async -> Void)?
         var test_didFinishScheduledACPFollowUpStart: (@MainActor () -> Void)?
+        /// Replaces only the provider start of a self worktree relocation's continuation turn.
+        var test_selfWorktreeRelocationContinuationStarter: (@MainActor (TabSession, String) async -> Void)?
 
         /// Test-only live-authority seam for prompt readiness orchestration.
         var test_agentSessionLinkHasActiveOutboundLink:
@@ -3473,6 +3476,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         publication: result,
                         teardownSettled: teardownSettled
                     )
+                    // Same post-publication seam: a session's own worktree switch applies only
+                    // at its origin turn's settled terminal boundary.
+                    self?.selfWorktreeRelocationTerminalSettled(
+                        session: session,
+                        revision: revision,
+                        publication: result,
+                        teardownSettled: teardownSettled
+                    )
                 }
             ),
             continuation: .init(
@@ -6104,20 +6115,25 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     func authoritativeLiveSessionStates(for sessionIDs: Set<UUID>) -> [UUID: AuthoritativeLiveSessionState] {
-        guard !sessionIDs.isEmpty else { return [:] }
-        let snapshot = makePersistentBindingResolutionSnapshot(for: sessionIDs)
-        return Dictionary(uniqueKeysWithValues: sessionIDs.map { sessionID in
-            let state: AuthoritativeLiveSessionState
-            do {
-                if let session = try authoritativeLiveSession(for: sessionID, using: snapshot) {
-                    state = session.runState.isActive ? .running : .idle
-                } else {
-                    state = .notFound
-                }
-            } catch {
-                state = .ambiguous
+        authoritativeLiveSessionCensus(for: sessionIDs).states
+    }
+
+    /// Rich liveness values and their states observed from one binding census, for a read that needs
+    /// both (runtime owners and liveness accounting) without building a second census in the same turn.
+    struct AuthoritativeLiveSessionCensus {
+        let sessions: [UUID: Result<TabSession?, Error>]
+        /// Observed when the census is taken, never re-derived later from a mutated session.
+        let states: [UUID: AuthoritativeLiveSessionState]
+    }
+
+    func authoritativeLiveSessionCensus(for sessionIDs: Set<UUID>) -> AuthoritativeLiveSessionCensus {
+        let sessions = authoritativeLiveSessions(for: sessionIDs)
+        return AuthoritativeLiveSessionCensus(sessions: sessions, states: sessions.mapValues { result in
+            switch result {
+            case let .success(session?): session.runState.isActive ? .running : .idle
+            case .success(nil): .notFound
+            case .failure: .ambiguous
             }
-            return (sessionID, state)
         })
     }
 
@@ -9469,12 +9485,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             WorktreeStartupInstrumentation.record(.bindingTransitionStarted, context: startupContext)
         }
         let previousBindings = session.worktreeBindings
-        let previousDestination = executionDestinationIdentity(in: previousBindings)
-        let nextDestination = executionDestinationIdentity(in: desiredBindings)
-        // Secondary bindings are execution authority too: changing only a secondary root must
-        // not reroute MCP tools beneath a still-running native provider.
-        let executionRootsChanged = previousDestination != nextDestination
-            || Self.executionRootMappings(previousBindings) != Self.executionRootMappings(desiredBindings)
+        let executionRootsChanged = worktreeBindingsChangeExecutionRoots(from: previousBindings, to: desiredBindings)
         let changedDuringActiveRun = session.runState.isActive
 
         if changedDuringActiveRun, executionRootsChanged {
@@ -9664,6 +9675,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
             throw error
         }
+    }
+
+    /// Whether replacing `previous` with `desired` changes where the provider or MCP tools execute.
+    /// Secondary bindings are execution authority too: changing only a secondary root must not
+    /// reroute MCP tools beneath a still-running native provider.
+    func worktreeBindingsChangeExecutionRoots(
+        from previous: [AgentSessionWorktreeBinding],
+        to desired: [AgentSessionWorktreeBinding]
+    ) -> Bool {
+        executionDestinationIdentity(in: previous) != executionDestinationIdentity(in: desired)
+            || Self.executionRootMappings(previous) != Self.executionRootMappings(desired)
     }
 
     private static func executionRootMappings(_ bindings: [AgentSessionWorktreeBinding]) -> [String: ExecutionDestinationIdentity] {
@@ -10183,12 +10205,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         requiresHydratedRuntime: Bool
     ) throws {
         guard let workspaceManager,
-              let workspace = workspaceManager.workspaces.first(where: { workspace in
-                  workspace.composeTabs.contains(where: {
-                      $0.id == tabID && $0.activeAgentSessionID == sessionID
-                  })
-              }),
-              expectedWorkspaceID.map({ $0 == workspace.id }) ?? true
+              let workspaceID = workspaceManager.agentSessionLifecycleWorkspaceID(tabID: tabID, sessionID: sessionID),
+              expectedWorkspaceID.map({ $0 == workspaceID }) ?? true
         else {
             throw MCPError.invalidParams(
                 "The requested tab and Agent session binding changed after its selector was frozen."
@@ -10451,7 +10469,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 sessionID: intendedSessionID,
                 parentSessionID: parentSessionID,
                 expectedWorkspaceID: expectedWorkspaceID,
-                freshCreation: freshCreation
+                freshCreation: freshCreation,
+                creationKind: creationKind
             )
             let createdTabID = creation.tabID
             defer { provisionalParentSessionIDBySessionID.removeValue(forKey: intendedSessionID) }
@@ -10627,7 +10646,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         sessionID: UUID,
         parentSessionID: UUID?,
         expectedWorkspaceID: UUID?,
-        freshCreation: AgentSessionCreationClaim? = nil
+        freshCreation: AgentSessionCreationClaim? = nil,
+        creationKind: MCPSessionCreationKind = .mcpControlled
     ) async throws -> BackgroundSessionTabCreation {
         guard promptManager != nil else {
             throw MCPError.internalError("Prompt manager unavailable.")
@@ -10640,7 +10660,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 name: name,
                 sessionID: sessionID,
                 expectedWorkspaceID: expectedWorkspaceID,
-                freshCreation: freshCreation
+                freshCreation: freshCreation,
+                creationKind: creationKind
             )
         } catch {
             provisionalParentSessionIDBySessionID.removeValue(forKey: sessionID)
@@ -10652,7 +10673,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         name: String?,
         sessionID: UUID,
         expectedWorkspaceID: UUID?,
-        freshCreation: AgentSessionCreationClaim? = nil
+        freshCreation: AgentSessionCreationClaim? = nil,
+        creationKind: MCPSessionCreationKind = .mcpControlled
     ) async throws -> BackgroundSessionTabCreation {
         guard let promptManager else {
             throw MCPError.internalError("Prompt manager unavailable.")
@@ -10699,7 +10721,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 removePendingUIRefresh(for: creation.session.tabID)
             }
         }
-        switch try await promptManager.createDurableBackgroundAgentSessionTab(
+        let admissionResult = try await promptManager.createDurableBackgroundAgentSessionTab(
             name: name,
             sessionID: sessionID,
             expectedWorkspaceID: expectedWorkspaceID,
@@ -10711,7 +10733,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
                 return true
             }
-        ) {
+        )
+        switch admissionResult {
         case let .created(createdTab, receipt, recoveryClaim):
             let identity = receipt.outcome.workspaceID.map {
                 AgentSessionLifecycleAuthority.Identity(
@@ -10742,22 +10765,58 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 recoveryClaim: recoveryClaim,
                 freshSession: capturedFreshSession
             )
-        case let .rejected(receipt, reason):
+        case let .rejected(receipt, reason), let .recoveryRequired(_, receipt, reason, _):
+            let retainedAdmission: AgentSessionLaneAdmissionFailure.RetainedAdmission?
+            if case let .recoveryRequired(identity, _, _, recovery) = admissionResult {
+                let recoveryValue: AgentSessionLaneAdmissionFailure.RetainedAdmission.Recovery = switch recovery {
+                case .recovered: .recovered
+                case .alreadyRecovered: .alreadyRecovered
+                case .localOnly: .localOnly
+                case .ownershipChanged: .ownershipChanged
+                case .retryablePartial: .retryablePartial
+                case let .failed(category): .failed(category.rawValue)
+                case let .blockedManual(category): .blockedManual(category.rawValue)
+                }
+                retainedAdmission = .init(identity: identity, recovery: recoveryValue)
+            } else {
+                retainedAdmission = nil
+            }
+            let retainedLifecycleIdentity = retainedAdmission.map {
+                AgentSessionLifecycleAuthority.Identity(
+                    workspaceID: $0.identity.workspaceID,
+                    tabID: $0.identity.tabID,
+                    sessionID: $0.identity.sessionID,
+                    persistentBindingGeneration: nil,
+                    bindingTransitionGeneration: 0
+                )
+            }
             sessionLifecycleAuthority.record(.init(
                 caller: .agentRunStart,
                 intent: .createOrContinue,
                 phase: .beforeProviderStart,
                 decision: .rejected,
-                identity: tentativeIdentity,
+                identity: retainedLifecycleIdentity ?? tentativeIdentity,
                 previousSessionID: nil,
                 currentSessionID: sessionID,
                 isPinned: false,
                 isLive: false,
                 isActive: false,
-                isProtected: false,
+                isProtected: retainedAdmission != nil,
                 workspaceSaveResult: receipt.outcome.diagnosticCategory,
                 reason: reason.rawValue
             ))
+            if case .oversightLane = creationKind {
+                throw AgentSessionLaneAdmissionFailure(
+                    reason: reason.rawValue,
+                    saveResult: receipt.outcome.diagnosticCategory,
+                    category: receipt.outcome.normalizedFailureCategory?.rawValue ?? "none",
+                    domainDiagnostic: receipt.outcome.domainDiagnostic,
+                    domainErrorCode: receipt.outcome.domainErrorCode?.rawValue,
+                    workingCommitted: receipt.outcome.workingCommitted || receipt.commitEvidence != .none,
+                    retainedAdmission: retainedAdmission
+                )
+            }
+            if retainedAdmission != nil, Task.isCancelled { throw CancellationError() }
             throw MCPError.internalError(
                 "The Agent session could not be started because its workspace binding was not durably accepted (reason=\(reason.rawValue), save=\(receipt.outcome.diagnosticCategory), category=\(receipt.outcome.normalizedFailureCategory?.rawValue ?? "none")). No provider was started; inspect manage_workspaces {action:\"list\"}, resolve the reported workspace admission failure, and retry only after it changes."
             )
