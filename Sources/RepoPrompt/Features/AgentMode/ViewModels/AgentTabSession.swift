@@ -1455,7 +1455,11 @@ final class AgentTabSession: ObservableObject {
     /// Cleared only after the provider accepts the turn.
     var pendingHandoff: AgentModeViewModel.PendingHandoffState = .init() {
         didSet {
-            if oldValue.executionLocationFailure != pendingHandoff.executionLocationFailure {
+            if oldValue.executionLocationFailure != pendingHandoff.executionLocationFailure
+                || oldValue.providerSwitchDelivery != pendingHandoff.providerSwitchDelivery
+                || oldValue.sourceItemID != pendingHandoff.sourceItemID
+                || oldValue.isStagedForSend != pendingHandoff.isStagedForSend
+            {
                 noteMonitorObservationInputsChanged()
             }
         }

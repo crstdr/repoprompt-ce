@@ -315,15 +315,18 @@ enum AgentProviderHandover {
         return first ... last
     }
 
+    /// Raw text for policy revalidation of a persisted readable marker; the serializer alone escapes it.
+    static func readableHistoryInstruction(_ range: ClosedRange<Int>, reference: HistoryReference) -> String {
+        "If needed, use server \(reference.server)'s advertised history tool: op=\"get_session\", session_id=\"\(reference.sessionID.uuidString)\", turn_start=\(max(range.lowerBound, range.upperBound - 19)), turn_end=\(range.upperBound) (zero-based, inclusive; max 20 turns/call), roles=[\"user\",\"assistant\",\"tool\",\"error\",\"summary\",\"system\"], max_chars=20000."
+    }
+
     private static func olderMarker(_ range: ClosedRange<Int>, reference: HistoryReference?) -> String {
         let first = range.lowerBound
         let last = range.upperBound
         if let reference {
-            // The validated server is text here, not an attribute; ordinary quotes remain literal.
-            let server = escapeValidated(reference.server)
             return """
             <omitted kind="older_turns" availability="readable" first="\(first)" last="\(last)">
-            If needed, use server \(server)'s advertised history tool: op="get_session", session_id="\(reference.sessionID.uuidString)", turn_start=\(max(first, last - 19)), turn_end=\(last) (zero-based, inclusive; max 20 turns/call), roles=["user","assistant","tool","error","summary","system"], max_chars=20000.
+            \(escapeValidated(readableHistoryInstruction(range, reference: reference)))
             </omitted>
             """
         }

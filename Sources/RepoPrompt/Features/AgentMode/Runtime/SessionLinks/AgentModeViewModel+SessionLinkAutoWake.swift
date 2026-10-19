@@ -628,10 +628,26 @@ extension AgentModeViewModel {
             }
             switch route {
             case .idleFollowUp:
+                let switchPreparation: ProviderSwitchSendPreparation?
+                switch await providerSwitchSendAdmission(
+                    session: session, input: "", skipsAugmentation: true,
+                    supplementalInput: reservedClaim.fragment,
+                    isCurrent: { self.agentSessionLinkAutoWakeSession(for: endpoint) === session
+                        && session.oversight.pendingAutoWake?.wakeID == wakeID
+                        && self.agentSessionLinkAutoWakeRoute(session) == .idleFollowUp
+                    }
+                ) {
+                case let .success(preparation): switchPreparation = preparation
+                case .failure:
+                    abandonAgentSessionLinkPromptClaim(reservedClaim)
+                    cancelAgentSessionLinkAutoWake(for: endpoint, reason: .requiredClaimUnavailable)
+                    return
+                }
                 let startOutcome = await startAgentRun(
                     tabID: endpoint.tabID,
                     initialMessage: "",
-                    directStartOptions: startOptions
+                    directStartOptions: startOptions,
+                    providerSwitchPreparation: switchPreparation
                 )
                 if case .some(.queuedFallback) = startOutcome {
                     // Codex owns a durable queued submission. Keep the wake identity attached until
@@ -1290,6 +1306,18 @@ extension AgentModeViewModel {
                 cancelAgentSessionLinkAutoWake(for: endpoint, reason: .eligibilityLost)
                 return
             }
+        }
+        if case .failure = await providerSwitchSendAdmission(
+            session: session, input: claim.fragment, skipsAugmentation: true,
+            inputAlreadyIncludesSupplement: true,
+            isCurrent: { self.agentSessionLinkAutoWakeSession(for: endpoint) === session
+                && session.oversight.pendingAutoWake?.wakeID == wakeID
+                && self.agentSessionLinkAutoWakeRoute(session) == .waitingContinuation
+            }
+        ) {
+            abandonAgentSessionLinkPromptClaim(claim)
+            cancelAgentSessionLinkAutoWake(for: endpoint, reason: .requiredClaimUnavailable)
+            return
         }
         guard agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: claim.dispatchID) else {
             return

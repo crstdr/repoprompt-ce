@@ -29,7 +29,8 @@ extension AgentModeViewModel {
         endpointMatchesGrant: Bool,
         isClosing: Bool,
         ignoresComposerSubmissionInFlight: Bool = false,
-        ignoresSelfCompactRequestID: UUID? = nil
+        ignoresSelfCompactRequestID: UUID? = nil,
+        ignoresProviderSwitchStalenessAfterAcceptance: Bool = false
     ) -> AgentSessionLinkDeliveryReadiness.Snapshot {
         AgentSessionLinkDeliveryReadiness.Snapshot(
             hasLoadedPersistedState: session.hasLoadedPersistedState,
@@ -55,6 +56,8 @@ extension AgentModeViewModel {
                 && session.selfCompactState.active?.id != ignoresSelfCompactRequestID,
             stopInProgress: session.stopState.isStopping(binding: session.persistentSessionBindingIdentity),
             backgroundCompactionSettling: session.isSettlingACPBackgroundCompaction,
+            providerSwitchUnconfirmed: providerSwitchUnconfirmed(session),
+            providerHandoverNeedsReview: !ignoresProviderSwitchStalenessAfterAcceptance && providerSwitchNeedsReview(session),
             hasWaitingPrompt: session.waitingPrompt != nil,
             hasPendingAskUser: session.pendingAskUser != nil,
             hasPendingUserInputRequest: session.pendingUserInputRequest != nil,
@@ -124,6 +127,21 @@ extension AgentModeViewModel {
             return .blocked(failure == .endpointInvalidated ? .endpointReadiness : failure)
         }
 
+        let envelope = AgentSessionLinkMessageEnvelope.render(
+            sourceSessionID: request.observerSessionID, sourceName: request.observerDisplayName,
+            linkID: request.linkID, linkGeneration: request.linkGeneration,
+            message: request.message, framing: request.framing
+        )
+        let providerMessage = AgentSessionLinkMessageEnvelope.providerPayload(
+            envelope: envelope, workflow: request.workflow,
+            includeBuiltInSessionCleanupGuidance: GlobalSettingsStore.shared.showBuiltInWorkflowCleanupGuidance()
+        )
+        let dispatchedMessage = session.isCodexComputerUseArmed
+            ? CodexComputerUseWorkflow.renderProviderPrompt(userInstructions: providerMessage) : providerMessage
+        if case let .failure(failure) = await providerSwitchSendAdmission(session: session, input: dispatchedMessage, isCurrent: {
+            stopFence.permitsStart(of: session) && liveness().permitsDelivery
+        }) { return .blocked(failure) }
+
         // 3. Local composer claim. Losing it means a local user Send won the race, which is exactly
         //    `target_not_idle` — the observer polls and retries rather than queueing behind the user.
         guard let target = makeComposerSubmitTarget(tabID: candidate.tabID, session: session),
@@ -155,6 +173,16 @@ extension AgentModeViewModel {
         guard commit == .committed else {
             releaseComposerSubmitClaim(claim)
             return .blocked(commit.refusal)
+        }
+
+        let switchPreparation: ProviderSwitchSendPreparation?
+        switch await providerSwitchSendAdmission(session: session, input: dispatchedMessage, isCurrent: {
+            stopFence.permitsStart(of: session) && liveness().permitsDelivery && self.composerSubmitClaimIsCurrent(claim)
+        }) {
+        case let .failure(failure):
+            releaseComposerSubmitClaim(claim)
+            return .blocked(failure)
+        case let .success(preparation): switchPreparation = preparation
         }
 
         // 5. The commit awaited, so every identity and readiness fact must be re-proven — including
@@ -197,22 +225,6 @@ extension AgentModeViewModel {
             return .blocked(.endpointWorkspace)
         }
 
-        // Freeze the exact provider payload before the durable row so an interrupted ACP turn can
-        // replay its original management envelope rather than unframed attributed words.
-        let envelope = AgentSessionLinkMessageEnvelope.render(
-            sourceSessionID: request.observerSessionID,
-            sourceName: request.observerDisplayName,
-            linkID: request.linkID,
-            linkGeneration: request.linkGeneration,
-            message: request.message,
-            framing: request.framing
-        )
-        let providerMessage = AgentSessionLinkMessageEnvelope.providerPayload(
-            envelope: envelope,
-            workflow: request.workflow,
-            includeBuiltInSessionCleanupGuidance: GlobalSettingsStore.shared
-                .showBuiltInWorkflowCleanupGuidance()
-        )
         return await persistAndStartNoncomposerTurn(
             session: liveSession,
             tabID: candidate.tabID,
@@ -222,7 +234,8 @@ extension AgentModeViewModel {
             providerMessage: providerMessage,
             workflow: request.workflow,
             attribution: request.attribution,
-            stopFence: stopFence
+            stopFence: stopFence,
+            providerSwitchPreparation: switchPreparation
         ) {
             let dispatchLiveness = liveness()
             guard self.agentSessionLinkLiveSession(matching: candidate) === liveSession,
@@ -236,7 +249,8 @@ extension AgentModeViewModel {
                     session: liveSession,
                     endpointMatchesGrant: dispatchLiveness.targetEndpointIsLive,
                     isClosing: dispatchLiveness.targetWindowIsClosing,
-                    ignoresComposerSubmissionInFlight: true
+                    ignoresComposerSubmissionInFlight: true,
+                    ignoresProviderSwitchStalenessAfterAcceptance: true
                 )
             ) == nil
         }
@@ -254,6 +268,7 @@ extension AgentModeViewModel {
         workflow: AgentWorkflowDefinition?,
         attribution: AgentCrossSessionAttribution?,
         stopFence: AgentRunStartStopFence,
+        providerSwitchPreparation: ProviderSwitchSendPreparation? = nil,
         dispatchIsCurrent: @MainActor () -> Bool
     ) async -> AgentSessionLinkSendTransactionOutcome {
         // Every noncomposer caller shares this pre-row fence. A completed but failed restoration
@@ -262,6 +277,23 @@ extension AgentModeViewModel {
             releaseComposerSubmitClaim(claim)
             let reason = AgentSessionLinkDeliveryReadiness.restorationBlockReason(liveSession.qualifiedRestorationReadiness)
             return .blocked(AgentSessionLinkSendFailure(reason ?? .targetLoading))
+        }
+        var switchPreparation = providerSwitchPreparation
+        if liveSession.pendingHandoff.providerSwitchDelivery != nil, switchPreparation == nil {
+            let input = liveSession.isCodexComputerUseArmed
+                ? CodexComputerUseWorkflow.renderProviderPrompt(userInstructions: providerMessage) : providerMessage
+            switch await providerSwitchSendAdmission(session: liveSession, input: input, isCurrent: {
+                stopFence.permitsStart(of: liveSession) && self.composerSubmitClaimIsCurrent(claim) && dispatchIsCurrent()
+            }) {
+            case let .failure(failure):
+                releaseComposerSubmitClaim(claim)
+                return .blocked(failure)
+            case let .success(preparation): switchPreparation = preparation
+            }
+        }
+        if let switchPreparation, !providerSwitchPreparationIsCurrent(switchPreparation, session: liveSession) {
+            releaseComposerSubmitClaim(claim)
+            return .blocked(.providerHandoverNeedsReview)
         }
         // 6. Durable acceptance. The bubble keeps raw words; the exact provider payload is metadata.
         let userItem = AgentChatItem.user(
@@ -302,6 +334,7 @@ extension AgentModeViewModel {
         return await startPersistedNoncomposerTurn(
             session: liveSession, tabID: tabID, claim: claim, savedItemID: userItem.id,
             acceptedAt: Date(), providerMessage: providerMessage, stopFence: stopFence,
+            providerSwitchPreparation: switchPreparation?.accepting(userItem.id),
             dispatchIsCurrent: dispatchIsCurrent
         )
     }
@@ -311,7 +344,9 @@ extension AgentModeViewModel {
     func startPersistedNoncomposerTurn(
         session liveSession: TabSession, tabID: UUID, claim: AgentComposerSubmitClaim,
         savedItemID: UUID, acceptedAt: Date, providerMessage: String,
-        stopFence: AgentRunStartStopFence, dispatchIsCurrent: @MainActor () -> Bool
+        stopFence: AgentRunStartStopFence,
+        providerSwitchPreparation: ProviderSwitchSendPreparation? = nil,
+        dispatchIsCurrent: @MainActor () -> Bool
     ) async -> AgentSessionLinkSendTransactionOutcome {
         let persistedOnly = AgentSessionLinkSendDelivery(
             targetItemID: savedItemID,
@@ -374,7 +409,8 @@ extension AgentModeViewModel {
             directStartOptions: AgentDirectRunStartOptions(
                 ignoresPendingHandoff: true, stopFence: stopFence
             ),
-            startOutcome: startRecorder
+            startOutcome: startRecorder,
+            providerSwitchPreparation: providerSwitchPreparation
         )
         releaseComposerSubmitClaim(claim)
         if startRecorder.outcome.didStart {

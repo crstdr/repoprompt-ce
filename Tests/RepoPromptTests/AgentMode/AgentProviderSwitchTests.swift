@@ -1,12 +1,112 @@
 #if DEBUG
     import Foundation
     @testable import RepoPromptApp
+    import RepoPromptDomainRuntime
     import XCTest
 
     final class AgentProviderSwitchTests: XCTestCase {
         private typealias Handover = AgentProviderHandover
         private let date = Date(timeIntervalSince1970: 1_700_000_000)
         private let sessionID = UUID(uuidString: "11111111-2222-3333-4444-555555555555")!
+
+        func testPendingDeliveryCodecAndLightweightHeaderPreservePayloadAndFailClosed() async throws {
+            let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: folder) }
+            let original = AgentSession(pendingHandoffPayload: "readable retained payload", pendingHandoffSourceItemID: sessionID)
+            let encoder = JSONEncoder()
+            let base = try XCTUnwrap(JSONSerialization.jsonObject(with: encoder.encode(original)) as? [String: Any])
+            let cases: [(Any?, AgentProviderSwitchDelivery?)] = [
+                (nil, nil), ("ready", .ready), ("sending", .sending),
+                ("future_state", .sending), (17, .sending), (["bad": true], .sending), (NSNull(), .sending)
+            ]
+            for (raw, expected) in cases {
+                var object = base
+                object["pendingHandoffProviderSwitchDelivery"] = raw
+                let data = try JSONSerialization.data(withJSONObject: object)
+                let decoded = try JSONDecoder().decode(AgentSession.self, from: data)
+                XCTAssertEqual(decoded.pendingHandoffProviderSwitchDelivery, expected, "raw=\(String(describing: raw))")
+                XCTAssertEqual(decoded.pendingHandoffPayload, original.pendingHandoffPayload)
+                XCTAssertEqual(decoded.pendingHandoffSourceItemID, sessionID)
+                let url = folder.appendingPathComponent("AgentSession-\(original.id.uuidString).json")
+                try data.write(to: url)
+                let stub = try await AgentSessionDataService.shared.loadAgentSessionStub(from: url)
+                XCTAssertEqual(stub.pendingHandoffProviderSwitchDelivery, expected)
+                XCTAssertEqual(stub.pendingHandoffPayload, original.pendingHandoffPayload)
+                let restored = try JSONDecoder().decode(AgentSession.self, from: encoder.encode(decoded))
+                XCTAssertEqual(restored.pendingHandoffProviderSwitchDelivery, expected)
+            }
+        }
+
+        @MainActor
+        func testM4RefusalsSerializeExactNonretryableOpenStringResults() throws {
+            struct OldClient: Decodable { let result: String
+                let delivered: Bool
+                let retryable: Bool
+                let detail: String
+            }
+            let cases: [(AgentSessionLinkSendFailure, String, String)] = [
+                (.providerSwitchUnconfirmed, "provider_switch_unconfirmed", "Only the user can resolve this in RepoPrompt; do not retry."),
+                (.providerHandoverDoesNotFit, "provider_handover_does_not_fit", "This message and the pending handover do not fit; a shorter new message may. Only the user can review the handover in RepoPrompt."),
+                (.providerHandoverNeedsReview, "provider_handover_needs_review", "Pending handover stale. Only the user can review it in RepoPrompt; do not retry.")
+            ]
+            for (failure, token, detail) in cases {
+                let value = AgentSessionLinkResponseRenderer.sendBlockedValue(failure, targetSessionID: sessionID)
+                let decoded = try JSONDecoder().decode(OldClient.self, from: JSONEncoder().encode(value))
+                XCTAssertEqual(decoded.result, token)
+                XCTAssertEqual(decoded.detail, detail)
+                XCTAssertFalse(decoded.delivered)
+                XCTAssertFalse(decoded.retryable)
+                XCTAssertFalse(failure.isDeliveryIndeterminate)
+                XCTAssertNil(value.objectValue?["subreason"])
+                XCTAssertNil(value.objectValue?["delivered_unknown"])
+            }
+            struct OldBoardClient: Decodable {
+                let sendBlockers: [String]
+                enum CodingKeys: String, CodingKey { case sendBlockers = "send_blockers" }
+            }
+            let blockers = ["provider_switch_unconfirmed", "provider_handover_needs_review", "future_opaque_blocker"]
+            let board = DomainAgentSessionLaneBoard(runOutcome: .none, failureReason: nil, sendBlockers: blockers, subagentRunning: 0, subagentFinished: 0)
+            let wireBoard = AgentSessionLinkResponseRenderer.laneBoardValue(board)
+            let oldBoard = try JSONDecoder().decode(OldBoardClient.self, from: JSONEncoder().encode(wireBoard))
+            XCTAssertEqual(oldBoard.sendBlockers, blockers)
+            var snapshot = AgentSessionLinkDeliveryReadiness.Snapshot.ready
+            snapshot.providerSwitchUnconfirmed = true
+            XCTAssertEqual(AgentSessionLinkDeliveryReadiness.failure(snapshot: snapshot), .providerSwitchUnconfirmed)
+            snapshot.providerSwitchUnconfirmed = false
+            snapshot.providerHandoverNeedsReview = true
+            XCTAssertEqual(AgentSessionLinkDeliveryReadiness.failure(snapshot: snapshot), .providerHandoverNeedsReview)
+            for (unconfirmed, expected) in [(true, AgentSessionLinkSendFailure.providerSwitchUnconfirmed), (false, .providerHandoverNeedsReview)] {
+                var readiness = AgentSessionLinkDeliveryReadiness.Snapshot.ready
+                readiness.providerSwitchUnconfirmed = unconfirmed
+                readiness.providerHandoverNeedsReview = !unconfirmed
+                for route: AgentSessionLinkManagedSteerRoute in [.codex, .waitingInstruction, .claudeInterrupt, .acpQueued] {
+                    XCTAssertEqual(AgentSessionLinkSteerAdmission.evaluate(readiness: readiness, runStateIsActive: true, pendingPromptExists: false, route: route), .blocked(expected))
+                }
+            }
+        }
+
+        @MainActor
+        func testReadyCutoffExcludesOnlyExactCurrentInputAndOwnNotices() {
+            let session = AgentTabSession(tabID: UUID())
+            let cutoff = AgentChatItem.user("earlier input", sequenceIndex: 0)
+            session.appendItem(cutoff)
+            session.pendingHandoff = .init(payload: "carrier", sourceItemID: cutoff.id, providerSwitchDelivery: .ready)
+            session.appendItem(.system("Provider changed from source to destination; handover: Full history.", sequenceIndex: 1, recoveryDiagnostic: .init(reason: "providerSwitch", outcome: "applied", text: "boundary")))
+            XCTAssertFalse(AgentModeViewModel.providerSwitchNeedsReview(session))
+            let accepted = AgentChatItem.user("same words", sequenceIndex: 2)
+            session.appendItem(accepted)
+            XCTAssertTrue(AgentModeViewModel.providerSwitchNeedsReview(session))
+            XCTAssertFalse(AgentModeViewModel.providerSwitchNeedsReview(session, excluding: accepted.id))
+            session.appendItem(.user("same words", sequenceIndex: 3))
+            XCTAssertTrue(AgentModeViewModel.providerSwitchNeedsReview(session, excluding: accepted.id), "Equal text cannot impersonate the exact current input")
+            session.pendingHandoff.providerSwitchDelivery = .sending
+            XCTAssertTrue(AgentModeViewModel.providerSwitchUnconfirmed(session))
+            XCTAssertFalse(AgentModeViewModel.providerSwitchNeedsReview(session))
+            session.pendingHandoff.clearAfterSend()
+            XCTAssertFalse(AgentModeViewModel.providerSwitchUnconfirmed(session))
+            XCTAssertNil(session.pendingHandoff.providerSwitchDelivery)
+        }
 
         func testHistoryUsesExactCarrierAndMinimalXMLTextAndAttributeEscaping() throws {
             let hostile = "& <tag> \"quote\" 'apostrophe' ]]> > é 🧭"
