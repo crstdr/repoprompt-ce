@@ -49,6 +49,10 @@ final class AgentTabSession: ObservableObject {
         return token
     }
 
+    func hasLocalComposerCandidate(itemID: UUID, fence: AgentRunStartStopFence) -> Bool {
+        localComposerCandidates.values.contains { $0.itemID == itemID && $0.fence == fence }
+    }
+
     enum LocalComposerDisposition { case retained, rolledBack }
 
     @discardableResult
@@ -1123,6 +1127,45 @@ final class AgentTabSession: ObservableObject {
         }
     }
 
+    /// A transient rollback value, not another occupancy owner or persisted record. Callers restore
+    /// only under their exact mutation claim and only with definite pre-write evidence.
+    struct ProviderSwitchContextSnapshot {
+        let usage: ContextUsageSnapshot?
+        let codexUsage: AgentContextUsage?
+        let compactedAt: Date?
+        let count: ContextUsageVouch?
+        let window: ContextUsageVouch?
+        let confidence: ContextUsageSnapshotConfidence?
+        let pendingTokens: [Int]
+        let accumulator: AgentModeViewModel.NonCodexTurnTokenAccumulator?
+    }
+
+    func captureProviderSwitchContext() -> ProviderSwitchContextSnapshot {
+        .init(
+            usage: contextUsageSnapshot,
+            codexUsage: codexContextUsage,
+            compactedAt: contextCompactedAt,
+            count: vouchedContextCount,
+            window: vouchedContextWindow,
+            confidence: vouchedContextCountConfidence,
+            pendingTokens: pendingNonCodexUserInputTokenQueue,
+            accumulator: activeNonCodexTurnTokenAccumulator
+        )
+    }
+
+    func restoreProviderSwitchContext(_ snapshot: ProviderSwitchContextSnapshot) {
+        contextUsageSnapshot = snapshot.usage
+        codexContextUsage = snapshot.codexUsage
+        contextCompactedAt = snapshot.compactedAt
+        batchingContextVouchSignals {
+            vouchedContextCount = snapshot.count
+            vouchedContextWindow = snapshot.window
+            vouchedContextCountConfidence = snapshot.confidence
+        }
+        pendingNonCodexUserInputTokenQueue = snapshot.pendingTokens
+        activeNonCodexTurnTokenAccumulator = snapshot.accumulator
+    }
+
     var contextCompactedAt: Date? {
         didSet {
             // A compaction invalidates the count; the window is unchanged.
@@ -1460,7 +1503,11 @@ final class AgentTabSession: ObservableObject {
     /// Cleared only after the provider accepts the turn.
     var pendingHandoff: AgentModeViewModel.PendingHandoffState = .init() {
         didSet {
-            if oldValue.executionLocationFailure != pendingHandoff.executionLocationFailure {
+            if oldValue.executionLocationFailure != pendingHandoff.executionLocationFailure
+                || oldValue.providerSwitchDelivery != pendingHandoff.providerSwitchDelivery
+                || oldValue.sourceItemID != pendingHandoff.sourceItemID
+                || oldValue.isStagedForSend != pendingHandoff.isStagedForSend
+            {
                 noteMonitorObservationInputsChanged()
             }
         }
@@ -2017,6 +2064,21 @@ final class AgentTabSession: ObservableObject {
             ),
             attemptID: attemptID
         )
+        if pendingHandoff.providerSwitchDelivery == .sending,
+           let proof = pendingHandoff.providerSwitchDispatch
+        {
+            if pendingHandoff.isStagedForSend, proof.binding == currentRestorationBindingToken,
+               proof.stopFence.permitsStart(of: self),
+               !AgentModeViewModel.providerSwitchNeedsReview(self, excluding: proof.acceptedInputID),
+               let associated = proof.associatingRun(ownership)
+            {
+                // Association borrows existing value identities; it owns no runtime lifetime.
+                pendingHandoff.providerSwitchDispatch = associated
+            } else {
+                // A second start cannot adopt this attempt's proof, even at the same binding.
+                pendingHandoff.isStagedForSend = false
+            }
+        }
         #if DEBUG
             perfRecorder.increment("run.lifecycle.attempt.started")
             perfRecorder.increment("run.lifecycle.attempt.started.source.\(source)")

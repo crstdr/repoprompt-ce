@@ -279,7 +279,8 @@ extension AgentModeViewModel {
                     && self.composerSubmitClaimIsCurrent(claim) && stopFence.permitsStart(of: session)
                     && AgentSessionLinkDeliveryReadiness.failure(snapshot: Self.agentSessionLinkDeliveryReadinessSnapshot(
                         session: session, endpointMatchesGrant: true, isClosing: false,
-                        ignoresComposerSubmissionInFlight: true
+                        ignoresComposerSubmissionInFlight: true,
+                        ignoresProviderSwitchStalenessAfterAcceptance: true
                     )) == nil
             }
             switch outcome {

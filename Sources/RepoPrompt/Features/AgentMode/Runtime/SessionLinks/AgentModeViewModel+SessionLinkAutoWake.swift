@@ -628,10 +628,26 @@ extension AgentModeViewModel {
             }
             switch route {
             case .idleFollowUp:
+                let switchPreparation: ProviderSwitchSendPreparation?
+                switch await providerSwitchSendAdmission(
+                    session: session, input: "", skipsAugmentation: true,
+                    supplementalInput: reservedClaim.fragment, autoWakeID: wakeID,
+                    isCurrent: { self.agentSessionLinkAutoWakeSession(for: endpoint) === session
+                        && session.oversight.pendingAutoWake?.wakeID == wakeID
+                        && self.agentSessionLinkAutoWakeRoute(session) == .idleFollowUp
+                    }
+                ) {
+                case let .success(preparation): switchPreparation = preparation
+                case .failure:
+                    abandonAgentSessionLinkPromptClaim(reservedClaim)
+                    cancelAgentSessionLinkAutoWake(for: endpoint, reason: .requiredClaimUnavailable)
+                    return
+                }
                 let startOutcome = await startAgentRun(
                     tabID: endpoint.tabID,
                     initialMessage: "",
-                    directStartOptions: startOptions
+                    directStartOptions: startOptions,
+                    providerSwitchPreparation: switchPreparation
                 )
                 if case .some(.queuedFallback) = startOutcome {
                     // Codex owns a durable queued submission. Keep the wake identity attached until
@@ -755,7 +771,7 @@ extension AgentModeViewModel {
     /// would otherwise take the ordinary-dispatch early return and turn a fenced lane update into an
     /// unfenced provider call with no claim, no provenance row, and no snooze/selection check.
     @discardableResult
-    func agentSessionLinkAcquirePhysicalDispatch(
+    func agentSessionLinkAcquireAutoWakePhysicalDispatch(
         for session: TabSession,
         dispatchID: AgentSessionLinkPromptDispatchID
     ) -> Bool {
@@ -1290,6 +1306,18 @@ extension AgentModeViewModel {
                 cancelAgentSessionLinkAutoWake(for: endpoint, reason: .eligibilityLost)
                 return
             }
+        }
+        if case .failure = await providerSwitchSendAdmission(
+            session: session, input: claim.fragment, skipsAugmentation: true,
+            inputAlreadyIncludesSupplement: true,
+            isCurrent: { self.agentSessionLinkAutoWakeSession(for: endpoint) === session
+                && session.oversight.pendingAutoWake?.wakeID == wakeID
+                && self.agentSessionLinkAutoWakeRoute(session) == .waitingContinuation
+            }
+        ) {
+            abandonAgentSessionLinkPromptClaim(claim)
+            cancelAgentSessionLinkAutoWake(for: endpoint, reason: .requiredClaimUnavailable)
+            return
         }
         guard agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: claim.dispatchID) else {
             return

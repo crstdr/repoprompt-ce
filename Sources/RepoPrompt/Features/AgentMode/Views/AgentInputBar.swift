@@ -31,6 +31,7 @@ struct AgentComposerActions {
     let modelOptions: (_ agent: AgentProviderKind, _ includeClaudeEffortVariants: Bool) -> [AgentModelOption]
     let canSelectAgentInCurrentChat: (_ agent: AgentProviderKind) -> Bool
     let selectAgentModel: (_ agent: AgentProviderKind, _ rawModel: String) -> Void
+    var reviewAgentModel: (_ agent: AgentProviderKind, _ rawModel: String, _ cursorParameterIntent: AgentModeViewModel.ProviderSwitchCursorParameterIntent?) -> Bool = { _, _, _ in false }
     let reasoningEffortOptionsForCurrentSelection: () -> [CodexReasoningEffort]
     let selectReasoningEffort: (_ effort: CodexReasoningEffort?) -> Void
     let selectACPModelParameter: (_ target: ACPModelParameterSelection, _ openCodeDiscoveryKey: OpenCodeACPModelParameterKey?) -> Void
@@ -93,24 +94,29 @@ struct AgentInputBar: View {
         #if DEBUG
             let _ = perfRecorder.increment("ui.body.inputBar")
         #endif
-        AgentComposerView(
-            props: composerUI.props,
-            placeholderText: composerPlaceholderText,
-            actions: composerActions,
-            promptManager: promptManager,
-            workspaceSearchService: workspaceSearchService,
-            selectionCoordinator: selectionCoordinator,
-            windowID: windowID,
-            currentTabID: currentTabID,
-            repromptViewModel: agentModeVM,
-            repromptStore: agentModeVM.repromptUIStore,
-            pendingSubmissionStore: composerUI,
-            resetTextFieldTrigger: $resetTextFieldTrigger,
-            composerBottomInset: $composerBottomInset,
-            transcriptBottomClearance: $transcriptBottomClearance,
-            isFocused: _isFocused
-        )
-        .equatable()
+        VStack(spacing: 8) {
+            if let currentTabID, let session = agentModeVM.sessions[currentTabID] {
+                AgentProviderSwitchPresentation(viewModel: agentModeVM, session: session)
+            }
+            AgentComposerView(
+                props: composerUI.props,
+                placeholderText: composerPlaceholderText,
+                actions: composerActions,
+                promptManager: promptManager,
+                workspaceSearchService: workspaceSearchService,
+                selectionCoordinator: selectionCoordinator,
+                windowID: windowID,
+                currentTabID: currentTabID,
+                repromptViewModel: agentModeVM,
+                repromptStore: agentModeVM.repromptUIStore,
+                pendingSubmissionStore: composerUI,
+                resetTextFieldTrigger: $resetTextFieldTrigger,
+                composerBottomInset: $composerBottomInset,
+                transcriptBottomClearance: $transcriptBottomClearance,
+                isFocused: _isFocused
+            )
+            .equatable()
+        }
         .overlay(alignment: .bottom) {
             statusPills
                 .padding(.bottom, Self.footerHeight + ComposerChrome<EmptyView, EmptyView>.baseBarHeight + composerBottomInset - 8)
@@ -154,8 +160,13 @@ struct AgentInputBar: View {
             },
             canSelectAgentInCurrentChat: { agent in agentModeVM.canSelectAgentInCurrentChat(agent) },
             selectAgentModel: { agent, rawModel in
+                if agentModeVM.requestProviderSwitchSelection(agent: agent, model: rawModel, tabID: currentTabID) { return }
+                guard !composerUI.props.areModelControlsDisabled else { return }
                 agentModeVM.selectedAgent = agent
                 agentModeVM.selectModel(rawModel: rawModel)
+            },
+            reviewAgentModel: { agent, model, intent in
+                agentModeVM.requestProviderSwitchSelection(agent: agent, model: model, tabID: currentTabID, cursorParameterIntent: intent)
             },
             reasoningEffortOptionsForCurrentSelection: { agentModeVM.reasoningEffortOptionsForCurrentSelection() },
             selectReasoningEffort: { effort in agentModeVM.selectReasoningEffort(effort) },
@@ -1045,8 +1056,8 @@ struct AgentComposerView: View, Equatable {
 
     @ViewBuilder
     private var agentProviderModelPicker: some View {
-        let isLocked = props.isProviderPickerLockedForCurrentTab
-        let lockedMessage = props.lockedAgentSelectionMessage
+        let isLocked = false
+        let lockedMessage: String? = nil
         StableMenuButton(
             items: agentProviderModelMenuItems,
             triggerStyle: .plain,
@@ -1078,8 +1089,6 @@ struct AgentComposerView: View, Equatable {
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
         }
-        .disabled(modelControlsDisabled)
-        .opacity(modelControlsDisabled ? 0.55 : 1.0)
         .hoverTooltip(providerChipTooltip(isLocked: isLocked, lockedMessage: lockedMessage))
         .frame(maxWidth: providerChipMaxWidth, alignment: .leading)
         .fixedSize(horizontal: true, vertical: false)
@@ -1087,24 +1096,11 @@ struct AgentComposerView: View, Equatable {
 
     private func agentProviderModelMenuItems() -> [StableMenuItem] {
         var items: [StableMenuItem] = []
-        if let lockedMessage = props.lockedAgentSelectionMessage {
-            items.append(.message(lockedMessage))
-            items.append(.separator)
-        }
-
         items.append(.header("Model"))
         for agent in props.availableAgents {
             let canSelectAgent = actions.canSelectAgentInCurrentChat(agent)
-            if canSelectAgent {
-                let modelItems = inputBarModelMenuItems(for: agent)
-                items.append(.submenu(agent.displayName, items: modelItems))
-            } else {
-                items.append(.action(
-                    agent.displayName,
-                    isEnabled: false,
-                    imageSystemName: "lock.fill"
-                ) {})
-            }
+            let modelItems = inputBarModelMenuItems(for: agent)
+            items.append(.submenu(agent.displayName, imageSystemName: canSelectAgent ? nil : "arrow.left.arrow.right", items: modelItems))
         }
         AgentProviderSettingsMenuAction.appendStableMenuItem(
             to: &items,
@@ -1136,10 +1132,12 @@ struct AgentComposerView: View, Equatable {
                     )
                 },
                 onSelectModel: { model in
+                    if actions.reviewAgentModel(.cursor, model.rawValue, nil) { return }
                     guard !modelControlsDisabled, actions.canMutateCursorModel(props.currentTabID), actions.canSelectAgentInCurrentChat(.cursor) else { return }
                     actions.selectAgentModel(.cursor, model.rawValue)
                 },
                 onSelectParameter: { model, parameter in
+                    if actions.reviewAgentModel(.cursor, model.rawValue, .select(parameter)) { return }
                     guard !modelControlsDisabled, actions.canMutateCursorModel(props.currentTabID), actions.canSelectAgentInCurrentChat(.cursor) else { return }
                     if props.selectedAgent != .cursor || (try? CursorAIModelCatalog.ModelSpecifier(raw: props.selectedModelRaw).baseModelRaw) != model.rawValue {
                         actions.selectAgentModel(.cursor, model.rawValue)
@@ -1147,6 +1145,7 @@ struct AgentComposerView: View, Equatable {
                     actions.selectACPModelParameter(parameter, nil)
                 },
                 onClearParameter: { model, identity in
+                    if actions.reviewAgentModel(.cursor, model.rawValue, .clear(identity)) { return }
                     guard !modelControlsDisabled, actions.canMutateCursorModel(props.currentTabID), actions.canSelectAgentInCurrentChat(.cursor) else { return }
                     if props.selectedAgent != .cursor || (try? CursorAIModelCatalog.ModelSpecifier(raw: props.selectedModelRaw).baseModelRaw) != model.rawValue {
                         actions.selectAgentModel(.cursor, model.rawValue)
