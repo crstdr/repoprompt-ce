@@ -260,6 +260,11 @@ final class AgentRunTerminalCommitBarrier {
             binding.appendError(errorText)
         }
 
+        var observationCutAllowsQuiet = true
+        if request.classifiesQuietCheckIn, let flush = binding.hooks.flushQuietToolObservations {
+            observationCutAllowsQuiet = await flush()
+        }
+        // No seal authority crosses the await. Recheck the exact owner and normal provider drain.
         guard validatesOwnership(request),
               binding.providerDrainGeneration == request.providerDrainGeneration,
               request.providerBuffersAreDrained()
@@ -271,7 +276,8 @@ final class AgentRunTerminalCommitBarrier {
         }
 
         binding.hooks.sealQuietCheckIn(
-            request.ownership, request.terminalState, request.classifiesQuietCheckIn,
+            request.ownership, request.terminalState,
+            request.classifiesQuietCheckIn && observationCutAllowsQuiet && binding.hooks.quietToolObservationsAreComplete(),
             queuedInstruction != nil || providerSuccessor != nil
         )
         let attemptTeardown = lifecycle.claimTerminalTeardown(

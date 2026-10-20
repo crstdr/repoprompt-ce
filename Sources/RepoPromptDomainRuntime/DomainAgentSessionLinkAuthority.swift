@@ -41,6 +41,22 @@ package final class DomainAgentSessionLinkCapabilityElevation: @unchecked Sendab
 /// - Ordinary explicit links have no date-based expiry. A derived exact-target link also requires
 ///   its owning user consent to remain live; storage availability is never an input.
 package actor DomainAgentSessionLinkAuthority {
+    #if DEBUG
+        /// W0(d) feasibility only, not a product metric, cache or decision input.
+        package struct TestScanMeasurement: Sendable {
+            package enum Kind: Sendable { case inboundInventory, presentationSnapshot }
+            package let kind: Kind
+            package let recordVisits: Int
+            package let elapsed: Duration
+        }
+
+        private var test_scanObserver: (@Sendable (TestScanMeasurement) -> Void)?
+
+        package func test_observeScans(_ observer: (@Sendable (TestScanMeasurement) -> Void)?) {
+            test_scanObserver = observer
+        }
+    #endif
+
     private var scopeConsent: DomainDelegationScopeLinkConsent?
     private var capabilityElevation: DomainAgentSessionLinkCapabilityElevation?
 
@@ -190,6 +206,7 @@ package actor DomainAgentSessionLinkAuthority {
     private struct TargetRecord {
         var endpoint: DomainAgentSessionLinkEndpointIdentity
         var snapshot: DomainAgentSessionObservationSnapshot
+        var runFacts: AgentRunQuietFacts?
         var changeSequence: UInt64
         /// Only publications strictly newer than this mark are accepted.
         var sourcePublicationHighWater: UInt64
@@ -444,7 +461,8 @@ package actor DomainAgentSessionLinkAuthority {
     package func activateLink(
         reservation: DomainAgentSessionLinkPendingReservation,
         initialSnapshot: DomainAgentSessionObservationSnapshot,
-        sourcePublicationSequence: UInt64
+        sourcePublicationSequence: UInt64,
+        runFacts: AgentRunQuietFacts? = nil
     ) -> DomainAgentSessionLinkActivationDisposition {
         guard !isDraining, !isShutDown else {
             pendingReservations.removeValue(forKey: reservation.linkID)
@@ -515,6 +533,7 @@ package actor DomainAgentSessionLinkAuthority {
             targets[reservation.target.sessionID] = TargetRecord(
                 endpoint: reservation.target,
                 snapshot: canonicalSnapshot(initialSnapshot, previous: nil),
+                runFacts: runFacts,
                 changeSequence: sequence,
                 // Seeded only from the chain that is actually installing.
                 sourcePublicationHighWater: sourcePublicationSequence,
@@ -653,8 +672,22 @@ package actor DomainAgentSessionLinkAuthority {
         forTarget targetSessionID: UUID,
         matching predicate: (LinkRecord) -> Bool
     ) -> DomainAgentSessionLinkInventory {
+        #if DEBUG
+            let scanStart = test_scanObserver.map { _ in ContinuousClock.now }
+            var recordVisits = 0
+            defer {
+                if let scanStart {
+                    test_scanObserver?(.init(kind: .inboundInventory, recordVisits: recordVisits, elapsed: scanStart.duration(to: .now)))
+                }
+            }
+        #endif
         var items: [DomainAgentSessionLinkInventoryItem] = []
-        for record in links.values where predicate(record) && hasSourceConsent(record.grant) {
+        // Intentionally retain the inherited full scan, including predicate/consent order.
+        for record in links.values {
+            #if DEBUG
+                if scanStart != nil { recordVisits += 1 }
+            #endif
+            guard predicate(record), hasSourceConsent(record.grant) else { continue }
             items.append(inventoryItem(record, outbound: false))
         }
         items.sort(by: Self.orderedByObserver)
@@ -739,11 +772,25 @@ package actor DomainAgentSessionLinkAuthority {
     package func presentationSnapshot(
         additionalEndpoints: Set<DomainAgentSessionLinkEndpointIdentity> = []
     ) -> DomainAgentSessionLinkPresentationSnapshot {
+        #if DEBUG
+            let scanStart = test_scanObserver.map { _ in ContinuousClock.now }
+            var recordVisits = 0
+            defer {
+                if let scanStart {
+                    test_scanObserver?(.init(kind: .presentationSnapshot, recordVisits: recordVisits, elapsed: scanStart.duration(to: .now)))
+                }
+            }
+        #endif
         var outbound: [DomainAgentSessionLinkEndpointIdentity: [DomainAgentSessionLinkInventoryItem]] = [:]
         var inbound: [DomainAgentSessionLinkEndpointIdentity: [DomainAgentSessionLinkInventoryItem]] = [:]
         var targetEndpoints: [DomainAgentSessionLinkEndpointIdentity: [UUID: DomainAgentSessionLinkEndpointIdentity]] = [:]
         var observerEndpoints: [DomainAgentSessionLinkEndpointIdentity: [UUID: DomainAgentSessionLinkEndpointIdentity]] = [:]
-        for record in links.values where hasSourceConsent(record.grant) {
+        // W0(d) instrumentation does not optimize or narrow this inherited full scan.
+        for record in links.values {
+            #if DEBUG
+                if scanStart != nil { recordVisits += 1 }
+            #endif
+            guard hasSourceConsent(record.grant) else { continue }
             let grant = record.grant
             outbound[grant.observer, default: []].append(inventoryItem(record, outbound: true))
             inbound[grant.target, default: []].append(inventoryItem(record, outbound: false))
@@ -1103,7 +1150,8 @@ package actor DomainAgentSessionLinkAuthority {
     package func publishTargetSnapshot(
         endpoint: DomainAgentSessionLinkEndpointIdentity,
         snapshot: DomainAgentSessionObservationSnapshot,
-        sourcePublicationSequence: UInt64
+        sourcePublicationSequence: UInt64,
+        runFacts: AgentRunQuietFacts? = nil
     ) -> DomainAgentSessionLinkTargetChangeDisposition {
         guard !isShutDown else { return .shuttingDown }
         guard var record = targets[endpoint.sessionID] else { return .unknownTarget }
@@ -1114,6 +1162,8 @@ package actor DomainAgentSessionLinkAuthority {
             return .stale(currentSourcePublicationSequence: record.sourcePublicationHighWater)
         }
         record.sourcePublicationHighWater = sourcePublicationSequence
+        // Nil is an accepted producer value too. Update it before public equality can return.
+        record.runFacts = runFacts
         let canonical = canonicalSnapshot(snapshot, previous: record.snapshot)
         guard canonical != record.snapshot else {
             targets[endpoint.sessionID] = record
@@ -1164,9 +1214,12 @@ package actor DomainAgentSessionLinkAuthority {
 
     package func observationSnapshot(
         forTargetEndpoint endpoint: DomainAgentSessionLinkEndpointIdentity
-    ) -> DomainAgentSessionObservationSnapshot? {
+    ) -> DomainAgentSessionLinkObservationEnvelope? {
         guard let record = targets[endpoint.sessionID], record.endpoint == endpoint else { return nil }
-        return record.snapshot
+        return DomainAgentSessionLinkObservationEnvelope(
+            endpoint: record.endpoint, sourcePublicationSequence: record.sourcePublicationHighWater,
+            snapshot: record.snapshot, runFacts: record.runFacts
+        )
     }
 
     /// Current authorized target state plus a freshly minted successor wait cursor.

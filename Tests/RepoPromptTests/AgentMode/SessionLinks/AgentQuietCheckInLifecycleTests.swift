@@ -196,17 +196,19 @@ final class AgentQuietCheckInLifecycleTests: XCTestCase {
 
     func testRawClaudeFinishedMessagesReplacementAndSilenceReachAcceptedVMAndBarrier() async {
         let cases: [([String], Bool)] = [
-            ([#"{"type":"system","subtype":"init"}"#, #"{"type":"result","result":"[ack]"}"#], true),
+            ([#"{"type":"system","subtype":"init"}"#, #"{"type":"result","subtype":"success","result":"[ack]"}"#], true),
             ([
                 #"{"type":"assistant","message":{"id":"one","content":[{"type":"text","text":"prose"}]}}"#,
-                #"{"type":"result","result":"[ack]"}"#
+                #"{"type":"result","subtype":"success","result":"[ack]"}"#
             ], true),
             ([
                 #"{"type":"assistant","message":{"id":"one","content":[{"type":"text","text":"prose"}]}}"#,
                 #"{"type":"assistant","message":{"id":"two","content":[{"type":"text","text":"[ack]"}]}}"#,
-                #"{"type":"result","result":"[ack]"}"#
+                #"{"type":"result","subtype":"success","result":"[ack]"}"#
             ], false),
-            ([#"{"type":"system","subtype":"init"}"#, #"{"type":"result","subtype":"success"}"#], true)
+            ([#"{"type":"system","subtype":"init"}"#, #"{"type":"result","subtype":"success"}"#], true),
+            // A result without its completion subtype is not positively successful metadata.
+            ([#"{"type":"result","result":"[ack]"}"#], false)
         ]
         for (wire, quiet) in cases {
             let (h, s, owner, runID) = fixture()
@@ -679,5 +681,39 @@ extension AgentQuietCheckInLifecycleTests {
             }
         }
         XCTAssertFalse(AgentSessionLinkPrompts.supportsQuietCheckIn(.devin), "One shared predicate keeps future copy and classification disabled together")
+    }
+}
+
+extension AgentQuietCheckInLifecycleTests {
+    func testClaudeTranslatorAndNativeIngressPreserveUnknownOutputBeforeSuppression() async throws {
+        let cases: [(String, String)] = [
+            ("unknown-assistant-output", #"{"type":"assistant","message":{"id":"w0e-message","content":[{"type":"future_output","value":"opaque"}]}}"#),
+            ("unknown-stream-output", #"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"future_delta","value":"opaque"}}}"#),
+            ("malformed-text-output", #"{"type":"assistant","message":{"id":"w0e-message","content":[{"type":"text","text":17}]}}"#),
+            ("system-metadata", #"{"type":"system","subtype":"future_metadata","metadata":{"value":17}}"#)
+        ]
+        for (label, wire) in cases {
+            let (h, s, owner, runID) = fixture()
+            defer { s.saveDebounceTask?.cancel() }
+            var translator = ClaudeSDKNDJSONTranslator()
+            let normalized = translator.parseNDJSONLine(Data(wire.utf8))
+            XCTAssertEqual(normalized.map(\.type), ["event"], label)
+            XCTAssertNil(normalized.first?.text, "No new model-facing text: \(label)")
+            guard let decoded = try ClaudeCompatiblePluginProtocolCodec.decodeLine(Data(wire.utf8)),
+                  case let .streamPayload(payload) = decoded
+            else {
+                XCTFail("Expected the actual codec's stream payload: \(label)")
+                continue
+            }
+            var providerTranslator = ClaudeCompatiblePluginNDJSONTranslator()
+            let dtoResults = providerTranslator.parseStreamPayload(payload).map { ClaudeCompatibleProviderRuntimeBridge.streamResult(from: $0) }
+            XCTAssertEqual(dtoResults.map(\.type), normalized.map(\.type), "Both entry points preserve the same negative evidence: \(label)")
+            for result in normalized {
+                await h.host.test_handleStreamResult(result, session: s, runID: runID, runAttemptID: owner.attemptID)
+            }
+            XCTAssertNil(s.quietLedger.candidateStartKey(owner: owner), "The semantic owner sees negative evidence without the native raw guard: \(label)")
+            // Real native codec/controller emits negative evidence before the runner's VM hook.
+            await assertClaudeControllerQuietCompletion([wire], quiet: false, expectedTexts: [], finalText: nil, expectsUncertainty: true)
+        }
     }
 }

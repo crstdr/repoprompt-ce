@@ -2106,7 +2106,8 @@ final class AgentTabSession: ObservableObject {
         kind: AgentRunLivenessSignalKind,
         stage: AgentRunLifecycleStage,
         retryIntent: AgentRunRetryIntent = .none,
-        timestampUptimeNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
+        timestampUptimeNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds,
+        quietDeclarationRepresentation: Bool = false
     ) -> AgentRunProgressAcceptance {
         let result = runLifecycle.recordProgress(
             ownership: ownership,
@@ -2115,7 +2116,7 @@ final class AgentTabSession: ObservableObject {
             retryIntent: retryIntent,
             timestampUptimeNanoseconds: timestampUptimeNanoseconds
         )
-        noteQuietProgress(result, kind: kind, stage: stage, retryIntent: retryIntent)
+        noteQuietProgress(result, kind: kind, stage: stage, retryIntent: retryIntent, quietDeclarationRepresentation: quietDeclarationRepresentation)
         recordRunProgressDiagnostic(result, kind: kind, stage: stage)
         return result
     }
@@ -2159,11 +2160,13 @@ final class AgentTabSession: ObservableObject {
         _ acceptance: AgentRunProgressAcceptance,
         kind: AgentRunLivenessSignalKind,
         stage: AgentRunLifecycleStage,
-        retryIntent: AgentRunRetryIntent
+        retryIntent: AgentRunRetryIntent,
+        quietDeclarationRepresentation: Bool = false
     ) {
         guard case let .accepted(snapshot) = acceptance,
               isCurrentRunAttemptForCurrentBinding(snapshot.ownership)
         else { return }
+        if quietDeclarationRepresentation, kind == .toolActivity, stage == .running, retryIntent == .none { return }
         if kind == .toolActivity || kind == .interaction || stage == .waitingForInteraction
             || stage == .retrying || stage == .cancelling || retryIntent != .none
         {
@@ -2177,12 +2180,27 @@ final class AgentTabSession: ObservableObject {
         quietLedger.noteOccurrence(owner: owner)
     }
 
+    /// Correlation owners call before a heuristic join can acquire an apparently exact UUID.
+    /// Uses the existing irreversible attempt veto; diagnostic attribution is not authority.
+    func noteUncertainToolCorrelation() {
+        guard let owner = activeRunOwnership, isCurrentRunAttemptForCurrentBinding(owner) else { return }
+        quietLedger.noteOccurrence(owner: owner)
+    }
+
     func noteAcceptedStream(_ result: AIStreamResult, owner: AgentRunOwnership) {
         guard isCurrentRunAttemptForCurrentBinding(owner) else { return }
+        #if DEBUG
+            if result.type == "tool_call" || result.type == "tool_result",
+               test_quietDeclarationMembership?(result) == true { return }
+        #endif
         quietLedger.noteAcceptedStream(result, owner: owner)
     }
 
     func sealQuietCheckIn(owner: AgentRunOwnership, terminalState: AgentSessionRunState, normal: Bool, hasSuccessor: Bool) {
+        #if DEBUG
+            test_beforeQuietMetadataSeal?()
+            test_observeQuietSealEligibility?(normal)
+        #endif
         guard isCurrentRunAttemptForCurrentBinding(owner) else { return }
         // Only positively routine candidates need a range. No history materialization or stored
         // array offset: binary-search the already ordered live suffix. Missing retained rows fail open.
@@ -2827,6 +2845,34 @@ final class AgentTabSession: ObservableObject {
     }
 
     #if DEBUG
+        var test_beforeQuietMetadataSeal: (() -> Void)?
+        var test_observeQuietSealEligibility: ((Bool) -> Void)?
+        var test_flushQuietToolObservations: (@MainActor () async -> Bool)?
+        var test_quietToolObservationsAreComplete: @MainActor () -> Bool = { true }
+        var test_quietDeclarationMembership: ((AIStreamResult) -> Bool)?
+        var test_codexQuietDeclarationMembership: ((CodexNativeSessionController.MCPToolIdentity) -> Bool)?
+        private(set) var test_quietMetadataVisitedItems = 0
+
+        /// W0 injects already-qualified exact membership; no production caller can certify a wake.
+        @discardableResult
+        func test_stampQuietMetadata(range: ClosedRange<Int>, expectedIDs: [UUID], wakeID: UUID) -> Bool {
+            guard range.lowerBound >= 0, range.upperBound < items.count,
+                  range.count == expectedIDs.count else { return false }
+            for (offset, index) in range.enumerated() {
+                test_quietMetadataVisitedItems += 1
+                guard items[index].id == expectedIDs[offset], items[index].kind != .user else { return false }
+            }
+            suppressSourceItemsChanged = true
+            for index in range {
+                test_quietMetadataVisitedItems += 1
+                items[index].quietCheckInWakeID = wakeID
+            }
+            suppressSourceItemsChanged = false
+            finishIncrementalSourceItemsMutation(.metadataRange(range))
+            isDirty = true
+            return true
+        }
+
         func testAssertSourceItemDerivedStateIsConsistent() {
             assertSourceItemDerivedStateIsConsistent()
         }

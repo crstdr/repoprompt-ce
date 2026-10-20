@@ -266,10 +266,19 @@ extension AgentModeRunService.Hooks {
         _ session: AgentTabSession
     ) -> AgentRunTerminalSessionBinding {
         let tabID = session.tabID
+        #if DEBUG
+            let observationFlush = session.test_flushQuietToolObservations
+            let observationCheck = session.test_quietToolObservationsAreComplete
+        #else
+            let observationFlush: (@MainActor () async -> Bool)? = nil
+            let observationCheck: @MainActor () -> Bool = { true }
+        #endif
         return AgentRunTerminalSessionBinding(
             tabID: tabID,
             lifecycle: session.runLifecycle,
             hooks: .init(
+                flushQuietToolObservations: observationFlush,
+                quietToolObservationsAreComplete: observationCheck,
                 sealQuietCheckIn: { owner, state, normal, successor in
                     session.sealQuietCheckIn(owner: owner, terminalState: state, normal: normal, hasSuccessor: successor)
                 },

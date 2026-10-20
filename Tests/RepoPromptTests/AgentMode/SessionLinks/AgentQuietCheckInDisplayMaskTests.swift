@@ -1,4 +1,5 @@
 import Combine
+import CryptoKit
 import Foundation
 import XCTest
 @_spi(TestSupport) @testable import RepoPromptApp
@@ -930,3 +931,789 @@ final class AgentQuietCheckInDisplayMaskTests: XCTestCase {
         print("QUIET_C5_STRUCTURAL samples=32 retainedSuffixRows=12 rekeyRetentionP99MS=\(samples.sorted()[31]) retentionPayloadItemsScanned=\(session.test_fullRetentionPayloadMapScannedItemCount - scansBefore) hiddenMembership=\(session.quietLedger.hiddenSourceIDs.count) newQuietAddressIndexes=0")
     }
 }
+
+/// The normal save owner may project on its persistence executor, not the main actor.
+private final class QuietW0TraversalCounts: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [String: Int] = [:]
+
+    func add(_ phase: String, _ count: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        values[phase, default: 0] += count
+    }
+
+    func snapshot() -> [String: Int] {
+        lock.lock()
+        defer { lock.unlock() }
+        return values
+    }
+}
+
+/// W0 feasibility only. Exact membership and an ordinary baseline are injected, not certified.
+/// The owner, retention, codecs, storage writer, cold loader and projection builders are real.
+@MainActor
+final class AgentQuietRetainedViewFeasibilityTests: XCTestCase {
+    func testFrozenRetainedTurnsComposeWithNewOrdinarySuffixThroughNormalSaveReload() async throws {
+        for tier in [AgentTranscriptRetentionTier.full, .condensed, .summary, .archived] {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent("quiet-w0-\(UUID())")
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let workspace = WorkspaceModel(name: "Quiet W0", repoPaths: [], customStoragePath: directory)
+            let service = AgentSessionDataService()
+            let firstOrdinary = ordinaryRows(base: 0, toolCount: 6) + ordinaryRows(base: 200, toolCount: 6).dropFirst()
+            let firstBaseline = try XCTUnwrap(AgentTranscriptIO.buildTranscript(
+                from: firstOrdinary, terminalState: .idle
+            ).turns.first)
+            let firstQuiet = quietRows(base: 100, wakeID: id(900)) + quietRows(base: 300, wakeID: id(902))
+            let secondRequest = row(1000, kind: .user, text: "New ordinary request")
+            let secondOrdinary = [secondRequest] + ordinaryRows(base: 1000, toolCount: 9).dropFirst()
+            // Eight newer ordinary executions move the protected tool tail off the old turn.
+            // Further ordinary work below is appended to this SAME still-full suffix after trim.
+            let initialSecondRows = Array(secondOrdinary.prefix(17))
+            var transcript = AgentTranscriptIO.buildTranscript(
+                from: firstOrdinary + firstQuiet + initialSecondRows, terminalState: .idle
+            )
+            AgentTranscriptIO.test_installQuietLocalBaseline(firstBaseline, in: &transcript)
+            // Set an eligible OLD turn's tier, as the existing retention tests do, to exercise
+            // each real destructive trim without inventing a production pressure threshold.
+            transcript.turns[0].retentionTier = tier
+            transcript = AgentTranscriptCompactor.compact(transcript)
+            let frozenFirst = transcript.turns[0]
+            let working = AgentTranscriptIO.workingSourceItems(from: transcript)
+            XCTAssertEqual(working.contains { $0.id == firstOrdinary[1].id }, tier == .full)
+            if tier != .full {
+                XCTAssertFalse(transcript.turns[0].allActivities.contains { $0.itemKind == .toolCall })
+                XCTAssertEqual(transcript.turns[0].summary?.toolCount, 14)
+                XCTAssertEqual(transcript.turns[0].quietLocal?.summary?.toolCount, 12)
+            }
+
+            let secondBaseline = try XCTUnwrap(AgentTranscriptIO.buildTranscript(
+                from: secondOrdinary, terminalState: .idle
+            ).turns.first)
+            let secondQuiet = quietRows(base: 1100, wakeID: id(901))
+            transcript = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(
+                existingTranscript: transcript,
+                workingItems: working + Array(secondOrdinary.dropFirst(initialSecondRows.count)) + secondQuiet,
+                terminalState: .completed
+            )
+            AgentTranscriptIO.test_installQuietLocalBaseline(secondBaseline, in: &transcript)
+            XCTAssertEqual(transcript.turns.map(\.id), [firstBaseline.id, secondBaseline.id], "No quiet turn boundary")
+            if tier != .full {
+                XCTAssertEqual(transcript.turns[0], frozenFirst, "New work must not reopen a source-discarded turn")
+            }
+            let canonicalBeforeSave = transcript
+            let sessionID = id(999)
+            let session = AgentSession(
+                id: sessionID, workspaceID: workspace.id, composeTabID: id(998), name: "Quiet W0",
+                transcript: transcript, lastRunState: AgentSessionRunState.completed.rawValue
+            )
+            let url = try await service.saveAgentSession(session, for: workspace)
+            let loaded = try await service.loadAgentSession(from: url)
+            let restored = try XCTUnwrap(loaded.transcript)
+            XCTAssertEqual(restored.turns.map(\.id), canonicalBeforeSave.turns.map(\.id))
+            XCTAssertEqual(restored.turns[0].retentionTier, tier)
+            XCTAssertEqual(restored.turns[1].retentionTier, .full)
+            XCTAssertTrue(restored.turns[1].allActivities.contains { $0.quietCheckInWakeID == id(901) })
+            let disk = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+            XCTAssertEqual((disk["items"] as? [Any])?.count, 0, "No second persisted source array")
+
+            let local = restored
+            try assertLocal(local.turns[0], baseline: firstBaseline, tools: 12, tier: tier)
+            try assertLocal(local.turns[1], baseline: secondBaseline, tools: 9, tier: .full)
+            let localProjection = AgentTranscriptProjectionBuilder.build(from: local, excludingQuiet: true)
+            let localRows = localProjection.workingRows + localProjection.archivedRows
+            XCTAssertFalse(localRows.contains { $0.text.contains("Quiet closing") || $0.toolName == "self_noop" })
+            let canonicalRows = AgentTranscriptIO.flattenFullTranscript(restored)
+            XCTAssertTrue(canonicalRows.contains { $0.text == "Quiet closing 1100" })
+            let audit = AgentTranscriptProjectionBuilder.build(from: restored)
+            XCTAssertTrue(audit.workingRows.contains { $0.text == "Quiet closing 1100" }, "Default projection stays canonical")
+            let handoff = try AgentTranscriptIO.buildHandoffTranscriptItems(from: restored, upToRowID: XCTUnwrap(secondQuiet.last?.id))
+            XCTAssertTrue(handoff.contains { $0.text == "Quiet closing 1100" }, "Canonical handoff must not consume the local mask")
+            if tier != .full {
+                XCTAssertEqual(restored.turns[0].summary?.toolCount, 14, "Canonical audit was not filtered")
+                XCTAssertEqual(restored.turns[0].quietLocal?.summary?.toolCount, 12)
+            }
+            let rebuilt = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(
+                existingTranscript: restored, workingItems: loaded.workingSourceItems(), terminalState: .completed
+            )
+            if tier != .full { XCTAssertEqual(rebuilt.turns[0], restored.turns[0]) }
+            try assertLocal(rebuilt.turns[0], baseline: firstBaseline, tools: 12, tier: tier)
+        }
+    }
+
+    func testBoundedMetadataMutationFoldsIntoNormalTerminalAndSavePaths() async throws {
+        for mode in ["immediate", "deferred", "inactive", "save"] {
+            var control: [String: Int] = [:]
+            var controlSave: [String: Int] = [:]
+            for stamps in [false, true] {
+                let directory = FileManager.default.temporaryDirectory.appendingPathComponent("quiet-w0-mutation-\(UUID())")
+                defer { try? FileManager.default.removeItem(at: directory) }
+                let service = AgentSessionDataService()
+                let vm = AgentModeViewModel(
+                    testWindowID: 1,
+                    testWorkspacePath: directory.path,
+                    codexControllerFactory: { _, _, _, _, _, _ in LifecycleNoopCodexController(recorder: LifecycleRecorder()) },
+                    headlessProviderFactory: { _, _ in XCTFail("No provider in W0")
+                        return AgentSessionLinkCapturingHeadlessProvider()
+                    },
+                    mcpServerEnabler: { false }
+                )
+                let tabID = UUID()
+                let manager = AgentSessionLinkEndpointTestSupport.installWorkspace(on: vm, tabID: tabID, name: "W0 mutation")
+                var workspace = try XCTUnwrap(manager.activeWorkspace)
+                workspace.customStoragePath = directory
+                manager.activeWorkspace = workspace
+                var savedURL: URL?
+                vm.test_setAgentSessionSaver { payload, workspace, count in
+                    let url = try await service.saveAgentSession(payload, for: workspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: count)
+                    savedURL = url
+                    return url
+                }
+                let session = vm.session(for: tabID)
+                session.hasLoadedPersistedState = true
+                session.selectedAgent = .openCode
+                _ = try XCTUnwrap(vm.test_installPersistentSessionBinding(sessionID: UUID(), on: session, updateWorkspaceMetadata: true))
+                session.recordRestorationAuthoritative(.persistedPayloadApplied)
+                session.installRunID(UUID())
+                let ordinary = ordinaryRows(base: 0, toolCount: 9).map { $0.replacingID(UUID()) }
+                let measuredTurnID = ordinary[0].id
+                let ordinaryBaseline = try XCTUnwrap(AgentTranscriptIO.buildTranscript(from: ordinary, terminalState: .idle).turns.first)
+                session.setItemsSilently(ordinary, reason: .persistedSessionHydration)
+                session.runState = .running
+                _ = session.beginRunAttempt(source: "test.W0.metadata")
+                vm.test_setAllowsScheduledDerivedTranscriptRefreshWithoutPromptManager(mode != "immediate")
+                if mode == "inactive" { vm.test_setCurrentTabIDOverride(UUID()) }
+                for var item in quietRows(base: 100, wakeID: id(900)) {
+                    item.quietCheckInWakeID = nil
+                    session.appendItem(item)
+                }
+                await vm.test_drainScheduledDerivedTranscriptRefresh(tabID: tabID)
+                let range = (session.items.count - 4) ... (session.items.count - 1)
+                let expectedIDs = range.map { session.items[$0].id }
+                let metrics = QuietW0TraversalCounts()
+                AgentTranscriptDebugInstrumentation.configure(.init(
+                    summaryTraversalHandler: { value in
+                        guard value.turnID == measuredTurnID else { return }
+                        metrics.add(value.phase, value.activityCount)
+                    },
+                    refreshAttemptHandler: { value in
+                        guard value.tabID == tabID else { return }
+                        metrics.add("refreshes", 1)
+                    }
+                ))
+                defer { AgentTranscriptDebugInstrumentation.reset()
+                    session.saveDebounceTask?.cancel()
+                }
+                if stamps {
+                    session.test_beforeQuietMetadataSeal = {
+                        XCTAssertTrue(session.terminalCommitInProgress)
+                        AgentTranscriptIO.test_installQuietLocalBaseline(ordinaryBaseline, in: &session.transcript)
+                        let revision = session.sourceItemsRevision
+                        let activityAt = session.lastActivityAt
+                        XCTAssertTrue(session.test_stampQuietMetadata(range: range, expectedIDs: expectedIDs, wakeID: self.id(900)))
+                        XCTAssertEqual(session.sourceItemsRevision, revision + 1)
+                        XCTAssertEqual(session.lastActivityAt, activityAt)
+                        XCTAssertEqual(session.test_quietMetadataVisitedItems, range.count * 2)
+                    }
+                }
+                await vm.test_finishQuietFeasibilityRun(session)
+                session.test_beforeQuietMetadataSeal = nil
+                XCTAssertNotNil(session.runLifecycle.lastTerminalCommitRevision, "Real terminal owner must settle")
+                let terminalMetrics = metrics.snapshot()
+                if stamps {
+                    for (phase, count) in terminalMetrics {
+                        XCTAssertLessThanOrEqual(count, control[phase] ?? 0, "\(mode): no additional \(phase) traversal")
+                    }
+                    XCTAssertTrue(session.transcript.allActivities.contains { $0.quietCheckInWakeID == self.id(900) })
+                    let rows = session.transcriptProjection.workingRows
+                    XCTAssertFalse(rows.contains { $0.text.contains("Quiet closing") || $0.toolName == "self_noop" }, "Real terminal projection consumes the injected receipt")
+                    XCTAssertTrue(rows.contains { $0.id == ordinaryBaseline.conclusionActivityID })
+                } else { control = terminalMetrics }
+                await vm.flushSave(for: tabID)
+                let saveMetrics = metrics.snapshot().mapValues { $0 }.reduce(into: [String: Int]()) { result, entry in
+                    result[entry.key] = entry.value - (terminalMetrics[entry.key] ?? 0)
+                }
+                if stamps {
+                    for (phase, count) in saveMetrics {
+                        XCTAssertLessThanOrEqual(count, controlSave[phase] ?? 0, "\(mode): no added save \(phase) traversal")
+                    }
+                } else { controlSave = saveMetrics }
+                XCTAssertEqual(saveMetrics["refreshes", default: 0], 0, "Normal save reuses the current canonical snapshot")
+                XCTAssertEqual(saveMetrics["turn-summary", default: 0], 0)
+                XCTAssertEqual(saveMetrics["span-summary", default: 0], 0)
+                let loaded = try await service.loadAgentSession(from: XCTUnwrap(savedURL))
+                if stamps { XCTAssertTrue(loaded.transcript?.allActivities.contains { $0.quietCheckInWakeID == self.id(900) } == true) }
+                print("QUIET_W0_G mode=\(mode) stamped=\(stamps) sourceRows=\(session.items.count) metadataVisits=\(session.test_quietMetadataVisitedItems) terminal=\(terminalMetrics) save=\(saveMetrics)")
+            }
+        }
+    }
+
+    /// Same existing projection/summary source passes, with local exclusion folded in.
+    /// Synthetic dimensions establish operation structure, not representative runtime.
+    func testLocalExclusionUsesExistingProjectionAndSummaryPasses() throws {
+        for tools in [0, 12, 49, 98] {
+            let ordinary = ordinaryRows(base: 0, toolCount: tools)
+            let baseline = try XCTUnwrap(AgentTranscriptIO.buildTranscript(from: ordinary, terminalState: .idle).turns.first)
+            var transcript = AgentTranscriptIO.buildTranscript(from: ordinary + quietRows(base: 10000, wakeID: id(900)), terminalState: .completed)
+            var visits: [String: Int] = [:]
+            AgentTranscriptDebugInstrumentation.configure(.init(summaryTraversalHandler: { value in
+                visits[value.phase, default: 0] += value.activityCount
+            }))
+            defer { AgentTranscriptDebugInstrumentation.reset() }
+            _ = AgentTranscriptProjectionBuilder.build(from: transcript)
+            let canonicalVisits = visits
+            visits = [:]
+            AgentTranscriptIO.test_installQuietLocalBaseline(baseline, in: &transcript)
+            let local = AgentTranscriptProjectionBuilder.build(from: transcript, excludingQuiet: true)
+            for (phase, count) in visits {
+                XCTAssertLessThanOrEqual(count, canonicalVisits[phase] ?? 0, "No extra source traversal for \(tools) tools: \(phase)")
+            }
+            XCTAssertFalse((local.workingRows + local.archivedRows).contains { $0.quietCheckInWakeID != nil })
+            let localVisits = visits
+            let expected = AgentTranscriptProjectionBuilder.build(from: .init(turns: [baseline]))
+            XCTAssertEqual(local.workingBlocks.map(\.id), expected.workingBlocks.map(\.id))
+            print("QUIET_W0_G_FOLDED tools=\(tools) sourceRows=\(transcript.allActivities.count) canonical=\(canonicalVisits) local=\(localVisits)")
+        }
+    }
+
+    func testCompletedDisplayNeedsNoSeparateTerminalStateOrLastActivityBaseline() throws {
+        let ordinary = ordinaryRows(base: 0, toolCount: 12)
+        let baseline = try XCTUnwrap(AgentTranscriptIO.buildTranscript(from: ordinary, terminalState: .idle).turns.first)
+        for terminal in [AgentSessionRunState.completed, .failed, .idle] {
+            var transcript = AgentTranscriptIO.buildTranscript(from: ordinary + quietRows(base: 1000, wakeID: id(900)), terminalState: terminal)
+            AgentTranscriptIO.test_installQuietLocalBaseline(baseline, in: &transcript)
+            // Conflicting canonical dates and status remain audit data. Local rendering uses
+            // the ordinary completion date; completedAt supplies the existing completion test.
+            transcript.turns[0].lastActivityAt = Date(timeIntervalSince1970: 99999)
+            try assertLocal(transcript.turns[0], baseline: baseline, tools: 12, tier: .full)
+            XCTAssertEqual(transcript.turns[0].terminalState, terminal)
+            XCTAssertEqual(transcript.turns[0].lastActivityAt, Date(timeIntervalSince1970: 99999))
+        }
+    }
+
+    func testExistingTailOwnerNeedsNoDispatchTimeFrozenLimitOverride() throws {
+        for tools in [0, 1, 7, 8, 9, 12] {
+            let ordinary = ordinaryRows(base: 0, toolCount: tools)
+            let baseline = try XCTUnwrap(AgentTranscriptIO.buildTranscript(from: ordinary, terminalState: .idle).turns.first)
+            for wakes in [1, 3, 9] {
+                let quiet = (0 ..< wakes).flatMap { quietRows(base: 1000 + $0 * 10, wakeID: id(900 + $0)) }
+                var transcript = AgentTranscriptIO.buildTranscript(from: ordinary + quiet, terminalState: .completed)
+                AgentTranscriptIO.test_installQuietLocalBaseline(baseline, in: &transcript)
+                let actual = AgentTranscriptProjectionBuilder.build(from: transcript, excludingQuiet: true)
+                let expected = AgentTranscriptProjectionBuilder.build(from: .init(turns: [baseline]))
+                XCTAssertEqual(actual.workingBlocks.map(\.id), expected.workingBlocks.map(\.id), "tools=\(tools) wakes=\(wakes)")
+                XCTAssertEqual(actual.workingRows.map(\.id), expected.workingRows.map(\.id))
+            }
+        }
+    }
+
+    func testRetainedBaselineFieldsHaveObservableConsumers() throws {
+        let ordinary = ordinaryRows(base: 0, toolCount: 12)
+        let baseline = try XCTUnwrap(AgentTranscriptIO.buildTranscript(from: ordinary, terminalState: .idle).turns.first)
+        var transcript = AgentTranscriptIO.buildTranscript(from: ordinary + quietRows(base: 1000, wakeID: id(900)) + ordinaryRows(base: 2000, toolCount: 8), terminalState: .completed)
+        AgentTranscriptIO.test_installQuietLocalBaseline(baseline, in: &transcript)
+        transcript.turns[0].retentionTier = .condensed
+        transcript = AgentTranscriptCompactor.compact(transcript)
+        let retained = transcript.turns[0]
+        try assertLocal(retained, baseline: baseline, tools: 12, tier: .condensed)
+        let expected = AgentTranscriptProjectionBuilder.build(from: .init(turns: [retained]), excludingQuiet: true)
+        let expectedConclusion = try XCTUnwrap(expected.workingBlocks.first { $0.kind == .conclusion })
+        for field in ["conclusion", "completedAt", "summary", "span-summary"] {
+            var omitted = retained
+            switch field {
+            case "conclusion": omitted.quietLocal?.conclusionActivityID = nil
+            case "completedAt": omitted.quietLocal?.completedAt = nil
+            case "summary": omitted.quietLocal?.summary = nil
+            default: omitted.responseSpans[0].quietLocal = nil
+            }
+            let actual = AgentTranscriptProjectionBuilder.build(from: .init(turns: [omitted]), excludingQuiet: true)
+            let conclusion = actual.workingBlocks.first { $0.kind == .conclusion }
+            // Removing any remaining baseline component changes a user-observable anchor,
+            // date, text or grouped count; no source-spelling/minimality oracle.
+            XCTAssertTrue(
+                conclusion?.primaryAnchor != expectedConclusion.primaryAnchor ||
+                    conclusion?.rows.first?.timestamp != expectedConclusion.rows.first?.timestamp ||
+                    conclusion?.rows.first?.text != expectedConclusion.rows.first?.text ||
+                    actual.workingBlocks.first { $0.kind == .groupedHistory }?.groupedHistory?.summary != expected.workingBlocks.first { $0.kind == .groupedHistory }?.groupedHistory?.summary,
+                field
+            )
+        }
+    }
+
+    /// Numeric-only workload diagnostics, not an owner-bounded worst case or a timing
+    /// acceptance test. 3436 provider turns is the supplied session total, NOT the count
+    /// of canonical user anchors. 98 = supplied max proxy 49 with an explicit 2x margin.
+    func testNumericRepresentativeSuffixGrowthDiagnostic() throws {
+        // The bounded run was stopped after N=64 at ~14.9s/refresh. Larger N=512/3436
+        // remains unmeasured, not a passing scale gate. Match existing scale-test opt-in
+        // so normal suite execution cannot silently resume this unbounded diagnostic.
+        guard ProcessInfo.processInfo.environment["RPCE_RUN_SCALE_TESTS"] == "1" else {
+            throw XCTSkip("Long W0 growth diagnostic requires an explicitly budgeted scale run; representative acceptance remains open")
+        }
+        var maximumMS = 0.0
+        for providerTurns in [1, 8, 64, 512, 3436] {
+            let proxyPerProviderTurn = 98
+            let toolsPerProviderTurn = proxyPerProviderTurn - 1
+            var source = [row(0, kind: .user, text: "One cumulative user anchor")]
+            for providerTurn in 0 ..< providerTurns {
+                let base = (providerTurn + 1) * 1000
+                // 97 tool calls + 1 assistant block = 98 proxy activities. Include actual
+                // result rows too: 195 source activities/provider turn. This is conservative
+                // placement/max occupancy, not a claim that the sampled turns all hit max.
+                source += ordinaryRows(base: base, toolCount: toolsPerProviderTurn).dropFirst().prefix(toolsPerProviderTurn * 2)
+                source.append(row(base + 900, kind: .assistant, text: "Ordinary provider completion"))
+            }
+            let baselineTranscript = AgentTranscriptIO.buildTranscript(from: source, terminalState: .idle)
+            let baseline = try XCTUnwrap(baselineTranscript.turns.first)
+            XCTAssertEqual(baselineTranscript.turns.count, 1)
+            XCTAssertEqual(baselineTranscript.turns[0].retentionTier, .full)
+            XCTAssertEqual(baselineTranscript.turns[0].allActivities.count, providerTurns * 195, "Newest full turn has no activity cap")
+            let quiet = quietRows(base: (providerTurns + 1) * 1000, wakeID: id(900))
+            var controlCounts: [String: Int] = [:]
+            var measuredTimes: [Double] = []
+            for stamped in [false, true] {
+                var existing = baselineTranscript
+                if stamped { AgentTranscriptIO.test_installQuietLocalBaseline(baseline, in: &existing) }
+                let appended = quiet.map { item in
+                    var item = item
+                    if !stamped { item.quietCheckInWakeID = nil }
+                    return item
+                }
+                var counts: [String: Int] = [:]
+                AgentTranscriptDebugInstrumentation.configure(.init(summaryTraversalHandler: { value in
+                    if value.turnID == baseline.id { counts[value.phase, default: 0] += value.activityCount }
+                }))
+                let start = Date.timeIntervalSinceReferenceDate
+                let rebuilt = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(
+                    existingTranscript: existing, workingItems: source + appended,
+                    earliestChangedIndex: source.count, terminalState: .completed
+                )
+                let projection = AgentTranscriptProjectionBuilder.build(from: rebuilt, excludingQuiet: stamped)
+                let elapsedMS = (Date.timeIntervalSinceReferenceDate - start) * 1000
+                AgentTranscriptDebugInstrumentation.reset()
+                measuredTimes.append(elapsedMS)
+                maximumMS = max(maximumMS, elapsedMS)
+                XCTAssertEqual(rebuilt.turns.count, 1)
+                XCTAssertEqual(rebuilt.turns[0].allActivities.count, providerTurns * 195 + 4)
+                if stamped {
+                    for (phase, count) in counts {
+                        XCTAssertLessThanOrEqual(count, controlCounts[phase] ?? 0, phase)
+                    }
+                    XCTAssertFalse(projection.workingRows.contains { $0.quietCheckInWakeID != nil })
+                } else { controlCounts = counts }
+                print("QUIET_W0_NUMERIC providerTurns=\(providerTurns) canonicalTurns=1 proxyPerProviderTurn=98 sourceActivities=\(providerTurns * 195 + 4) stamped=\(stamped) elapsedMS=\(elapsedMS) passes=\(counts)")
+            }
+            XCTAssertEqual(measuredTimes.count, 2)
+        }
+        // A proposed diagnostic envelope derived from the largest observed sample, with
+        // 100% extra time for scheduler/allocator variability; not a new product limit or
+        // an independently validated performance acceptance threshold.
+        print("QUIET_W0_NUMERIC_ENVELOPE measuredMaximumMS=\(maximumMS) proposedRepeatBudgetMS=\(maximumMS * 2) margin=100percent finiteOwnerSuffixBound=none")
+    }
+
+    func testActiveLocalViewCannotCachePreSealRowsAsCompleted() throws {
+        let ordinary = ordinaryRows(base: 0, toolCount: 12)
+        let baseline = try XCTUnwrap(AgentTranscriptIO.buildTranscript(from: ordinary, terminalState: .idle).turns.first)
+        let first = quietRows(base: 1000, wakeID: id(900))
+        let second = quietRows(base: 2000, wakeID: id(901))
+        let unsealed = second.map { item in
+            var item = item
+            item.quietCheckInWakeID = nil
+            return item
+        }
+        var active = AgentTranscriptIO.buildTranscript(from: ordinary + first + unsealed, terminalState: .running)
+        AgentTranscriptIO.test_installQuietLocalBaseline(baseline, in: &active)
+        let before = AgentTranscriptProjectionBuilder.buildWithCaches(from: active, turnCaches: [:], excludingQuiet: true)
+        XCTAssertNil(before.updatedTurnCaches[baseline.id], "A previous ordinary completion cannot certify current active rows/cache currency")
+        XCTAssertTrue(before.projection.workingRows.contains { $0.text == "Quiet closing 2000" })
+        var completed = AgentTranscriptIO.buildTranscript(from: ordinary + first + second, terminalState: .completed)
+        AgentTranscriptIO.test_installQuietLocalBaseline(baseline, in: &completed)
+        let after = AgentTranscriptProjectionBuilder.buildWithCaches(from: completed, turnCaches: before.updatedTurnCaches, excludingQuiet: true)
+        XCTAssertFalse(after.projection.workingRows.contains { $0.quietCheckInWakeID != nil })
+        XCTAssertTrue(after.projection.workingRows.contains { $0.id == baseline.conclusionActivityID })
+        let audit = AgentTranscriptProjectionBuilder.buildWithCaches(from: completed, turnCaches: after.updatedTurnCaches)
+        XCTAssertTrue(audit.projection.workingRows.contains { $0.text == "Quiet closing 2000" }, "A local cache cannot be reused for canonical audit/export")
+    }
+
+    private func assertLocal(
+        _ turn: AgentTranscriptTurn, baseline: AgentTranscriptTurn, tools: Int, tier: AgentTranscriptRetentionTier,
+        file: StaticString = #filePath, line: UInt = #line
+    ) throws {
+        let projection = AgentTranscriptProjectionBuilder.build(from: .init(turns: [turn]), excludingQuiet: true)
+        let blocks = projection.workingBlocks + projection.archivedBlocks
+        let conclusion = try XCTUnwrap(blocks.first { $0.kind == .conclusion }, file: file, line: line)
+        XCTAssertEqual(conclusion.primaryAnchor, try .conclusion(turnID: turn.id, activityID: XCTUnwrap(baseline.conclusionActivityID)), file: file, line: line)
+        let fullText = try XCTUnwrap(baseline.allActivities.first { $0.id == baseline.conclusionActivityID }?.text)
+        let expectedText = tier == .summary || tier == .archived
+            ? String(fullText.prefix(220)).trimmingCharacters(in: .whitespacesAndNewlines) + "…"
+            : (tier == .condensed ? fullText.trimmingCharacters(in: .whitespacesAndNewlines) : fullText)
+        XCTAssertEqual(conclusion.rows.first?.text, expectedText, file: file, line: line)
+        XCTAssertEqual(conclusion.rows.first?.timestamp, baseline.completedAt, file: file, line: line)
+        if tier == .full {
+            var ordinaryReference = baseline
+            // Preserve the existing owner's later global-tail tightening, not an obsolete
+            // dispatch-time raw cap. Exclusion must not expand an older full turn's tail.
+            ordinaryReference.frozenDetailedToolTailLimit = turn.frozenDetailedToolTailLimit
+            let expected = AgentTranscriptProjectionBuilder.build(from: .init(turns: [ordinaryReference]))
+            let expectedTools = expected.workingBlocks.filter { $0.kind == .standaloneTool }.flatMap(\.activityIDs)
+            let actualTools = blocks.filter { $0.kind == .standaloneTool }.flatMap(\.activityIDs)
+            XCTAssertEqual(actualTools, expectedTools, file: file, line: line)
+            if turn.frozenDetailedToolTailLimit != 0 {
+                XCTAssertFalse(expectedTools.isEmpty, "Current suffix oracle exercises detailed tools", file: file, line: line)
+            }
+        } else {
+            XCTAssertEqual(turn.quietLocal?.summary?.toolCount, tools, file: file, line: line)
+            XCTAssertEqual(turn.quietLocal?.summary?.notableToolNames, ["read_file"], file: file, line: line)
+            XCTAssertEqual(turn.quietLocal?.summary?.hadWarning, true, file: file, line: line)
+            if tier != .archived {
+                let group = try XCTUnwrap(blocks.first { $0.kind == .groupedHistory }?.groupedHistory, file: file, line: line)
+                XCTAssertEqual(group.summary.hiddenToolCardCount, tools, file: file, line: line)
+                XCTAssertEqual(group.summary.toolSummary?.shortNarration, "Ordinary narration", file: file, line: line)
+            }
+        }
+    }
+
+    private func ordinaryRows(base: Int, toolCount: Int) -> [AgentChatItem] {
+        var result = [row(base, kind: .user, text: "Ordinary request")]
+        for index in 0 ..< toolCount {
+            var call = row(base + index * 2 + 1, kind: .toolCall, text: "")
+            call.toolName = "read_file"
+            call.toolInvocationID = id(base + 5000 + index)
+            call.toolArgsJSON = #"{"path":"example.swift"}"#
+            var response = row(base + index * 2 + 2, kind: .toolResult, text: "Ordinary result")
+            response.toolName = "read_file"
+            response.toolInvocationID = call.toolInvocationID
+            response.toolResultJSON = index == 0 ? #"{"status":"warning","content":"ordinary"}"# : #"{"content":"ordinary"}"#
+            result += [call, response]
+        }
+        let tail = max(70, toolCount * 2 + 1)
+        result.append(row(base + tail, kind: .assistant, text: "Ordinary narration"))
+        result.append(row(base + tail + 1, kind: .thinking, text: "Ordinary reasoning"))
+        result.append(row(base + tail + 2, kind: .assistant, text: String(repeating: "Ordinary conclusion. ", count: 15)))
+        return result
+    }
+
+    private func quietRows(base: Int, wakeID: UUID) -> [AgentChatItem] {
+        var call = row(base, kind: .toolCall, text: "")
+        call.toolName = "self_noop"
+        call.toolInvocationID = id(base + 6000)
+        call.toolArgsJSON = "{}"
+        var response = row(base + 1, kind: .toolResult, text: "{}")
+        response.toolName = "self_noop"
+        response.toolInvocationID = call.toolInvocationID
+        response.toolResultJSON = "{}"
+        return [call, response, row(base + 2, kind: .thinking, text: "Quiet reasoning"), row(base + 3, kind: .assistant, text: "Quiet closing \(base)")].map {
+            var stamped = $0
+            stamped.quietCheckInWakeID = wakeID
+            return stamped
+        }
+    }
+
+    private func row(_ value: Int, kind: AgentChatItemKind, text: String) -> AgentChatItem {
+        AgentChatItem(id: id(value), timestamp: Date(timeIntervalSince1970: Double(value + 1)), kind: kind, text: text, sequenceIndex: value)
+    }
+
+    private func id(_ value: Int) -> UUID {
+        UUID(uuidString: String(format: "00000000-0000-0000-0000-%012d", value))!
+    }
+}
+
+/// BEGIN W0 PAIRED COMMON HARNESS -- identical in pristine and candidate worktrees.
+/// Approved empirical W0(g) owner-boundary diagnostic, not dispatch/fanout certification.
+@MainActor
+final class AgentQuietW0PairedScaleTests: XCTestCase {
+    private struct Input {
+        let seed: [AgentChatItem]
+        let wakes: [[AgentChatItem]]
+        let batches: [Int: [AgentChatItem]]
+        let digest: String
+    }
+
+    private struct Counts: Codable {
+        var calls: [String: Int] = [:]
+        var rows: [String: Int] = [:]
+        mutating func add(_ phase: String, _ count: Int) {
+            calls[phase, default: 0] += 1
+            rows[phase, default: 0] += count
+        }
+    }
+
+    func testRepresentative200() throws {
+        try run(wakeCount: 200)
+    }
+
+    func testStress400() throws {
+        try run(wakeCount: 400)
+    }
+
+    private func run(wakeCount: Int) throws {
+        guard ProcessInfo.processInfo.environment["RPCE_RUN_SCALE_TESTS"] == "1" else {
+            throw XCTSkip("W0 paired empirical job requires its explicit 600-second scale admission")
+        }
+        MainActor.preconditionIsolated()
+        let input = try makeInput(wakeCount: wakeCount)
+        // Exercise real per-window chat registries, not a replacement registry/history owner.
+        // These inactive chats have no mutated source. Link role/admission/fanout is NOT
+        // simulated here: the standing ~10 directional links belong to the next W0(d) gate.
+        let windows = (1 ... 3).map { windowID in
+            AgentModeViewModel(
+                testWindowID: windowID, testWorkspacePath: FileManager.default.temporaryDirectory.path,
+                codexControllerFactory: { _, _, _, _, _, _ in LifecycleNoopCodexController(recorder: LifecycleRecorder()) },
+                headlessProviderFactory: { _, _ in
+                    XCTFail("No live provider in W0 paired scale")
+                    return AgentSessionLinkCapturingHeadlessProvider()
+                }, mcpServerEnabler: { false }
+            )
+        }
+        var chats: [AgentTabSession] = []
+        for (windowIndex, window) in windows.enumerated() {
+            for index in 0 ..< 100 {
+                chats.append(window.session(for: uuid(900_000 + windowIndex * 100 + index)))
+            }
+        }
+        let vm = windows[0]
+        let session = chats[0]
+        // Explicitly model one already-coalesced source batch at each provider-terminal cut.
+        // There is no automatic second refresh/save task, provider run, or publication proof.
+        session.onSourceItemsChanged = nil
+        session.selectedAgent = .openCode
+        defer {
+            AgentTranscriptDebugInstrumentation.reset()
+            for chat in chats {
+                chat.saveDebounceTask?.cancel()
+                chat.derivedTranscriptRefreshTask?.cancel()
+            }
+        }
+        for item in input.seed {
+            session.appendItem(item)
+        }
+        let initial = AgentTranscriptIO.buildTranscript(from: session.items, terminalState: .completed)
+        _ = vm.applyTranscriptPresentation(initial, to: session)
+        let turnID = try XCTUnwrap(session.transcript.turns.first?.id)
+        var allCounts = Counts()
+        var currentCounts = Counts()
+        AgentTranscriptDebugInstrumentation.configure(.init(
+            rebuildHandler: { value in
+                currentCounts.add(value.usedIncrementalFinalTurnUpdate ? "incremental-rebuild" : "fallback-rebuild", value.workingItemsCount)
+            },
+            summaryTraversalHandler: { value in
+                if value.turnID == turnID { currentCounts.add(value.phase, value.activityCount) }
+            },
+            projectionBuildHandler: { _ in currentCounts.add("projection-build", 0) }
+        ))
+        var ownerTimes: [Double] = []
+        var appendTimes: [Double] = []
+        let sampleStart = DispatchTime.now().uptimeNanoseconds
+        print("QUIET_W0_PAIRED_INPUT " + json([
+            "role": QuietW0ScaleAdapter.role, "wakes": wakeCount, "inputSHA256": input.digest,
+            "chatOwners": chats.count, "windowOwners": windows.count,
+            "standingDirectionalLinks": 10, "fanoutExercised": false,
+            "proxyDefinition": "tool calls plus assistant text blocks; results/system rows counted separately",
+            "nativeProxyUnits": wakeCount * 12 + (wakeCount / 20) * 98 + 1,
+            "ordinaryWakeSourceRows": 24, "quietWakeSourceRows": 14, "ordinaryBatchSourceRows": 195,
+            "onMainActor": true,
+            "percentiles": "median average middle pair; p95 nearest rank",
+            "boundary": "metadata preparation/stamp + incremental rebuild + production presentation builder/live commit; common raw admission timed separately"
+        ]))
+
+        for wake in 1 ... wakeCount {
+            currentCounts = Counts()
+            var appendMS = 0.0
+            var ownerMS = 0.0
+            var rebuildMS = 0.0
+            var presentationMS = 0.0
+            func apply(_ rows: [AgentChatItem], quiet: Bool) throws {
+                let firstChanged = session.items.count
+                let appendStart = DispatchTime.now().uptimeNanoseconds
+                for row in rows {
+                    session.appendItem(row)
+                }
+                appendMS += elapsedMS(since: appendStart)
+                let start = DispatchTime.now().uptimeNanoseconds
+                try QuietW0ScaleAdapter.prepare(quiet: quiet, range: firstChanged ... (session.items.count - 1), session: session)
+                let rebuildStart = DispatchTime.now().uptimeNanoseconds
+                var imported = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(
+                    existingTranscript: session.transcript, workingItems: session.items,
+                    earliestChangedIndex: firstChanged, terminalState: .completed,
+                    nextSequenceIndex: session.nextSequenceIndex
+                )
+                rebuildMS += elapsedMS(since: rebuildStart)
+                QuietW0ScaleAdapter.afterRebuild(quiet: quiet, transcript: &imported)
+                let presentationStart = DispatchTime.now().uptimeNanoseconds
+                let built = AgentModeViewModel.buildTranscriptPresentation(
+                    from: imported, sourceItems: session.items,
+                    precomputedEphemeralPayloadByItemID: session.ephemeralToolResultPayloadByItemID,
+                    precomputedEphemeralPayloadRevisionByItemID: session.ephemeralToolResultPayloadRevisionByItemID,
+                    selectedAgent: session.selectedAgent, previousPerformanceSnapshot: session.transcriptPerformanceSnapshot,
+                    trackedLocalInputIDs: Set(session.localInputIndex.records.map(\.itemID)),
+                    previousSanitizedTranscript: session.transcript, previousBaseProjection: session.baseTranscriptProjection,
+                    previousTurnProjectionCaches: session.turnProjectionCaches,
+                    previousProjectionProtection: session.transcriptProjectionProtection,
+                    projectionProtection: .none, trustedIncrementalFinalTurnStartSequenceIndex: 0
+                )
+                vm.test_applyQuietW0ScalePresentation(built, to: session)
+                presentationMS += elapsedMS(since: presentationStart)
+                ownerMS += elapsedMS(since: start)
+                XCTAssertEqual(session.transcript.turns.count, 1, "Routine wakes and ordinary batches never add a user anchor")
+                XCTAssertEqual(session.transcript.turns[0].retentionTier, .full)
+                XCTAssertEqual(session.transcript.turns[0].allActivities.count, session.items.count - 1, "No source prefilter or newest-suffix activity cap")
+                try QuietW0ScaleAdapter.check(quiet: quiet, rows: rows, session: session)
+            }
+            if let batch = input.batches[wake] { try apply(batch, quiet: false) }
+            try apply(input.wakes[wake - 1], quiet: wake.isMultiple(of: 3))
+            ownerTimes.append(ownerMS)
+            appendTimes.append(appendMS)
+            for (phase, count) in currentCounts.calls {
+                allCounts.calls[phase, default: 0] += count
+            }
+            for (phase, count) in currentCounts.rows {
+                allCounts.rows[phase, default: 0] += count
+            }
+            print("QUIET_W0_PAIRED_WAKE " + json([
+                "role": QuietW0ScaleAdapter.role, "wake": wake, "target": wakeCount,
+                "quiet": wake.isMultiple(of: 3), "ordinaryBatch": input.batches[wake] != nil,
+                "sourceRows": session.items.count, "canonicalActivities": session.transcript.turns[0].allActivities.count,
+                "ownerMS": ownerMS, "appendMS": appendMS, "rebuildMS": rebuildMS, "presentationMS": presentationMS,
+                "calls": currentCounts.calls, "rowVisits": currentCounts.rows,
+                "metadataVisits": QuietW0ScaleAdapter.metadataVisits(session)
+            ]))
+            if wake.isMultiple(of: 50) {
+                print("QUIET_W0_PAIRED_CURVE " + json([
+                    "role": QuietW0ScaleAdapter.role, "wake": wake, "target": wakeCount,
+                    "cumulative": stats(ownerTimes), "last50": stats(Array(ownerTimes.suffix(50))),
+                    "sourceRows": session.items.count
+                ]))
+            }
+        }
+        XCTAssertNil(allCounts.calls["fallback-rebuild"], "Every measured append must use the actual incremental final-user-suffix route")
+        print("QUIET_W0_PAIRED_SUMMARY " + json([
+            "role": QuietW0ScaleAdapter.role, "wakes": wakeCount, "inputSHA256": input.digest,
+            "sourceRows": session.items.count, "canonicalActivities": session.transcript.turns[0].allActivities.count,
+            "canonicalUserAnchors": session.transcript.turns.count,
+            "nativeProxyUnits": wakeCount * 12 + (wakeCount / 20) * 98 + 1,
+            "quietWakes": wakeCount / 3, "ordinaryBatches": wakeCount / 20,
+            "ownerMS": stats(ownerTimes), "rawAppendMS": stats(appendTimes),
+            "calls": allCounts.calls, "rowVisits": allCounts.rows,
+            "measurementWallMS": elapsedMS(since: sampleStart), "finiteNewestSuffixBound": false
+        ]))
+    }
+
+    private func makeInput(wakeCount: Int) throws -> Input {
+        var serial = 0
+        func row(_ kind: AgentChatItemKind, _ text: String) -> AgentChatItem {
+            serial += 1
+            return AgentChatItem(id: uuid(serial), timestamp: Date(timeIntervalSince1970: 1_700_000_000 + Double(serial)), kind: kind, text: text, sequenceIndex: serial - 1)
+        }
+        func tools(_ count: Int, quiet: Bool) -> [AgentChatItem] {
+            var result: [AgentChatItem] = []
+            for _ in 0 ..< count {
+                var call = row(.toolCall, "")
+                call.toolName = quiet ? "self_noop" : "read_file"
+                call.toolInvocationID = uuid(1_000_000 + serial)
+                call.toolArgsJSON = quiet ? "{}" : #"{"path":"example.swift"}"#
+                var response = row(.toolResult, quiet ? #"{"result":"declared"}"# : "Ordinary result")
+                response.toolName = call.toolName
+                response.toolInvocationID = call.toolInvocationID
+                response.toolResultJSON = quiet ? #"{"result":"declared"}"# : #"{"content":"ordinary"}"#
+                result += [call, response]
+            }
+            return result
+        }
+        let seed = [row(.user, "Standing task"), row(.assistant, "Initial ordinary completion")]
+        var wakes: [[AgentChatItem]] = []
+        var batches: [Int: [AgentChatItem]] = [:]
+        var rawInput = seed
+        for wake in 1 ... wakeCount {
+            if wake.isMultiple(of: 20) {
+                // 97 calls + 1 assistant block = 98 native proxy units, 195 source rows.
+                let batch = tools(97, quiet: false) + [row(.assistant, "Ordinary batch completion")]
+                batches[wake] = batch
+                rawInput += batch
+            }
+            let markerIdentity = row(.system, "")
+            var rows = [AgentChatItem.laneUpdateAutoWake(wakeID: markerIdentity.id, acceptedAt: markerIdentity.timestamp, sequenceIndex: markerIdentity.sequenceIndex)]
+            if wake.isMultiple(of: 3) {
+                // Exactly one declaration, then trailing text-only closing blocks. No
+                // other tools/refusal/error/recovery or invented neutral provider noise.
+                // 1 call + 11 assistant blocks = 12 proxy units; result + provenance add 2 rows.
+                rows += tools(1, quiet: true)
+                for index in 1 ... 11 {
+                    rows.append(row(.assistant, "Quiet closing segment \(index)"))
+                }
+            } else {
+                // 11 calls + 1 assistant block = 12 proxy units, plus 11 results + provenance.
+                rows += tools(11, quiet: false) + [row(.assistant, "Ordinary wake completion")]
+            }
+            wakes.append(rows)
+            rawInput += rows
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        encoder.dateEncodingStrategy = .millisecondsSince1970
+        let data = try encoder.encode(rawInput.map { AgentChatItemPersist(from: $0, sanitizeToolResults: false) })
+        let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        return Input(seed: seed, wakes: wakes, batches: batches, digest: digest)
+    }
+
+    private func stats(_ values: [Double]) -> [String: Double] {
+        let sorted = values.sorted()
+        let middle = sorted.count / 2
+        return [
+            "median": sorted.count.isMultiple(of: 2) ? (sorted[middle - 1] + sorted[middle]) / 2 : sorted[middle],
+            "p95": sorted[Int(ceil(Double(sorted.count) * 0.95)) - 1], "max": sorted.last ?? 0
+        ]
+    }
+
+    private func elapsedMS(since start: UInt64) -> Double {
+        Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+    }
+
+    private func json(_ object: [String: Any]) -> String {
+        guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else {
+            XCTFail("Invalid W0 measurement JSON")
+            return "{}"
+        }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    private func uuid(_ serial: Int) -> UUID {
+        UUID(uuidString: String(format: "00100000-0000-0000-0000-%012d", serial))!
+    }
+}
+
+// END W0 PAIRED COMMON HARNESS
+
+/// BEGIN W0 PAIRED ADAPTER -- only optional-carrier APIs differ from pristine.
+@MainActor
+private enum QuietW0ScaleAdapter {
+    static let role = "candidate"
+
+    static func prepare(quiet: Bool, range: ClosedRange<Int>, session: AgentTabSession) throws {
+        guard quiet else { return }
+        let ordinary = try XCTUnwrap(session.transcript.turns.last)
+        AgentTranscriptIO.test_installQuietLocalBaseline(ordinary, in: &session.transcript)
+        let ids = range.map { session.items[$0].id }
+        let wakeID = try XCTUnwrap(ids.first)
+        XCTAssertTrue(session.test_stampQuietMetadata(range: range, expectedIDs: ids, wakeID: wakeID))
+    }
+
+    static func afterRebuild(quiet: Bool, transcript: inout AgentTranscript) {
+        guard !quiet, let ordinary = transcript.turns.last, ordinary.quietLocal != nil else { return }
+        // Known ordinary work updates the two baseline fields from the actual freshly
+        // rebuilt canonical owner. No filtered-source import or side history is prepared.
+        AgentTranscriptIO.test_installQuietLocalBaseline(ordinary, in: &transcript)
+    }
+
+    static func check(quiet: Bool, rows: [AgentChatItem], session: AgentTabSession) throws {
+        guard quiet else { return }
+        let ids = Set(rows.map(\.id))
+        XCTAssertFalse(session.baseTranscriptProjection.workingRows.contains { ids.contains($0.id) })
+        XCTAssertTrue(session.transcript.turns[0].allActivities.contains { ids.contains($0.id) }, "Audit remains canonical")
+    }
+
+    static func metadataVisits(_ session: AgentTabSession) -> Int {
+        session.test_quietMetadataVisitedItems
+    }
+}
+
+// END W0 PAIRED ADAPTER

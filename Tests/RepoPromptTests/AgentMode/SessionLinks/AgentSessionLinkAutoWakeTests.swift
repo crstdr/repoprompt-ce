@@ -5240,7 +5240,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         UUID(uuidString: String(format: "0000000%d-0000-0000-0000-000000005501", index))!
     }
 
-    private static func inventory(
+    static func inventory(
         observerSessionID: UUID,
         revision: UInt64,
         targetCount: Int = 2
@@ -5325,7 +5325,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
     /// `laneIndices` defaults to the entry set, but is separable so a test can reproduce the
     /// activation publication: lanes exist and carry a target epoch while no status edge has been
     /// queued for them yet.
-    private static func laneSnapshot(
+    static func laneSnapshot(
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
         linkSetRevision: UInt64 = 1,
         queueRevision: UInt64 = 1,
@@ -6043,7 +6043,7 @@ extension AgentSessionLinkAutoWakeTests {
         target.session.runState = .running
         let targetEndpoint = try AgentSessionLinkEndpointTestSupport.endpoint(target.viewModel, tabID: target.tabID)
         try await AsyncTestWait.waitUntil("F1 running frame accepted", timeout: 4) {
-            bridge.test_pairedRunStatus(for: targetEndpoint) == .running
+            await bridge.test_pairedRunStatus(for: targetEndpoint) == .running
         }
         await bridge.test_settleTargetPublications()
         // Seed the precondition through the same ledger physical-origin seam as the shared native
@@ -6404,14 +6404,14 @@ extension AgentSessionLinkAutoWakeTests {
                 finalizeNonCodexUsage: false, supportsFollowUp: false, notifyTurnComplete: false, classifiesQuietCheckIn: true
             ))
             let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
-            try await AsyncTestWait.waitUntil("ring source idle frame accepted") { bridge.test_pairedRunStatus(for: endpoint) == .idle }
+            try await AsyncTestWait.waitUntil("ring source idle frame accepted") { await bridge.test_pairedRunStatus(for: endpoint) == .idle }
             await bridge.test_settleTargetPublications()
             await bridge.test_refreshStatus(sessionIDs: [a.sessionID, b.sessionID])
         }
         for fixture in [a, b] {
             fixture.session.runState = .running
             let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
-            try await AsyncTestWait.waitUntil("ring ordinary running frame accepted") { bridge.test_pairedRunStatus(for: endpoint) == .running }
+            try await AsyncTestWait.waitUntil("ring ordinary running frame accepted") { await bridge.test_pairedRunStatus(for: endpoint) == .running }
             let owner = fixture.session.beginRunAttempt(source: "test.E.ordinary")
             fixture.session.noteAcceptedTaskInput()
             try await finish(fixture, owner)
@@ -6485,7 +6485,7 @@ extension AgentSessionLinkAutoWakeTests {
                         ? fixture.session.beginRunAttempt(source: "test.E.failing.codex")
                         : try beginAndAcquireQuietWake(fixture, claim: claim)
                     fixture.session.runState = .running
-                    try await AsyncTestWait.waitUntil("failing ring running frame accepted") { bridge.test_pairedRunStatus(for: endpoint) == .running }
+                    try await AsyncTestWait.waitUntil("failing ring running frame accepted") { await bridge.test_pairedRunStatus(for: endpoint) == .running }
                     if fixture.session.selectedAgent == .claudeCode {
                         let intent = try ClaudeAgentModeCoordinator.NativeSessionIntent.runAttempt(ownership: owner, runID: XCTUnwrap(fixture.session.runID))
                         let outcome = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(session: fixture.session, text: "", attachments: [], intent: intent, allowsCatalogRouteControllerRecovery: false)
@@ -6508,7 +6508,9 @@ extension AgentSessionLinkAutoWakeTests {
                     XCTAssertEqual(after.ordinaryThrough, after.settledThrough)
                     XCTAssertNil(fixture.session.activeRunOwnership)
                     try await AsyncTestWait.waitUntil("failing ring exact new paired ordinary closure accepted") {
-                        bridge.test_pairedRunStatus(for: endpoint) == .idle && bridge.test_pairedRunFacts(for: endpoint) == after
+                        let status = await bridge.test_pairedRunStatus(for: endpoint)
+                        let facts = await bridge.test_pairedRunFacts(for: endpoint)
+                        return status == .idle && facts == after
                     }
                     await bridge.test_settleTargetPublications()
                     await bridge.test_refreshStatus(sessionIDs: [a.sessionID, b.sessionID])
@@ -6562,7 +6564,7 @@ extension AgentSessionLinkAutoWakeTests {
             guard let wakeID = claim.dispatchID.autoWakeID, fixture.session.liveItemIDs.contains(wakeID) else {
                 return XCTFail("Ring cannot pay a receipt without actual native acceptance")
             }
-            try await AsyncTestWait.waitUntil("ring quiet running frame accepted") { bridge.test_pairedRunStatus(for: endpoint) == .running }
+            try await AsyncTestWait.waitUntil("ring quiet running frame accepted") { await bridge.test_pairedRunStatus(for: endpoint) == .running }
             try bridge.applyPassiveMonitorNoticeReceipt(XCTUnwrap(claim.passive?.receipt), observerEndpoint: endpoint)
             try await finish(fixture, owner)
         }

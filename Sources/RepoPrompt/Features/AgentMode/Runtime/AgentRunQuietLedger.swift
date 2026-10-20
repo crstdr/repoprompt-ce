@@ -1,18 +1,5 @@
 import Foundation
-
-/// Process-local cumulative proof. Unknown is represented by nil, never saturated fresh facts.
-struct AgentRunQuietFacts: Equatable, Hashable {
-    let settledThrough: UInt64
-    let ordinaryThrough: UInt64
-
-    init?(settledThrough: UInt64, ordinaryThrough: UInt64) {
-        guard ordinaryThrough <= settledThrough else { return nil }
-        self.settledThrough = settledThrough
-        self.ordinaryThrough = ordinaryThrough
-    }
-
-    static let zero = AgentRunQuietFacts(settledThrough: 0, ordinaryThrough: 0)!
-}
+import RepoPromptDomainRuntime
 
 /// Owned by one live source binding. The existing lifecycle facade remains the attempt authority;
 /// this value never looks up a session, repairs history, publishes, persists, or starts work.
@@ -22,6 +9,22 @@ struct AgentRunQuietLedger {
         let ownership: AgentRunOwnership
         let isQuiet: Bool
         let facts: AgentRunQuietFacts?
+    }
+
+    /// One candidate slot on the existing attempt, not a registry. A second distinct call or host
+    /// execution irreversibly invalidates this exactly-one proof, even if transcript dedup merges it.
+    private struct CodexAssociation {
+        let callID: String
+        let threadID: String
+        let turnID: String
+        let runID: UUID
+        var hostID: UUID?
+        var nativeID: UUID?
+        var nativeCallSeen = false
+        var nativeResultSeen = false
+        var hostCallSeen = false
+        var hostResultSeen = false
+        var invalid = false
     }
 
     private struct Attempt {
@@ -35,6 +38,10 @@ struct AgentRunQuietLedger {
         var hasOccurrence = false
         var rangeIsComplete = true
         var seal: Seal?
+        var codexAssociation: CodexAssociation?
+        var declarationBodyEntries: UInt8 = 0
+        var declarationHostInvocationID: UUID?
+        var acceptedDeclarationInvocationID: UUID?
     }
 
     private var attempt: Attempt?
@@ -130,6 +137,185 @@ struct AgentRunQuietLedger {
     mutating func noteOccurrence(owner: AgentRunOwnership) {
         guard isOpen(owner: owner) else { return }
         attempt?.hasOccurrence = true
+    }
+
+    /// Body entry, before validation/refusal. Registration and canonical deduplication do not count.
+    @discardableResult
+    mutating func enterDeclarationBody(owner: AgentRunOwnership, hostInvocationID: UUID) -> Bool {
+        guard isOpen(owner: owner) else { return false }
+        let entries = min(2, (attempt?.declarationBodyEntries ?? 0) + 1)
+        attempt?.declarationBodyEntries = entries
+        guard attempt?.declarationBodyEntries == 1 else { noteOccurrence(owner: owner)
+            return false
+        }
+        attempt?.declarationHostInvocationID = hostInvocationID
+        return true
+    }
+
+    /// The caller supplies its captured registration origin and independently resolved live endpoint.
+    /// No production caller/tool registration is added by W0.
+    @discardableResult
+    mutating func acceptDeclarationBody(
+        owner: AgentRunOwnership,
+        hostInvocationID: UUID,
+        wakeID: UUID,
+        origin: AgentSelfMCPCallOrigin,
+        currentEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        currentRunID: UUID?
+    ) -> Bool {
+        guard isOpen(owner: owner) else { return false }
+        guard candidateStartKey(owner: owner) != nil, attempt?.routineWakeID == wakeID,
+              attempt?.declarationBodyEntries == 1, attempt?.declarationHostInvocationID == hostInvocationID,
+              origin.endpoint == currentEndpoint, origin.runID == currentRunID, origin.runAttemptID == owner.attemptID,
+              currentEndpoint.tabID == owner.binding.tabID, currentEndpoint.sessionID == owner.binding.persistentSessionID,
+              currentEndpoint.persistentBindingGeneration == owner.binding.persistentBindingGeneration,
+              currentEndpoint.bindingTransitionGeneration == owner.binding.bindingTransitionGeneration
+        else { noteOccurrence(owner: owner)
+            return false
+        }
+        attempt?.acceptedDeclarationInvocationID = hostInvocationID
+        return true
+    }
+
+    func declarationBodyEntryCardinality(owner: AgentRunOwnership) -> UInt8? {
+        attempt?.owner == owner ? attempt?.declarationBodyEntries : nil
+    }
+
+    mutating func noteDeclarationAssistantText(owner: AgentRunOwnership, text: String) {
+        guard isOpen(owner: owner), !text.isEmpty else { return }
+        if attempt?.acceptedDeclarationInvocationID == nil { noteOccurrence(owner: owner) }
+    }
+
+    func declarationMaySeal(owner: AgentRunOwnership, canonicalInvocations: [UUID]) -> Bool {
+        guard candidateStartKey(owner: owner) != nil, attempt?.declarationBodyEntries == 1,
+              let accepted = attempt?.acceptedDeclarationInvocationID,
+              attempt?.declarationHostInvocationID == accepted else { return false }
+        return canonicalInvocations == [accepted]
+    }
+
+    private mutating func codexAssociation(
+        owner: AgentRunOwnership,
+        runID: UUID?,
+        threadID: String?,
+        callID: String?,
+        turnID: String?
+    ) -> CodexAssociation? {
+        guard let current = attempt, current.owner == owner, current.seal == nil,
+              current.provider == .codexExec, current.routineWakeID != nil else { return nil }
+        guard let runID, let threadID, !threadID.isEmpty, let callID, !callID.isEmpty,
+              let turnID, !turnID.isEmpty
+        else { noteOccurrence(owner: owner)
+            return nil
+        }
+        if var existing = current.codexAssociation {
+            guard existing.runID == runID, existing.threadID == threadID,
+                  existing.turnID == turnID, existing.callID == callID
+            else {
+                existing.invalid = true
+                attempt?.codexAssociation = existing
+                noteOccurrence(owner: owner)
+                return nil
+            }
+            return existing
+        }
+        return CodexAssociation(callID: callID, threadID: threadID, turnID: turnID, runID: runID)
+    }
+
+    /// Native identity is correlation evidence only. The accepted host H and captured origin are
+    /// still required independently. Missing/result-before-call/ambiguity cannot be repaired later.
+    @discardableResult
+    mutating func observeCodexNative(
+        owner: AgentRunOwnership,
+        runID: UUID?,
+        currentThreadID: String?,
+        currentTurnID: String?,
+        identity: CodexNativeSessionController.MCPToolIdentity?,
+        nativeID: UUID?,
+        isResult: Bool,
+        isError: Bool
+    ) -> Bool {
+        guard isOpen(owner: owner) else { return false }
+        guard let identity, let nativeID,
+              identity.threadID == currentThreadID, identity.turnID == currentTurnID,
+              let raw = ToolInvocationContext.correlationString(.string(identity.callID)),
+              var pair = codexAssociation(
+                  owner: owner,
+                  runID: runID,
+                  threadID: currentThreadID,
+                  callID: raw,
+                  turnID: currentTurnID
+              )
+        else { noteOccurrence(owner: owner)
+            return false
+        }
+        if (pair.nativeID != nil && pair.nativeID != nativeID) || (isResult && !pair.nativeCallSeen) || isError {
+            pair.invalid = true
+            noteOccurrence(owner: owner)
+        }
+        pair.nativeID = nativeID
+        pair.nativeCallSeen = pair.nativeCallSeen || !isResult
+        pair.nativeResultSeen = pair.nativeResultSeen || isResult
+        attempt?.codexAssociation = pair
+        return !pair.invalid
+    }
+
+    @discardableResult
+    mutating func observeCodexHost(
+        owner: AgentRunOwnership,
+        runID: UUID?,
+        currentThreadID: String?,
+        currentTurnID: String?,
+        context: ToolInvocationContext?,
+        hostID: UUID,
+        isResult: Bool,
+        isError: Bool
+    ) -> Bool {
+        guard isOpen(owner: owner) else { return false }
+        guard let context, context.invocationID == hostID, context.metadata.invocationID == hostID,
+              context.codexThreadID == currentThreadID
+        else { noteOccurrence(owner: owner)
+            return false
+        }
+        // The normal Codex terminal drain retires its active turn before queued result delivery.
+        // Only a previously observed call may supply that retired turn, never an orphan result.
+        let turnID = currentTurnID ?? (isResult ? attempt?.codexAssociation?.turnID : nil)
+        guard var pair = codexAssociation(
+            owner: owner,
+            runID: runID,
+            threadID: currentThreadID,
+            callID: context.codexCallID,
+            turnID: turnID
+        ) else { return false }
+        if (pair.hostID != nil && pair.hostID != hostID) || (isResult && !pair.hostCallSeen) || isError {
+            pair.invalid = true
+            noteOccurrence(owner: owner)
+        }
+        pair.hostID = hostID
+        pair.hostCallSeen = pair.hostCallSeen || !isResult
+        pair.hostResultSeen = pair.hostResultSeen || isResult
+        attempt?.codexAssociation = pair
+        return !pair.invalid
+    }
+
+    func codexAssociationHasNativeResult(
+        owner: AgentRunOwnership,
+        hostID: UUID,
+        runID: UUID?,
+        threadID: String?
+    ) -> Bool {
+        guard isOpen(owner: owner), let pair = attempt?.codexAssociation,
+              pair.runID == runID, pair.threadID == threadID, pair.hostID == hostID else { return false }
+        return !pair.invalid && pair.hostCallSeen && pair.nativeCallSeen && pair.nativeResultSeen
+    }
+
+    func codexAssociationIsComplete(
+        owner: AgentRunOwnership,
+        hostID: UUID,
+        runID: UUID?,
+        threadID: String?
+    ) -> Bool {
+        codexAssociationHasNativeResult(owner: owner, hostID: hostID, runID: runID, threadID: threadID)
+            && attempt?.codexAssociation?.hostResultSeen == true
     }
 
     mutating func invalidateRange(owner: AgentRunOwnership) {

@@ -674,6 +674,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         [DomainAgentSessionLinkEndpointIdentity: AgentSessionLinkRunCatalogProjection] = [:]
 
     #if DEBUG
+        /// W0 observes the actual scheduled idle dispatch and refuses before any provider work.
+        var test_beforeRoutineIdleFollowUpStart: ((TabSession, UUID) -> Bool)?
         var test_afterClaudeAttachmentSelfCancel: (@MainActor () async -> Void)?
         var test_claudeAttachmentRestartFinished: (@MainActor () -> Void)?
         var test_afterProviderInputAugmentation: (@MainActor () async -> Void)?
@@ -1206,6 +1208,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         var test_claudeCoordinator: ClaudeAgentModeCoordinator {
             claudeCoordinator
+        }
+
+        func test_finishQuietFeasibilityRun(_ session: TabSession) async {
+            await runService.test_publishNaturalCompletion(session)
         }
 
         func test_initializeRunService() {
@@ -14559,6 +14565,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             session.transcriptPerformanceSnapshot.refreshRequestCount += 1
         #endif
 
+        if session.terminalCommitInProgress, case .metadataRange? = mutation {
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.Transcript.scheduleRefresh,
+                scheduleSignpost,
+                EditFlowPerf.Dimensions(status: reason.rawValue, outcome: "terminal-metadata-fold")
+            )
+            session.pendingDerivedTranscriptRefreshReason = .liveMutation
+            return
+        }
+
         guard reason == .liveMutation, canScheduleAsyncRefresh else {
             EditFlowPerf.end(
                 EditFlowPerf.Stage.Transcript.scheduleRefresh,
@@ -15391,14 +15407,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 previousProtection: previousProjectionProtection,
                 protection: projectionProtection,
                 reusableFrozenPrefixTurnCount: projectionReusableTurnCount,
-                context: processingContext
+                context: processingContext,
+                excludingQuiet: true
             ) {
                 baseProjection = reusedProjection
                 updatedTurnProjectionCaches = AgentTranscriptProjectionBuilder.updatedTurnCaches(
                     for: sanitizedTranscript,
                     projection: reusedProjection,
                     protection: projectionProtection,
-                    existingTurnCaches: previousTurnProjectionCaches
+                    existingTurnCaches: previousTurnProjectionCaches,
+                    excludingQuiet: true
                 )
                 #if DEBUG || EDIT_FLOW_PERF
                     performanceSnapshot.projectionReuseSuccessCount += 1
@@ -15409,7 +15427,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     from: sanitizedTranscript,
                     protection: projectionProtection,
                     turnCaches: previousTurnProjectionCaches,
-                    context: processingContext
+                    context: processingContext,
+                    excludingQuiet: true
                 )
                 baseProjection = buildResult.projection
                 updatedTurnProjectionCaches = buildResult.updatedTurnCaches
@@ -15423,7 +15442,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 from: sanitizedTranscript,
                 protection: projectionProtection,
                 turnCaches: previousTurnProjectionCaches,
-                context: processingContext
+                context: processingContext,
+                excludingQuiet: true
             )
             baseProjection = buildResult.projection
             updatedTurnProjectionCaches = buildResult.updatedTurnCaches
@@ -15735,6 +15755,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             "[AgentModeVM][TranscriptOrder] applyStructured tab=\(session.tabID) turns=\(presentation.transcript.turns.count) workingRowTail=\(Self.transcriptRowDebugWindow(presentation.workingProjection.workingRows)) workingBlockTail=\(Self.transcriptBlockDebugWindow(presentation.workingProjection.workingBlocks))"
         )
     }
+
+    #if DEBUG
+        /// W0 paired harness access to the existing live-refresh commit, not a new owner.
+        func test_applyQuietW0ScalePresentation(_ presentation: BuiltTranscriptPresentation, to session: TabSession) {
+            applyBuiltTranscriptPresentation(presentation, sourceItems: session.items, isLiveRefresh: true, to: session)
+        }
+    #endif
 
     @discardableResult
     func applyTranscriptPresentation(

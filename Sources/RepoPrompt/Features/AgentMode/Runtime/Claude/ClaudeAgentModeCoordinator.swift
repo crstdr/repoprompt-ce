@@ -399,6 +399,12 @@ final class ClaudeAgentModeCoordinator {
         await handler.startTracking(runID: runID, session: session, clientNameHint: session.selectedAgent.mcpClientNameHint)
     }
 
+    #if DEBUG
+        func testToolTrackingHandler(for session: AgentTabSession) -> ClaudeAgentToolTrackingHandler {
+            toolHandler(for: session)
+        }
+    #endif
+
     private func toolHandler(for session: AgentTabSession) -> ClaudeAgentToolTrackingHandler {
         if let existing = toolHandlerByTabID[session.tabID] {
             existing.hooks = toolTrackingHooks

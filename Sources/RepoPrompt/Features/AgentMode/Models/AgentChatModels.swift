@@ -252,6 +252,9 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
     /// retention drops the row.
     public var recoveryDiagnostic: AgentTranscriptRecoveryDiagnostic?
 
+    /// W0 feasibility carrier only; no production certification writer is installed.
+    public var quietCheckInWakeID: UUID?
+
     public init(
         id: UUID = UUID(),
         timestamp: Date = Date(),
@@ -274,7 +277,8 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         crossSessionAttribution: AgentCrossSessionAttribution? = nil,
         dispatchedProviderText: String? = nil,
         laneUpdateDisplayAttribution: AgentLaneUpdateDisplayAttribution? = nil,
-        recoveryDiagnostic: AgentTranscriptRecoveryDiagnostic? = nil
+        recoveryDiagnostic: AgentTranscriptRecoveryDiagnostic? = nil,
+        quietCheckInWakeID: UUID? = nil
     ) {
         self.id = id
         self.timestamp = timestamp
@@ -301,6 +305,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         self.dispatchedProviderText = dispatchedProviderText
         self.laneUpdateDisplayAttribution = laneUpdateDisplayAttribution?.validated
         self.recoveryDiagnostic = recoveryDiagnostic
+        self.quietCheckInWakeID = quietCheckInWakeID
     }
 
     public var hasDisplayableAssistantBody: Bool {
@@ -319,6 +324,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         case dispatchedProviderText
         case laneUpdateDisplayAttribution
         case recoveryDiagnostic
+        case quietCheckInWakeID
     }
 
     public init(from decoder: Decoder) throws {
@@ -359,6 +365,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
             AgentTranscriptRecoveryDiagnostic.self,
             forKey: .recoveryDiagnostic
         )
+        quietCheckInWakeID = try? c.decode(UUID.self, forKey: .quietCheckInWakeID)
     }
 
     // MARK: - Factory Methods
@@ -571,7 +578,8 @@ extension AgentChatItem {
             userInputOrigin: userInputOrigin,
             crossSessionAttribution: crossSessionAttribution,
             dispatchedProviderText: dispatchedProviderText,
-            laneUpdateDisplayAttribution: laneUpdateDisplayAttribution
+            laneUpdateDisplayAttribution: laneUpdateDisplayAttribution,
+            quietCheckInWakeID: quietCheckInWakeID
         )
     }
 }
@@ -628,6 +636,9 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
     /// Typed recovery record for a `.system` recovery notice row; bounded, payload-free.
     public var recoveryDiagnostic: AgentTranscriptRecoveryDiagnostic?
 
+    /// W0 feasibility carrier only; no production certification writer is installed.
+    public var quietCheckInWakeID: UUID?
+
     public init(from item: AgentChatItem, sanitizeToolResults: Bool = true) {
         id = item.id
         timestamp = item.timestamp
@@ -651,6 +662,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         dispatchedProviderText = item.dispatchedProviderText
         laneUpdateDisplayAttribution = item.laneUpdateDisplayAttribution?.validated
         recoveryDiagnostic = item.recoveryDiagnostic
+        quietCheckInWakeID = item.quietCheckInWakeID
         toolResultStatus = nil
 
         if sanitizeToolResults, item.kind == .toolResult {
@@ -728,7 +740,8 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
             crossSessionAttribution: crossSessionAttribution,
             dispatchedProviderText: dispatchedProviderText,
             laneUpdateDisplayAttribution: laneUpdateDisplayAttribution,
-            recoveryDiagnostic: recoveryDiagnostic
+            recoveryDiagnostic: recoveryDiagnostic,
+            quietCheckInWakeID: quietCheckInWakeID
         )
     }
 
@@ -780,6 +793,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         case dispatchedProviderText
         case laneUpdateDisplayAttribution
         case recoveryDiagnostic
+        case quietCheckInWakeID
     }
 
     public init(from decoder: Decoder) throws {
@@ -818,6 +832,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
             AgentTranscriptRecoveryDiagnostic.self,
             forKey: .recoveryDiagnostic
         )
+        quietCheckInWakeID = try? container.decode(UUID.self, forKey: .quietCheckInWakeID)
     }
 }
 

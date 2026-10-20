@@ -806,6 +806,7 @@ extension AgentModeViewModel {
         case remove(index: Int, itemKind: AgentChatItemKind)
         case replaceAll
         case structural
+        case metadataRange(ClosedRange<Int>)
 
         var changedIndexRange: ClosedRange<Int>? {
             switch self {
@@ -814,6 +815,8 @@ extension AgentModeViewModel {
                  let .mutate(index, _),
                  let .remove(index, _):
                 index ... index
+            case let .metadataRange(range):
+                range
             case .replaceAll, .structural:
                 nil
             }
@@ -827,6 +830,8 @@ extension AgentModeViewModel {
                 itemKind == .user
             case let .replace(_, previousKind, currentKind):
                 previousKind == .user || currentKind == .user
+            case .metadataRange:
+                false
             case .replaceAll, .structural:
                 true
             }
@@ -836,7 +841,7 @@ extension AgentModeViewModel {
             switch self {
             case .remove, .replaceAll, .structural:
                 true
-            case .append, .replace, .mutate:
+            case .append, .replace, .mutate, .metadataRange:
                 false
             }
         }

@@ -3,6 +3,34 @@ import Foundation
 import XCTest
 
 final class ClaudeSDKNDJSONTranslatorTests: XCTestCase {
+    func testNativeStringIdentityIsRetainedWithoutReplacingTranslatorUUIDsForIdenticalCalls() throws {
+        var translator = ClaudeSDKNDJSONTranslator()
+        var ids: [UUID] = []
+        for nativeID in ["toolu_first", "toolu_second"] {
+            let calls = translator.parseNDJSONLine(jsonLine([
+                "type": "assistant", "message": ["content": [[
+                    "type": "tool_use",
+                    "id": nativeID,
+                    "name": "mcp__RepoPromptCE__read_file",
+                    "input": ["path": "same.swift"]
+                ]]]
+            ]))
+            let call = try XCTUnwrap(calls.first { $0.type == "tool_call" })
+            try ids.append(XCTUnwrap(call.toolInvocationID))
+            XCTAssertEqual(call.claudeToolUseID, nativeID)
+            let result = try XCTUnwrap(translator.parseNDJSONLine(jsonLine([
+                "type": "user", "message": ["content": [[
+                    "type": "tool_result",
+                    "tool_use_id": nativeID,
+                    "content": [["type": "text", "text": "contents"]]
+                ]]]
+            ])).first)
+            XCTAssertEqual(result.claudeToolUseID, nativeID)
+            XCTAssertEqual(result.toolInvocationID, call.toolInvocationID)
+        }
+        XCTAssertNotEqual(ids[0], ids[1])
+    }
+
     func testAssistantToolAndResultSmokePreservesUsageArgsAndStableInvocationID() throws {
         var translator = ClaudeSDKNDJSONTranslator(
             treatsToolResultErrorsAsHostOwned: { $0 == "mcp__RepoPromptCE__read_file" }
@@ -116,8 +144,9 @@ final class ClaudeSDKNDJSONTranslatorTests: XCTestCase {
             "usage": ["input_tokens": 11, "output_tokens": 0],
             "total_cost_usd": 0.12
         ]))
-        XCTAssertEqual(cancelled.map(\.type), ["message_stop"])
-        let cancelledStop = try XCTUnwrap(cancelled.first)
+        XCTAssertEqual(cancelled.map(\.type), ["event", "message_stop"])
+        XCTAssertNil(cancelled.first?.text, "Abort artifact suppression must retain negative evidence without error copy")
+        let cancelledStop = try XCTUnwrap(cancelled.first { $0.type == "message_stop" })
         XCTAssertEqual(cancelledStop.providerSessionID, "claude-session-2")
         XCTAssertEqual(cancelledStop.promptTokens, 11)
         XCTAssertEqual(cancelledStop.completionTokens, 0)
@@ -349,6 +378,58 @@ final class ClaudeSDKNDJSONTranslatorTests: XCTestCase {
         ]))
         XCTAssertEqual(mainThread.first?.type, "usage", "A null parent is the main thread")
         XCTAssertEqual(mainThread.first?.contextUsedTokens, 1000)
+    }
+
+    func testUnknownMalformedAndPartialOutputRetainsActivityInBothEntryPoints() throws {
+        let wires = [
+            #"{"type":"assistant","message":{"id":"m","content":[{"type":"future_output"}]}}"#,
+            #"{"type":"assistant","message":{"id":"m","content":[17]}}"#,
+            #"{"type":"assistant","message":{"id":"m","content":[{"type":"text","text":17}]}}"#,
+            #"{"type":"assistant","message":{"id":"m","content":[{"type":"thinking","thinking":null}]}}"#,
+            #"{"type":"assistant","message":{"id":"m"}}"#,
+            #"{"type":"assistant","message":{"id":"m","content":false}}"#,
+            #"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"future_delta"}}}"#,
+            #"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":17}}}"#,
+            #"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"signature_delta","signature":null}}}"#,
+            #"{"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"text"}}}"#,
+            #"{"type":"stream_event","event":{"type":"future_event"}}"#,
+            #"{"type":"stream_event"}"#,
+            #"{"type":"future_notification","metadata":{}}"#,
+            #"{"type":"system","subtype":"future_metadata","metadata":{}}"#
+        ]
+        for wire in wires {
+            var ndjson = ClaudeSDKNDJSONTranslator()
+            let results = ndjson.parseNDJSONLine(Data(wire.utf8))
+            XCTAssertEqual(results.map(\.type), ["event"], wire)
+            XCTAssertNil(results.first?.text, wire)
+            guard let decoded = try ClaudeSDKProtocolCodec.decodeLine(Data(wire.utf8)),
+                  case let .streamPayload(payload) = decoded
+            else { return XCTFail("Expected a normalized payload: \(wire)") }
+            var normalized = ClaudeSDKNDJSONTranslator()
+            XCTAssertEqual(normalized.parseStreamPayload(payload), results, wire)
+        }
+    }
+
+    func testUnknownUnitDoesNotEraseKnownOutputAndKnownMetadataDoesNotInventOutput() {
+        var translator = ClaudeSDKNDJSONTranslator()
+        let mixed = translator.parseNDJSONLine(Data(#"{"type":"assistant","message":{"id":"m","content":[{"type":"text","text":"before"},{"type":"future_output"},{"type":"text","text":"after"}]}}"#.utf8))
+        XCTAssertEqual(mixed.map(\.type), ["content", "event", "content"])
+        XCTAssertEqual(mixed.compactMap(\.text), ["before", "after"])
+        for wire in [
+            #"{"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"text","text":""}}}"#,
+            #"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"signature_delta","signature":"opaque"}}}"#,
+            #"{"type":"stream_event","event":{"type":"content_block_stop"}}"#,
+            #"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}"#
+        ] {
+            XCTAssertTrue(translator.parseNDJSONLine(Data(wire.utf8)).isEmpty, wire)
+        }
+        XCTAssertEqual(translator.parseNDJSONLine(Data(#"{"type":"system","subtype":"init"}"#.utf8)).map(\.type), ["lifecycle"])
+        XCTAssertEqual(translator.parseNDJSONLine(Data(#"{"type":"result","subtype":"success"}"#.utf8)).map(\.type), ["message_stop"])
+        XCTAssertEqual(translator.parseNDJSONLine(Data(#"{"type":"result"}"#.utf8)).map(\.type), ["event", "message_stop"], "Incomplete completion cannot silently qualify as success")
+        for wire in ["unparseable", "[]", "17", #"{"type":"error"}"#] {
+            XCTAssertEqual(translator.parseNDJSONLine(Data(wire.utf8)).map(\.type), ["event"], wire)
+        }
+        XCTAssertTrue(translator.parseNDJSONLine(Data(" \n".utf8)).isEmpty, "Blank framing is not an event")
     }
 
     private func jsonObject(from jsonString: String?, file: StaticString = #filePath, line: UInt = #line) throws -> [String: String] {

@@ -1512,7 +1512,7 @@ final actor ClaudeNativeProcessSessionController {
             emit(.rateLimit(rateLimit))
         }
         let streamResults = translator.parseNDJSONLine(data)
-        if Self.hasUnrepresentedQuietActivity(payload) {
+        if !streamResults.contains(where: { $0.type == "event" }), Self.hasUnattributedAssistantMessage(payload) {
             emitQuietUncertainty("Unclassified provider activity")
         }
         #if DEBUG
@@ -1694,64 +1694,22 @@ final actor ClaudeNativeProcessSessionController {
         emit(.stream(AIStreamResult(type: "event", text: reason)))
     }
 
-    /// Inspect only this incoming payload, never transcript history. The translator intentionally
-    /// omits framing, empty deltas and optional reasoning; unknown or hidden semantic activity must
-    /// not be mistaken for silence. No payload text or parallel event history is retained.
-    private static func hasUnrepresentedQuietActivity(_ payload: [String: Any]) -> Bool {
+    /// First-party message attribution is transport-owned. Output shape, unknown notifications
+    /// and malformed payload evidence are owned by the ordinary translator in both entry points.
+    private static func hasUnattributedAssistantMessage(_ payload: [String: Any]) -> Bool {
         switch payload["type"] as? String {
         case "assistant", "message":
             let message = (payload["message"] as? [String: Any]) ?? payload
             guard let messageID = message["id"] as? String, !messageID.isEmpty else { return true }
-            if payload["parent_tool_use_id"] as? String != nil || payload["parentToolUseId"] as? String != nil { return true }
-            guard let content = message["content"] else { return true }
-            if content is String { return false }
-            guard let blocks = content as? [[String: Any]] else { return true }
-            return blocks.contains { block in
-                switch block["type"] as? String {
-                case "text": !(block["text"] is String)
-                case "thinking": !(block["thinking"] is String)
-                case "tool_use", "tool_result": false // Translator emits activity even with fallback fields.
-                default: true
-                }
-            }
+            return payload["parent_tool_use_id"] as? String != nil || payload["parentToolUseId"] as? String != nil
         case "stream_event":
-            guard let event = payload["event"] as? [String: Any] else { return true }
-            switch event["type"] as? String {
-            case "message_start":
-                guard let message = event["message"] as? [String: Any],
-                      let messageID = message["id"] as? String, !messageID.isEmpty
-                else { return true }
-                return false
-            case "message_delta", "message_stop", "content_block_stop": return false
-            case "content_block_start":
-                guard let block = event["content_block"] as? [String: Any] else { return true }
-                switch block["type"] as? String {
-                case "text": return !(block["text"] is String)
-                case "thinking": return !(block["thinking"] is String)
-                default: return true
-                }
-            case "content_block_delta":
-                guard let delta = event["delta"] as? [String: Any] else { return true }
-                // Empty Strings are legitimate framing. Missing/malformed payloads are not
-                // neutral merely because their type name is recognized by the translator.
-                switch delta["type"] as? String {
-                case "text_delta": return !(delta["text"] is String)
-                case "thinking_delta": return !(delta["thinking"] is String)
-                case "signature_delta": return !(delta["signature"] is String)
-                default: return true
-                }
-            default: return true
-            }
-        case "system":
-            // Initialization and running/idle lifecycle are represented by typed results.
-            return !["init", "session_state_changed"].contains(payload["subtype"] as? String ?? "")
-        case "result":
-            if let result = payload["result"], !(result is String) { return true }
-            return payload["subtype"] as? String != "success" || payload["is_error"] as? Bool == true
-        case "rate_limit_event":
-            let info = payload["rate_limit_info"] as? [String: Any]
-            return info?["status"] as? String != "allowed"
-        default: return true // Includes user/tool/auth/error and future event types, even if empty.
+            guard let event = payload["event"] as? [String: Any], event["type"] as? String == "message_start" else { return false }
+            guard let message = event["message"] as? [String: Any],
+                  let messageID = message["id"] as? String, !messageID.isEmpty
+            else { return true }
+            return false
+        default:
+            return false
         }
     }
 

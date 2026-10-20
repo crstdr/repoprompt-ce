@@ -585,6 +585,18 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             }
         }
 
+        func testW0fClaudeReturnedCatalogConvergesAfterLateGrant() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { _ in
+                try await self.exerciseLiveDiscovery(w0fProvider: .claudeCode)
+            }
+        }
+
+        func testW0fCodexReturnedCatalogNeverRepairsQuietOnlyChanges() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { _ in
+                try await self.exerciseLiveDiscovery(w0fProvider: .codexExec)
+            }
+        }
+
         private enum ProofMutation {
             case unrelatedRoute
             case exactConnectionPolicyABA
@@ -598,7 +610,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
 
         private func exerciseLiveDiscovery(
             activate: Bool = false, inbound: Bool = false, originalQualificationFamilyABA: Bool = false,
-            proofMutation: ProofMutation? = nil
+            proofMutation: ProofMutation? = nil, w0fProvider: AgentProviderKind? = nil
         ) async throws {
             try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
             let manager = ServerNetworkManager.shared
@@ -608,6 +620,10 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             let bridge = AgentSessionLinkRuntimeBridge.shared
             let authority = AppDomainRuntimeComposition.shared.runtime.agentSessionLinkAuthority
             let provider = HeldDiscoveryProvider()
+            let codexRecorder = LifecycleRecorder()
+            let codex = LifecycleNoopCodexController(recorder: codexRecorder)
+            let clientName = w0fProvider == .codexExec ? AgentProviderKind.codexMCPClientID : AgentProviderKind.claudeMCPClientID
+            let w0fKind = w0fProvider ?? .claudeCode
             let runID = UUID()
             var transport: PersistentMCPTestEndpoint?
             var grant: DomainAgentSessionLinkReference?
@@ -622,6 +638,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             var delayedCatalog: Task<Set<String>, Error>?
             let registration = try await AppDomainRuntimeComposition.shared.register(window.mcpServer.windowMCPToolCatalogService)
             let cleanup: @MainActor () async -> Void = {
+                await manager.debugSetReturnedCatalogToolsForTesting(nil)
                 await manager.debugSetAfterExpectedCatalogSurfaceForTesting(nil)
                 await manager.debugSetAfterBecomeOverseerProofRegistrationForTesting(nil)
                 await qualificationGate.release()
@@ -647,7 +664,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                     await transport.connectionManager.stop()
                     await manager.debugRemoveConnection(transport.connectionID)
                 }
-                await manager.clearClientConnectionPolicy(for: AgentProviderKind.claudeMCPClientID, windowID: window.windowID, runID: runID)
+                await manager.clearClientConnectionPolicy(for: clientName, windowID: window.windowID, runID: runID)
                 await manager.cleanupRunRoutingState(for: runID, windowID: window.windowID)
                 await window.tearDown()
                 await AppDomainRuntimeComposition.shared.unregister(registration.handle)
@@ -671,7 +688,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 for tab in workspace.composeTabs {
                     let payload = try AgentSession(
                         id: XCTUnwrap(tab.activeAgentSessionID), workspaceID: workspace.id,
-                        composeTabID: tab.id, name: tab.name, agentKind: AgentProviderKind.claudeCode.rawValue,
+                        composeTabID: tab.id, name: tab.name, agentKind: w0fKind.rawValue,
                         autoWakeOnOversightUpdates: false
                     )
                     _ = try await AgentSessionDataService.shared.saveAgentSession(payload, for: workspace)
@@ -685,7 +702,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 let target = await vm.ensureSessionReady(tabID: targetTab, reconnectActiveProviders: false)
                 for (session, expectedID) in [(observer, observerID), (target, targetID)] {
                     XCTAssertEqual(session.activeAgentSessionID, expectedID)
-                    XCTAssertEqual(session.selectedAgent, .claudeCode)
+                    XCTAssertEqual(session.selectedAgent, w0fKind)
                     XCTAssertTrue(session.qualifiedRestorationReadiness.isAuthoritative)
                     XCTAssertEqual(vm.ownerValidatedSessionIndex[expectedID]?.tabID, session.tabID)
                     let projector = SpawnProvenanceDelegationMembershipProjector.production(worktreeOwnership: bridge.worktreeOwnership)
@@ -709,12 +726,21 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 }
 
                 observer.installRunID(runID)
-                observer.claudeController = provider
+                if w0fProvider == .codexExec {
+                    observer.codexController = codex
+                    _ = try await codex.startOrResume(existing: nil, baseInstructions: "")
+                    _ = try await codex.startUserTurn(text: "", images: [], model: nil, reasoningEffort: nil, serviceTier: nil)
+                } else {
+                    observer.claudeController = provider
+                }
+                if w0fProvider != nil {
+                    await manager.debugSetReturnedCatalogToolsForTesting(Self.w0fReturnedShape())
+                }
                 observer.runState = .running
                 // Install the ordinary restricted Agent policy BEFORE initialize/tools/list. This
                 // transport is never an external unrestricted caller that is converted after the fact.
                 await manager.installClientConnectionPolicy(
-                    for: AgentProviderKind.claudeMCPClientID, windowID: window.windowID,
+                    for: clientName, windowID: window.windowID,
                     restrictedTools: AgentModeMCPToolPolicy.restrictedTools, oneShot: true,
                     reason: "Live Oversee discovery regression", ttl: 60, tabID: observerTab,
                     runID: runID, additionalTools: nil, purpose: .agentModeRun,
@@ -723,7 +749,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 await manager.setEnabled(true)
                 let connection = try await PersistentMCPTestEndpoint.make(
                     label: "held-provider", networkManager: manager,
-                    clientName: AgentProviderKind.claudeMCPClientID, requiredToolNames: [MCPWindowToolName.readFile]
+                    clientName: clientName, requiredToolNames: [MCPWindowToolName.readFile]
                 )
                 transport = connection
                 await provider.attach(connection)
@@ -748,6 +774,12 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 XCTAssertEqual(route.connectionID, connection.connectionID)
                 XCTAssertEqual(route.observerEndpoint, endpoint)
                 XCTAssertEqual(window.mcpServer.connectionIDByRunID[runID], connection.connectionID)
+
+                if w0fProvider != nil {
+                    let initial = try await w0fProjection(manager, runID)
+                    let supported = await manager.hasCurrentReturnedTool(Self.w0fTool(), routeToken: route, projectionRevision: initial.projectionRevision)
+                    XCTAssertFalse(supported, "A started provider without the returned definition has no positive support")
+                }
 
                 if originalQualificationFamilyABA || proofMutation != nil {
                     let registered = expectation(description: "Exact observed proof registered before async qualification")
@@ -954,12 +986,23 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                     XCTAssertNotEqual(projection.expectedSurface, projection.returnedSurface, "A late bootstrap completion must preserve newer full expectations")
                     XCTAssertTrue(AgentSessionLinkCodexCatalogRepair.isStuckProjection(projection))
                 }
+                if w0fProvider != nil {
+                    await bridge.test_settleProjections()
+                    let stale = try await w0fProjection(manager, runID)
+                    let supported = await manager.hasCurrentReturnedTool(Self.w0fTool(), routeToken: route, projectionRevision: stale.projectionRevision)
+                    XCTAssertFalse(supported, "A grant/notification is not returned tool evidence")
+                }
                 let after = try await provider.listTools()
                 let visibleElapsed = start.duration(to: clock.now)
                 let turnAtVisibleCatalog = await provider.heldTurnSnapshot
                 XCTAssertEqual(turnAtVisibleCatalog, heldTurn, "The refreshed catalog must be observable on the same uninterrupted provider turn")
                 XCTAssertTrue(after.contains(MCPWindowToolName.agentSessionLink))
                 XCTAssertTrue(after.contains(MCPWindowToolName.becomeOverseer), "Targeted bootstrap remains discoverable in the continuing flow")
+                if let w0fProvider {
+                    try await w0fRepairControls(manager: manager, provider: provider, window: window, observer: observer, endpoint: endpoint, route: route, runID: runID, kind: w0fProvider, codex: codex, codexRecorder: codexRecorder)
+                    await cleanup()
+                    return
+                }
                 let afterDefinitions = try await provider.definitions(wireCaptureName: inbound ? "inbound-after" : (activate ? "activation-after" : "grant-after"))
                 try DiscoveryArtifactCapture.write(afterDefinitions, name: inbound ? "inbound-after" : (activate ? "activation-after" : "grant-after"))
                 let full = try XCTUnwrap(afterDefinitions.first { $0["name"] as? String == MCPWindowToolName.agentSessionLink })
@@ -1259,5 +1302,146 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
         }
 
         func respondToPermissionRequest(id _: String, decision _: AgentApprovalDecision) {}
+    }
+#endif
+#if DEBUG
+    @MainActor
+    private extension AgentSessionLinkLiveDiscoveryTests {
+        nonisolated static func w0fTool() -> MCP.Tool {
+            MCP.Tool(
+                name: "self_noop", description: "Quietly close a routine wake that needs nothing.",
+                inputSchema: .object(["type": .string("object"), "properties": .object([:]), "additionalProperties": .bool(false)])
+            )
+        }
+
+        nonisolated static func w0fReturnedShape(copies: Int = 1, permissiveSchema: Bool = false) -> @Sendable ([MCP.Tool], Bool) -> [MCP.Tool] {
+            { tools, outbound in
+                guard outbound, tools.contains(where: { $0.name == MCPWindowToolName.agentSessionLink }) else { return tools }
+                let candidate = w0fTool()
+                let returned = permissiveSchema
+                    ? MCP.Tool(name: candidate.name, description: candidate.description, inputSchema: .object(["type": .string("object")]))
+                    : candidate
+                return tools + Array(repeating: returned, count: copies)
+            }
+        }
+
+        func w0fProjection(_ manager: ServerNetworkManager, _ runID: UUID) async throws -> AgentSessionLinkRunCatalogProjection {
+            let projection = await manager.debugRunCatalogProjection(for: runID)
+            return try XCTUnwrap(projection)
+        }
+
+        func w0fRepairControls(
+            manager: ServerNetworkManager, provider: HeldDiscoveryProvider, window: WindowState,
+            observer: AgentTabSession, endpoint: DomainAgentSessionLinkEndpointIdentity,
+            route: AgentSessionLinkRunCatalogRouteToken, runID: UUID, kind: AgentProviderKind,
+            codex: LifecycleNoopCodexController, codexRecorder: LifecycleRecorder
+        ) async throws {
+            let owner = observer.beginRunAttempt(source: "W0f.catalog-proof")
+            let positive = try await w0fProjection(manager, runID)
+            let nativeBefore = await provider.heldTurnSnapshot
+            let codexBefore = codexRecorder.events
+            let generation = observer.codexControllerGeneration
+            XCTAssertEqual(positive.expectedSurface, positive.returnedSurface)
+            XCTAssertTrue(positive.containsReturnedTool(Self.w0fTool()))
+
+            /// W0-only consumer. No product hint, dispatch admission or terminal decision is wired.
+            func hint(_ sample: AgentSessionLinkRunCatalogProjection, owner capturedOwner: AgentRunOwnership) async -> String? {
+                guard let token = await manager.authoritativeRunCatalogRouteToken(runID: runID, windowID: window.windowID, tabID: endpoint.tabID) else { return nil }
+                let supported = await manager.hasCurrentReturnedTool(Self.w0fTool(), routeToken: token, projectionRevision: sample.projectionRevision)
+                guard supported, !Task.isCancelled, sample.routeToken == token,
+                      ToolAvailabilityStore.shared.isEnabled(Self.w0fTool().name),
+                      sample.hasActiveOutboundLink == true, observer.runID == runID,
+                      observer.isCurrentRunAttemptForCurrentBinding(capturedOwner),
+                      window.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
+                      window.agentModeViewModel.agentSessionLinkRunCatalogProjectionByEndpoint[endpoint]?.projectionRevision == sample.projectionRevision,
+                      manager.hasLiveProviderInputConnection(token)
+                else { return nil }
+                return "Nothing needed? Call self_noop."
+            }
+            func assertNoQuietRepair() {
+                guard kind == .codexExec else { return }
+                window.agentModeViewModel.test_codexCoordinator.codexRepairSessionLinkCatalogIfQuiescent(for: observer)
+                XCTAssertNil(observer.codexSessionLinkCatalogRepairCycle)
+                XCTAssertEqual(observer.codexControllerGeneration, generation)
+                XCTAssertTrue(observer.codexController === codex)
+                XCTAssertEqual(observer.runID, runID)
+            }
+            let supportedHint = await hint(positive, owner: owner)
+            XCTAssertEqual(supportedHint, "Nothing needed? Call self_noop.")
+            // The returned catalog is not permission to borrow another attempt or route.
+            let successor = observer.beginRunAttempt(source: "W0f.catalog-proof.successor")
+            let oldAttemptHint = await hint(positive, owner: owner)
+            XCTAssertNil(oldAttemptHint)
+            let foreign = AgentSessionLinkRunCatalogRouteToken(runID: runID, observerEndpoint: endpoint, connectionID: UUID(), routingAuthorityGeneration: route.routingAuthorityGeneration, connectionLifecycleGeneration: route.connectionLifecycleGeneration)
+            let foreignSupport = await manager.hasCurrentReturnedTool(Self.w0fTool(), routeToken: foreign, projectionRevision: positive.projectionRevision)
+            XCTAssertFalse(foreignSupport)
+
+            // Equivalent absent/suppressed and ambiguous returned catalogs. The healthy idle Codex
+            // controller must not even open a cycle; ordinary delivery remains available.
+            if kind == .codexExec { observer.runState = .idle }
+            for (label, copies, permissive) in [("absent/suppressed", 0, false), ("ambiguous", 2, false), ("non-exact schema", 1, true)] {
+                await manager.debugSetReturnedCatalogToolsForTesting(Self.w0fReturnedShape(copies: copies, permissiveSchema: permissive))
+                _ = try await provider.listTools()
+                let current = try await w0fProjection(manager, runID)
+                XCTAssertEqual(current.expectedSurface, positive.expectedSurface, label)
+                XCTAssertEqual(current.returnedSurface, positive.returnedSurface, label)
+                XCTAssertTrue(current.isReady, "Quiet support cannot gate ordinary delivery: \(label)")
+                let delivery = await window.agentModeViewModel.qualifyProviderInputRoute(for: observer)
+                XCTAssertEqual(delivery, .ready(route), "Ordinary route qualification never waits on quiet support")
+                let absentHint = await hint(current, owner: successor)
+                let staleHint = await hint(positive, owner: successor)
+                XCTAssertNil(absentHint, label)
+                XCTAssertNil(staleHint, "A prior positive catalog revision is not current")
+                assertNoQuietRepair()
+            }
+
+            // Real global disable is confined to the test runner's disposable sandbox. It must
+            // veto retained positive evidence even before tools/list has refreshed.
+            observer.runState = .running
+            await manager.debugSetReturnedCatalogToolsForTesting(Self.w0fReturnedShape())
+            _ = try await provider.listTools()
+            let beforeDisable = try await w0fProjection(manager, runID)
+            await manager.setEnabled(false)
+            let disabledHint = await hint(beforeDisable, owner: successor)
+            XCTAssertNil(disabledHint)
+            _ = try await provider.listTools()
+            let disabled = try await w0fProjection(manager, runID)
+            XCTAssertFalse(disabled.containsReturnedTool(Self.w0fTool()))
+            await manager.setEnabled(true)
+            _ = try await provider.listTools()
+            let restored = try await w0fProjection(manager, runID)
+            let restoredHint = await hint(restored, owner: successor)
+            XCTAssertEqual(restoredHint, "Nothing needed? Call self_noop.")
+            let nativeAfter = await provider.heldTurnSnapshot
+            XCTAssertEqual(nativeAfter, nativeBefore)
+            XCTAssertEqual(codexRecorder.events, codexBefore)
+            if kind == .codexExec {
+                observer.runState = .idle
+                assertNoQuietRepair()
+                // One deterministic overlap proves the new payload cannot revive an older
+                // positive response after a newer same-run catalog publication.
+                let gate = DiscoveryCatalogGate()
+                let paused = expectation(description: "older catalog completion suspended")
+                await manager.debugSetAfterExpectedCatalogSurfaceForTesting { await gate.hold { paused.fulfill() } }
+                let older = Task { try await provider.listTools() }
+                await fulfillment(of: [paused], timeout: 2)
+                await manager.debugSetAfterExpectedCatalogSurfaceForTesting(nil)
+                do {
+                    await manager.debugSetReturnedCatalogToolsForTesting(Self.w0fReturnedShape(copies: 0))
+                    _ = try await provider.listTools()
+                    await gate.release()
+                    _ = try await older.value
+                } catch {
+                    await gate.release()
+                    _ = await older.result
+                    throw error
+                }
+                let latest = try await w0fProjection(manager, runID)
+                XCTAssertNil(latest.returnedCatalog, "Overlapping older completion is unknown, never positive support")
+                let overlappedHint = await hint(latest, owner: successor)
+                XCTAssertNil(overlappedHint)
+                assertNoQuietRepair()
+            }
+        }
     }
 #endif

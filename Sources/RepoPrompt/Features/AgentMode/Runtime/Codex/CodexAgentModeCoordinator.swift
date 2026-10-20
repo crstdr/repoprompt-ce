@@ -8815,6 +8815,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
 
     func ensureCodexToolTrackingIfNeeded(for session: AgentTabSession, runID: UUID) async {
         guard shouldManageCodexTooling else { return }
+        await startCodexToolTracking(for: session, runID: runID)
+    }
+
+    private func startCodexToolTracking(for session: AgentTabSession, runID: UUID) async {
+        let capturedOwner = session.runID == runID ? session.activeRunOwnership : nil
         let controller = toolTrackingByTabID[session.tabID] ?? {
             let c = AgentToolTrackingController()
             toolTrackingByTabID[session.tabID] = c
@@ -8822,15 +8827,46 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }()
         await controller.startTracking(
             runID: runID,
+            attemptID: capturedOwner?.attemptID,
             clientNameHint: AgentProviderKind.codexExec.mcpClientNameHint,
             onCalled: { [weak self, weak session] invocationID, toolName, args in
                 guard let self, let session else { return }
+                if let capturedOwner, !session.isCurrentRunAttemptForCurrentBinding(capturedOwner, expectedRunID: runID) { return }
+                observeCodexHostIdentity(session: session, owner: capturedOwner, runID: runID, hostID: invocationID, isResult: false, isError: false)
                 handleCodexToolCall(invocationID: invocationID, toolName: toolName, args: args, session: session)
             },
             onCompleted: { [weak self, weak session] invocationID, toolName, args, resultJSON, isError in
                 guard let self, let session else { return }
+                if let capturedOwner, !session.isCurrentRunAttemptForCurrentBinding(capturedOwner, expectedRunID: runID) { return }
+                observeCodexHostIdentity(session: session, owner: capturedOwner, runID: runID, hostID: invocationID, isResult: true, isError: isError)
                 handleCodexToolResult(invocationID: invocationID, toolName: toolName, args: args, resultJSON: resultJSON, isError: isError, session: session)
             }
+        )
+    }
+
+    private func observeCodexHostIdentity(
+        session: AgentTabSession,
+        owner: AgentRunOwnership?,
+        runID: UUID,
+        hostID: UUID,
+        isResult: Bool,
+        isError: Bool
+    ) {
+        guard let owner, session.selectedAgent == .codexExec,
+              session.isCurrentRunAttemptForCurrentBinding(owner, expectedRunID: runID)
+        else {
+            session.noteUncertainToolCorrelation()
+            return
+        }
+        _ = session.quietLedger.observeCodexHost(
+            owner: owner,
+            runID: runID,
+            currentThreadID: session.codexConversationID,
+            currentTurnID: currentAuthoritativeNativeToolTurnID(for: session),
+            context: MCPInvocationContextBridge.current,
+            hostID: hostID,
+            isResult: isResult,
+            isError: isError
         )
     }
 
@@ -8841,6 +8877,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session: AgentTabSession
     ) {
         guard isRepoPromptTrackerToolName(toolName) else { return }
+        if invocationID == nil { session.noteUncertainToolCorrelation() }
         logCodexTranscriptOrdering(
             "tracker toolCall received",
             session: session,
@@ -8870,6 +8907,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session: AgentTabSession
     ) {
         guard isRepoPromptTrackerToolName(toolName) else { return }
+        if invocationID == nil { session.noteUncertainToolCorrelation() }
         logCodexTranscriptOrdering(
             "tracker toolResult received",
             session: session,
@@ -9694,6 +9732,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session: AgentTabSession
     ) -> Bool {
         let scope: (threadID: String?, turnID: String?, itemID: String?)? = switch event {
+        case let .toolCall(_, _, _, identity?):
+            (identity.threadID, identity.turnID, identity.callID)
+        case let .toolResult(_, _, _, _, _, identity?):
+            (identity.threadID, identity.turnID, identity.callID)
         case let .canonicalAssistantDelta(_, itemScope):
             (nil, itemScope.turnID, itemScope.itemID)
         case let .assistantCompleted(payload):
@@ -9760,6 +9802,29 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             return
         }
         if let ownership = session.activeRunOwnership {
+            var provisionalDeclaration = false
+            let nativeTool: (String, UUID?, CodexNativeSessionController.MCPToolIdentity?, Bool, Bool)? = switch event {
+            case let .toolCall(name, id, _, identity): (name, id, identity, false, false)
+            case let .toolResult(name, id, _, _, error, identity): (name, id, identity, true, error != false)
+            default: nil
+            }
+            if let (name, nativeID, identity, isResult, isError) = nativeTool,
+               AgentToolTrackingSupport.isExplicitRepoPromptTool(name)
+            {
+                let exact = session.quietLedger.observeCodexNative(
+                    owner: ownership,
+                    runID: session.runID,
+                    currentThreadID: session.codexConversationID,
+                    currentTurnID: currentAuthoritativeNativeToolTurnID(for: session),
+                    identity: identity,
+                    nativeID: nativeID,
+                    isResult: isResult,
+                    isError: isError
+                )
+                #if DEBUG
+                    if let identity, exact { provisionalDeclaration = session.test_codexQuietDeclarationMembership?(identity) == true }
+                #endif
+            }
             let progress: (kind: AgentRunLivenessSignalKind, stage: AgentRunLifecycleStage, retryIntent: AgentRunRetryIntent) = switch event {
             case .toolCall, .toolResult, .commandExecutionRunning:
                 (.toolActivity, .running, .none)
@@ -9787,7 +9852,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 ownership: ownership,
                 kind: progress.kind,
                 stage: progress.stage,
-                retryIntent: progress.retryIntent
+                retryIntent: progress.retryIntent,
+                quietDeclarationRepresentation: provisionalDeclaration
             )
         }
         #if DEBUG
@@ -9966,7 +10032,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 notifyOnCompleted: false,
                 deleteDeferredFilesWhenFailureHasNoInFlight: true
             )
-        case let .toolCall(toolName, invocationID, argsJSON):
+        case let .toolCall(toolName, invocationID, argsJSON, _):
             guard session.runState.isActive else { return }
             let toolName = AgentToolNamePolicy.accepted(toolName) ?? AgentToolNamePolicy.fallbackName
             clearCodexPendingAuthRetryTurn(session)
@@ -10007,7 +10073,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             session.appendItem(toolItem)
             AgentModeViewModel.logCodexDebug("[AgentModeVM][CodexUI] append toolCall tool=\(toolName) invocationID=\(invocationID?.uuidString ?? "nil") argsChars=\(argsJSON?.count ?? 0) totalItems=\(session.items.count)")
             viewModel?.requestUIRefresh(tabID: session.tabID)
-        case let .toolResult(toolName, invocationID, argsJSON, resultJSON, isError):
+        case let .toolResult(toolName, invocationID, argsJSON, resultJSON, isError, _):
             guard session.runState.isActive else { return }
             let toolName = AgentToolNamePolicy.accepted(toolName) ?? AgentToolNamePolicy.fallbackName
             clearCodexPendingAuthRetryTurn(session)
@@ -11316,6 +11382,22 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             clearCodexControllerInstanceState(for: session)
         }
 
+        func testStartCodexToolTracking(for session: AgentTabSession, runID: UUID) async {
+            await startCodexToolTracking(for: session, runID: runID)
+        }
+
+        func testFlushCodexToolTracking(for session: AgentTabSession) async {
+            await toolTrackingByTabID[session.tabID]?.waitForPendingEventDeliveries()
+        }
+
+        func testEnqueueCodexToolTrackingBarrier(for session: AgentTabSession, _ operation: @escaping @Sendable () async -> Void) {
+            toolTrackingByTabID[session.tabID]?.enqueueEventDeliveryBarrierForTesting(operation)
+        }
+
+        func testStopCodexToolTracking(for session: AgentTabSession) async {
+            await stopCodexToolTrackingAndWait(for: session)
+        }
+
         func test_handleCodexNativeEvent(
             _ event: CodexNativeSessionController.Event,
             session: AgentTabSession,
@@ -11807,9 +11889,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             "mcpElicitationRequest server=\(request.serverName ?? "nil")"
         case let .serverRequestIssue(issue):
             "serverRequestIssue kind=\(issue.kind.rawValue) method=\(issue.method)"
-        case let .toolCall(name, invocationID, _):
+        case let .toolCall(name, invocationID, _, _):
             "toolCall tool=\(name) invocationID=\(invocationID?.uuidString ?? "nil")"
-        case let .toolResult(name, invocationID, _, resultJSON, isError):
+        case let .toolResult(name, invocationID, _, resultJSON, isError, _):
             "toolResult tool=\(name) invocationID=\(invocationID?.uuidString ?? "nil") isError=\(isError.map(String.init(describing:)) ?? "nil") resultChars=\(resultJSON.count)"
         case let .commandExecutionRunning(update):
             "commandExecutionRunning invocationID=\(update.invocationID?.uuidString ?? "nil") processID=\(update.processID ?? "nil") outputChars=\(update.appendedOutput?.count ?? 0)"

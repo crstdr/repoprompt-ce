@@ -3309,3 +3309,161 @@ extension CodexResumeWedgeCommitTests {
         else { XCTAssertGreaterThan(f.session.quietLedger.hiddenSourceIDs.count, 1, "The ack row is hidden with the wake") }
     }
 }
+
+extension CodexResumeWedgeCommitTests {
+    func testProtocolMetadataIsNotOutputAndUnknownOrMalformedIngressRemainsOrdinary() async throws {
+        let thread = CodexJSONValue.string(Self.oldThreadID)
+        let turn = CodexJSONValue.string("w0e-turn")
+        let settings = CodexProtocolMetadataTestFixtures.settings(threadID: Self.oldThreadID)
+        let cases: [(String, String, [String: CodexJSONValue], Bool)] = [
+            ("moderation", "turn/moderationMetadata", ["metadata": .object([
+                // Arbitrary JSON inside metadata is not a ResponseItem, even if it resembles one.
+                "item": .object(["type": .string("function_call"), "arguments": .string("{}")])
+            ])], false),
+            ("settings-before-close", "thread/settings/updated", settings, false),
+            ("malformed-settings", "thread/settings/updated", ["threadSettings": .array([])], true),
+            ("partial-settings", "thread/settings/updated", ["threadSettings": .object([:])], true),
+            ("missing-moderation-metadata", "turn/moderationMetadata", [:], true),
+            ("metadata-field-is-not-output-proof", "rawResponseItem/completed", ["metadata": .object([:])], true),
+            ("future-metadata-method", "thread/futureMetadata/updated", ["metadata": .object([:])], true),
+            ("unknown-raw-output", "rawResponseItem/completed", ["item": .object([
+                "id": .string("opaque-output"), "type": .string("other")
+            ])], true),
+            ("unrepresented-real-function-call", "rawResponseItem/completed", ["item": .object([
+                "id": .string("function-output"), "type": .string("function_call"),
+                "call_id": .string("call-output"), "name": .string("ordinary_tool"), "arguments": .string("{}")
+            ])], true),
+            ("unknown-canonical-output", "item/completed", ["item": .object([
+                "id": .string("opaque-item"), "type": .string("futureOutput")
+            ])], true),
+            ("malformed-raw-output", "rawResponseItem/completed", ["item": .object([
+                "id": .string("bad-output"), "type": .string("message"),
+                "role": .string("assistant"), "content": .number(17)
+            ])], true),
+            ("partial-started-message", "item/started", ["item": .object(["id": .string("partial"), "type": .string("agentMessage")])], true),
+            ("malformed-started-reasoning", "item/started", ["item": .object(["id": .string("partial"), "type": .string("reasoning"), "summary": .number(17)])], true),
+            ("malformed-item-envelope", "item/completed", [:], true)
+        ]
+        for (label, method, payload, ordinary) in cases {
+            let f = makeFixture([])
+            defer { f.session.saveDebounceTask?.cancel() }
+            f.viewModel.test_initializeRunService()
+            let runID = UUID()
+            f.session.installRunID(runID)
+            let controller = CodexNativeSessionController(client: CodexAppServerClient(), runID: runID, tabID: f.session.tabID, windowID: -1, workspacePaths: .uniform(nil))
+            f.session.codexController = controller
+            f.session.codexConversationID = Self.oldThreadID
+            let owner = try XCTUnwrap(f.session.activeRunOwnership)
+            f.session.quietLedger.markRoutineWake(owner: owner, wakeID: UUID())
+            await controller.test_installThreadState(threadID: Self.oldThreadID, authoritativeTurnID: "w0e-turn", routingTurnID: "w0e-turn")
+            await controller.test_handleNotification(method: "turn/started", params: [
+                "threadId": thread, "turn": .object(["id": turn, "status": .string("inProgress"), "items": .array([])])
+            ])
+            // Supplied incident ordering, using the unchanged legacy ack behavior only as a
+            // diagnostic control: wake -> final ack -> metadata/output -> normal completion.
+            // This is not a declaration, registration, or eventual self_noop certification.
+            await controller.test_handleNotification(method: "item/completed", params: [
+                "threadId": thread, "turnId": turn, "completedAtMs": .number(0),
+                "item": .object(["id": .string("w0e-answer"), "type": .string("agentMessage"), "text": .string("[ack]")])
+            ])
+            // Settings has no turnId in the pinned schema. It is still received during this turn.
+            let scope: [String: CodexJSONValue] = method == "thread/settings/updated" ? ["threadId": thread] : ["threadId": thread, "turnId": turn]
+            await controller.test_handleNotification(method: method, params: payload.merging(scope) { _, value in value })
+            await controller.test_handleNotification(method: "turn/completed", params: [
+                "threadId": thread, "turn": .object(["id": turn, "status": .string("completed"), "items": .array([])])
+            ])
+            await controller.shutdown()
+            var warnings: [String] = []
+            var metadataMethods: [String] = []
+            var reachedTerminal = false
+            for await event in controller.events {
+                if case let .livenessActivity(activity) = event, activity.kind == .warning { warnings.append(activity.method) }
+                if case .turnCompleted = event {
+                    reachedTerminal = true
+                    XCTAssertEqual(f.session.quietLedger.candidateStartKey(owner: owner) == nil, ordinary, "pre-presentation/terminal veto: \(label)")
+                }
+                let previousSequence = f.session.runLifecycle.liveness?.lastAcceptedSequence ?? 0
+                await f.coordinator.test_handleCodexNativeEvent(event, session: f.session, sourceController: controller)
+                if case let .livenessActivity(activity) = event, activity.kind == .protocolMetadata {
+                    metadataMethods.append(activity.method)
+                    XCTAssertNil(activity.itemID, label)
+                    XCTAssertNil(activity.message, label)
+                    XCTAssertTrue(activity.activeFlags.isEmpty, label)
+                    XCTAssertGreaterThan(f.session.runLifecycle.liveness?.lastAcceptedSequence ?? 0, previousSequence, "Ordinary metadata still records normal liveness: \(label)")
+                    XCTAssertNotNil(f.session.quietLedger.candidateStartKey(owner: owner), label)
+                }
+            }
+            XCTAssertEqual(metadataMethods, ordinary ? [] : [method], "The ordinary adapter positively represents metadata: \(label)")
+            XCTAssertTrue(reachedTerminal, label)
+            XCTAssertEqual(warnings, ordinary ? [method] : [], label)
+            XCTAssertEqual(f.session.runState, .completed, label)
+            XCTAssertEqual(f.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: ordinary ? 1 : 0), label)
+            print("W0E_REPAIRED_CODEX \(label) warning=\(warnings) ordinary=\(ordinary)")
+        }
+    }
+}
+
+/// Static replay of the pinned 0.159.0 ThreadSettings construction example.
+/// This is protocol metadata, not declaration/capability or model-output evidence.
+enum CodexProtocolMetadataTestFixtures {
+    static func settings(threadID: String) -> [String: CodexJSONValue] {
+        ["threadId": .string(threadID), "threadSettings": .object([
+            "disabledPluginIds": .array([]), "cwd": .string("/tmp/repo"),
+            "approvalPolicy": .string("never"), "approvalsReviewer": .string("user"),
+            "sandboxPolicy": .object(["type": .string("danger-full-access")]),
+            "activePermissionProfile": .null, "model": .string("gpt-5.4"),
+            "modelProvider": .string("openai"), "serviceTier": .null, "effort": .null,
+            "summary": .null, "multiAgentMode": .string("explicitRequestOnly"), "personality": .null,
+            "collaborationMode": .object([
+                "mode": .string("default"), "settings": .object([
+                    "model": .string("gpt-5.4"), "reasoning_effort": .null, "developer_instructions": .null
+                ])
+            ])
+        ])]
+    }
+}
+
+/// Characterizes an approved pre-existing upstream transport-decoder limitation, not desired loss handling.
+/// Frames dropped before dispatch cannot reach classification; decoded unknown/malformed output is
+/// protected independently. This legacy [ack] control is not an eventual self_noop declaration.
+extension CodexResumeWedgeCommitTests {
+    func testPreExistingUpstreamDecoderLimitationDropsUndecodableFramesBeforeClassification() async throws {
+        for badLine in ["unparseable provider bytes", "{}"] {
+            let f = makeFixture([])
+            defer { f.session.saveDebounceTask?.cancel() }
+            f.viewModel.test_initializeRunService()
+            let runID = UUID()
+            f.session.installRunID(runID)
+            let client = CodexAppServerClient()
+            let notifications = await client.subscribeNotifications()
+            let controller = CodexNativeSessionController(client: client, runID: runID, tabID: f.session.tabID, windowID: -1, workspacePaths: .uniform(nil))
+            f.session.codexController = controller
+            f.session.codexConversationID = Self.oldThreadID
+            let owner = try XCTUnwrap(f.session.activeRunOwnership)
+            f.session.quietLedger.markRoutineWake(owner: owner, wakeID: UUID())
+            await controller.test_installThreadState(threadID: Self.oldThreadID, authoritativeTurnID: "wire-turn", routingTurnID: "wire-turn")
+            for wire in [
+                #"{"method":"turn/started","params":{"threadId":"old-committed-thread","turn":{"id":"wire-turn","status":"inProgress","items":[]}}}"#,
+                #"{"method":"item/completed","params":{"threadId":"old-committed-thread","turnId":"wire-turn","item":{"id":"wire-answer","type":"agentMessage","text":"[ack]"}}}"#,
+                badLine,
+                #"{"method":"turn/completed","params":{"threadId":"old-committed-thread","turn":{"id":"wire-turn","status":"completed","items":[]}}}"#
+            ] {
+                await client.debugIngestRawStdoutLine(Data(wire.utf8))
+            }
+            var methods: [String] = []
+            for await packet in notifications {
+                methods.append(packet.method)
+                await controller.test_handleNotification(method: packet.method, params: packet.params)
+                if packet.method == "turn/completed" { break }
+            }
+            await controller.shutdown()
+            for await event in controller.events {
+                await f.coordinator.test_handleCodexNativeEvent(event, session: f.session, sourceController: controller)
+            }
+            XCTAssertEqual(f.session.runState, .completed)
+            XCTAssertEqual(methods, ["turn/started", "item/completed", "turn/completed"], "Pre-existing transport drop: \(badLine)")
+            XCTAssertEqual(f.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: 0), "Dropped frame never reaches classification: \(badLine)")
+            await client.stop()
+        }
+    }
+}

@@ -630,6 +630,13 @@ extension AgentModeViewModel {
             }
             switch route {
             case .idleFollowUp:
+                #if DEBUG
+                    if test_beforeRoutineIdleFollowUpStart?(session, wakeID) == false {
+                        agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: dispatchID)
+                        cancelAgentSessionLinkAutoWake(for: endpoint, reason: .requiredClaimUnavailable)
+                        return
+                    }
+                #endif
                 let startOutcome = await startAgentRun(
                     tabID: endpoint.tabID,
                     initialMessage: "",
