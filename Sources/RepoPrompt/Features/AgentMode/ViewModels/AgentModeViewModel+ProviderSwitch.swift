@@ -390,7 +390,13 @@ extension AgentModeViewModel {
         session.isDirty = true
         Task { @MainActor [weak self, weak session] in
             guard let self, let session else { return }
-            if case .failure = await flushSaveRequired(for: session.tabID, workspaceID: workspaceID),
+            // A returned frozen clear must survive later save-token drift. The ordinary fresh-save
+            // owner carries it forward; only an unacknowledged write restores uncertainty.
+            var saverReturned = false
+            let result = await flushSaveRequired(for: session.tabID, workspaceID: workspaceID, observingSavePhase: {
+                if case .writeReturned = $0 { saverReturned = true }
+            })
+            if case .failure = result, !saverReturned,
                sessions[session.tabID] === session, session.currentRestorationBindingToken == binding,
                session.pendingHandoff == cleared
             {

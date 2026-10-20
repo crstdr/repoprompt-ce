@@ -689,6 +689,8 @@ extension AgentModeViewModel {
     enum RequiredSavePhase: Equatable {
         case beforeWrite
         case writeMayHaveCommitted
+        /// The frozen payload's saver returned, but its live-owner currency may still fail.
+        case writeReturned
         case durablySaved(AgentSessionRestorationBindingToken)
     }
 

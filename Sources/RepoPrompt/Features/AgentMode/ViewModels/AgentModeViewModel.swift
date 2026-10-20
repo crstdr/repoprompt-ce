@@ -17805,6 +17805,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         do {
             observingPhase?(.writeMayHaveCommitted)
             let fileURL = try await agentSessionSaver(agentSession, workspace, canonicalItemCount)
+            observingPhase?(.writeReturned)
             agentSession.fileURL = fileURL
             guard isSaveCommitTokenCurrent(saveToken, creationHandle: effectiveCreationSave?.handle) else {
                 requestFreshSaveForCurrentOwner(sessionID: sessionID, fallbackSession: session)

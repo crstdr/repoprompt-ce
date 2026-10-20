@@ -319,6 +319,74 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             }
         }
 
+        func testSwitchAcceptedClearKeepsSuccessfulWriteDespitePostWriteDeferral() async throws {
+            enum Fault: Error { case afterWrite }
+            for drift in ["saveRequest", "transcript", "throwAfterWrite"] {
+                try await withFixture { fixture in
+                    let vm = fixture.viewModel
+                    let session = fixture.sourceSession
+                    vm.test_setSuppressesAgentSessionPersistence(false)
+                    defer {
+                        session.saveDebounceTask?.cancel()
+                        session.saveDebounceTask = nil
+                        vm.test_setSuppressesAgentSessionPersistence(nil)
+                    }
+                    try installSwitch(fixture)
+                    let preparation = try await switchPreparation(fixture)
+                    let payload = try XCTUnwrap(session.pendingHandoff.payload)
+                    let file = fixture.rootURL.appendingPathComponent("accepted-clear.json")
+                    let release = AgentSessionLinkStopSignal<Void>()
+                    defer { release.finish(()) }
+                    var writes: [AgentSession] = []
+                    var clearWriteEntered = false
+                    vm.test_setAgentSessionSaver { saved, _, _ in
+                        try JSONEncoder().encode(saved).write(to: file, options: .atomic)
+                        writes.append(saved)
+                        if writes.count == 2 {
+                            XCTAssertNil(saved.pendingHandoffProviderSwitchDelivery)
+                            XCTAssertNil(saved.pendingHandoffPayload)
+                            clearWriteEntered = true
+                            await release.value()
+                            if drift == "throwAfterWrite" { throw Fault.afterWrite }
+                        }
+                        return file
+                    }
+                    let messages = await vm.prepareProviderSwitchHandoverForSend(preparation, session: session, stopFence: .init(session: session))
+                    XCTAssertNotNil(messages)
+                    let runID = UUID()
+                    session.installRunID(runID)
+                    session.beginRunAttempt(source: "test.switch.postWriteClear")
+                    let dispatch = AgentSessionLinkPromptDispatchID.headlessRun(runID: runID)
+                    XCTAssertTrue(vm.providerSwitchAcquirePhysicalDispatch(session: session, dispatchID: dispatch))
+                    let context = AgentSessionLinkDispatchContext(session: session, dispatchID: dispatch)
+                    vm.providerSwitchRecordPhysicalAcceptance(session: session, context: context)
+                    try await AsyncTestWait.waitUntil("accepted clear reaches the saver gate") { clearWriteEntered }
+                    let writtenClear = try JSONDecoder().decode(AgentSession.self, from: Data(contentsOf: file))
+                    XCTAssertNil(writtenClear.pendingHandoffPayload)
+                    XCTAssertEqual(writtenClear.toLiveItems().count(where: { $0.recoveryDiagnostic?.outcome == "sent" }), 1)
+                    if drift == "transcript" {
+                        session.appendItem(.assistant("Later streaming output", sequenceIndex: session.nextSequenceIndex))
+                    } else {
+                        // A real concurrent save request invalidates the in-flight commit token.
+                        await vm.flushSave(for: session.tabID)
+                    }
+                    release.finish(())
+                    try await AsyncTestWait.waitUntil("existing fresh-save owner persists the settled carrier") { writes.count >= 3 && !session.isDirty }
+                    let latest = try JSONDecoder().decode(AgentSession.self, from: Data(contentsOf: file))
+                    XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, drift == "throwAfterWrite" ? .sending : nil, drift)
+                    XCTAssertEqual(latest.pendingHandoffProviderSwitchDelivery, drift == "throwAfterWrite" ? .sending : nil, drift)
+                    XCTAssertEqual(session.pendingHandoff.payload, drift == "throwAfterWrite" ? payload : nil, drift)
+                    XCTAssertEqual(latest.pendingHandoffPayload, drift == "throwAfterWrite" ? payload : nil, drift)
+                    XCTAssertFalse(session.pendingHandoff.isStagedForSend)
+                    XCTAssertNil(session.pendingHandoff.providerSwitchDispatch)
+                    XCTAssertEqual(latest.toLiveItems().count(where: { $0.recoveryDiagnostic?.outcome == "sent" }), 1)
+                    if drift == "transcript" {
+                        XCTAssertTrue(latest.toLiveItems().contains { $0.text == "Later streaming output" })
+                    }
+                }
+            }
+        }
+
         func testSwitchLatePhysicalAcceptanceCannotClearReboundSlot() async throws {
             try await withFixture { fixture in
                 let session = fixture.sourceSession
@@ -357,6 +425,33 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 let write = await fixture.viewModel.flushSaveRequired(for: session.tabID, workspaceID: workspaceID, observingSavePhase: { phases.append($0) })
                 guard case .failure = write else { return XCTFail("Scripted write must fail") }
                 XCTAssertEqual(phases, [.beforeWrite, .writeMayHaveCommitted])
+
+                let release = AgentSessionLinkStopSignal<Void>()
+                defer { release.finish(()) }
+                var entered = false
+                fixture.viewModel.test_setAgentSessionSaver { saved, _, _ in
+                    let file = fixture.rootURL.appendingPathComponent("returned-write.json")
+                    try JSONEncoder().encode(saved).write(to: file, options: .atomic)
+                    entered = true
+                    await release.value()
+                    return file
+                }
+                phases = []
+                let deferred = Task {
+                    await fixture.viewModel.flushSaveRequired(for: session.tabID, workspaceID: workspaceID, observingSavePhase: { phases.append($0) })
+                }
+                defer { deferred.cancel() }
+                try await AsyncTestWait.waitUntil("required save reaches its frozen write") { entered }
+                await fixture.viewModel.flushSave(for: session.tabID)
+                release.finish(())
+                guard case .failure = await deferred.value else { return XCTFail("A successful write with stale currency must still defer the generic required flush") }
+                XCTAssertEqual(phases, [.beforeWrite, .writeMayHaveCommitted, .writeReturned])
+                XCTAssertTrue(session.isDirty)
+
+                phases = []
+                let saved = await fixture.viewModel.flushSaveRequired(for: session.tabID, workspaceID: workspaceID, observingSavePhase: { phases.append($0) })
+                guard case .success = saved else { return XCTFail("An unchanged write must retain ordinary required-save success") }
+                XCTAssertEqual(phases, try [.beforeWrite, .writeMayHaveCommitted, .writeReturned, .durablySaved(XCTUnwrap(session.currentRestorationBindingToken))])
             }
         }
 
