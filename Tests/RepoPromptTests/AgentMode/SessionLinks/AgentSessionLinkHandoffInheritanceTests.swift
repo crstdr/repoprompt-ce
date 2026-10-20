@@ -274,6 +274,149 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             }
         }
 
+        func testReturnedPredispatchSendingAndReadyWritesWithholdDispatchAsReadyNeedsReview() async throws {
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                try installSwitch(fixture)
+                let preparation = try await switchPreparation(fixture)
+                let handoff = session.pendingHandoff
+                let accepted = AgentChatItem.user("accepted input must not be replayed", sequenceIndex: session.nextSequenceIndex)
+                session.appendItem(accepted)
+                let sessionID = session.activeAgentSessionID
+                let sendingRelease = AgentSessionLinkStopSignal<Void>()
+                let readyRelease = AgentSessionLinkStopSignal<Void>()
+                var sendingEntered = false
+                var readyEntered = false
+                var isAttemptUnderTest = true
+                var writes: [AgentProviderSwitchDelivery?] = []
+                var starts = 0
+                let file = fixture.rootURL.appendingPathComponent("returned-predispatch-ready.json")
+                defer {
+                    isAttemptUnderTest = false
+                    sendingRelease.finish(())
+                    readyRelease.finish(())
+                    vm.test_providerSwitchStart = nil
+                }
+                vm.test_providerSwitchStart = { _, _, _ in starts += 1 }
+                vm.test_setAgentSessionSaver { saved, _, _ in
+                    guard isAttemptUnderTest, saved.id == sessionID else { return file }
+                    writes.append(saved.pendingHandoffProviderSwitchDelivery)
+                    XCTAssertEqual(saved.pendingHandoffPayload, handoff.payload)
+                    try JSONEncoder().encode(saved).write(to: file, options: .atomic)
+                    if writes.count == 1 {
+                        sendingEntered = true
+                        await sendingRelease.value()
+                    } else if writes.count == 2 {
+                        readyEntered = true
+                        await readyRelease.value()
+                    } else { XCTFail("Only the sending write and VM-owned ready re-save are expected") }
+                    return file
+                }
+                var completed = false
+                let attempt = Task {
+                    let messages = await vm.prepareProviderSwitchHandoverForSend(preparation.accepting(accepted.id, session: session), session: session, stopFence: .init(session: session))
+                    completed = true
+                    return messages
+                }
+                defer { attempt.cancel() }
+                try await AsyncTestWait.waitUntil("sending write enters or preparation settles") { sendingEntered || completed }
+                guard sendingEntered else { return XCTFail("Expected the actual sending write") }
+                await vm.flushSave(for: session.tabID) // Invalidate the in-flight token without invoking a runner.
+                sendingRelease.finish(())
+                try await AsyncTestWait.waitUntil("ready re-save enters or preparation settles") { readyEntered || completed }
+                guard readyEntered else { return XCTFail("A returned sending write with no runner must enter the existing ready re-save") }
+                await vm.flushSave(for: session.tabID) // The ready write also returns before stale-token refusal.
+                readyRelease.finish(())
+                let messages = await attempt.value
+                isAttemptUnderTest = false
+                XCTAssertNil(messages)
+                XCTAssertEqual(writes, [.sending, .ready])
+                XCTAssertEqual(starts, 0)
+                XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .ready)
+                XCTAssertEqual(session.pendingHandoff.payload, handoff.payload)
+                XCTAssertEqual(session.pendingHandoff.sourceItemID, handoff.sourceItemID)
+                XCTAssertFalse(session.pendingHandoff.isStagedForSend)
+                XCTAssertNil(session.pendingHandoff.providerSwitchDispatch)
+                XCTAssertNil(session.activeRunOwnership)
+                XCTAssertNil(session.agentTask)
+                XCTAssertTrue(session.items.contains { $0.id == accepted.id })
+                XCTAssertFalse(session.items.contains { $0.recoveryDiagnostic?.outcome == "sent" })
+                let saved = try JSONDecoder().decode(AgentSession.self, from: Data(contentsOf: file))
+                XCTAssertEqual(saved.pendingHandoffProviderSwitchDelivery, .ready)
+                XCTAssertTrue(saved.toLiveItems().contains { $0.id == accepted.id })
+                guard case .failure(.providerHandoverNeedsReview) = await vm.providerSwitchSendAdmission(session: session, input: "later input") else {
+                    return XCTFail("Known no-dispatch recovery must use existing M4c, never resend")
+                }
+            }
+        }
+
+        func testThrownPredispatchReadyResaveRetainsSendingUncertaintyAndAcceptedInput() async throws {
+            enum Fault: Error { case readyWrite }
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                try installSwitch(fixture)
+                let preparation = try await switchPreparation(fixture)
+                let payload = session.pendingHandoff.payload
+                let accepted = AgentChatItem.user("accepted input remains history only", sequenceIndex: session.nextSequenceIndex)
+                session.appendItem(accepted)
+                let sessionID = session.activeAgentSessionID
+                let sendingRelease = AgentSessionLinkStopSignal<Void>()
+                var sendingEntered = false
+                var isAttemptUnderTest = true
+                var writes: [AgentProviderSwitchDelivery?] = []
+                var starts = 0
+                let file = fixture.rootURL.appendingPathComponent("unconfirmed-ready-resave.json")
+                defer {
+                    isAttemptUnderTest = false
+                    sendingRelease.finish(())
+                    vm.test_providerSwitchStart = nil
+                }
+                vm.test_providerSwitchStart = { _, _, _ in starts += 1 }
+                vm.test_setAgentSessionSaver { saved, _, _ in
+                    guard isAttemptUnderTest, saved.id == sessionID else { return file }
+                    writes.append(saved.pendingHandoffProviderSwitchDelivery)
+                    XCTAssertEqual(saved.pendingHandoffPayload, payload)
+                    try JSONEncoder().encode(saved).write(to: file, options: .atomic)
+                    if writes.count == 1 {
+                        sendingEntered = true
+                        await sendingRelease.value()
+                        return file
+                    }
+                    XCTAssertEqual(saved.pendingHandoffProviderSwitchDelivery, .ready)
+                    throw Fault.readyWrite // Even an actual write is unacknowledged when its saver throws.
+                }
+                var completed = false
+                let attempt = Task {
+                    let messages = await vm.prepareProviderSwitchHandoverForSend(preparation.accepting(accepted.id, session: session), session: session, stopFence: .init(session: session))
+                    completed = true
+                    return messages
+                }
+                defer { attempt.cancel() }
+                try await AsyncTestWait.waitUntil("sending write enters or preparation settles") { sendingEntered || completed }
+                guard sendingEntered else { return XCTFail("Expected the actual sending write") }
+                await vm.flushSave(for: session.tabID)
+                sendingRelease.finish(())
+                let messages = await attempt.value
+                isAttemptUnderTest = false
+                XCTAssertNil(messages)
+                XCTAssertEqual(writes, [.sending, .ready])
+                XCTAssertEqual(starts, 0)
+                XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .sending)
+                XCTAssertEqual(session.pendingHandoff.payload, payload)
+                XCTAssertFalse(session.pendingHandoff.isStagedForSend)
+                XCTAssertNil(session.pendingHandoff.providerSwitchDispatch)
+                XCTAssertNil(session.activeRunOwnership)
+                XCTAssertNil(session.agentTask)
+                XCTAssertTrue(session.items.contains { $0.id == accepted.id })
+                XCTAssertFalse(session.items.contains { $0.recoveryDiagnostic?.outcome == "sent" })
+                guard case .failure(.providerSwitchUnconfirmed) = await vm.providerSwitchSendAdmission(session: session, input: "later input") else {
+                    return XCTFail("A thrown ready re-save must remain existing M4a uncertainty")
+                }
+            }
+        }
+
         func testSwitchExactStagedPhysicalSendClearsOnceAndClearSaveFailureRestoresUncertainty() async throws {
             enum Fault: Error { case clear }
             for clearFails in [false, true] {
@@ -1176,6 +1319,83 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             }
         }
 
+        func testGenerationSettlementInvalidatesSourceConfigurationDriftWithoutAutomaticRetry() async throws {
+            GlobalSettingsStore.installApplicationModelIdentityPolicy()
+            for timing in ["during", "queued"] {
+                for drift in ["none", "reasoning", "claude", "parameters"] {
+                    try await withFixture { fixture in
+                        let vm = fixture.viewModel
+                        let session = fixture.sourceSession
+                        if drift == "reasoning" { session.selectedAgent = .codexExec }
+                        if drift == "claude" { session.selectedAgent = .claudeCode }
+                        if drift == "parameters" { session.selectedAgent = .cursor }
+                        session.selectedModelRaw = vm.defaultModelRaw(for: session.selectedAgent)
+                        vm.updateBindingsFromSession(session)
+                        vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("settlement-config.json") }
+                        let binding = session.currentRestorationBindingToken
+                        let agent = session.selectedAgent
+                        let model = session.selectedModelRaw
+                        var generations = 0
+                        var conclusionID: UUID?
+                        var settledRevision: Int?
+                        vm.test_providerSwitchGeneration = { outgoing, _, _ in
+                            generations += 1
+                            let conclusion = AgentChatItem.assistant("result for the captured source configuration", sequenceIndex: outgoing.nextSequenceIndex)
+                            outgoing.appendItem(conclusion)
+                            conclusionID = conclusion.id
+                            outgoing.runState = .completed
+                            if timing == "queued" {
+                                // Queue the real settlement task, then change only configuration in
+                                // this uninterrupted actor turn, before its replacement preview opens.
+                                vm.providerSwitchGenerationSettled(outgoing)
+                            }
+                            let revision = outgoing.sourceItemsRevision
+                            switch drift {
+                            case "reasoning":
+                                outgoing.selectedReasoningEffortRaw = outgoing.selectedReasoningEffortRaw == "high" ? "low" : "high"
+                            case "claude":
+                                outgoing.selectedClaudeEffortRaw = outgoing.selectedClaudeEffortRaw == "high" ? "low" : "high"
+                            case "parameters":
+                                let selection = ACPModelParameterSelection(providerID: .cursor, baseModelRaw: outgoing.selectedModelRaw, kind: .thinking, configID: "effort", valueRaw: "high")
+                                outgoing.recordAcceptedACPModelParameterWrite([selection])
+                                outgoing.acpModelParameterSelections = [selection]
+                            default: break
+                            }
+                            XCTAssertEqual(outgoing.sourceItemsRevision, revision, "Configuration drift must not be disguised as transcript drift")
+                            settledRevision = revision
+                            vm.updateBindingsFromSession(outgoing)
+                        }
+                        await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
+                        let originalID = try XCTUnwrap(vm.providerSwitchPreview?.id)
+                        await vm.generateProviderSwitchHandover(originalID)
+                        try await AsyncTestWait.waitUntil("settlement rebuild after \(timing) \(drift) drift") {
+                            vm.providerSwitchPreview?.id != originalID && vm.providerSwitchPreview?.building == false
+                        }
+                        let current = try XCTUnwrap(vm.providerSwitchPreview)
+                        XCTAssertEqual(current.binding, binding)
+                        XCTAssertEqual(current.sourceAgent, agent)
+                        XCTAssertEqual(current.sourceModel, model)
+                        XCTAssertEqual(current.sourceRevision, settledRevision)
+                        XCTAssertEqual(current.cutoff, conclusionID)
+                        XCTAssertNil(current.generationItemID, "Invalidation must not leave Generating stuck")
+                        XCTAssertNotNil(current.wordLimit)
+                        XCTAssertNil(vm.providerSwitchPreviewBlocker(current), "The next explicit Generate must remain available")
+                        if drift == "none" {
+                            XCTAssertEqual(current.generatedSummary?.text, "result for the captured source configuration")
+                            XCTAssertNotNil(current.choices.first(where: { $0.mode == .summary })?.carrier)
+                        } else {
+                            XCTAssertNil(current.generatedSummary, "\(timing) \(drift)")
+                            XCTAssertNil(current.choices.first(where: { $0.mode == .summary })?.carrier, "\(timing) \(drift)")
+                        }
+                        XCTAssertTrue(session.items.contains { $0.id == conclusionID }, "The invalidated result remains ordinary retained history")
+                        XCTAssertEqual(generations, 1, "Invalidation never automatically Generates")
+                        XCTAssertNil(session.pendingHandoff.payload)
+                        XCTAssertNil(session.activeComposerSubmitAttempt)
+                    }
+                }
+            }
+        }
+
         func testMalformedSwitchCarrierStillPermitsDirectClaimedDiscardWithoutSourceOrReset() async throws {
             for malformed in [
                 "<repoprompt_provider_handover version=\"1\" mode=\"history\" source_provider=\" \" source_model=\"model\"></repoprompt_provider_handover>",
@@ -1214,6 +1434,84 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     XCTAssertEqual(session.items.last?.text, "Pending handover discarded; chat history unchanged.")
                     XCTAssertEqual(session.items.last?.recoveryDiagnostic?.outcome, "discarded")
                     XCTAssertNil(session.activeComposerSubmitAttempt)
+                }
+            }
+        }
+
+        func testDirectBannerDiscardPresentsOwnedSaveFailuresWithoutChangingRecoveryPolicy() async throws {
+            enum Fault: Error { case write }
+            for phase in ["prewrite", "indeterminate"] {
+                for drift in ["none", "binding", "slot"] where phase == "indeterminate" || drift == "none" {
+                    try await withFixture { fixture in
+                        let vm = fixture.viewModel
+                        let session = fixture.sourceSession
+                        try installSwitch(fixture)
+                        let originalHandoff = session.pendingHandoff
+                        let originalRows = session.items.map(\.id)
+                        let sessionID = session.activeAgentSessionID
+                        session.providerSessionID = "discard-must-not-retire-native-context"
+                        var isDiscardAttemptUnderTest = true
+                        var writes = 0
+                        var retirements = 0
+                        var successorSlot: AgentModeViewModel.PendingHandoffState?
+                        vm.test_providerSwitchRetirement = { _ in retirements += 1 }
+                        vm.test_providerSwitchBeforeSave = { outgoing in
+                            if phase == "prewrite" { outgoing.isInstallingHandoffWorktreeBindings = true }
+                        }
+                        defer {
+                            isDiscardAttemptUnderTest = false
+                            session.isInstallingHandoffWorktreeBindings = false
+                            vm.test_providerSwitchBeforeSave = nil
+                        }
+                        vm.test_setAgentSessionSaver { saved, _, _ in
+                            // Window teardown may save again after this operation has settled.
+                            // Only the exact Discard under test owns this fault injection.
+                            guard isDiscardAttemptUnderTest, saved.id == sessionID else {
+                                return fixture.rootURL.appendingPathComponent("outside-discard-attempt.json")
+                            }
+                            writes += 1
+                            XCTAssertNil(saved.pendingHandoffPayload)
+                            XCTAssertNil(saved.pendingHandoffProviderSwitchDelivery)
+                            try JSONEncoder().encode(saved).write(to: fixture.rootURL.appendingPathComponent("discard-may-have-written.json"), options: .atomic)
+                            if drift == "binding" { session.testInstallPersistentSessionBinding(sessionID: UUID()) }
+                            if drift == "slot" {
+                                let replacement = try AgentModeViewModel.PendingHandoffState(payload: self.switchCarrier(padding: 1), createdAt: Date(), sourceItemID: session.items.last?.id, providerSwitchDelivery: .sending)
+                                session.pendingHandoff = replacement
+                                successorSlot = replacement
+                            }
+                            throw Fault.write
+                        }
+                        let action = try XCTUnwrap(vm.requestProviderSwitchBannerAction(for: session, discard: true))
+                        let discarded = await action.value
+                        isDiscardAttemptUnderTest = false
+                        XCTAssertFalse(discarded)
+                        XCTAssertNil(vm.providerSwitchPreview, "Failure reporting cannot open Review")
+                        XCTAssertNil(vm.providerSwitchMutation)
+                        XCTAssertNil(session.activeComposerSubmitAttempt)
+                        XCTAssertEqual(retirements, 0)
+                        XCTAssertEqual(session.providerSessionID, "discard-must-not-retire-native-context")
+                        XCTAssertEqual(writes, phase == "prewrite" ? 0 : 1)
+                        XCTAssertEqual(Array(session.items.prefix(originalRows.count)).map(\.id), originalRows)
+                        if phase == "prewrite" {
+                            XCTAssertEqual(session.pendingHandoff, originalHandoff)
+                            XCTAssertFalse(session.items.contains { $0.recoveryDiagnostic?.outcome == "discarded" })
+                        } else if let successorSlot {
+                            XCTAssertEqual(session.pendingHandoff, successorSlot, "A failed older Discard cannot mutate the replacement slot")
+                        } else {
+                            XCTAssertEqual(session.pendingHandoff, .init(), "Possible-write failure must not roll the discard back")
+                            XCTAssertEqual(session.items.count(where: { $0.recoveryDiagnostic?.outcome == "discarded" }), 1)
+                        }
+                        if drift == "none" {
+                            let errors = session.items.filter { $0.kind == .error }
+                            XCTAssertEqual(errors.count, 1, "The real banner entry must not silently drop the existing save failure")
+                            if let error = errors.last {
+                                XCTAssertEqual(error.text, phase == "prewrite" ? "Handoff is still preparing this chat's worktree execution location." : String(describing: Fault.write))
+                                XCTAssertTrue(vm.transcriptItems.contains { $0.id == error.id }, "The existing captured-session error row must be visibly published")
+                            }
+                        } else {
+                            XCTAssertFalse(session.items.contains { $0.kind == .error }, "A stale Discard failure must not be presented on a successor binding or slot")
+                        }
+                    }
                 }
             }
         }

@@ -273,8 +273,19 @@ extension AgentModeViewModel {
         session.pendingHandoff.providerSwitchDispatch = preparation.physicalDispatch
         let sending = session.pendingHandoff
         session.isDirty = true
-        guard case .success = await flushSaveRequired(for: session.tabID, workspaceID: workspaceID) else {
-            // Even a failed save may have committed. Never dispatch or claim a safe resend.
+        var sendingSaverReturned = false
+        let sendingSave = await flushSaveRequired(for: session.tabID, workspaceID: workspaceID, observingSavePhase: {
+            if case .writeReturned = $0 { sendingSaverReturned = true }
+        })
+        guard case .success = sendingSave else {
+            if sendingSaverReturned, sessions[session.tabID] === session,
+               session.currentRestorationBindingToken == preparation.binding, session.pendingHandoff == sending
+            {
+                // This VM has not released input to a runner. A known returned write may re-save
+                // ready, but never authorizes dispatch or replay of the accepted input.
+                await providerSwitchRestoreReadyBeforeDispatch(session: session, sending: sending, workspaceID: workspaceID)
+            }
+            // Unknown writes or loss of the exact no-runner proof remain inert sending.
             if sessions[session.tabID] === session, session.currentRestorationBindingToken == preparation.binding,
                session.pendingHandoff == sending
             {
@@ -293,8 +304,8 @@ extension AgentModeViewModel {
               providerSwitchHistoryToolAllowed(session) == preparation.historyToolAllowed,
               providerSwitchInstructionStrings(session, includeSupplement: !preparation.inputAlreadyIncludesSupplement) == preparation.instructions
         else {
-            // Only this VM path proves the runner has not been invoked. A failed ready re-save
-            // restores sending; controller-specific Boolean/typed failures never enter this path.
+            // Only this VM path proves the runner has not been invoked. An unacknowledged ready
+            // re-save restores sending; controller-specific failures never enter this path.
             await providerSwitchRestoreReadyBeforeDispatch(session: session, sending: sending, workspaceID: workspaceID)
             return nil
         }
@@ -316,14 +327,22 @@ extension AgentModeViewModel {
     func providerSwitchRestoreReadyBeforeDispatch(
         session: TabSession, sending: PendingHandoffState, workspaceID: UUID
     ) async {
-        guard sessions[session.tabID] === session, session.pendingHandoff == sending else { return }
+        guard sessions[session.tabID] === session, session.pendingHandoff == sending,
+              let proof = sending.providerSwitchDispatch, proof.binding == session.currentRestorationBindingToken,
+              proof.runOwnership == nil, proof.runID == nil, proof.dispatchID == nil,
+              !session.runState.isActive, session.activeRunOwnership == nil else { return }
         let binding = session.currentRestorationBindingToken
         session.pendingHandoff.providerSwitchDelivery = .ready
         session.pendingHandoff.isStagedForSend = false
         session.pendingHandoff.providerSwitchDispatch = nil
         let ready = session.pendingHandoff
         session.isDirty = true
-        if case .failure = await flushSaveRequired(for: session.tabID, workspaceID: workspaceID),
+        var readySaverReturned = false
+        let readySave = await flushSaveRequired(for: session.tabID, workspaceID: workspaceID, observingSavePhase: {
+            if case .writeReturned = $0 { readySaverReturned = true }
+        })
+        if case .failure = readySave,
+           !(readySaverReturned && !session.runState.isActive && session.activeRunOwnership == nil),
            sessions[session.tabID] === session, session.currentRestorationBindingToken == binding,
            session.pendingHandoff == ready
         {
@@ -1072,13 +1091,16 @@ extension AgentModeViewModel {
         guard let preview = providerSwitchPreview, preview.session === session,
               sessions[session.tabID] === session, session.currentRestorationBindingToken == preview.binding,
               workspaceManager?.activeWorkspaceID == preview.workspaceID,
-              session.selectedAgent == preview.sourceAgent, session.selectedModelRaw == preview.sourceModel,
               session.pendingHandoff == preview.originalHandoff,
               let rowID = preview.generationItemID, !preview.generationFinished else { return }
         refreshDerivedTranscriptState(for: session, publishActivePresentation: false)
         guard let turn = session.transcript.turns.first(where: { $0.request?.id == rowID }),
               turn.completedAt != nil, !(turn.terminalState?.isActive ?? false) else { return }
         providerSwitchPreview?.generationFinished = true
+        guard providerSwitchPreviewIsCurrent(preview, content: false) else {
+            refreshProviderSwitchPreviewAfterDrift(preview)
+            return
+        }
         let usedTools = !AgentProviderHandover.isZeroEffectfulToolControlTurn(turn)
         let conclusion = turn.allActivities.first { $0.id == turn.conclusionActivityID }?.text
         let settledRevision = session.sourceItemsRevision
@@ -1089,13 +1111,20 @@ extension AgentModeViewModel {
             guard let self, providerSwitchPreview?.id == preview.id,
                   sessions[session.tabID] === session, session.currentRestorationBindingToken == preview.binding,
                   workspaceManager?.activeWorkspaceID == preview.workspaceID,
-                  session.selectedAgent == preview.sourceAgent, session.selectedModelRaw == preview.sourceModel,
                   session.pendingHandoff == preview.originalHandoff else { return }
+            guard providerSwitchPreviewIsCurrent(preview, content: false) else {
+                refreshProviderSwitchPreviewAfterDrift(preview)
+                return
+            }
             let openedID = await openProviderSwitchPreview(agent: preview.destination, model: preview.model, tabID: session.tabID, updated: true, cursorParameterIntent: preview.cursorParameterIntent)
             guard let openedID, var current = providerSwitchPreview, current.id == openedID, current.session === session,
                   current.originalHandoff == preview.originalHandoff, !current.isReview,
                   session.sourceItemsRevision == settledRevision, current.binding == preview.binding,
                   current.projection != nil, current.budget != nil else { return }
+            guard providerSwitchPreviewIsCurrent(preview, content: false) else {
+                refreshProviderSwitchPreviewAfterDrift(current)
+                return
+            }
             guard let index = current.choices.firstIndex(where: { $0.mode == .summary }) else { return }
             if usedTools {
                 current.choices[index].unavailable = "the model used tools"
@@ -1173,6 +1202,16 @@ extension AgentModeViewModel {
         }
         var noticeID: UUID?
         var phase: RequiredSavePhase = .beforeWrite
+        func presentFailure(_ message: String, matching handoff: PendingHandoffState) {
+            if requiresPresentedPreview {
+                if providerSwitchPreview?.id == id { providerSwitchPreview?.failure = message }
+            } else if providerSwitchPreviewIdentityIsCurrent(preview),
+                      composerSubmitClaimIsCurrent(claim), providerSwitchMutation?.id == mutation.id,
+                      session.pendingHandoff == handoff
+            {
+                session.appendItem(.error(message, sequenceIndex: session.nextSequenceIndex))
+            }
+        }
         do {
             guard current() else { return false }
             let payload = discard ? nil : await providerSwitchPayload(id, mode: preview.selected ?? .history)
@@ -1258,7 +1297,9 @@ extension AgentModeViewModel {
                     }
                     refreshDerivedTranscriptState(for: session)
                 }
-                if case let .failure(failure) = result, requiresPresentedPreview, providerSwitchPreview?.id == id { providerSwitchPreview?.failure = failure.message }
+                if case let .failure(failure) = result {
+                    presentFailure(failure.message, matching: phase == .beforeWrite ? rollback.handoff : staged)
+                }
                 updateBindingsFromSession(session)
                 return false
             }
@@ -1270,7 +1311,7 @@ extension AgentModeViewModel {
         } catch {
             if sessions[session.tabID] === session, session.currentRestorationBindingToken == preview.binding,
                composerSubmitClaimIsCurrent(claim), phase == .beforeWrite { rollback.restore(session) }
-            if requiresPresentedPreview, providerSwitchPreview?.id == id { providerSwitchPreview?.failure = error.localizedDescription }
+            presentFailure(error.localizedDescription, matching: rollback.handoff)
             updateBindingsFromSession(session)
             return false
         }
