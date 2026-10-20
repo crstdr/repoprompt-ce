@@ -103,9 +103,12 @@ enum AgentProviderHandover {
         }
 
         func fits(_ carrier: Carrier) -> Bool {
-            carrier.utf8Bytes <= maximumBytes
-                && (carrier.mode != .summary || carrier.utf8Bytes <= maximumSummaryBytes)
-                && carrier.estimatedTokens <= remainingCarrierTokens
+            fits(bytes: carrier.utf8Bytes, mode: carrier.mode)
+        }
+
+        fileprivate func fits(bytes: Int, mode: Mode) -> Bool {
+            bytes <= maximumBytes && (mode != .summary || bytes <= maximumSummaryBytes)
+                && estimate(bytes: bytes) <= remainingCarrierTokens
         }
 
         fileprivate var summaryByteAllowance: Int {
@@ -148,17 +151,27 @@ enum AgentProviderHandover {
     static func newestCompleteTurns(
         _ projection: Projection, source: Source, historyReference: HistoryReference?, budget: Budget
     ) -> Carrier? {
-        var selected: [Turn] = []
-        var result: Carrier?
-        for turn in projection.turns.reversed() {
+        // Measure each turn once, plus the candidate's small omission framing. Materialize only
+        // the final suffix; repeatedly prepending and serializing growing candidates is quadratic.
+        let framing = carrier(source: source, mode: .newestTurns, turns: [], omitted: nil, tools: false, images: false, reference: nil, body: []).utf8Bytes
+        var turnBytes = 0
+        var hasTools = false
+        var selectedStart: Int?
+        for position in projection.turns.indices.reversed() {
+            let turn = projection.turns[position]
             guard turn.settled else { break }
-            selected.insert(turn, at: 0)
-            let omitted = olderRange(in: projection, before: turn.index)
-            let candidate = makeCarrier(selected, source: source, mode: .newestTurns, omitted: omitted, historyReference: historyReference)
-            guard budget.fits(candidate) else { break }
-            result = candidate
+            turnBytes += turnBody(turn).utf8.count
+            hasTools = hasTools || turn.hasTools
+            let omitted = position > 0 ? projection.turns[0].index ... projection.turns[position - 1].index : nil
+            let omissionBytes = omitted.map { olderMarker($0, reference: historyReference).utf8.count } ?? 0
+            let bodyCount = projection.turns.count - position + (omitted == nil ? 0 : 1) + (hasTools ? 1 : 0)
+            let bytes = framing + turnBytes + omissionBytes + (hasTools ? toolMarker.utf8.count : 0) + bodyCount - 1
+            guard budget.fits(bytes: bytes, mode: .newestTurns) else { break }
+            selectedStart = position
         }
-        return result
+        guard let selectedStart else { return nil }
+        let omitted = selectedStart > 0 ? projection.turns[0].index ... projection.turns[selectedStart - 1].index : nil
+        return makeCarrier(Array(projection.turns[selectedStart...]), source: source, mode: .newestTurns, omitted: omitted, historyReference: historyReference)
     }
 
     static func summary(
@@ -308,13 +321,6 @@ enum AgentProviderHandover {
     </omitted>
     """
 
-    private static func olderRange(in projection: Projection, before index: Int) -> ClosedRange<Int>? {
-        guard let first = projection.turns.first?.index,
-              let last = projection.turns.last(where: { $0.index < index })?.index
-        else { return nil }
-        return first ... last
-    }
-
     /// Raw text for policy revalidation of a persisted readable marker; the serializer alone escapes it.
     static func readableHistoryInstruction(_ range: ClosedRange<Int>, reference: HistoryReference) -> String {
         "If needed, use server \(reference.server)'s advertised history tool: op=\"get_session\", session_id=\"\(reference.sessionID.uuidString)\", turn_start=\(max(range.lowerBound, range.upperBound - 19)), turn_end=\(range.upperBound) (zero-based, inclusive; max 20 turns/call), roles=[\"user\",\"assistant\",\"tool\",\"error\",\"summary\",\"system\"], max_chars=20000."
@@ -337,11 +343,15 @@ enum AgentProviderHandover {
         """
     }
 
+    private static func turnBody(_ turn: Turn) -> String {
+        (["<turn index=\"\(turn.index)\">"] + turn.elements + ["</turn>"]).joined(separator: "\n")
+    }
+
     private static func makeCarrier(_ turns: [Turn], source: Source, mode: Mode, omitted: ClosedRange<Int>?, historyReference: HistoryReference?) -> Carrier {
         var body: [String] = []
         if let omitted { body.append(olderMarker(omitted, reference: historyReference)) }
         for turn in turns {
-            body.append((["<turn index=\"\(turn.index)\">"] + turn.elements + ["</turn>"]).joined(separator: "\n"))
+            body.append(turnBody(turn))
         }
         let tools = turns.contains(where: \.hasTools)
         if tools { body.append(toolMarker) }

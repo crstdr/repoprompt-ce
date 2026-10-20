@@ -6052,6 +6052,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     replayTurn.text
                 }
             }
+            // Capture this replay's exact dispatch before transport, independently of whether
+            // supplement monitoring exists. Never reconstruct it from a later pending slot.
+            let replayDispatchContext = replayTurn.monitoringDispatchContext
+                ?? AgentSessionLinkDispatchContext(session: session, dispatchID: replayDispatchID)
             let acquiredPhysicalDispatch = viewModel?.agentSessionLinkAcquirePhysicalDispatch(
                 for: session,
                 dispatchID: replayDispatchID
@@ -6103,7 +6107,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 return receipt
             }
             dispatched = true
-            viewModel?.acceptAgentSessionLinkDispatch(session: session, context: monitoring?.dispatchContext, claim: nil)
+            viewModel?.acceptAgentSessionLinkDispatch(session: session, context: monitoring?.dispatchContext ?? replayDispatchContext, claim: nil)
             await applySuccessfulCodexNativeSend(
                 for: session,
                 runID: runID,

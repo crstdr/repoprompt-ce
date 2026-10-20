@@ -26,12 +26,12 @@ struct AgentProviderSwitchPresentation: View {
                         }
                         Button("Discard handover") {
                             Task {
-                                guard viewModel.sessions[session.tabID] === session,
-                                      let id = await viewModel.openProviderSwitchPreview(agent: session.selectedAgent, model: session.selectedModelRaw, tabID: session.tabID) else { return }
-                                await viewModel.applyProviderSwitch(id, discard: true)
+                                guard viewModel.sessions[session.tabID] === session else { return }
+                                await viewModel.discardProviderSwitchHandover(tabID: session.tabID)
                             }
                         }
                     }
+                    .disabled(viewModel.providerSwitchMutation != nil)
                 }
                 .font(.callout)
                 .padding(10)

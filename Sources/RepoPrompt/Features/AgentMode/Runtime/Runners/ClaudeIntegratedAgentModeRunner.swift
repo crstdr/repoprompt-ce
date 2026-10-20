@@ -160,7 +160,6 @@ final class ClaudeIntegratedAgentModeRunner {
         hooks.bindingObservation.updateBindings(session)
 
         let isPeriodic = session.oversight.pendingAutoWake?.isPeriodic == true
-        let carriesSwitchHandoff = session.pendingHandoff.providerSwitchDelivery != nil && session.pendingHandoff.isStagedForSend
         session.agentTask = Task { [weak self, weak session, hooks] in
             guard let session else { return }
             defer {
@@ -231,7 +230,7 @@ final class ClaudeIntegratedAgentModeRunner {
                     switch sendOutcome {
                     case .sent:
                         didSendToProvider = true
-                        if !isPeriodic || carriesSwitchHandoff, providerControlCommand == nil, selfCompactDispatchID == nil { self.hooks.providerInput.recordPendingHandoffSendOutcome(session, true) }
+                        if !isPeriodic, providerControlCommand == nil, selfCompactDispatchID == nil { self.hooks.providerInput.recordPendingHandoffSendOutcome(session, true) }
                     case .failed:
                         nativeFailureMetadata = (errorText: nil, shouldShutdownSession: false)
                         throw NativeTerminalFailure()
@@ -275,7 +274,7 @@ final class ClaudeIntegratedAgentModeRunner {
                         runID: runID,
                         for: session
                     ) {
-                        if !isPeriodic || carriesSwitchHandoff, providerControlCommand == nil, selfCompactDispatchID == nil { self.hooks.providerInput.recordPendingHandoffSendOutcome(session, false) }
+                        if !isPeriodic, providerControlCommand == nil, selfCompactDispatchID == nil { self.hooks.providerInput.recordPendingHandoffSendOutcome(session, false) }
                         let revision = await self.finalize(
                             session: session,
                             runID: runID,
@@ -298,7 +297,7 @@ final class ClaudeIntegratedAgentModeRunner {
                     case .failed: .failed
                     }
                     if !didSendToProvider {
-                        if !isPeriodic || carriesSwitchHandoff, providerControlCommand == nil, selfCompactDispatchID == nil { self.hooks.providerInput.recordPendingHandoffSendOutcome(session, false) }
+                        if !isPeriodic, providerControlCommand == nil, selfCompactDispatchID == nil { self.hooks.providerInput.recordPendingHandoffSendOutcome(session, false) }
                     }
                     await self.finalize(
                         session: session,

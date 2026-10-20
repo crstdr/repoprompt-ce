@@ -49,6 +49,10 @@ final class AgentTabSession: ObservableObject {
         return token
     }
 
+    func hasLocalComposerCandidate(itemID: UUID, fence: AgentRunStartStopFence) -> Bool {
+        localComposerCandidates.values.contains { $0.itemID == itemID && $0.fence == fence }
+    }
+
     enum LocalComposerDisposition { case retained, rolledBack }
 
     @discardableResult
@@ -2055,6 +2059,21 @@ final class AgentTabSession: ObservableObject {
             ),
             attemptID: attemptID
         )
+        if pendingHandoff.providerSwitchDelivery == .sending,
+           let proof = pendingHandoff.providerSwitchDispatch
+        {
+            if pendingHandoff.isStagedForSend, proof.binding == currentRestorationBindingToken,
+               proof.stopFence.permitsStart(of: self),
+               !AgentModeViewModel.providerSwitchNeedsReview(self, excluding: proof.acceptedInputID),
+               let associated = proof.associatingRun(ownership)
+            {
+                // Association borrows existing value identities; it owns no runtime lifetime.
+                pendingHandoff.providerSwitchDispatch = associated
+            } else {
+                // A second start cannot adopt this attempt's proof, even at the same binding.
+                pendingHandoff.isStagedForSend = false
+            }
+        }
         #if DEBUG
             perfRecorder.increment("run.lifecycle.attempt.started")
             perfRecorder.increment("run.lifecycle.attempt.started.source.\(source)")

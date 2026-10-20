@@ -524,6 +524,29 @@
             }
         }
 
+        func testManyShortTurnsSelectsContiguousMeasuredSuffixWithoutRepeatedSerialization() throws {
+            let turnCount = 512
+            let transcript = AgentTranscript(turns: (0 ..< turnCount).map { fixture(request: "short task \($0)", replies: [.assistant("retained reply \($0)")]) })
+            let projection = try Handover.project(transcript)
+            let reference = try Handover.HistoryReference(server: "configured-server", sessionID: sessionID, historyAllowed: true, indicesMatch: true)
+            let started = Date()
+            let carrier = try XCTUnwrap(Handover.newestCompleteTurns(projection, source: source(), historyReference: reference, budget: budget(window: 1_000_000)))
+            let elapsed = Date().timeIntervalSince(started)
+            XCTAssertEqual(carrier.turnIndices, Array(0 ..< turnCount))
+            let text = Handover.render(carrier)
+            XCTAssertEqual(text.utf8.count, carrier.utf8Bytes)
+            XCTAssertLessThan(carrier.utf8Bytes, Handover.maximumBytes)
+            let tightBudget = budget(window: 24000)
+            let suffix = try XCTUnwrap(Handover.newestCompleteTurns(projection, source: source(), historyReference: reference, budget: tightBudget))
+            let first = try XCTUnwrap(suffix.turnIndices.first)
+            XCTAssertGreaterThan(first, 0)
+            XCTAssertEqual(suffix.turnIndices, Array(first ..< turnCount))
+            XCTAssertEqual(suffix.omittedOlderTurns, 0 ... first - 1)
+            XCTAssertTrue(tightBudget.fits(suffix))
+            XCTAssertEqual(Handover.render(suffix).utf8.count, suffix.utf8Bytes)
+            print("PROVIDER_SWITCH_SHORT_TURNS turns=\(turnCount) fullBytes=\(carrier.utf8Bytes) suffixTurns=\(suffix.turnIndices.count) selectionSeconds=\(elapsed)")
+        }
+
         private func source() -> Handover.Source {
             try! .init(provider: "claudeCode", model: "source-model")
         }

@@ -321,8 +321,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     #if DEBUG
         var test_providerSwitchRetirement: (@MainActor (TabSession) async -> Void)?
         var test_providerSwitchGeneration: (@MainActor (TabSession, UUID, String) async -> Void)?
+        var test_providerSwitchGenerationStart: (@MainActor (TabSession, String, AgentRunStartOutcomeRecorder) async -> Void)?
+        var test_providerSwitchGenerationRebuildDidFinish: (@MainActor () -> Void)?
         var test_providerSwitchBeforeSave: (@MainActor (TabSession) -> Void)?
         var test_providerSwitchStart: (@MainActor (TabSession, String, String) async -> Void)?
+        var test_beforeProviderSwitchScheduledAdmission: (@MainActor (TabSession) async -> Void)?
+        var test_beforeProviderSwitchPreviewRefresh: (@MainActor (TabSession) async -> Void)?
     #endif
 
     /// Selected agent kind
@@ -3486,6 +3490,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         publication: result,
                         teardownSettled: teardownSettled
                     )
+                    self?.providerSwitchRunSettled(session, revision: revision, publication: result)
                     self?.providerSwitchGenerationSettled(session)
                     // Same post-publication seam: a session's own worktree switch applies only
                     // at its origin turn's settled terminal boundary.
@@ -14525,6 +14530,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         selectedWorkflow = workflow
         syncComposerUIState(tabID: tabID)
         syncStatusPillsUIState()
+        providerSwitchPreviewDidChange(session)
     }
 
     func normalizeTranscriptFollowStateForViewActivation(tabID: UUID?) {
@@ -18869,9 +18875,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             agentSelfCompactCancelForAcceptedLocalInput(session)
             let stopFence = AgentRunStartStopFence(session: session)
             let originalBinding = session.persistentSessionBindingIdentity
-            Task { [weak self] in
-                guard let self else { return }
-                await submitUserTurnAfterHydration(
+            let deferred = Task<UserTurnSubmissionResult, Never> { [weak self] in
+                guard let self else { return .blocked(message: Self.staleComposerSubmitTargetMessage) }
+                return await submitUserTurnAfterHydration(
                     tabID: tabID,
                     originalSession: session,
                     originalBinding: originalBinding,
@@ -18889,9 +18895,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     restorationSelectedWorkflow: activeWorkflow,
                     restorationSelectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
                     stopFence: stopFence,
-                    isLocalComposerInput: isLocalComposerInput
+                    isLocalComposerInput: isLocalComposerInput,
+                    providerSwitchClaim: providerSwitchClaim
                 )
             }
+            scheduledProviderSwitchSubmission?(deferred)
             return .submitted
         }
 
@@ -18923,6 +18931,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     #endif
 
+    @discardableResult
     func submitUserTurnAfterHydration(
         tabID: UUID,
         originalSession: TabSession,
@@ -18941,68 +18950,42 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         restorationSelectedWorkflow: AgentWorkflowDefinition? = nil,
         restorationSelectedWorkflowMutationGeneration: UInt64? = nil,
         stopFence: AgentRunStartStopFence,
-        isLocalComposerInput: Bool = true
-    ) async {
+        isLocalComposerInput: Bool = true,
+        providerSwitchClaim: AgentComposerSubmitClaim? = nil
+    ) async -> UserTurnSubmissionResult {
         guard sessions[tabID] === originalSession,
               originalSession.persistentSessionBindingIdentity == originalBinding
-        else { return }
+        else { return .blocked(message: Self.staleComposerSubmitTargetMessage) }
         let session = originalSession
-        func restoreStoppedSubmission() {
-            guard sessions[tabID] === originalSession,
-                  originalSession.persistentSessionBindingIdentity == originalBinding
-            else { return }
-            restoreRejectedManualSubmissionComposerState(
-                tabID: tabID,
-                session: session,
-                draftText: rawDraftText ?? trimmedText,
-                images: attachmentsToSend,
-                taggedFiles: taggedFilesToSend,
-                selectedWorkflow: restorationSelectedWorkflow,
-                selectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
-                message: "This scheduled run was cancelled by Stop."
-            )
+        func rejected(_ message: String) -> UserTurnSubmissionResult {
+            if isLocalComposerInput, sessions[tabID] === session, session.persistentSessionBindingIdentity == originalBinding {
+                let submittedDraft = rawDraftText ?? trimmedText
+                restoreRejectedManualSubmissionComposerState(
+                    tabID: tabID, session: session,
+                    draftText: retrieveDraftText(for: tabID) == submittedDraft ? "" : submittedDraft,
+                    images: attachmentsToSend, taggedFiles: taggedFilesToSend,
+                    selectedWorkflow: restorationSelectedWorkflow,
+                    selectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
+                    message: message
+                )
+            }
+            return .blocked(message: message)
         }
-        guard stopFence.permitsStart(of: session) else {
-            restoreStoppedSubmission()
-            return
+        guard !Task.isCancelled, stopFence.permitsStart(of: session) else {
+            return rejected("This scheduled run was cancelled by Stop.")
         }
         if session.selectedAgent == .codexExec, CodexManagedSessionFence.shared.isFenced {
-            restoreRejectedManualSubmissionComposerState(
-                tabID: tabID,
-                session: session,
-                draftText: rawDraftText ?? trimmedText,
-                images: attachmentsToSend,
-                taggedFiles: taggedFilesToSend,
-                selectedWorkflow: restorationSelectedWorkflow,
-                selectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
-                message: CodexManagedSessionFence.blockedMessage
-            )
-            return
+            return rejected(CodexManagedSessionFence.blockedMessage)
         }
         await prepareSessionForRunStart(tabID: tabID, session: session)
         guard let hydratedSession = sessions[tabID], hydratedSession === session,
-              stopFence.permitsStart(of: hydratedSession)
-        else {
-            restoreStoppedSubmission()
-            return
-        }
-        if let message = hydratedSession.operationAdmissionFailureMessage {
-            restoreRejectedManualSubmissionComposerState(
-                tabID: tabID, session: session, draftText: rawDraftText ?? trimmedText,
-                images: attachmentsToSend, taggedFiles: taggedFilesToSend,
-                selectedWorkflow: restorationSelectedWorkflow,
-                selectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
-                message: message
-            )
-            return
-        }
-        if hydratedSession.pendingHandoff.providerSwitchDelivery == nil {
-            hydratedSession.selectedWorkflow = nil
-            if currentTabID == tabID { selectedWorkflow = nil }
-            hydratedSession.pendingImageAttachments.removeAll()
-            hydratedSession.pendingTaggedFileAttachments.removeAll()
-        }
-        _ = submitPreparedUserTurn(
+              hydratedSession.persistentSessionBindingIdentity == originalBinding,
+              !Task.isCancelled, stopFence.permitsStart(of: hydratedSession)
+        else { return rejected("This scheduled run was cancelled by Stop.") }
+        if let message = hydratedSession.operationAdmissionFailureMessage { return rejected(message) }
+        let carriedSwitch = hydratedSession.pendingHandoff.providerSwitchDelivery != nil
+        var pending: Task<UserTurnSubmissionResult, Never>?
+        let immediate = submitPreparedUserTurn(
             tabID: tabID,
             session: hydratedSession,
             trimmedText: trimmedText,
@@ -19019,8 +19002,29 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             restorationSelectedWorkflow: restorationSelectedWorkflow,
             restorationSelectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
             stopFence: stopFence,
-            isLocalComposerInput: isLocalComposerInput
+            isLocalComposerInput: isLocalComposerInput,
+            providerSwitchClaim: providerSwitchClaim,
+            scheduledProviderSwitchSubmission: { pending = $0 }
         )
+        let result: UserTurnSubmissionResult = if let pending {
+            await withTaskCancellationHandler { await pending.value } onCancel: { pending.cancel() }
+        } else { immediate }
+        if case let .blocked(message) = result { return rejected(message) }
+        guard result == .submitted else { return result }
+        if !carriedSwitch {
+            // Consume only the submitted snapshot, never B/W2 added while A/W1 was hydrating.
+            if isLocalComposerInput, hydratedSession.userWorkflowSelectionMutationGeneration == restorationSelectedWorkflowMutationGeneration,
+               hydratedSession.selectedWorkflow == restorationSelectedWorkflow
+            {
+                hydratedSession.selectedWorkflow = nil
+                if currentTabID == tabID { selectedWorkflow = nil }
+            }
+            let imageIDs = Set(attachmentsToSend.map(\.id))
+            let fileIDs = Set(taggedFilesToSend.map(\.id))
+            hydratedSession.pendingImageAttachments.removeAll { imageIDs.contains($0.id) }
+            hydratedSession.pendingTaggedFileAttachments.removeAll { fileIDs.contains($0.id) }
+        }
+        return result
     }
 
     private static func validatedSteeringOriginRunID(
@@ -19575,6 +19579,45 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     }
 
+    /// Non-mutating ordinary text composition, shared by submission and destination preview.
+    func composeOrdinaryUserTurnText(
+        _ text: String,
+        computerUseArmed: Bool,
+        includesInterview: Bool,
+        workflow: AgentWorkflowDefinition?,
+        includeBuiltInCleanupGuidance: Bool
+    ) -> String {
+        var effectiveUserText = text
+        if computerUseArmed {
+            effectiveUserText = CodexComputerUseWorkflow.renderProviderPrompt(userInstructions: effectiveUserText)
+        }
+        if includesInterview {
+            effectiveUserText = """
+            <interview_first>
+            Before starting this task, interview me to make sure you fully understand what I need. Follow these rules exactly:
+            \("")
+            1. Ask ONE question at a time using the `ask_user` tool. Always include an `options` array with 2–4 concrete multiple-choice answers so I can respond quickly. Add a final option like "Other (I'll explain)" when my answer might not be listed.
+            2. After each answer, adapt your next question based on what I told you. Narrow in on specifics — don't repeat what you already know.
+            3. Ask 1–3 questions total. Stop early if the task is already clear enough.
+            4. After the interview, briefly summarize what you learned and how it shapes your approach, then proceed with the task.
+            \("")
+            Example flow:
+            - Q1: "What's the main goal?" → options: ["Add new feature", "Fix a bug", "Refactor existing code", "Other (I'll explain)"]
+            - User picks "Add new feature"
+            - Q2 (adapted): "Where should this feature live?" → options: ["Extend FooView", "New standalone view", "Backend service layer", "Other (I'll explain)"]
+            - ...and so on, each question building on previous answers.
+            </interview_first>
+            \("")
+            \(effectiveUserText)
+            """
+        }
+
+        return workflow?.wrapUserText(
+            effectiveUserText,
+            includeBuiltInSessionCleanupGuidance: includeBuiltInCleanupGuidance
+        ) ?? effectiveUserText
+    }
+
     @discardableResult
     private func submitPreparedUserTurn(
         tabID: UUID,
@@ -19642,43 +19685,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         } else {
             bubbleText = "Included \(taggedFilesToSend.count) file\(taggedFilesToSend.count == 1 ? "" : "s")"
         }
-        // Prepend interview instruction to the user message if enabled (first message only).
-        // A managed steer carries its own RepoPrompt-framed provider text and never consumes the
-        // target user's interview preference.
-        var effectiveUserText = managedTurn?.providerText ?? nativePreparedTurn?.providerText ?? trimmedText
-        if nativePreparedTurn == nil, session.isCodexComputerUseArmed {
-            effectiveUserText = CodexComputerUseWorkflow.renderProviderPrompt(userInstructions: effectiveUserText)
-        }
-        if managedTurn == nil,
-           interviewFirst,
-           session.items.isEmpty || !session.items.contains(where: { $0.kind == .assistant })
-        {
-            effectiveUserText = """
-            <interview_first>
-            Before starting this task, interview me to make sure you fully understand what I need. Follow these rules exactly:
-            \("")
-            1. Ask ONE question at a time using the `ask_user` tool. Always include an `options` array with 2–4 concrete multiple-choice answers so I can respond quickly. Add a final option like "Other (I'll explain)" when my answer might not be listed.
-            2. After each answer, adapt your next question based on what I told you. Narrow in on specifics — don't repeat what you already know.
-            3. Ask 1–3 questions total. Stop early if the task is already clear enough.
-            4. After the interview, briefly summarize what you learned and how it shapes your approach, then proceed with the task.
-            \("")
-            Example flow:
-            - Q1: "What's the main goal?" → options: ["Add new feature", "Fix a bug", "Refactor existing code", "Other (I'll explain)"]
-            - User picks "Add new feature"
-            - Q2 (adapted): "Where should this feature live?" → options: ["Extend FooView", "New standalone view", "Backend service layer", "Other (I'll explain)"]
-            - ...and so on, each question building on previous answers.
-            </interview_first>
-            \("")
-            \(effectiveUserText)
-            """
-        }
-
-        // Wrap text with workflow template if selected
-        let includeBuiltInCleanupGuidance = GlobalSettingsStore.shared.showBuiltInWorkflowCleanupGuidance()
-        let wrappedText = providerSwitchPreparation?.rawInput ?? (activeWorkflow?.wrapUserText(
-            effectiveUserText,
-            includeBuiltInSessionCleanupGuidance: includeBuiltInCleanupGuidance
-        ) ?? effectiveUserText)
+        let computerUseArmedAtComposition = session.isCodexComputerUseArmed
+        let wrappedText = providerSwitchPreparation?.rawInput ?? composeOrdinaryUserTurnText(
+            managedTurn?.providerText ?? nativePreparedTurn?.providerText ?? trimmedText,
+            computerUseArmed: nativePreparedTurn == nil && computerUseArmedAtComposition,
+            includesInterview: managedTurn == nil && interviewFirst
+                && (session.items.isEmpty || !session.items.contains(where: { $0.kind == .assistant })),
+            workflow: activeWorkflow,
+            includeBuiltInCleanupGuidance: GlobalSettingsStore.shared.showBuiltInWorkflowCleanupGuidance()
+        )
         if session.pendingHandoff.providerSwitchDelivery != nil, providerSwitchPreparation == nil {
             let claim: AgentComposerSubmitClaim
             let ownsClaim = providerSwitchClaim == nil
@@ -19696,6 +19711,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let capturedStop = stopFence ?? AgentRunStartStopFence(session: session)
             let task = Task<UserTurnSubmissionResult, Never> { @MainActor [self] in
                 defer { if ownsClaim { releaseComposerSubmitClaim(claim) } }
+                #if DEBUG
+                    await test_beforeProviderSwitchScheduledAdmission?(session)
+                #endif
+                guard session.isCodexComputerUseArmed == computerUseArmedAtComposition else {
+                    return .blocked(message: Self.staleComposerSubmitTargetMessage)
+                }
                 guard sessions[tabID] === session, session.currentRestorationBindingToken == capturedBinding,
                       session.pendingHandoff == capturedHandoff else { return .blocked(message: Self.staleComposerSubmitTargetMessage) }
                 let admission = await providerSwitchSendAdmission(
@@ -19776,7 +19797,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             crossSessionAttribution: managedTurn?.attribution,
             dispatchedProviderText: managedTurn != nil ? wrappedText : nil
         )
-        let acceptedSwitchPreparation = providerSwitchPreparation?.accepting(userItem.id)
+        let acceptedSwitchPreparation = providerSwitchPreparation?.accepting(userItem.id, session: session)
         let turnRuntimeAnchorRollback = recordAgentTurnUserAnchor(for: session, userItem: userItem)
         session.appendItem(userItem)
         // Only the validated composer ingress supplies this positive token. Shared MCP/API
@@ -20528,11 +20549,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     private func resolvedNativeSlashCommand(
         in text: String,
-        session: TabSession
+        session: TabSession,
+        destination: AgentProviderKind? = nil
     ) -> ResolvedNativeSlashCommand? {
-        guard let token = Self.extractSlashSkillTokens(from: text).first,
+        guard (destination ?? session.selectedAgent) == .codexExec,
+              let token = Self.extractSlashSkillTokens(from: text).first,
               !token.name.lowercased().hasPrefix("skill:"),
-              let command = codexCoordinator.nativeSlashCommand(named: token.name, session: session)
+              let command = CodexAgentModeCoordinator.NativeSlashCommand(rawValue: token.name.lowercased())
         else {
             return nil
         }
@@ -20540,6 +20563,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             .substring(with: token.argumentsRange)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return ResolvedNativeSlashCommand(command: command, token: token, argumentsText: argumentsText)
+    }
+
+    func composeProviderSwitchPreviewDraft(_ composition: ProviderSwitchComposition, destination: AgentProviderKind, session: TabSession) -> String {
+        let invocation = resolvedNativeSlashCommand(in: composition.draft, session: session, destination: destination)
+        let native = invocation.flatMap { $0.command.behavior == .userTurnWrapper ? prepareNativeSlashPreparedUserTurn($0) : nil }
+        return composeOrdinaryUserTurnText(
+            native?.providerText ?? composition.draft,
+            computerUseArmed: native == nil && composition.computerUseArmed,
+            includesInterview: native == nil && composition.includesInterview,
+            workflow: composition.workflow, includeBuiltInCleanupGuidance: composition.includeCleanupGuidance
+        )
     }
 
     private func prepareNativeSlashPreparedUserTurn(
@@ -21234,7 +21268,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session: TabSession? = nil,
         ignoresPendingHandoff: Bool = false
     ) async -> String {
-        let effectiveAgent = session?.selectedAgent ?? agent ?? activeSession?.selectedAgent ?? selectedAgent
+        let effectiveAgent = agent ?? session?.selectedAgent ?? activeSession?.selectedAgent ?? selectedAgent
         let withSkillExpansion = await expandSlashSkillInvocationIfNeeded(text, agentKind: effectiveAgent)
         let lookupContext: WorkspaceLookupContext = if let session {
             await agentWorkspaceLookupContext(tabID: session.tabID, session: session)
@@ -21518,7 +21552,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             session = self.session(for: tabID)
         }
         if session.pendingHandoff.providerSwitchDelivery != nil, providerSwitchPreparation == nil {
-            let message = AgentSessionLinkSendFailure.providerSwitchUnconfirmed.message
+            let message = Self.providerSwitchStartRefusal(session).message
             startOutcome?.recordStartFailure(message: message)
             return .failed(message: message)
         }
@@ -21627,8 +21661,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if session.pendingHandoff.providerSwitchDelivery != nil {
             switchMessages = await prepareProviderSwitchHandoverForSend(providerSwitchPreparation, session: session, stopFence: stopFence)
             guard switchMessages != nil else {
-                startOutcome?.recordStartFailure(message: AgentSessionLinkSendFailure.providerSwitchUnconfirmed.message)
-                return .failed(message: AgentSessionLinkSendFailure.providerSwitchUnconfirmed.message)
+                let message = Self.providerSwitchStartRefusal(session).message
+                startOutcome?.recordStartFailure(message: message)
+                return .failed(message: message)
             }
         } else {
             switchMessages = nil
@@ -21675,7 +21710,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
 
         #if DEBUG
-            if providerSwitchPreparation != nil, let test_providerSwitchStart {
+            if let test_providerSwitchStart {
                 await test_providerSwitchStart(session, augmentedInitialMessage, initialMessageForRun)
                 startOutcome?.recordAccepted()
                 return nil

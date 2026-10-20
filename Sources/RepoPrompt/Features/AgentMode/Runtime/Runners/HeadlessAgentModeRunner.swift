@@ -187,7 +187,6 @@ final class HeadlessAgentModeRunner {
         localComposerCandidate: UUID?
     ) async {
         let isPeriodic = session.oversight.pendingAutoWake?.isPeriodic == true
-        let carriesSwitchHandoff = session.pendingHandoff.providerSwitchDelivery != nil && session.pendingHandoff.isStagedForSend
         var providerInitializationCompleted = false
         let report = await DomainAgentRunExecutionCore.execute(
             failureText: { "Agent failed: \($0.localizedDescription)" }
@@ -234,7 +233,7 @@ final class HeadlessAgentModeRunner {
             session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained)
             providerInitializationCompleted = true
             await lease.providerInitializationCompleted(provider: session.selectedAgent.rawValue, outcome: "ready")
-            if !isPeriodic || carriesSwitchHandoff { hooks.providerInput.recordPendingHandoffSendOutcome(session, true) }
+            if !isPeriodic { hooks.providerInput.recordPendingHandoffSendOutcome(session, true) }
             hooks.attachments.stageConsumedAttachmentFilesForDeferredCleanup(attachments, session)
             hooks.attachments.markAttachmentsConsumed(session, attachmentReservationID)
             _ = await lease.releaseWhenRouted()
@@ -280,7 +279,7 @@ final class HeadlessAgentModeRunner {
             if !providerInitializationCompleted {
                 await lease.providerInitializationCompleted(provider: session.selectedAgent.rawValue, outcome: "cancelled")
             }
-            if !isPeriodic || carriesSwitchHandoff { hooks.providerInput.recordPendingHandoffSendOutcome(session, false) }
+            if !isPeriodic { hooks.providerInput.recordPendingHandoffSendOutcome(session, false) }
             terminalState = .cancelled
             source = "headless.cancelled"
             notifyTurnComplete = false
@@ -289,7 +288,7 @@ final class HeadlessAgentModeRunner {
             if !providerInitializationCompleted {
                 await lease.providerInitializationCompleted(provider: session.selectedAgent.rawValue, outcome: "failed")
             }
-            if !isPeriodic || carriesSwitchHandoff { hooks.providerInput.recordPendingHandoffSendOutcome(session, false) }
+            if !isPeriodic { hooks.providerInput.recordPendingHandoffSendOutcome(session, false) }
             terminalState = .failed
             source = "headless.failed"
             notifyTurnComplete = false

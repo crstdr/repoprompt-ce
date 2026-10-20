@@ -38,7 +38,8 @@ extension AgentModeViewModel {
             bindingTransitionInProgress: session.bindingTransitionInProgress,
             isClosing: isClosing,
             endpointMatchesGrant: endpointMatchesGrant,
-            runStateIsActive: session.runState.isActive,
+            runStateIsActive: session.runState.isActive
+                || (!ignoresComposerSubmissionInFlight && providerSwitchHasOwnedCarryingAttempt(session)),
             terminalCommitInProgress: session.terminalCommitInProgress,
             mcpFollowUpRunPending: session.mcpFollowUpRunPending,
             isComposerSubmissionInFlight: ignoresComposerSubmissionInFlight
@@ -176,8 +177,11 @@ extension AgentModeViewModel {
             return .blocked(commit.refusal)
         }
 
-        // The authorization hop cannot bless text composed under a different arming state.
-        guard session.isCodexComputerUseArmed == computerUseArmedAtAdmission else {
+        // Only a switch carries admission evidence across authorization. Ordinary SEND keeps its
+        // existing postauthorization composition behavior in persistAndStartNoncomposerTurn.
+        if session.pendingHandoff.providerSwitchDelivery != nil,
+           session.isCodexComputerUseArmed != computerUseArmedAtAdmission
+        {
             releaseComposerSubmitClaim(claim)
             return .blocked(.endpointPostReadiness)
         }
@@ -313,6 +317,7 @@ extension AgentModeViewModel {
             crossSessionAttribution: attribution
         )
         let anchorRollback = recordAgentTurnUserAnchor(for: liveSession, userItem: userItem)
+        switchPreparation = switchPreparation?.accepting(userItem.id, session: liveSession)
         liveSession.appendItem(userItem)
         updateBindingsFromSession(liveSession)
         requestUIRefresh(tabID: tabID, urgent: true)
@@ -340,7 +345,7 @@ extension AgentModeViewModel {
         return await startPersistedNoncomposerTurn(
             session: liveSession, tabID: tabID, claim: claim, savedItemID: userItem.id,
             acceptedAt: Date(), providerMessage: providerMessage, stopFence: stopFence,
-            providerSwitchPreparation: switchPreparation?.accepting(userItem.id),
+            providerSwitchPreparation: switchPreparation,
             dispatchIsCurrent: dispatchIsCurrent
         )
     }
@@ -394,10 +399,9 @@ extension AgentModeViewModel {
         //    template in front, so that guarantee narrows to exactly the one a local workflow turn
         //    already has — `submitUserTurn` wraps before `startAgentRun` too — and never weakens to
         //    a sender-controlled string, because the sender's words stay inside `<message>`.
-        //    `.crossSessionDelivery`
-        //    additionally leaves any staged handoff untouched, so the target's next *local* send
-        //    still receives the continuity it was staged for. Nothing focuses, activates, or
-        //    switches the target window.
+        //    `.crossSessionDelivery` leaves legacy staged handoffs for the next local input;
+        //    an admitted provider-switch carrier instead accompanies this attributed input.
+        //    Nothing focuses, activates, or switches the target window.
         // Local arming authorizes this tab's turns, including attributed remote input.
         let dispatchedProviderMessage = providerSwitchPreparation?.augmentedInput
             ?? (
