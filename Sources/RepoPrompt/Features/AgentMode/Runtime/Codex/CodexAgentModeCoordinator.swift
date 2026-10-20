@@ -8362,6 +8362,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                                   isSelfNote || viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) == true
                             else { throw CancellationError() }
                         }
+                        // Read proof can suspend after acquisition. Assert the same frozen switch
+                        // evidence again at this final synchronous release fence, never re-fit it.
+                        guard viewModel?.providerSwitchAcquirePhysicalDispatch(session: session, dispatchID: promptDispatchID)
+                            ?? (session.pendingHandoff.providerSwitchDelivery == nil)
+                        else { throw CancellationError() }
                         // A parked note remains unattempted throughout optional Read proof.
                         // Claim it before synchronous frontier consumption, with no intervening await.
                         if let noteDispatchID {

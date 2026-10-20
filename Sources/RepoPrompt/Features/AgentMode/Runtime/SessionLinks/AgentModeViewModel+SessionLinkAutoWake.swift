@@ -631,7 +631,7 @@ extension AgentModeViewModel {
                 let switchPreparation: ProviderSwitchSendPreparation?
                 switch await providerSwitchSendAdmission(
                     session: session, input: "", skipsAugmentation: true,
-                    supplementalInput: reservedClaim.fragment,
+                    supplementalInput: reservedClaim.fragment, autoWakeID: wakeID,
                     isCurrent: { self.agentSessionLinkAutoWakeSession(for: endpoint) === session
                         && session.oversight.pendingAutoWake?.wakeID == wakeID
                         && self.agentSessionLinkAutoWakeRoute(session) == .idleFollowUp

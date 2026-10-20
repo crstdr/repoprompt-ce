@@ -1027,6 +1027,80 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         MonitorSupplementAssertions.assertNotPersisted(in: fixture.session)
     }
 
+    func testProviderSwitchNativeReadProofRechecksFrozenCompositionBeforeTransport() async throws {
+        for drift in [false, true] {
+            let fixture = try makeFixture()
+            await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
+            let session = fixture.session
+            let vm = fixture.viewModel
+            let input = try await AgentSessionLinkTransportLocalInputFixture.install(on: vm, session: session)
+            addTeardownBlock { @MainActor in await input.cleanup() }
+            await input.correction("SWITCH-READ-PROOF-CORRECTION")
+            let request = AgentChatItem.user("retained source history", sequenceIndex: 0)
+            let turn = AgentTranscriptTurn(request: .init(from: request), responseSpans: [], conclusionActivityID: nil, terminalState: .completed, startedAt: request.timestamp, completedAt: request.timestamp)
+            let projection = try AgentProviderHandover.project(AgentTranscript(turns: [turn]))
+            let source = try AgentProviderHandover.Source(provider: "source", model: "source-model")
+            let payload = AgentProviderHandover.render(AgentProviderHandover.history(projection, source: source, historyReference: nil))
+            session.pendingHandoff = .init(payload: payload, createdAt: Date(), providerSwitchDelivery: .ready)
+            vm.test_setAgentSessionSaver { _, _, _ in FileManager.default.temporaryDirectory.appendingPathComponent("switch-read-proof-\(UUID()).json") }
+            guard case let .success(.some(preparation)) = await vm.providerSwitchSendAdmission(session: session, input: "ordinary switched input") else {
+                return XCTFail("Fitting carrier must admit before native acquisition")
+            }
+            let messages = await vm.prepareProviderSwitchHandoverForSend(preparation, session: session, stopFence: .init(session: session))
+            let text = try XCTUnwrap(messages?.initial)
+            session.beginRunAttempt(source: "test.switch.nativeReadFence")
+            let gate = TestReleaseFence(name: "switched Codex optional Read proof")
+            vm.test_agentSessionLinkLocalInputReadProof = { decoration in
+                let valid = await input.bridge.proveLocalInputRead(decoration, observer: input.observer)
+                XCTAssertTrue(valid, "The existing real Read authority must pass, not cause the refusal")
+                await gate.enterAndWait()
+                return valid
+            }
+            let send = Task { @MainActor in
+                await fixture.coordinator.sendCodexNativeMessage(session: session, text: text, attachments: [])
+            }
+            defer { gate.release()
+                send.cancel()
+                vm.test_agentSessionLinkLocalInputReadProof = nil
+            }
+            let entered = await gate.waitUntilEntered()
+            XCTAssertTrue(entered)
+            let proof = try XCTUnwrap(session.pendingHandoff.providerSwitchDispatch)
+            XCTAssertNotNil(proof.dispatchID, "The actual native coordinator must have acquired before Read proof waits")
+            XCTAssertNotNil(proof.runOwnership)
+            XCTAssertTrue(fixture.startedTurns.isEmpty)
+            let route = try XCTUnwrap(vm.agentSessionLinkRunCatalogProjectionByEndpoint[input.observer]?.routeToken)
+            let instructions = vm.providerSwitchInstructionStrings(session)
+            if drift {
+                let inventory = try XCTUnwrap(input.host.publishedPromptInventories[input.observer.sessionID])
+                vm.agentSessionLinkPublishPromptInventory(.init(
+                    observerSessionID: inventory.observerSessionID, linkSetRevision: inventory.linkSetRevision + 1,
+                    items: inventory.items + [.init(targetSessionID: UUID(), displayName: "Additional same-route lane", capabilityNames: ["poll", "read", "send_when_idle", "wait"])]
+                ), to: input.observer)
+                XCTAssertNotEqual(vm.providerSwitchInstructionStrings(session), instructions)
+            }
+            XCTAssertEqual(vm.agentSessionLinkRunCatalogProjectionByEndpoint[input.observer]?.routeToken, route, "Supplement drift must not invalidate the route instead")
+            XCTAssertEqual(session.pendingHandoff.providerSwitchDispatch, proof, "Admitted evidence must never refresh")
+            gate.release()
+            let outcome = await send.value
+            if drift {
+                XCTAssertFalse(outcome.didSend)
+                XCTAssertTrue(fixture.startedTurns.isEmpty, "No controller transport may follow postacquisition composition drift")
+                XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .sending)
+                XCTAssertEqual(session.pendingHandoff.payload, payload)
+                XCTAssertFalse(session.items.contains { $0.recoveryDiagnostic?.outcome == "sent" })
+            } else {
+                XCTAssertEqual(outcome, .sent)
+                XCTAssertEqual(fixture.startedTurns.count, 1)
+                XCTAssertTrue(try XCTUnwrap(fixture.startedTurns.first).contains("SWITCH-READ-PROOF-CORRECTION"))
+                XCTAssertEqual(session.pendingHandoff, .init())
+                XCTAssertEqual(session.items.count(where: { $0.recoveryDiagnostic?.reason == "providerSwitch" && $0.recoveryDiagnostic?.outcome == "sent" }), 1)
+                try input.assertConsumed()
+            }
+            vm.test_agentSessionLinkLocalInputReadProof = nil
+        }
+    }
+
     func testLocalInputCodexExpectedTurnRetryUsesBaselineWithoutHarvestingNewCorrection() async throws {
         let fixture = try makeFixture()
         await fixture.inventory.publishCodex(revision: 1, targetCount: 1)

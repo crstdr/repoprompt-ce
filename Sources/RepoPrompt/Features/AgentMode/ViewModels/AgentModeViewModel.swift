@@ -20571,7 +20571,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return composeOrdinaryUserTurnText(
             native?.providerText ?? composition.draft,
             computerUseArmed: native == nil && composition.computerUseArmed,
-            includesInterview: native == nil && composition.includesInterview,
+            includesInterview: composition.includesInterview,
             workflow: composition.workflow, includeBuiltInCleanupGuidance: composition.includeCleanupGuidance
         )
     }

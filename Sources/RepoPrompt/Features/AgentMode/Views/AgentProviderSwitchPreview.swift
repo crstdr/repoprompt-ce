@@ -19,16 +19,10 @@ struct AgentProviderSwitchPresentation: View {
                     }
                     HStack {
                         Button("Review") {
-                            Task {
-                                guard viewModel.sessions[session.tabID] === session else { return }
-                                await viewModel.openProviderSwitchPreview(agent: session.selectedAgent, model: session.selectedModelRaw, tabID: session.tabID)
-                            }
+                            viewModel.requestProviderSwitchBannerAction(for: session, discard: false)
                         }
                         Button("Discard handover") {
-                            Task {
-                                guard viewModel.sessions[session.tabID] === session else { return }
-                                await viewModel.discardProviderSwitchHandover(tabID: session.tabID)
-                            }
+                            viewModel.requestProviderSwitchBannerAction(for: session, discard: true)
                         }
                     }
                     .disabled(viewModel.providerSwitchMutation != nil)

@@ -698,6 +698,7 @@ extension AgentModeViewModel {
         let admission: ProviderSwitchAdmissionEvidence
         let acceptedInputID: UUID?
         let composerAttemptID: UUID?
+        let autoWakeID: UUID?
         let stopFence: AgentRunStartStopFence
         /// Value identities only: never retains a task, session, controller, or terminal resource.
         let runOwnership: AgentRunOwnership?
@@ -710,6 +711,7 @@ extension AgentModeViewModel {
                 admission: admission,
                 acceptedInputID: acceptedInputID,
                 composerAttemptID: composerAttemptID,
+                autoWakeID: autoWakeID,
                 stopFence: stopFence,
                 runOwnership: runOwnership,
                 runID: runID
@@ -730,6 +732,7 @@ extension AgentModeViewModel {
                 admission: admission,
                 acceptedInputID: acceptedInputID,
                 composerAttemptID: composerAttemptID,
+                autoWakeID: autoWakeID,
                 stopFence: stopFence,
                 runOwnership: ownership,
                 runID: nil

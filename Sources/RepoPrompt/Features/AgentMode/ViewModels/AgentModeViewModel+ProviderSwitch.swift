@@ -19,6 +19,7 @@ extension AgentModeViewModel {
         let computerUseArmed: Bool
         let catalogWindow: Int?
         let composerAttemptID: UUID?
+        let autoWakeID: UUID?
         let stopFence: AgentRunStartStopFence
         var acceptedInputID: UUID?
 
@@ -40,6 +41,7 @@ extension AgentModeViewModel {
                 admission: .init(self),
                 acceptedInputID: acceptedInputID,
                 composerAttemptID: composerAttemptID,
+                autoWakeID: autoWakeID,
                 stopFence: stopFence,
                 runOwnership: nil,
                 runID: nil
@@ -86,6 +88,7 @@ extension AgentModeViewModel {
         skipsAugmentation: Bool = false,
         inputAlreadyIncludesSupplement: Bool = false,
         supplementalInput: String? = nil,
+        autoWakeID: UUID? = nil,
         isCurrent: @MainActor () -> Bool = { !Task.isCancelled }
     ) async -> Result<ProviderSwitchSendPreparation?, AgentSessionLinkSendFailure> {
         guard let delivery = session.pendingHandoff.providerSwitchDelivery else { return .success(nil) }
@@ -146,7 +149,7 @@ extension AgentModeViewModel {
             augmentedInput: augmented, initialThreadInput: initial, instructions: instructions,
             inputAlreadyIncludesSupplement: inputAlreadyIncludesSupplement,
             historyToolAllowed: historyAllowed, computerUseArmed: computerUseArmed,
-            catalogWindow: catalogWindow, composerAttemptID: composerAttemptID, stopFence: stopFence
+            catalogWindow: catalogWindow, composerAttemptID: composerAttemptID, autoWakeID: autoWakeID, stopFence: stopFence
         ))
     }
 
@@ -198,6 +201,10 @@ extension AgentModeViewModel {
         if let ownership = proof.runOwnership {
             return session.isCurrentRunAttempt(ownership, expectedRunID: proof.runID)
         }
+        if let wakeID = proof.autoWakeID, let attempt = session.oversight.pendingAutoWake,
+           attempt.wakeID == wakeID, !attempt.isPeriodic, attempt.phase == .preparingDispatch,
+           attempt.physicalOutcome == .notAttempted
+        { return true }
         if let claimID = proof.composerAttemptID, session.activeComposerSubmitAttempt?.id == claimID { return true }
         if let inputID = proof.acceptedInputID {
             return session.hasLocalComposerCandidate(itemID: inputID, fence: proof.stopFence)
@@ -672,6 +679,26 @@ extension AgentModeViewModel {
         return true
     }
 
+    /// Capture banner intent before its task hop; a later binding or slot is not the clicked chat.
+    @discardableResult
+    func requestProviderSwitchBannerAction(for session: TabSession, discard: Bool) -> Task<Bool, Never>? {
+        guard sessions[session.tabID] === session, providerSwitchMutation == nil,
+              session.pendingHandoff.providerSwitchDelivery != nil else { return nil }
+        let binding = session.currentRestorationBindingToken
+        let workspaceID = workspaceManager?.activeWorkspaceID
+        let handoff = session.pendingHandoff
+        let agent = session.selectedAgent
+        let model = session.selectedModelRaw
+        return Task { @MainActor [weak self] in
+            guard let self, sessions[session.tabID] === session,
+                  session.currentRestorationBindingToken == binding,
+                  workspaceManager?.activeWorkspaceID == workspaceID,
+                  session.pendingHandoff == handoff else { return false }
+            if discard { return await discardProviderSwitchHandover(tabID: session.tabID) }
+            return await openProviderSwitchPreview(agent: agent, model: model, tabID: session.tabID) != nil
+        }
+    }
+
     @discardableResult
     func openProviderSwitchPreview(agent: AgentProviderKind, model: String, tabID: UUID, updated: Bool = false, cursorParameterIntent: ProviderSwitchCursorParameterIntent? = nil, retainingSummary: ProviderSwitchGeneratedSummary? = nil) async -> UUID? {
         guard providerSwitchMutation == nil, let session = sessions[tabID] else { return nil }
@@ -908,6 +935,11 @@ extension AgentModeViewModel {
             }
             let composition = providerSwitchComposition(preview.session, destination: preview.destination)
             let canRetain = preview.session.sourceItemsRevision == preview.sourceRevision
+                && preview.session.selectedAgent == preview.sourceAgent
+                && preview.session.selectedModelRaw == preview.sourceModel
+                && preview.session.selectedReasoningEffortRaw == preview.sourceReasoningEffort
+                && preview.session.selectedClaudeEffortRaw == preview.sourceClaudeEffort
+                && preview.session.acpModelParameterSelections == preview.sourceParameters
                 && composition.computerUseArmed == preview.composition.computerUseArmed
                 && composition.includesInterview == preview.composition.includesInterview
                 && composition.interviewPreference == preview.composition.interviewPreference
