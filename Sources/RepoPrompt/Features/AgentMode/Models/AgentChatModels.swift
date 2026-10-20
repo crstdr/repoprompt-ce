@@ -252,7 +252,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
     /// retention drops the row.
     public var recoveryDiagnostic: AgentTranscriptRecoveryDiagnostic?
 
-    /// W0 feasibility carrier only; no production certification writer is installed.
+    /// Host-certified membership of this exact source row. Never inferred from model text.
     public var quietCheckInWakeID: UUID?
 
     public init(
@@ -579,7 +579,7 @@ extension AgentChatItem {
             crossSessionAttribution: crossSessionAttribution,
             dispatchedProviderText: dispatchedProviderText,
             laneUpdateDisplayAttribution: laneUpdateDisplayAttribution,
-            quietCheckInWakeID: quietCheckInWakeID
+            quietCheckInWakeID: newID == id ? quietCheckInWakeID : nil
         )
     }
 }
@@ -636,7 +636,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
     /// Typed recovery record for a `.system` recovery notice row; bounded, payload-free.
     public var recoveryDiagnostic: AgentTranscriptRecoveryDiagnostic?
 
-    /// W0 feasibility carrier only; no production certification writer is installed.
+    /// Host-certified membership of this exact source row. Never inferred from model text.
     public var quietCheckInWakeID: UUID?
 
     public init(from item: AgentChatItem, sanitizeToolResults: Bool = true) {

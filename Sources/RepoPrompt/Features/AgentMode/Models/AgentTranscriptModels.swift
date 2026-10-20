@@ -554,7 +554,7 @@ struct AgentTranscriptFullRenderGroupedHistoryCache: Equatable {
     let summary: AgentTranscriptGroupedHistorySummary
 }
 
-/// W0 feasibility carriers. They use the existing bounded summaries, never retained source arrays.
+/// Local-only formatter inputs. Reuse the existing bounded summaries, never retained source arrays.
 public struct AgentTranscriptQuietLocalTurn: Codable, Sendable, Equatable {
     public var summary: AgentTranscriptTurnSummary?
     public var conclusionActivityID: UUID?
@@ -563,6 +563,26 @@ public struct AgentTranscriptQuietLocalTurn: Codable, Sendable, Equatable {
 
 public struct AgentTranscriptQuietLocalSpan: Codable, Sendable, Equatable {
     public var collapsedSummary: AgentTranscriptGroupedHistorySummary?
+
+    public init(collapsedSummary: AgentTranscriptGroupedHistorySummary?) {
+        self.collapsedSummary = collapsedSummary
+    }
+
+    private enum CodingKeys: String, CodingKey { case collapsedSummary }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        // An explicit null is a valid empty local span; a missing field is not proof.
+        guard container.contains(.collapsedSummary) else {
+            throw DecodingError.keyNotFound(CodingKeys.collapsedSummary, .init(codingPath: decoder.codingPath, debugDescription: "Missing local summary"))
+        }
+        collapsedSummary = try container.decodeIfPresent(AgentTranscriptGroupedHistorySummary.self, forKey: .collapsedSummary)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(collapsedSummary, forKey: .collapsedSummary)
+    }
 }
 
 public struct AgentTranscriptProviderResponseSpan: Codable, Identifiable, Sendable, Equatable {

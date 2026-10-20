@@ -1109,9 +1109,12 @@ final class AgentQuietRetainedViewFeasibilityTests: XCTestCase {
                         XCTAssertTrue(session.terminalCommitInProgress)
                         AgentTranscriptIO.test_installQuietLocalBaseline(ordinaryBaseline, in: &session.transcript)
                         let revision = session.sourceItemsRevision
+                        let oldSaveToken = try! XCTUnwrap(vm.test_saveCommitToken(for: session, workspaceID: workspace.id))
+                        XCTAssertTrue(vm.test_isSaveCommitTokenCurrent(oldSaveToken))
                         let activityAt = session.lastActivityAt
                         XCTAssertTrue(session.test_stampQuietMetadata(range: range, expectedIDs: expectedIDs, wakeID: self.id(900)))
                         XCTAssertEqual(session.sourceItemsRevision, revision + 1)
+                        XCTAssertFalse(vm.test_isSaveCommitTokenCurrent(oldSaveToken), "Pre-stamp preparation cannot authorize the certified source revision")
                         XCTAssertEqual(session.lastActivityAt, activityAt)
                         XCTAssertEqual(session.test_quietMetadataVisitedItems, range.count * 2)
                     }
@@ -1333,6 +1336,390 @@ final class AgentQuietRetainedViewFeasibilityTests: XCTestCase {
         XCTAssertTrue(after.projection.workingRows.contains { $0.id == baseline.conclusionActivityID })
         let audit = AgentTranscriptProjectionBuilder.buildWithCaches(from: completed, turnCaches: after.updatedTurnCaches)
         XCTAssertTrue(audit.projection.workingRows.contains { $0.text == "Quiet closing 2000" }, "A local cache cannot be reused for canonical audit/export")
+    }
+
+    func testW1AtomicMembershipAndPreStampCheckpointFailVisible() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("quiet-w1-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let workspace = WorkspaceModel(name: "Quiet proof", repoPaths: [], customStoragePath: directory)
+        let service = AgentSessionDataService()
+        let session = AgentTabSession(tabID: id(999))
+        let ordinary = ordinaryRows(base: 0, toolCount: 2)
+        session.setItemsSilently(ordinary, reason: .persistedSessionHydration)
+        session.transcript = AgentTranscriptIO.buildTranscript(from: session.items, terminalState: .completed)
+        let turn = try XCTUnwrap(session.transcript.turns.last)
+        let baseline = AgentTranscriptQuietLocalTurn(summary: nil, conclusionActivityID: turn.conclusionActivityID, completedAt: turn.completedAt)
+        let quiet = quietRows(base: 100, wakeID: id(900)).map { item in
+            var item = item
+            item.quietCheckInWakeID = nil
+            return item
+        }
+        session.appendItem(quiet[0])
+        session.appendItem(row(150, kind: .system, text: "Foreign host marker"))
+        quiet.dropFirst().forEach(session.appendItem)
+        session.transcript = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(
+            existingTranscript: session.transcript, workingItems: session.items, terminalState: .completed
+        )
+        let checkpoint = AgentSession(id: id(990), workspaceID: workspace.id, composeTabID: session.tabID, name: "Checkpoint", transcript: session.transcript)
+        let url = try await service.saveAgentSession(checkpoint, for: workspace)
+        let loadedCheckpoint = try await service.loadAgentSession(from: url)
+        let before = try XCTUnwrap(loadedCheckpoint.transcript)
+        XCTAssertTrue(AgentTranscriptProjectionBuilder.build(from: before, excludingQuiet: true).workingRows.contains { $0.toolName == "self_noop" })
+        XCTAssertTrue(before.allActivities.allSatisfy { $0.quietCheckInWakeID == nil })
+
+        let members = session.items.enumerated().filter { quiet.map(\.id).contains($0.element.id) }.map { (index: $0.offset, id: $0.element.id) }
+        let revision = session.sourceItemsRevision
+        let activityAt = session.lastActivityAt
+        let stampWakeID = id(900)
+        var publishedStampCounts: [Int] = []
+        let subscription = session.$items.dropFirst().sink { source in
+            publishedStampCounts.append(source.count { $0.quietCheckInWakeID == stampWakeID })
+        }
+        defer { subscription.cancel() }
+        var callbacks = 0
+        session.onSourceItemsChanged = { source, mutation in
+            callbacks += 1
+            XCTAssertEqual(mutation.changedIndexRange, members.first!.index ... members.last!.index)
+            XCTAssertFalse(mutation.isStructural)
+            XCTAssertEqual(source.sourceItemsRevision, revision + 1)
+            XCTAssertEqual(source.transcript.turns.last?.quietLocal, baseline)
+            XCTAssertEqual(source.items.filter { $0.quietCheckInWakeID == self.id(900) }.map(\.id), quiet.map(\.id))
+            XCTAssertNil(source.derivedTranscriptSyncState)
+        }
+        for bad in [members + [members[0]], [(index: members[0].index, id: id(9999))], [(index: 0, id: ordinary[0].id)]] {
+            XCTAssertFalse(session.stampQuietCheckInMembers(bad, wakeID: id(900), turnID: turn.id, baseline: baseline, expectedSourceRevision: revision))
+            XCTAssertTrue(session.items.allSatisfy { $0.quietCheckInWakeID == nil })
+            XCTAssertNil(session.transcript.turns.last?.quietLocal)
+        }
+        XCTAssertFalse(session.stampQuietCheckInMembers(members, wakeID: id(900), turnID: turn.id, baseline: baseline, expectedSourceRevision: revision - 1))
+        XCTAssertEqual(callbacks, 0)
+        XCTAssertTrue(session.stampQuietCheckInMembers(members, wakeID: id(900), turnID: turn.id, baseline: baseline, expectedSourceRevision: revision))
+        XCTAssertEqual(callbacks, 1)
+        XCTAssertEqual(publishedStampCounts, [members.count], "Subscribers must never receive a half-stamped source batch")
+        XCTAssertEqual(session.lastActivityAt, activityAt)
+        session.onSourceItemsChanged = nil
+        session.transcript = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(existingTranscript: session.transcript, workingItems: session.items, earliestChangedIndex: members[0].index, terminalState: .completed)
+        var certified = checkpoint
+        certified.transcript = session.transcript
+        let certifiedURL = try await service.saveAgentSession(certified, for: workspace)
+        let loadedCertified = try await service.loadAgentSession(from: certifiedURL)
+        let restored = try XCTUnwrap(loadedCertified.transcript)
+        XCTAssertEqual(restored.allActivities.filter { $0.quietCheckInWakeID == id(900) }.map(\.id), quiet.map(\.id))
+        let local = AgentTranscriptProjectionBuilder.build(from: restored, excludingQuiet: true)
+        XCTAssertFalse(local.workingRows.contains { $0.toolName == "self_noop" || $0.text == "Quiet closing 100" })
+        XCTAssertTrue(local.workingRows.contains { $0.text == "Foreign host marker" }, "Noncontiguous membership never swallows a foreign marker")
+        XCTAssertEqual(AgentTranscriptIO.latestAssistantPreviewText(from: restored), "Quiet closing 100")
+        XCTAssertTrue(try AgentTranscriptIO.buildHandoffTranscriptItems(from: restored, upToRowID: XCTUnwrap(quiet.last?.id)).contains { $0.text == "Quiet closing 100" })
+    }
+
+    func testW1ChangedSourceInvalidatesButRetentionCopiesPreserveMembership() throws {
+        for operation in ["replace", "mutate", "last", "batch", "direct", "repair"] {
+            let session = AgentTabSession(tabID: id(999))
+            let ordinary = ordinaryRows(base: 0, toolCount: 2)
+            let quiet = quietRows(base: 100, wakeID: id(900))
+            session.setItemsSilently(ordinary + quiet, reason: .persistedSessionHydration)
+            session.transcript = AgentTranscriptIO.buildTranscript(from: session.items, terminalState: .completed)
+            let baseline = try XCTUnwrap(AgentTranscriptIO.buildTranscript(from: ordinary, terminalState: .completed).turns.first)
+            AgentTranscriptIO.test_installQuietLocalBaseline(baseline, in: &session.transcript)
+            let index = session.items.count - 1
+            let original = session.items[index]
+            session.setItemsSilentlyForRetentionCompaction(session.items)
+            XCTAssertEqual(session.items[index].quietCheckInWakeID, id(900))
+            var changed = original
+            changed.text = String(repeating: "Later ordinary material. ", count: 12)
+            switch operation {
+            case "replace": session.replaceItem(at: index, with: changed)
+            case "mutate": session.mutateItem(at: index) { $0.text = changed.text }
+            case "last": session.updateLastItem { $0.text = changed.text }
+            case "batch": session.mutateItemsBatch { $0[index] = changed }
+            case "direct": session.items[index] = changed
+            default: session.setItemsSilently(Array(session.items.dropLast()) + [changed], reason: .pendingToolFinalizationRepair)
+            }
+            XCTAssertNil(session.items[index].quietCheckInWakeID, operation)
+            XCTAssertEqual(session.items[index - 1].quietCheckInWakeID, id(900), "Unchanged sibling remains certified")
+            let rebuilt = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(existingTranscript: session.transcript, workingItems: session.items, earliestChangedIndex: index, terminalState: .completed)
+            let local = AgentTranscriptProjectionBuilder.build(from: rebuilt, excludingQuiet: true)
+            XCTAssertTrue(local.workingRows.contains { $0.id == original.id && $0.text == changed.text }, operation)
+            XCTAssertFalse(local.workingRows.contains { $0.toolName == "self_noop" }, operation)
+            XCTAssertEqual(rebuilt.turns.last?.quietLocal?.conclusionActivityID, original.id)
+        }
+        let stamped = quietRows(base: 100, wakeID: id(900))[0]
+        XCTAssertEqual(stamped.replacingID(stamped.id).quietCheckInWakeID, id(900))
+        XCTAssertNil(stamped.replacingID(id(9999)).quietCheckInWakeID)
+        var reused = stamped
+        reused.text = "Reused identity"
+        let repaired = AgentSourceItemIDRepair.repairDuplicateIDs(in: [stamped, reused]).items
+        XCTAssertEqual(repaired[0].quietCheckInWakeID, id(900))
+        XCTAssertNil(repaired[1].quietCheckInWakeID)
+    }
+
+    func testW1ChangedHiddenRowEvictsExactTurnCacheEvenWhenValidationTokenIsUnchanged() throws {
+        for operation in ["mutate", "batch-rekey", "direct-rekey"] {
+            let session = AgentTabSession(tabID: id(999))
+            let ordinary = ordinaryRows(base: 0, toolCount: 2)
+            let later = row(200, kind: .assistant, text: String(repeating: "Later ordinary conclusion. ", count: 12))
+            let rows = ordinary + quietRows(base: 100, wakeID: id(900)) + [later]
+            session.setItemsSilently(rows, reason: .persistedSessionHydration)
+            session.transcript = AgentTranscriptIO.buildTranscript(from: rows, terminalState: .completed)
+            let baseline = try XCTUnwrap(AgentTranscriptIO.buildTranscript(from: ordinary + [later], terminalState: .completed).turns.first)
+            AgentTranscriptIO.test_installQuietLocalBaseline(baseline, in: &session.transcript)
+            let before = AgentTranscriptProjectionBuilder.buildWithCaches(from: session.transcript, turnCaches: [:], excludingQuiet: true)
+            session.fullTranscriptProjection = before.projection
+            session.baseTranscriptProjection = before.projection
+            session.turnProjectionCaches = before.updatedTurnCaches
+            let cached = try XCTUnwrap(session.turnProjectionCaches[baseline.id])
+            let changedIndex = try XCTUnwrap(session.items.firstIndex { $0.id == id(102) })
+            var changed = session.items[changedIndex]
+            changed.text = "New ordinary reasoning"
+            switch operation {
+            case "mutate": session.mutateItem(at: changedIndex) { $0 = changed }
+            case "batch-rekey": session.mutateItemsBatch { $0[changedIndex] = changed.replacingID(id(9999)) }
+            default: session.items[changedIndex] = changed.replacingID(id(9999))
+            }
+            XCTAssertNil(session.items[changedIndex].quietCheckInWakeID, operation)
+            XCTAssertNil(session.turnProjectionCaches[baseline.id], operation)
+            let rebuilt = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(existingTranscript: session.transcript, workingItems: session.items, earliestChangedIndex: changedIndex, terminalState: .completed)
+            XCTAssertEqual(cached.token, try AgentTranscriptProjectionBuilder.validationToken(for: XCTUnwrap(rebuilt.turns.first), excludingQuiet: true), "The ordinary cache token alone cannot detect changed hidden content")
+            let after = AgentTranscriptProjectionBuilder.buildWithCaches(from: rebuilt, turnCaches: session.turnProjectionCaches, excludingQuiet: true)
+            XCTAssertTrue(after.projection.workingRows.contains { $0.text == "New ordinary reasoning" }, operation)
+            XCTAssertFalse(before.projection.workingRows.contains { $0.id == id(102) })
+        }
+    }
+
+    func testW1OrdinaryWritesCannotRestoreRevokedCertificates() throws {
+        for operation in ["replace", "mutate", "last", "batch", "direct", "repair", "append", "batch-reinsert", "direct-reinsert"] {
+            let session = AgentTabSession(tabID: id(999))
+            let ordinary = ordinaryRows(base: 0, toolCount: 2)
+            session.setItemsSilently(ordinary + quietRows(base: 100, wakeID: id(900)), reason: .persistedSessionHydration)
+            session.transcript = AgentTranscriptIO.buildTranscript(from: session.items, terminalState: .completed)
+            let baseline = try XCTUnwrap(AgentTranscriptIO.buildTranscript(from: ordinary, terminalState: .completed).turns.first)
+            AgentTranscriptIO.test_installQuietLocalBaseline(baseline, in: &session.transcript)
+            let index = session.items.count - 1
+            var captured = session.items[index]
+            session.mutateItem(at: index) { $0.text = "First ordinary edit" }
+            XCTAssertNil(session.items[index].quietCheckInWakeID)
+            captured.text = String(repeating: "Changed captured ordinary content. ", count: 12)
+            switch operation {
+            case "replace": session.replaceItem(at: index, with: captured)
+            case "mutate": session.mutateItem(at: index) { $0 = captured }
+            case "last": session.updateLastItem { $0 = captured }
+            case "batch": session.mutateItemsBatch { $0[index] = captured }
+            case "direct": session.items[index] = captured
+            case "repair": session.setItemsSilently(Array(session.items.dropLast()) + [captured], reason: .pendingToolFinalizationRepair)
+            case "append":
+                session.removeItem(at: index)
+                session.appendItem(captured)
+            case "batch-reinsert":
+                session.removeItem(at: index)
+                session.mutateItemsBatch { $0.append(captured) }
+            default:
+                session.removeItem(at: index)
+                session.items.append(captured)
+            }
+            XCTAssertNil(session.items.last?.quietCheckInWakeID, operation)
+            XCTAssertEqual(session.items[index - 1].quietCheckInWakeID, id(900), "Unchanged sibling stays certified")
+            let rebuilt = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(existingTranscript: session.transcript, workingItems: session.items, terminalState: .completed)
+            let restored = try JSONDecoder().decode(AgentTranscript.self, from: JSONEncoder().encode(rebuilt))
+            for transcript in [rebuilt, restored] {
+                let local = AgentTranscriptProjectionBuilder.build(from: transcript, excludingQuiet: true)
+                XCTAssertTrue(local.workingRows.contains { $0.id == captured.id && $0.text == captured.text }, operation)
+                XCTAssertFalse(local.workingRows.contains { $0.toolName == "self_noop" }, operation)
+            }
+        }
+    }
+
+    func testW1SuccessfulStampEvictsUnchangedTokenTurnCache() throws {
+        let session = AgentTabSession(tabID: id(999))
+        let ordinary = ordinaryRows(base: 0, toolCount: 2)
+        let later = row(300, kind: .assistant, text: String(repeating: "Later ordinary conclusion. ", count: 12))
+        let unstamped = quietRows(base: 200, wakeID: id(901)).map { item in
+            var item = item
+            item.quietCheckInWakeID = nil
+            return item
+        }
+        session.setItemsSilently(ordinary + quietRows(base: 100, wakeID: id(900)) + unstamped + [later], reason: .persistedSessionHydration)
+        session.transcript = AgentTranscriptIO.buildTranscript(from: session.items, terminalState: .completed)
+        let baseline = try XCTUnwrap(AgentTranscriptIO.buildTranscript(from: ordinary + [later], terminalState: .completed).turns.first)
+        AgentTranscriptIO.test_installQuietLocalBaseline(baseline, in: &session.transcript)
+        let before = AgentTranscriptProjectionBuilder.buildWithCaches(from: session.transcript, turnCaches: [:], excludingQuiet: true)
+        session.turnProjectionCaches = before.updatedTurnCaches
+        let cached = try XCTUnwrap(session.turnProjectionCaches[baseline.id])
+        let members = session.items.enumerated().filter { unstamped.map(\.id).contains($0.element.id) }.map { (index: $0.offset, id: $0.element.id) }
+        XCTAssertTrue(before.projection.workingRows.contains { $0.id == id(203) })
+        XCTAssertTrue(try session.stampQuietCheckInMembers(members, wakeID: id(901), turnID: baseline.id, baseline: XCTUnwrap(session.transcript.turns.last?.quietLocal), expectedSourceRevision: session.sourceItemsRevision))
+        XCTAssertNil(session.turnProjectionCaches[baseline.id])
+        let rebuilt = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(existingTranscript: session.transcript, workingItems: session.items, terminalState: .completed)
+        XCTAssertEqual(cached.token, try AgentTranscriptProjectionBuilder.validationToken(for: XCTUnwrap(rebuilt.turns.last), excludingQuiet: true), "This schedule must not rely on formatter-token changes")
+        let after = AgentTranscriptProjectionBuilder.buildWithCaches(from: rebuilt, turnCaches: session.turnProjectionCaches, excludingQuiet: true)
+        XCTAssertFalse(after.projection.workingRows.contains { $0.text.contains("Quiet closing") || $0.toolName == "self_noop" })
+        let restored = try JSONDecoder().decode(AgentTranscript.self, from: JSONEncoder().encode(rebuilt))
+        XCTAssertEqual(after.projection, AgentTranscriptProjectionBuilder.build(from: restored, excludingQuiet: true))
+        XCTAssertEqual(AgentTranscriptProjectionBuilder.build(from: rebuilt).workingRows.map(\.id), AgentTranscriptProjectionBuilder.build(from: session.transcript).workingRows.map(\.id))
+    }
+
+    func testW1StampRejectsUnprojectedNewUserTurn() throws {
+        let session = AgentTabSession(tabID: id(999))
+        session.setItemsSilently(ordinaryRows(base: 0, toolCount: 2), reason: .persistedSessionHydration)
+        session.transcript = AgentTranscriptIO.buildTranscript(from: session.items, terminalState: .completed)
+        let turn = try XCTUnwrap(session.transcript.turns.last)
+        let baseline = AgentTranscriptQuietLocalTurn(summary: nil, conclusionActivityID: turn.conclusionActivityID, completedAt: turn.completedAt)
+        session.appendItem(row(200, kind: .user, text: "New user turn before derived refresh"))
+        let start = session.items.count
+        for var item in quietRows(base: 300, wakeID: id(900)) {
+            item.quietCheckInWakeID = nil
+            session.appendItem(item)
+        }
+        let source = session.items
+        let revision = session.sourceItemsRevision
+        var callbacks = 0
+        session.onSourceItemsChanged = { _, _ in callbacks += 1 }
+        XCTAssertFalse(session.stampQuietCheckInMembers((start ..< session.items.count).map { (index: $0, id: session.items[$0].id) }, wakeID: id(900), turnID: turn.id, baseline: baseline, expectedSourceRevision: revision))
+        XCTAssertEqual(session.items, source)
+        XCTAssertEqual(session.sourceItemsRevision, revision)
+        XCTAssertNil(session.transcript.turns.last?.quietLocal)
+        XCTAssertEqual(callbacks, 0)
+    }
+
+    func testW1FullRebuildCapturesLocalSummariesBeforeNaturalDownshift() throws {
+        let session = AgentTabSession(tabID: id(999))
+        let ordinary = ordinaryRows(base: 0, toolCount: 12)
+        let baseline = try XCTUnwrap(AgentTranscriptIO.buildTranscript(from: ordinary, terminalState: .completed).turns.first)
+        session.setItemsSilently(ordinary + quietRows(base: 100, wakeID: id(900)), reason: .persistedSessionHydration)
+        session.transcript = AgentTranscriptIO.buildTranscript(from: session.items, terminalState: .completed)
+        AgentTranscriptIO.test_installQuietLocalBaseline(baseline, in: &session.transcript)
+        // Exceed the real compactor budget in one full-source rebuild, not by assigning tiers.
+        for turn in 1 ... 40 {
+            ordinaryRows(base: turn * 1000, toolCount: turn == 40 ? 9 : 0).forEach(session.appendItem)
+        }
+        let rebuilt = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(existingTranscript: session.transcript, workingItems: session.items, terminalState: .completed)
+        let retained = try XCTUnwrap(rebuilt.turns.first)
+        XCTAssertNotEqual(retained.retentionTier, .full)
+        XCTAssertEqual(rebuilt.turns.last?.retentionTier, .full)
+        XCTAssertNotNil(retained.quietLocal?.summary)
+        try assertLocal(retained, baseline: baseline, tools: 12, tier: retained.retentionTier)
+        let restored = try JSONDecoder().decode(AgentTranscript.self, from: JSONEncoder().encode(rebuilt))
+        try assertLocal(XCTUnwrap(restored.turns.first), baseline: baseline, tools: 12, tier: retained.retentionTier)
+        let audit = AgentTranscriptProjectionBuilder.build(from: restored)
+        XCTAssertTrue((audit.workingRows + audit.archivedRows).contains { $0.text == "Quiet closing 100" })
+    }
+
+    func testW1NormalRebuildComposesOrdinarySuffixAndQuietAcrossEveryRetentionTier() async throws {
+        for tier in [AgentTranscriptRetentionTier.full, .condensed, .summary, .archived] {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent("quiet-w1-tier-\(UUID())")
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let workspace = WorkspaceModel(name: "Retained proof", repoPaths: [], customStoragePath: directory)
+            let service = AgentSessionDataService()
+            let session = AgentTabSession(tabID: id(999))
+            let firstOrdinary = ordinaryRows(base: 0, toolCount: 12)
+            let firstBaseline = try XCTUnwrap(AgentTranscriptIO.buildTranscript(from: firstOrdinary, terminalState: .completed).turns.first)
+            session.setItemsSilently(firstOrdinary, reason: .persistedSessionHydration)
+            session.transcript = AgentTranscriptIO.buildTranscript(from: session.items, terminalState: .completed)
+            func appendCertified(_ rows: [AgentChatItem], wakeID: UUID) throws {
+                let turn = try XCTUnwrap(session.transcript.turns.last)
+                let baseline = turn.quietLocal ?? AgentTranscriptQuietLocalTurn(summary: nil, conclusionActivityID: turn.conclusionActivityID, completedAt: turn.completedAt)
+                let start = session.items.count
+                for var row in rows {
+                    row.quietCheckInWakeID = nil
+                    session.appendItem(row)
+                }
+                XCTAssertTrue(session.stampQuietCheckInMembers((start ..< session.items.count).map { (index: $0, id: session.items[$0].id) }, wakeID: wakeID, turnID: turn.id, baseline: baseline, expectedSourceRevision: session.sourceItemsRevision))
+                session.transcript = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(existingTranscript: session.transcript, workingItems: session.items, earliestChangedIndex: start, terminalState: .completed)
+            }
+            try appendCertified(quietRows(base: 100, wakeID: id(900)), wakeID: id(900))
+            // The actual newest turn stays full. Only old, tool-tail-eligible history trims.
+            let secondOrdinary = ordinaryRows(base: 1000, toolCount: 9)
+            secondOrdinary.forEach(session.appendItem)
+            session.transcript = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(existingTranscript: session.transcript, workingItems: session.items, terminalState: .completed)
+            session.transcript.turns[0].retentionTier = tier
+            session.transcript = AgentTranscriptCompactor.compact(session.transcript)
+            let frozen = session.transcript.turns[0]
+            session.setItemsSilentlyForRetentionCompaction(AgentTranscriptIO.workingSourceItems(from: session.transcript))
+            session.appendItem(row(1100, kind: .assistant, text: String(repeating: "New ordinary suffix conclusion. ", count: 12)))
+            session.transcript = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(existingTranscript: session.transcript, workingItems: session.items, earliestChangedIndex: session.items.count - 1, terminalState: .completed)
+            let secondBaseline = try XCTUnwrap(session.transcript.turns.last)
+            try appendCertified(quietRows(base: 1200, wakeID: id(901)), wakeID: id(901))
+            // Force the full fallback as well as the incremental path, then restore flatten/rebuild.
+            session.transcript = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(existingTranscript: session.transcript, workingItems: session.items, terminalState: .completed)
+            let saved = AgentSession(id: id(998), workspaceID: workspace.id, composeTabID: session.tabID, name: "Retained", transcript: session.transcript)
+            let url = try await service.saveAgentSession(saved, for: workspace)
+            let loaded = try await service.loadAgentSession(from: url)
+            let restored = try XCTUnwrap(loaded.transcript)
+            let rebuilt = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(existingTranscript: restored, workingItems: loaded.workingSourceItems(), terminalState: .completed)
+            XCTAssertEqual(rebuilt.turns.last?.retentionTier, .full)
+            if tier != .full { XCTAssertEqual(rebuilt.turns[0], frozen) }
+            try assertLocal(rebuilt.turns[0], baseline: firstBaseline, tools: 12, tier: tier)
+            let local = AgentTranscriptProjectionBuilder.build(from: rebuilt, excludingQuiet: true)
+            XCTAssertTrue(local.workingRows.contains { $0.id == secondBaseline.conclusionActivityID && $0.text == String(repeating: "New ordinary suffix conclusion. ", count: 12) })
+            XCTAssertFalse((local.workingRows + local.archivedRows).contains { $0.toolName == "self_noop" || $0.text.contains("Quiet closing") })
+            XCTAssertEqual(rebuilt.turns.last?.quietLocal?.completedAt, secondBaseline.completedAt)
+            XCTAssertEqual(AgentTranscriptIO.latestAssistantPreviewText(from: rebuilt), "Quiet closing 1200")
+            // Continued ordinary work on the SAME certified full suffix updates, not freezes,
+            // its formatter inputs without a test-only baseline reset.
+            session.transcript = rebuilt
+            session.setItemsSilently(loaded.workingSourceItems(), reason: .persistedSessionHydration)
+            session.appendItem(row(1300, kind: .assistant, text: String(repeating: "Still later ordinary conclusion. ", count: 12)))
+            session.transcript = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(existingTranscript: rebuilt, workingItems: session.items, earliestChangedIndex: session.items.count - 1, terminalState: .completed)
+            try appendCertified(quietRows(base: 1400, wakeID: id(902)), wakeID: id(902))
+            let finalLocal = AgentTranscriptProjectionBuilder.build(from: session.transcript, excludingQuiet: true)
+            XCTAssertTrue(finalLocal.workingRows.contains { $0.text == String(repeating: "Still later ordinary conclusion. ", count: 12) })
+            XCTAssertFalse(finalLocal.workingRows.contains { $0.text.contains("Quiet closing") })
+        }
+    }
+
+    func testW1MalformedOrMissingDisplayProofNeverReconstructsFromCallOrText() throws {
+        let ordinary = ordinaryRows(base: 0, toolCount: 12)
+        let baseline = try XCTUnwrap(AgentTranscriptIO.buildTranscript(from: ordinary, terminalState: .completed).turns.first)
+        var transcript = AgentTranscriptIO.buildTranscript(from: ordinary + quietRows(base: 100, wakeID: id(900)) + ordinaryRows(base: 1000, toolCount: 9), terminalState: .completed)
+        AgentTranscriptIO.test_installQuietLocalBaseline(baseline, in: &transcript)
+        transcript.turns[0].retentionTier = .condensed
+        transcript = AgentTranscriptCompactor.compact(transcript)
+        let encoded = try JSONEncoder().encode(transcript)
+        for damage in ["missing-turn", "malformed-turn", "missing-span", "malformed-stamp", "retained-stamp"] {
+            var payload = encoded
+            if damage == "malformed-stamp" {
+                var full = AgentTranscriptIO.buildTranscript(from: ordinary + quietRows(base: 100, wakeID: id(900)), terminalState: .completed)
+                AgentTranscriptIO.test_installQuietLocalBaseline(baseline, in: &full)
+                payload = try JSONEncoder().encode(full)
+            }
+            var object = try XCTUnwrap(JSONSerialization.jsonObject(with: payload) as? [String: Any])
+            var turns = try XCTUnwrap(object["turns"] as? [[String: Any]])
+            if damage == "missing-turn" { turns[0].removeValue(forKey: "quietLocal") }
+            if damage == "malformed-turn" { turns[0]["quietLocal"] = ["completedAt": "not-a-date"] }
+            if damage == "missing-span" {
+                var spans = try XCTUnwrap(turns[0]["responseSpans"] as? [[String: Any]])
+                spans[0]["quietLocal"] = [:] as [String: Any]
+                turns[0]["responseSpans"] = spans
+            }
+            if damage == "malformed-stamp" {
+                var full = try XCTUnwrap(turns[0]["responseSpans"] as? [[String: Any]])
+                var activities = try XCTUnwrap(full[0]["activities"] as? [[String: Any]])
+                let callIndex = try XCTUnwrap(activities.firstIndex { $0["toolName"] as? String == "self_noop" || ($0["id"] as? String)?.lowercased() == id(100).uuidString.lowercased() })
+                activities[callIndex]["quietCheckInWakeID"] = "not-a-uuid"
+                full[0]["activities"] = activities
+                turns[0]["responseSpans"] = full
+            }
+            if damage == "retained-stamp" {
+                var spans = try XCTUnwrap(turns[0]["responseSpans"] as? [[String: Any]])
+                var activities = try XCTUnwrap(spans[0]["activities"] as? [[String: Any]])
+                XCTAssertEqual(activities.count, 1, "The normal retained canonical conclusion is the witness")
+                activities[0]["quietCheckInWakeID"] = "not-a-uuid"
+                spans[0]["activities"] = activities
+                turns[0]["responseSpans"] = spans
+            }
+            object["turns"] = turns
+            let decoded = try JSONDecoder().decode(AgentTranscript.self, from: JSONSerialization.data(withJSONObject: object))
+            XCTAssertEqual(decoded.turns.count, damage == "malformed-stamp" ? 1 : 2, "Optional damage must not discard canonical audit")
+            if damage == "malformed-stamp" {
+                XCTAssertNil(decoded.turns[0].allActivities.first { $0.id == id(100) }?.quietCheckInWakeID)
+                XCTAssertTrue(AgentTranscriptProjectionBuilder.build(from: decoded, excludingQuiet: true).workingRows.contains { $0.id == id(100) })
+            } else {
+                let local = AgentTranscriptProjectionBuilder.build(from: decoded, excludingQuiet: true)
+                let audit = AgentTranscriptProjectionBuilder.build(from: decoded)
+                XCTAssertEqual(local.workingRows, audit.workingRows, damage)
+            }
+        }
+        let legacy = AgentTranscriptIO.buildTranscript(from: [row(0, kind: .user, text: "Request"), row(1, kind: .assistant, text: "[ack]")], terminalState: .completed)
+        XCTAssertTrue(AgentTranscriptProjectionBuilder.build(from: legacy, excludingQuiet: true).workingRows.contains { $0.text == "[ack]" })
     }
 
     private func assertLocal(
