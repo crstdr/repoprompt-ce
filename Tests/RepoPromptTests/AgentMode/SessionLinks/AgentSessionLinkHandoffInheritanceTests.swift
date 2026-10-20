@@ -146,6 +146,9 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
         func testColdClaudePickerActionPresentsReviewBeforeAnyProviderDispatch() async throws {
             _ = NSApplication.shared
             XCTAssertFalse(AppLaunchConfiguration.current.forcesMCPAutoStart)
+            let previousPerfOverride = AgentModePerfDiagnostics.debugProcessOverrideEnabled
+            AgentModePerfDiagnostics.setDebugProcessOverrideEnabled(true)
+            defer { AgentModePerfDiagnostics.setDebugProcessOverrideEnabled(previousPerfOverride) }
             for additionalWindow in [false, true] {
                 var providerConstructions = 0
                 var fixtures: [Fixture] = []
@@ -190,7 +193,12 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     window.isReleasedWhenClosed = false
                     window.animationBehavior = .none
                     var inputAppeared = false
-                    let host = NSHostingView(rootView: AnyView(input.onAppear { inputAppeared = true }))
+                    let composerBodiesBeforeMount = (AgentModePerfDiagnostics.debugStateSnapshot(lineLimit: 1)["counters"] as? [String: Int])?["ui.body.composer"] ?? 0
+                    let host = NSHostingView(rootView: AnyView(
+                        input
+                            .environment(\.agentModePerfRecorder, AppAgentModePerfRecorder())
+                            .onAppear { inputAppeared = true }
+                    ))
                     window.contentView = host
                     window.orderFront(nil)
                     host.layoutSubtreeIfNeeded()
@@ -206,6 +214,43 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     }
                     host.layoutSubtreeIfNeeded()
                     host.displayIfNeeded()
+                    try await AsyncTestWait.waitUntil("instrumented composer native editor mounted", timeout: 2) {
+                        self.findPickerEditor(in: host)?.window === window
+                    }
+                    let settled = expectation(description: "Mounted composer render settles")
+                    RunLoop.main.perform {
+                        MainActor.assumeIsolated {
+                            host.layoutSubtreeIfNeeded()
+                            host.displayIfNeeded()
+                            settled.fulfill()
+                        }
+                    }
+                    await fulfillment(of: [settled], timeout: 2)
+                    let composerBodiesBefore = (AgentModePerfDiagnostics.debugStateSnapshot(lineLimit: 1)["counters"] as? [String: Int])?["ui.body.composer"] ?? 0
+                    XCTAssertGreaterThan(composerBodiesBefore, composerBodiesBeforeMount, "Mounting the real composer must increment the counter.")
+                    let composerRevision = vm.ui.composer.revision
+                    let publicationCount = 10
+                    var sidebarPublications = 0
+                    let sidebarObservation = vm.$sessionSidebarSearchText.dropFirst().sink { _ in sidebarPublications += 1 }
+                    defer { sidebarObservation.cancel() }
+                    for publication in 0 ..< publicationCount {
+                        vm.sessionSidebarSearchText = "unrelated sidebar search \(publication)"
+                        let rendered = expectation(description: "Sidebar publication \(publication) reaches hosted render")
+                        RunLoop.main.perform {
+                            MainActor.assumeIsolated {
+                                host.layoutSubtreeIfNeeded()
+                                host.displayIfNeeded()
+                                rendered.fulfill()
+                            }
+                        }
+                        await fulfillment(of: [rendered], timeout: 2)
+                    }
+                    let composerBodiesAfter = (AgentModePerfDiagnostics.debugStateSnapshot(lineLimit: 1)["counters"] as? [String: Int])?["ui.body.composer"] ?? 0
+                    XCTAssertEqual(sidebarPublications, publicationCount, "Distinct writes must really publish on the observed VM.")
+                    XCTAssertEqual(vm.ui.composer.revision, composerRevision, "Sidebar searches must not change composer inputs.")
+                    XCTContext.runActivity(named: "Unrelated VM publications: \(sidebarPublications); composer bodies: \(composerBodiesBefore) → \(composerBodiesAfter)") { _ in
+                        XCTAssertEqual(composerBodiesAfter, composerBodiesBefore, "The observed presentation wrapper must preserve the equatable composer boundary.")
+                    }
                     XCTAssertNil(window.attachedSheet)
                     var previewEvents: [String] = []
                     var previewWasInstalled = false
@@ -256,7 +301,6 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     XCTAssertEqual(session.selectedModelRaw, sourceModel)
                     XCTAssertEqual(providerConstructions, 0)
                     XCTAssertTrue(presented, "The production InputBar picker must display Review with no pending handover; additionalWindow=\(additionalWindow)")
-                    print("PICKER_REVIEW_PROBE extraWindow=\(additionalWindow) inputAppeared=\(inputAppeared) previewEvents=\(productionEvents) exactOwner=\(ownerStillMatches) productionSheet=\(presented) controlSheet=\(window.attachedSheet != nil) nativeProviderConstructions=\(providerConstructions)")
                     vm.cancelProviderSwitchPreview()
                     try await AsyncTestWait.waitUntil("production picker Review closes", timeout: 2) {
                         vm.providerSwitchPreview == nil && window.attachedSheet == nil
