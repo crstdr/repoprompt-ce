@@ -202,8 +202,8 @@ actor GitStatusActor {
         }
     }
 
-    /// Best-effort cache release on window close; an in-flight refresh can repopulate it.
-    /// Poller teardown policy is unchanged.
+    /// Best-effort cache release on window close, after polling and view-model tasks drain.
+    /// Other windows can still populate the shared cache.
     func invalidateUntrackedStats() async {
         let backend = await vcsService.gitBackend()
         for root in Set(rootInfos.values.compactMap(\.repoRootPath)) {

@@ -29,6 +29,19 @@ final class AgentRowActivityArcLayerViewTests: XCTestCase {
         XCTAssertFalse(rotation.isRemovedOnCompletion)
     }
 
+    /// The fork wrapper retains upstream's layer-backed arc while pausing decorative motion.
+    func testRunningIndicatorPausesForHiddenWindowsAndReduceMotion() throws {
+        for (visible, reduceMotion, animates) in [(true, false, true), (false, false, false), (true, true, false)] {
+            let hosted = hostIndicator(isWindowPresentationVisible: visible, reduceMotion: reduceMotion)
+            defer { hosted.window.close() }
+            let arc = try XCTUnwrap(arcViews(in: hosted.host).first)
+            XCTAssertEqual(
+                arc.arcLayer.animation(forKey: AgentRowActivityArcLayerView.animationKey) != nil,
+                animates
+            )
+        }
+    }
+
     /// SwiftUI draws in y-down space, so `rotationEffect(.degrees(+360))` spins clockwise and
     /// `Circle().trim(0, 0.7)` runs clockwise from 3 o'clock, leaving its gap at the top right. The
     /// layer arc must match: AppKit flips the flipped host view's backing layer, so the arc layer is
@@ -133,6 +146,21 @@ final class AgentRowActivityArcLayerViewTests: XCTestCase {
     }
 
     // MARK: - Helpers
+
+    /// The row's mode-resolving indicator, hosted with an explicit window-visibility override.
+    private func hostIndicator(
+        isWindowPresentationVisible: Bool,
+        reduceMotion: Bool
+    ) -> (host: NSHostingView<AnyView>, window: NSWindow) {
+        let host = NSHostingView(rootView: AnyView(
+            AgentRowRunningIndicator(reduceMotionOverride: reduceMotion)
+                .environment(\.windowIsPresentationVisible, isWindowPresentationVisible)
+        ))
+        let window = makeWindow()
+        window.contentView = host
+        host.layoutSubtreeIfNeeded()
+        return (host, window)
+    }
 
     /// The sidebar row's own running arc, hosted in a window the way the row hosts it.
     private func hostRunningArc() -> (host: NSHostingView<AgentRowActivityArc>, window: NSWindow) {

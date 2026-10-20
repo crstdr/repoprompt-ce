@@ -35,7 +35,11 @@ final class AgentSessionLinkRunnerHarness {
     /// Runs immediately before `prepareForNextTurn()` on the ACP path, inside the window the old
     /// (buggy) composition point sat in. A test uses it to prove composition reads membership *after*
     /// that suspension.
+    var onTurnComplete: (() -> Void)?
     var onAttachmentsConsumed: (@MainActor () -> Void)?
+    var nativeTranscriptHost: AgentModeViewModel?
+    var onTerminalPublication: (@MainActor (AgentRunTerminalCommitRevision, AgentTabSession) -> Void)?
+    var onNativeStreamResult: (@MainActor (AIStreamResult, AgentTabSession, UUID, UUID) async -> Void)?
 
     /// Runs while the message is being built, i.e. the last synchronous MainActor point before the
     /// headless runner's lease `providerInitializationStarted` hop. A test uses it to enqueue a
@@ -81,7 +85,11 @@ final class AgentSessionLinkRunnerHarness {
         headlessProviderFactory: @escaping AgentModeViewModel.HeadlessProviderFactory,
         acpProviderFactory: @escaping AgentModeViewModel.ACPProviderFactory = { _, _ in nil },
         workspacePath: String = FileManager.default.currentDirectoryPath,
-        sessionLinkHost: AgentModeViewModel? = nil
+        sessionLinkHost: AgentModeViewModel? = nil,
+        awaitNoActiveMCPTools: @escaping (UUID) async throws -> Void = { _ in },
+        replayTranscript: Bool = false,
+        codexController: (any CodexSessionControlling)? = nil,
+        claudeControllerFactory: ClaudeAgentModeCoordinator.ClaudeControllerFactory? = nil
     ) {
         self.stubSystemPrompt = stubSystemPrompt
         self.headlessProviderFactory = headlessProviderFactory
@@ -93,7 +101,7 @@ final class AgentSessionLinkRunnerHarness {
             items: []
         )
 
-        let codexController = LifecycleNoopCodexController(recorder: recorder)
+        let codexController = codexController ?? LifecycleNoopCodexController(recorder: recorder)
         let policyInstaller: AgentModeViewModel.ConnectionPolicyInstaller = { _, _, _, _, _, _, _, runID, _, _, _, _, _ in
             // No MCP infrastructure in these suites: signal routing immediately so the bootstrap lease
             // resolves instead of waiting for a connection that will never arrive.
@@ -104,6 +112,7 @@ final class AgentSessionLinkRunnerHarness {
             testWindowID: 1,
             testWorkspacePath: workspacePath,
             codexControllerFactory: { _, _, _, _, _, _ in codexController },
+            claudeControllerFactory: claudeControllerFactory,
             headlessProviderFactory: headlessProviderFactory,
             acpProviderFactory: acpProviderFactory,
             connectionPolicyInstaller: policyInstaller,
@@ -130,7 +139,7 @@ final class AgentSessionLinkRunnerHarness {
             },
             bindPendingOracleReviewContext: { _, _ in },
             cancelMCPToolsForRun: { _, _ in },
-            awaitNoActiveMCPTools: { _ in },
+            awaitNoActiveMCPTools: awaitNoActiveMCPTools,
             activeAgentRunWaitQuery: { _ in false },
             childAgentRunWaitDrainTimeoutSeconds: 0.01
         )
@@ -157,7 +166,7 @@ final class AgentSessionLinkRunnerHarness {
             presentation: .init(
                 setAgentRunActive: { _, _ in },
                 requestUIRefresh: { _, _ in },
-                notifyAgentTurnComplete: { _ in }
+                notifyAgentTurnComplete: { _ in harnessBox?.onTurnComplete?() }
             ),
             bindingObservation: .init(
                 updateBindings: { _ in }
@@ -169,11 +178,20 @@ final class AgentSessionLinkRunnerHarness {
                 scheduleSave: { _ in }
             ),
             transcript: .init(
-                handleHeadlessStreamResult: { _, _, _, _ in },
-                finalizeStreamingItems: { _ in },
+                handleHeadlessStreamResult: { result, session, runID, attemptID in
+                    await harnessBox?.onNativeStreamResult?(result, session, runID, attemptID)
+                    if replayTranscript { await harnessBox?.host.test_handleStreamResult(result, session: session, runID: runID, runAttemptID: attemptID) }
+                },
+                finalizeStreamingItems: { session in
+                    if let host = harnessBox?.nativeTranscriptHost { host.finalizeStreamingItems(in: session) }
+                    else if replayTranscript { harnessBox?.host.finalizeStreamingItems(in: session) }
+                },
                 finalizePendingToolCalls: { _, _ in },
                 finalizePendingToolCallsWithUpperBound: { _, _, _ in },
-                flushPendingAssistantDelta: { _ in },
+                flushPendingAssistantDelta: { session in
+                    if let host = harnessBox?.nativeTranscriptHost { host.flushPendingAssistantDelta(session) }
+                    else if replayTranscript { harnessBox?.host.flushPendingAssistantDelta(session) }
+                },
                 clearPendingAssistantDelta: { _ in }
             ),
             providerInput: .init(
@@ -263,7 +281,10 @@ final class AgentSessionLinkRunnerHarness {
             terminalSettlement: .init(
                 prepareTerminalPublication: { _ in },
                 makeTerminalPublicationEnvelope: { _, _, _, _, _ in nil },
-                publishTerminalCommit: { _, _, _ in .accepted(successorEpoch: nil) }
+                publishTerminalCommit: { session, revision, _ in
+                    harnessBox?.onTerminalPublication?(revision, session)
+                    return .accepted(successorEpoch: nil)
+                }
             ),
             continuation: .init(
                 startFollowUpRun: { _, _ in },
@@ -341,10 +362,16 @@ final class AgentSessionLinkRunnerHarness {
         let session = host.session(for: tabID)
         session.selectedAgent = agent
         session.hasLoadedPersistedState = true
+        // This harness supplies an existing payload; allocation alone owns unfinished creation.
+        let sessionID = UUID()
         _ = try XCTUnwrap(host.test_installPersistentSessionBinding(
-            sessionID: UUID(), on: session, updateWorkspaceMetadata: true
+            sessionID: sessionID, on: session, updateWorkspaceMetadata: true
         ))
         session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        _ = try XCTUnwrap(
+            session.permitsBoundOperationAndSave ? session.currentRestorationBindingToken : nil,
+            "The bound transport fixture must be restored before provider dispatch."
+        )
         return session
     }
 
@@ -518,6 +545,8 @@ enum AgentSessionLinkACPServerScript {
     /// traffic exists yet, so these are live-unverified):
     /// - `ACP_ADVERTISE_COMMANDS` (comma list): an `available_commands_update` right after
     ///   `session/new`; `__malformed__` sends a non-list `availableCommands`.
+    /// - `ACP_ADVERTISE_BEFORE_NEW_RESPONSE` (`1`): delivers the bootstrap advertisement before
+    ///   the `session/new` response, while the controller's session identity is still unopened.
     /// - `ACP_ADVERTISE_AFTER_PROMPT` (comma list, may be empty): a replacement list during each prompt.
     /// - `ACP_PROMPT_LOG` (path): each `session/prompt` `prompt` array, one JSON line per prompt.
     /// - `ACP_RPC_LOG` (path): actual JSON-RPC requests and successful responses.
@@ -639,11 +668,14 @@ enum AgentSessionLinkACPServerScript {
                 if os.environ.get("ACP_ADVERTISE_COMMANDS") is not None:
                     advertise(params.get("sessionId"), os.environ["ACP_ADVERTISE_COMMANDS"])
             elif method == "session/new":
+                advertises_before = os.environ.get("ACP_ADVERTISE_BEFORE_NEW_RESPONSE") == "1"
+                if advertises_before and os.environ.get("ACP_ADVERTISE_COMMANDS") is not None:
+                    advertise("monitor-acp-session", os.environ["ACP_ADVERTISE_COMMANDS"])
                 respond(request.get("id"), {
                     "sessionId": "monitor-acp-session",
                     "configOptions": config_options()
                 })
-                if os.environ.get("ACP_ADVERTISE_COMMANDS") is not None:
+                if not advertises_before and os.environ.get("ACP_ADVERTISE_COMMANDS") is not None:
                     advertise("monitor-acp-session", os.environ["ACP_ADVERTISE_COMMANDS"])
             elif method == "session/cancel" and os.environ.get("ACP_ADVERTISE_ON_CANCEL") is not None:
                 advertise(params.get("sessionId"), os.environ["ACP_ADVERTISE_ON_CANCEL"])

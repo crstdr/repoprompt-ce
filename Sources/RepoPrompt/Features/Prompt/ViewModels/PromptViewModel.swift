@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 import RepoPromptCodeMapCore
+import RepoPromptDomainRuntime
 import RepoPromptFileSystem
 import RepoPromptInstrumentation
 import RepoPromptSettingsCore
@@ -48,6 +49,7 @@ class PromptViewModel: ObservableObject {
             (@MainActor (AgentProvisionalAdmissionIdentity, AgentAdmissionPersistenceReceipt) async -> Void)?
         private var agentAdmissionRecoveryCompletedHandlerForTesting:
             (@MainActor (AgentProvisionalAdmissionIdentity, AgentAdmissionRecoveryOutcome) async -> Void)?
+        var test_beforeAgentAdmissionFailureCleanup: (@MainActor () async -> Void)?
         private var agentAdmissionRecoveryRetryHandlerForTesting:
             (@MainActor (Int, AgentAdmissionRecoveryOutcome) async -> Void)?
 
@@ -3359,6 +3361,7 @@ class PromptViewModel: ObservableObject {
                 replacementTabID: UUID()
             )
             let recoveryClaim = AgentProvisionalAdmissionClaim(identity: provisionalIdentity)
+            try MCPAgentRunStartExecutionScope.current?.recordTarget(sessionID: sessionID, tabID: newTab.id)
 
             let preAdmissionForegroundStoredTab = manager.workspaces[index].activeComposeTabID.flatMap { activeTabID in
                 manager.workspaces[index].composeTabs.first(where: { $0.id == activeTabID })
@@ -3388,6 +3391,7 @@ class PromptViewModel: ObservableObject {
             manager.markWorkspaceDirty(workspaceID: expectedWorkspaceID)
 
             let receipt = await manager.persistAgentAdmission(provisionalIdentity)
+            if receipt.commitEvidence != .none { MCPAgentRunStartExecutionScope.current?.confirmTarget() }
             await notifyAgentAdmissionPersistenceReceiptForTesting(
                 provisionalIdentity,
                 receipt: receipt
@@ -3408,6 +3412,10 @@ class PromptViewModel: ObservableObject {
             case .commit:
                 return .created(newTab, receipt, recoveryClaim)
             case let .localRollback(reason):
+                try? MCPAgentRunStartExecutionScope.current?.enterReturn()
+                #if DEBUG
+                    await test_beforeAgentAdmissionFailureCleanup?()
+                #endif
                 await rollbackProvisionalAgentSessionTab(
                     checkpoint: rollbackCheckpoint,
                     manager: manager
@@ -3418,6 +3426,10 @@ class PromptViewModel: ObservableObject {
                 }
                 return .rejected(receipt, reason)
             case let .recoverWorkspace(reason):
+                try? MCPAgentRunStartExecutionScope.current?.enterReturn()
+                #if DEBUG
+                    await test_beforeAgentAdmissionFailureCleanup?()
+                #endif
                 guard recoveryClaim.beginWorkspaceRecovery() else {
                     // A changed claim does not prove that the canonical identity was removed.
                     // Preserve its evidence instead of authorizing a second allocation.

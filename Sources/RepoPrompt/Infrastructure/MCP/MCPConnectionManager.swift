@@ -1353,21 +1353,6 @@ actor ServerNetworkManager {
 
     private var bootstrapClaimedPIDByConnectionID: [UUID: Int] = [:]
     private var bootstrapObservedPeerPIDByConnectionID: [UUID: Int] = [:]
-
-    private struct AutomaticAgentAdmission {
-        enum Source {
-            case pendingPolicy(key: String, id: UUID)
-            case liveToken(String)
-        }
-
-        let runID: UUID
-        let authorityGeneration: UInt64
-        let observedHelperPID: Int
-        let source: Source
-    }
-
-    /// One initialize handoff only; never a standing connection/name grant.
-    private var automaticAgentAdmissions: [UUID: AutomaticAgentAdmission] = [:]
     private let terminalRecordClaimsByConnectionID = MCPDomainTerminalClaimRegistry<MCPTerminalRecord>()
     private var connectionTasks: [UUID: Task<Void, Never>] = [:]
     private var pendingConnections: [UUID: String] = [:]
@@ -2032,6 +2017,10 @@ actor ServerNetworkManager {
     #if DEBUG
         private var debugAfterDirectAdmissionPendingPublishedForTesting: (@Sendable (UUID) async -> Void)?
         private var debugAfterBootstrapPolicyReadinessForTesting: (@Sendable (String) async -> Void)?
+        private var debugForceResolvedToolMissingForTesting: (@Sendable () async -> Bool)?
+        private var debugBeforeToolNotFoundObserversForTesting: (@Sendable () async -> Void)?
+        private var debugForceConnectionLimiterUnavailableForTesting: (@Sendable (UUID) async -> Bool)?
+        private var debugBeforeFinishRequestProgressForTesting: (@Sendable () async -> Void)?
         private var debugAfterConnectionCallLimiterResolutionForTesting: (@Sendable (UUID) async -> Void)?
         private var debugAfterConnectionCallPermitAcquiredForTesting: (@Sendable (UUID) async -> Void)?
         private var debugAfterConnectionCallLimiterRejectionForTesting: (@Sendable (UUID) async -> Void)?
@@ -3265,6 +3254,7 @@ actor ServerNetworkManager {
         var additionalGrants: Set<String> {
             var grants: Set<String> = []
             if hasAnyActiveLink || hasActivatedOverseer { grants.insert(MCPWindowToolName.agentSessionLink) }
+            if hasActiveOutboundLink { grants.insert(MCPWindowToolName.selfNoop) }
             if canListBecomeOverseer { grants.insert(MCPWindowToolName.becomeOverseer) }
             if isSessionAdminEligible { grants.insert(MCPWindowToolName.sessionAdmin) }
             return grants
@@ -7415,7 +7405,6 @@ actor ServerNetworkManager {
             connectionLifecycleGenerationByID.removeValue(forKey: id)
             bootstrapClaimedPIDByConnectionID.removeValue(forKey: id)
             bootstrapObservedPeerPIDByConnectionID.removeValue(forKey: id)
-            automaticAgentAdmissions.removeValue(forKey: id)
             #if DEBUG
                 debugDomainPeerIdentityByConnectionID.removeValue(forKey: id)
             #endif
@@ -8435,7 +8424,6 @@ actor ServerNetworkManager {
         connectionLifecycleGenerationByID.removeValue(forKey: id)
         bootstrapClaimedPIDByConnectionID.removeValue(forKey: id)
         bootstrapObservedPeerPIDByConnectionID.removeValue(forKey: id)
-        automaticAgentAdmissions.removeValue(forKey: id)
         connectionTasks.removeValue(forKey: id)
         pendingConnections.removeValue(forKey: id)
         connectionStats.removeValue(forKey: id)
@@ -8770,124 +8758,6 @@ actor ServerNetworkManager {
         return mutableArgs
     }
 
-    /// Admission-only exception for app-launched providers. The controller verifies the helper
-    /// executable; this actor rechecks the same observed peer against current run-owned evidence.
-    /// Claimed PIDs, names alone, and expected ancestry without a policy/token never authorize it.
-    /// The one-initialize proof must survive normal policy consumption; fallback cannot widen it.
-    func authorizeAutomaticAppManagedAgentAdmission(
-        connectionID: UUID,
-        clientName: String,
-        verifiedBundledHelperPID: Int
-    ) async -> Bool {
-        automaticAgentAdmissions.removeValue(forKey: connectionID)
-        guard let generation = connectionLifecycleGenerationByID[connectionID] else { return false }
-        let deadline = Date().addingTimeInterval(2)
-        // Launchers register the parent PID just after Process.run(). The helper may win
-        // that race. Wait only while a PID-gated policy exists, using observed identity
-        // throughout; absence of proof never becomes approval when the bound expires.
-        repeat {
-            guard !Task.isCancelled,
-                  isCurrentConnection(connectionID, lifecycleGeneration: generation),
-                  bootstrapObservedPeerPIDByConnectionID[connectionID] == verifiedBundledHelperPID
-            else { return false }
-            if tryAuthorizeAutomaticAppManagedAgentAdmission(
-                connectionID: connectionID, clientName: clientName,
-                verifiedBundledHelperPID: verifiedBundledHelperPID
-            ) { return true }
-            guard hasPIDGatedPendingPolicy(for: clientName), Date() < deadline else { return false }
-            try? await Task.sleep(for: .milliseconds(50))
-        } while true
-    }
-
-    private func tryAuthorizeAutomaticAppManagedAgentAdmission(
-        connectionID: UUID,
-        clientName: String,
-        verifiedBundledHelperPID: Int
-    ) -> Bool {
-        automaticAgentAdmissions.removeValue(forKey: connectionID)
-        guard let generation = connectionLifecycleGenerationByID[connectionID],
-              isCurrentConnection(connectionID, lifecycleGeneration: generation),
-              verifiedBundledHelperPID > 1,
-              bootstrapObservedPeerPIDByConnectionID[connectionID] == verifiedBundledHelperPID
-        else { return false }
-
-        func ownsLiveRun(_ runID: UUID) -> Bool {
-            guard runPolicyStateByRunID[runID] != nil,
-                  let authorityGeneration = runRoutingAuthorityGenerationByRunID[runID],
-                  revocationFenceGenerationByRunID[runID] != authorityGeneration
-            else { return false }
-            let expectedPIDs = expectedAgentPIDs(for: clientName)
-                .intersection(expectedAgentPIDs(for: clientName, runID: runID))
-            return !expectedPIDs.isEmpty && isAncestor(expectedPIDs: expectedPIDs, ofPid: pid_t(verifiedBundledHelperPID))
-        }
-
-        if let entry = oldestPendingPolicyEntry(for: clientName, where: { policy in
-            guard policy.requiresExpectedAgentPID,
-                  policy.reservationConnectionID == nil,
-                  let runID = policy.runID
-            else { return false }
-            return ownsLiveRun(runID)
-        }) {
-            // Do not let an old connection's token or mapping borrow a successor run's policy.
-            let boundRunID = runIDByConnectionID[connectionID]
-            let sessionKey = connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID]
-            let affinity = preferredLiveRunAffinity(for: clientName, sessionKey: sessionKey)
-            guard let runID = entry.policy.runID,
-                  let authorityGeneration = runRoutingAuthorityGenerationByRunID[runID],
-                  boundRunID == nil || boundRunID == runID,
-                  affinity == nil || affinity?.runID == runID
-            else { return false }
-            automaticAgentAdmissions[connectionID] = AutomaticAgentAdmission(
-                runID: runID, authorityGeneration: authorityGeneration,
-                observedHelperPID: verifiedBundledHelperPID,
-                source: .pendingPolicy(key: entry.key, id: entry.policy.id)
-            )
-            return true
-        }
-
-        // Reconnects require the exact live capability token as well as current ancestry.
-        // An expected process alone cannot join an established run under a new token.
-        let sessionKey = connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID]
-        guard let sessionKey,
-              let affinity = preferredLiveRunAffinity(for: clientName, sessionKey: sessionKey),
-              admittedPolicyRunIDs.contains(affinity.runID),
-              ownsLiveRun(affinity.runID),
-              let authorityGeneration = runRoutingAuthorityGenerationByRunID[affinity.runID],
-              runIDByConnectionID[connectionID].map({ $0 == affinity.runID }) ?? true
-        else { return false }
-        automaticAgentAdmissions[connectionID] = AutomaticAgentAdmission(
-            runID: affinity.runID, authorityGeneration: authorityGeneration,
-            observedHelperPID: verifiedBundledHelperPID, source: .liveToken(sessionKey)
-        )
-        return true
-    }
-
-    private func isCurrentAutomaticAgentAdmission(
-        _ proof: AutomaticAgentAdmission,
-        connectionID: UUID,
-        clientName: String,
-        requiresPendingPolicy: Bool
-    ) -> Bool {
-        guard runPolicyStateByRunID[proof.runID] != nil,
-              runRoutingAuthorityGenerationByRunID[proof.runID] == proof.authorityGeneration,
-              revocationFenceGenerationByRunID[proof.runID] != proof.authorityGeneration,
-              bootstrapObservedPeerPIDByConnectionID[connectionID] == proof.observedHelperPID,
-              isExpectedAgentDescendant(clientName: clientName, clientPid: proof.observedHelperPID, runID: proof.runID) == true
-        else { return false }
-        switch proof.source {
-        case let .pendingPolicy(key, id):
-            guard requiresPendingPolicy else { return true }
-            pruneExpiredPolicies(for: clientName)
-            return pendingPoliciesByClient[key]?.contains {
-                $0.id == id && $0.runID == proof.runID && $0.reservationConnectionID == nil
-            } == true
-        case let .liveToken(token):
-            return (connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID]) == token
-                && preferredLiveRunAffinity(for: clientName, sessionKey: token)?.runID == proof.runID
-                && admittedPolicyRunIDs.contains(proof.runID)
-        }
-    }
-
     /// Shared post-approval initialize sequence. Routing is still PID/run-admitted and lifecycle fenced.
     private func completeApprovedAgentInitialization(
         clientName: String,
@@ -8897,10 +8767,6 @@ actor ServerNetworkManager {
         clientPid: Int,
         expectedLifecycleGeneration: UInt64
     ) async -> Bool {
-        let automaticAdmission = automaticAgentAdmissions.removeValue(forKey: connectionID)
-        if let automaticAdmission,
-           !isCurrentAutomaticAgentAdmission(automaticAdmission, connectionID: connectionID, clientName: clientName, requiresPendingPolicy: true)
-        { return false }
         let readiness = await awaitAgentPolicyAdmissionIfNeeded(
             clientName: clientName,
             bootstrapClientName: bootstrapClientName,
@@ -8914,9 +8780,6 @@ actor ServerNetworkManager {
             return false
         }
 
-        if let automaticAdmission,
-           !isCurrentAutomaticAgentAdmission(automaticAdmission, connectionID: connectionID, clientName: clientName, requiresPendingPolicy: true)
-        { return false }
         let policyOutcome = await applyPendingPolicyIfAvailable(
             clientName: clientName,
             connectionID: connectionID,
@@ -8931,14 +8794,6 @@ actor ServerNetworkManager {
             )
             pendingConnections.removeValue(forKey: connectionID)
             return false
-        }
-        if let automaticAdmission {
-            guard isCurrentAutomaticAgentAdmission(
-                automaticAdmission, connectionID: connectionID, clientName: clientName, requiresPendingPolicy: false
-            ),
-                runIDByConnectionID[connectionID] == automaticAdmission.runID,
-                admittedPolicyRunIDs.contains(automaticAdmission.runID)
-            else { return false }
         }
         notifyConnectionWaiters(
             connectionID: connectionID,
@@ -11322,6 +11177,21 @@ actor ServerNetworkManager {
                 debugAfterBootstrapPolicyReadinessForTesting = handler
             }
 
+            func debugSetMissingStartFinalizationForTesting(
+                missing: (@Sendable () async -> Bool)?, beforeObservers: (@Sendable () async -> Void)?
+            ) {
+                debugForceResolvedToolMissingForTesting = missing
+                debugBeforeToolNotFoundObserversForTesting = beforeObservers
+            }
+
+            func debugSetEarlyStartFinalizationForTesting(
+                limiterUnavailable: (@Sendable (UUID) async -> Bool)?,
+                beforeFinish: (@Sendable () async -> Void)?
+            ) {
+                debugForceConnectionLimiterUnavailableForTesting = limiterUnavailable
+                debugBeforeFinishRequestProgressForTesting = beforeFinish
+            }
+
             func debugSetAfterConnectionCallLimiterResolutionForTesting(
                 _ handler: (@Sendable (UUID) async -> Void)?
             ) {
@@ -13485,7 +13355,7 @@ actor ServerNetworkManager {
         // ------------------------------------------------------------------
         //  tools/call  (UPDATED)
         // ------------------------------------------------------------------
-        await server.withMethodHandler(CallTool.self) { [weak self] params in
+        let requestBody: @Sendable (CallTool.Parameters) async -> CallTool.Result = { [weak self] params in
             guard let self else {
                 return CallTool.Result(
                     content: [MCP.Tool.Content.text(text: "Server unavailable", annotations: nil, _meta: nil)],
@@ -13586,7 +13456,8 @@ actor ServerNetworkManager {
                     appInvocationID: inheritedRequestIdentity?.appInvocationID,
                     requestOrdinal: inheritedRequestIdentity?.requestOrdinal
                 )
-                let invocationID = requestIdentity.appInvocationID.flatMap { UUID(uuidString: $0) } ?? UUID()
+                let invocationID = MCPAgentRunStartExecutionScope.current?.invocationID
+                    ?? requestIdentity.appInvocationID.flatMap { UUID(uuidString: $0) } ?? UUID()
                 let resolvedRequestIdentity: MCPRequestTimelineIdentity? = MCPRequestTimelineIdentity(
                     jsonRPCRequestID: requestIdentity.jsonRPCRequestID,
                     connectionID: requestIdentity.connectionID,
@@ -13613,7 +13484,7 @@ actor ServerNetworkManager {
                     ))
                 }
             #else
-                let invocationID = UUID()
+                let invocationID = MCPAgentRunStartExecutionScope.current?.invocationID ?? UUID()
                 let resolvedRequestIdentity: MCPRequestTimelineIdentity? = nil
                 let lifecycleCorrelation = EditFlowPerf.makeLifecycleCorrelationIfActive()
             #endif
@@ -13907,11 +13778,7 @@ actor ServerNetworkManager {
                 let effectivePolicy = initialPolicy
                 // Recomputed live rather than read from the installed policy: a `list_changed`
                 // notification can lag a grant change in either direction, so stale advertisement
-                let liveSessionLinkGrant = (
-                    toolName == MCPWindowToolName.agentSessionLink
-                        || toolName == MCPWindowToolName.becomeOverseer
-                        || toolName == MCPWindowToolName.sessionAdmin
-                )
+                let liveSessionLinkGrant = AgentSessionLinkCatalogSurface.toolNames.contains(toolName)
                     ? await liveSessionLinkGrantSnapshot(connectionID: connectionID, modelOnly: isMemoryOnlyModelCall)
                     : nil
                 guard await isCurrentToolPolicyAdmission(policyAdmissionToken) else {
@@ -13938,9 +13805,7 @@ actor ServerNetworkManager {
                         return policyChangedResult()
                     }
                 } catch MCPDomainCallPolicyDenial.missingAdditionalGrant
-                    where toolName == MCPWindowToolName.agentSessionLink
-                    || toolName == MCPWindowToolName.becomeOverseer
-                    || toolName == MCPWindowToolName.sessionAdmin
+                    where AgentSessionLinkCatalogSurface.toolNames.contains(toolName)
                 {
                     #if DEBUG
                         await debugPolicyDiagnostic("toolsCallRejected", connectionID: connectionID, policy: effectivePolicy, extra: [
@@ -13952,6 +13817,7 @@ actor ServerNetworkManager {
                     // reveals nothing beyond "you have no oversight authority".
                     return CallTool.Result.err("Tool '\(toolName)' is not available for this session.")
                 } catch MCPDomainCallPolicyDenial.missingAdditionalGrant {
+                    try? MCPAgentRunStartExecutionScope.current?.enterReturn()
                     #if DEBUG
                         await debugPolicyDiagnostic("toolsCallRejected", connectionID: connectionID, policy: effectivePolicy, extra: [
                             "toolName": toolName,
@@ -14015,11 +13881,7 @@ actor ServerNetworkManager {
                 // Rebuild with a fresh exact link fact. The early grant check and this role/profile
                 // gate are separated by routing work, so carrying the earlier answer would let a
                 // revocation stale-authorize this exception.
-                let liveSessionLinkGrant = (
-                    toolName == MCPWindowToolName.agentSessionLink
-                        || toolName == MCPWindowToolName.becomeOverseer
-                        || toolName == MCPWindowToolName.sessionAdmin
-                )
+                let liveSessionLinkGrant = AgentSessionLinkCatalogSurface.toolNames.contains(toolName)
                     ? await liveSessionLinkGrantSnapshot(connectionID: connectionID, modelOnly: isMemoryOnlyModelCall)
                     : nil
                 guard await isCurrentToolPolicyAdmission(policyAdmissionToken) else {
@@ -14101,6 +13963,10 @@ actor ServerNetworkManager {
                 nil
             }
             func finishRequestProgress(_ result: CallTool.Result) async -> CallTool.Result {
+                try? MCPAgentRunStartExecutionScope.current?.enterReturn()
+                #if DEBUG
+                    await debugBeforeFinishRequestProgressForTesting?()
+                #endif
                 if let capturedProgressState {
                     await domainHost.finishRequestProgress(capturedProgressState)
                 }
@@ -14146,12 +14012,17 @@ actor ServerNetworkManager {
             if let admissionTimeout = promptExportAdmissionTimeoutResultIfExpired() {
                 return await finishRequestProgress(admissionTimeout)
             }
-            let limiterResolution = await EditFlowPerf.measure(
+            var limiterResolution = await EditFlowPerf.measure(
                 EditFlowPerf.Stage.MCPToolCall.limiterResolution,
                 EditFlowPerf.Dimensions(toolName: toolName)
             ) {
                 await self.connectionCallLimiterResolution(for: connectionID)
             }
+            #if DEBUG
+                if await debugForceConnectionLimiterUnavailableForTesting?(connectionID) == true {
+                    limiterResolution = nil
+                }
+            #endif
             endPreLimiterEnvelopeIfNeeded()
             guard let limiterResolution else {
                 connectionLog("tools/call \(toolName): rejected because connection limiter is unavailable")
@@ -14164,6 +14035,7 @@ actor ServerNetworkManager {
                 )
             }
             func finalizeToolResult(_ result: CallTool.Result) async -> CallTool.Result {
+                try? MCPAgentRunStartExecutionScope.current?.enterReturn()
                 guard promptExportMutationObservation?.snapshot()?.state == .applied else {
                     return await finishRequestProgress(result)
                 }
@@ -14900,7 +14772,7 @@ actor ServerNetworkManager {
                                         slot: MCPCodeStructureSettlementRegistry.Slot?
                                     )
                                     if contract.cleanupDisposition == .detachAndSettle,
-                                       toolName != MCPWindowToolName.fileActions
+                                       [MCPWindowToolName.getCodeStructure, MCPWindowToolName.readFile, MCPWindowToolName.getFileTree].contains(toolName)
                                     {
                                         guard let windowID = invocationContext.dispatchAuthorization?.windowIdentity?.windowID else {
                                             throw MCPToolExecutionDispatchError.structureSettlementWindowUnresolved
@@ -15180,6 +15052,20 @@ actor ServerNetworkManager {
                                         )
                                     }
 
+                                    if let startScope = MCPAgentRunStartExecutionScope.current,
+                                       startScope.connectionID == connectionID,
+                                       startScope.invocationID == invocationID
+                                    {
+                                        do {
+                                            let value = try await tracedOperation(nil)
+                                            await recordSynchronousSettlement(.success)
+                                            return value
+                                        } catch {
+                                            try? startScope.enterReturn()
+                                            await recordSynchronousSettlement(MCPToolExecutionCancelledError.matches(error) ? .cancellation : .error)
+                                            throw error
+                                        }
+                                    }
                                     switch contract {
                                     case let .bounded(deadline, cancellationGrace, _):
                                         do {
@@ -15691,6 +15577,9 @@ actor ServerNetworkManager {
                                         scope: registrationScope
                                     )
                                 }
+                                #if DEBUG
+                                    if await self.debugForceResolvedToolMissingForTesting?() == true { resolvedTool = nil }
+                                #endif
                                 if let resolvedTool {
                                     let toolDef = resolvedTool.definition
                                     connectionLog("tools/call \(toolName): dispatching exact domain binding scope=\(String(describing: registrationScope))")
@@ -16171,6 +16060,10 @@ actor ServerNetworkManager {
                                 }
 
                                 EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.serviceToolLookup, serviceToolLookupState)
+                                try? MCPAgentRunStartExecutionScope.current?.enterReturn()
+                                #if DEBUG
+                                    await self.debugBeforeToolNotFoundObserversForTesting?()
+                                #endif
                                 endPermitPreDispatchEnvelopeIfNeeded()
                                 releaseResourceAdmissionLeases(outcome: "tool_not_found")
                                 let permitPostDispatchEnvelopeState = EditFlowPerf.begin(
@@ -16224,6 +16117,43 @@ actor ServerNetworkManager {
                 } // withPermit wrapper
             } // LimiterEnvelope wrapper
             return await finalizeToolResult(result)
+        }
+        await server.withMethodHandler(CallTool.self) { [weak self] params in
+            guard let self else {
+                return CallTool.Result(content: [.text(text: "Server unavailable", annotations: nil, _meta: nil)], isError: true)
+            }
+            let canonicalName = Self.canonicalToolName(for: params.name)
+            var startRoutingArguments = params.arguments ?? [:]
+            startRoutingArguments.removeValue(forKey: MCPExportResponseDeliveryDeadlineRegistry.requestIdentityArgumentKey)
+            let startArguments = canonicalName == MCPWindowToolName.agentRun
+                ? MCPToolArgsNormalizer.normalize(
+                    params: startRoutingArguments, originalToolName: params.name, canonicalToolName: canonicalName
+                ).payload
+                : params.arguments ?? [:]
+            guard MCPToolExecutionContractCatalog.isAgentRunStartCall(
+                toolName: canonicalName, arguments: startArguments
+            ) else {
+                return await MCPAgentRunStartExecutionScope.$current.withValue(nil) { await requestBody(params) }
+            }
+            let environment = await toolExecutionWatchdogEnvironment
+            let scope = MCPAgentRunStartExecutionScope(connectionID: connectionID, environment: environment)
+            return await MCPAgentRunStartExecutionScope.$current.withValue(scope) {
+                do {
+                    return try await MCPToolExecutionWatchdog.execute(
+                        deadline: MCPTimeoutPolicy.agentRunStartSetupDeadline,
+                        cancellationGrace: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace,
+                        cleanupDisposition: .detachAndSettle,
+                        startScope: scope, environment: environment,
+                        operation: { await requestBody(params) }
+                    )
+                } catch {
+                    // Deadline-to-return is memory-only: no routing, snapshots, or host cleanup.
+                    let code = MCPToolExecutionCancelledError.matches(error)
+                        ? "tool_execution_cancelled" : "tool_execution_deadline_exceeded"
+                    let value = scope.timeoutValue(code: code, message: "Start request did not settle within its setup/return envelope; inspect its existing identity before recovery.")
+                    return CallTool.Result(content: [.text(text: ToolOutputFormatter.rawJSONString(value), annotations: nil, _meta: nil)], isError: true)
+                }
+            }
         }
     }
 

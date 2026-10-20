@@ -125,7 +125,18 @@ final class AgentSessionLinkPresentationProjectionTests: XCTestCase {
             XCTAssertEqual(
                 manager.test_lifecycleBindingTabValidationCount,
                 count,
-                "One current-model tab validation per candidate, independent of its array position"
+                "One lifecycle validation per candidate, independent of its array position"
+            )
+            manager.test_lifecycleBindingTabValidationCount = 0
+            for candidate in candidates {
+                XCTAssertEqual(fixture.viewModel.agentSidebarOversightTargetEndpoint(
+                    tabID: candidate.tabID, expectedSessionID: candidate.sessionID
+                ), candidate.domainEndpoint)
+            }
+            XCTAssertEqual(
+                manager.test_lifecycleBindingTabValidationCount,
+                count,
+                "One lifecycle validation per endpoint, independent of its array position"
             )
             let last = try XCTUnwrap(candidates.last)
             manager.test_lifecycleBindingTabValidationCount = 0
@@ -628,6 +639,48 @@ final class AgentSessionLinkPresentationProjectionTests: XCTestCase {
         let staleBulk = fixture.viewModel.agentSessionLinkOversightRoles(for: [row])[fixture.tabID]
         XCTAssertEqual(staleBulk?.overseeingCount, 0)
         XCTAssertEqual(staleBulk?.isOverseen, false)
+    }
+
+    func testHUDBulkRolesAtFifteenHundredChatsPreservesSparseStateWithinBudget() throws {
+        let fixture = try makeFixture()
+        let manager = try XCTUnwrap(fixture.viewModel.workspaceManager)
+        var workspace = try XCTUnwrap(manager.activeWorkspace)
+        workspace.composeTabs += (0 ..< 1499).map { index in
+            ComposeTabState(id: UUID(), name: "Chat \(index)", activeAgentSessionID: UUID())
+        }
+        manager.workspaces = manager.workspaces.map { $0.id == workspace.id ? workspace : $0 }
+        manager.activeWorkspace = workspace
+        for tab in workspace.composeTabs.prefix(10) {
+            let session = fixture.viewModel.session(for: tab.id)
+            session.hasLoadedPersistedState = true
+            _ = try XCTUnwrap(fixture.viewModel.test_ensureSessionBoundToTab(session))
+            let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: tab.id)
+            fixture.viewModel.agentSessionLinkPublishProjection(
+                props(endpoint: endpoint, outboundCount: 1), to: endpoint
+            )
+        }
+        let rows = try XCTUnwrap(manager.activeWorkspace).composeTabs.map { tab in
+            AgentModeViewModel.SidebarSession(
+                id: tab.id, tabID: tab.id, title: tab.name, lastUserMessageAt: nil,
+                activityDate: Date(timeIntervalSince1970: 100), isPinned: false,
+                sessionID: tab.activeAgentSessionID, parentSessionID: nil, depth: 0, isMCPControlled: false
+            )
+        }
+        let sessionCount = fixture.viewModel.sessions.count
+        let clock = ContinuousClock()
+        var samples: [Duration] = []
+        for _ in 0 ..< 30 {
+            let start = clock.now
+            let roles = fixture.viewModel.agentSessionLinkOversightRoles(for: rows)
+            samples.append(start.duration(to: clock.now))
+            XCTAssertEqual(roles.count, 10)
+            XCTAssertTrue(roles.values.allSatisfy { $0.overseeingCount == 1 && !$0.isOverseen })
+        }
+        XCTAssertEqual(fixture.viewModel.sessions.count, sessionCount, "Role reads must not hydrate unrelated chats")
+        XCTAssertEqual(fixture.viewModel.monitorPillPropsByEndpoint.count, 10)
+        samples.sort()
+        XCTAssertLessThan(try XCTUnwrap(samples.last), .seconds(1))
+        print("HUD_ROLE_SCALE chats=1500 linked=10 trials=30 median=\(samples[15]) p95=\(samples[28]) max=\(samples[29]) budget=1s/call")
     }
 
     func testHUDRoleProjectionParityAcrossWorkspacesAndDuplicateRows() throws {

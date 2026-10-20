@@ -742,6 +742,21 @@ extension AgentModeViewModel {
                 locationLabelsByReference[reference] = locationLabel
             }
         }
+        // The first reservation knows the route before begin makes the run active. Later adapters
+        // retain that frozen qualification, not a route re-derived from the now-running session.
+        let routineQuietCheckIn: Bool = if let attempt = session.oversight.pendingAutoWake, attempt.wakeID == effectiveID.autoWakeID {
+            if attempt.phase.ownsTransportBoundary,
+               let reserved = agentSessionLinkPromptClaimStore.pendingClaim(dispatchID: effectiveID, observerSessionID: context.epoch.endpoint.sessionID)
+            {
+                reserved.routineQuietCheckIn
+            } else {
+                attempt.admissionBasis == .routineStatusOrOverflow
+                    && agentSessionLinkAutoWakeRoute(session) == .idleFollowUp
+                    && AgentSessionLinkPrompts.supportsQuietCheckIn(context.epoch.providerContext)
+            }
+        } else {
+            false
+        }
         return agentSessionLinkPromptClaimStore.claimOutcome(
             dispatchID: effectiveID,
             epoch: context.epoch,
@@ -757,6 +772,7 @@ extension AgentModeViewModel {
                     observer: context.epoch.endpoint, inventory: context.inventory, baseline: baseline
                 )
             },
+            routineQuietCheckIn: routineQuietCheckIn,
             render: AgentSessionLinkPrompts.rendered
         )
     }
@@ -854,6 +870,7 @@ extension AgentModeViewModel {
             )
         }
         return AgentSessionLinkDecoratedProviderText(
+            quietMarkerProducerLifetime: session.retainQuietMarkerProducer(for: claim),
             dispatchContext: captured,
             text: AgentSessionLinkPromptComposer.decorated(providerText, with: claim),
             claim: claim,

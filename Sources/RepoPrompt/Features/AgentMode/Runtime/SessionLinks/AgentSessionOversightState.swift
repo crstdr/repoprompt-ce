@@ -71,13 +71,25 @@ struct AgentSessionOversightState {
 
     // MARK: Reserved wake attempt
 
+    /// Diagnostic correlation only: independent of persistent identities and never saved.
+    let wakeDiagnosticObserver = AgentSessionLinkAutoWakeDiagnostics.ObserverCorrelationID()
+
     /// The one automatic lane-update follow-up this exact incarnation has reserved, if any.
     ///
     /// Ephemeral by construction: it lives beside the run lifecycle it competes with, is never
     /// persisted, and dies with the incarnation. Appearing or clearing feeds the owning session's
     /// observation signal, because another observer must not `send` into a session that has already
     /// reserved a turn.
-    var pendingAutoWake: AgentSessionLinkAutoWakeAttempt?
+    var pendingAutoWake: AgentSessionLinkAutoWakeAttempt? {
+        didSet {
+            if oldValue?.wakeID != pendingAutoWake?.wakeID {
+                AgentSessionLinkAutoWakeDiagnostics.reservationChanged(observer: wakeDiagnosticObserver, from: oldValue?.phase, to: nil)
+                AgentSessionLinkAutoWakeDiagnostics.reservationChanged(observer: wakeDiagnosticObserver, from: nil, to: pendingAutoWake?.phase)
+            } else {
+                AgentSessionLinkAutoWakeDiagnostics.reservationChanged(observer: wakeDiagnosticObserver, from: oldValue?.phase, to: pendingAutoWake?.phase)
+            }
+        }
+    }
 
     /// Whether one queue publication was absorbed while the current Auto-wake could not schedule a
     /// reevaluation of its own.
@@ -98,7 +110,29 @@ struct AgentSessionOversightState {
     /// never recur. Keeping only the current one means suppression is released by exactly the events
     /// that should release it — the failed content being acknowledged, removed, or replaced by a
     /// genuinely new transition — instead of surviving indefinitely in a set nothing prunes.
-    var suppressedWakeFingerprint: AgentSessionLinkPassiveStatusNotices.WakeEligibilityFingerprint?
+    private struct WakeSuppression {
+        let fingerprint: AgentSessionLinkPassiveStatusNotices.WakeEligibilityFingerprint
+        let producerWakeID: UUID
+    }
+
+    private var wakeSuppression: WakeSuppression?
+    var suppressedWakeFingerprint: AgentSessionLinkPassiveStatusNotices.WakeEligibilityFingerprint? {
+        wakeSuppression?.fingerprint
+    }
+
+    mutating func suppressWake(_ fingerprint: AgentSessionLinkPassiveStatusNotices.WakeEligibilityFingerprint?, producerWakeID: UUID) {
+        guard let fingerprint else { return } // Missing failure proof never clears another producer.
+        wakeSuppression = WakeSuppression(fingerprint: fingerprint, producerWakeID: producerWakeID)
+    }
+
+    mutating func clearWakeSuppression() {
+        wakeSuppression = nil
+    }
+
+    mutating func clearWakeSuppression(ifProducedBy wakeID: UUID) {
+        guard wakeSuppression?.producerWakeID == wakeID else { return }
+        wakeSuppression = nil
+    }
 
     // MARK: Per-lane snooze policy
 
