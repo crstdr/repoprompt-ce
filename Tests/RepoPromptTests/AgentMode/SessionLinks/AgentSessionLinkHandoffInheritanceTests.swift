@@ -1311,6 +1311,147 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             }
         }
 
+        func testGeneratedSummarySurvivesOwedNoticeReceiptAndLaterNoticeRefit() async throws {
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                let (endpoint, lane) = try summaryMonitorContext(fixture)
+                var notices = AgentSessionLinkPassiveStatusNotices(observerEndpoint: endpoint)
+                notices.enable(samples: [lane], linkSetRevision: 1)
+                let finished = AgentSessionLinkPassiveStatusNotices.Sample(reference: lane.reference, targetEndpoint: lane.targetEndpoint, targetSessionID: lane.targetSessionID, displayName: lane.displayName, status: .idle, idleForSend: true, latestVisibleAssistantPreview: "First lane result")
+                notices.reconcile(samples: [finished], linkSetRevision: 1, deliverable: true)
+                XCTAssertEqual(notices.snapshot.entries.count, 1)
+                vm.agentSessionLinkPublishPassiveStatusNotices(notices.snapshot, to: endpoint)
+                vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("owed-summary.json") }
+                var generations = 0
+                vm.test_providerSwitchGeneration = { outgoing, _, request in
+                    generations += 1
+                    let decorated = vm.agentSessionLinkDecoratedProviderText(request, session: outgoing, dispatchID: .claudeNativeSend(UUID()))
+                    do {
+                        let receipt = try XCTUnwrap(decorated.claim?.passive?.receipt)
+                        XCTAssertTrue(decorated.text.contains("First lane result"))
+                        vm.acceptAgentSessionLinkPromptClaim(decorated.claim)
+                        notices.apply(receipt)
+                        XCTAssertTrue(notices.snapshot.entries.isEmpty, "Apply the actually rendered receipt through the existing reducer")
+                        vm.agentSessionLinkPublishPassiveStatusNotices(notices.snapshot, to: endpoint)
+                    } catch { XCTFail("Missing ordinary notice claim: \(error)") }
+                    outgoing.appendItem(.assistant("summary remains valid after normal notice delivery", sequenceIndex: outgoing.nextSequenceIndex))
+                    outgoing.runState = .completed
+                }
+                await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
+                let original = try XCTUnwrap(vm.providerSwitchPreview)
+                await vm.generateProviderSwitchHandover(original.id)
+                try await AsyncTestWait.waitUntil("summary rebuild after receipt") { vm.providerSwitchPreview?.id != original.id && vm.providerSwitchPreview?.building == false }
+                let settled = try XCTUnwrap(vm.providerSwitchPreview)
+                XCTAssertEqual(settled.generatedSummary?.text, "summary remains valid after normal notice delivery")
+                XCTAssertNotNil(settled.choices.first { $0.mode == .summary }?.carrier)
+                XCTAssertLessThan(try XCTUnwrap(settled.budget).instructionTokens, try XCTUnwrap(original.budget).instructionTokens)
+                notices.reconcile(samples: [lane], linkSetRevision: 1, deliverable: true)
+                notices.reconcile(samples: [finished], linkSetRevision: 1, deliverable: true)
+                XCTAssertEqual(notices.snapshot.entries.count, 1)
+                vm.agentSessionLinkPublishPassiveStatusNotices(notices.snapshot, to: endpoint)
+                vm.updateBindingsFromSession(session)
+                try await AsyncTestWait.waitUntil("summary refit for newly owed notice") { vm.providerSwitchPreview?.id != settled.id && vm.providerSwitchPreview?.building == false }
+                let current = try XCTUnwrap(vm.providerSwitchPreview)
+                XCTAssertEqual(current.generatedSummary?.text, settled.generatedSummary?.text)
+                XCTAssertEqual(current.cutoff, settled.cutoff)
+                XCTAssertEqual(current.sourceRevision, settled.sourceRevision)
+                XCTAssertNotNil(current.choices.first { $0.mode == .summary }?.carrier)
+                XCTAssertGreaterThan(try XCTUnwrap(current.budget).instructionTokens, try XCTUnwrap(settled.budget).instructionTokens)
+                XCTAssertEqual(notices.snapshot.entries.count, 1, "Refitting must not acknowledge newly owed content")
+                XCTAssertEqual(generations, 1)
+                XCTAssertNil(session.pendingHandoff.payload)
+            }
+        }
+
+        func testGeneratedSummaryDropsOnStableMonitorInstructionChanges() async throws {
+            for drift in ["membership", "grant", "reference"] {
+                try await withFixture { fixture in
+                    let vm = fixture.viewModel
+                    let session = fixture.sourceSession
+                    let (endpoint, lane) = try summaryMonitorContext(fixture)
+                    vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("stable-instructions.json") }
+                    var generations = 0
+                    vm.test_providerSwitchGeneration = { outgoing, _, _ in
+                        generations += 1
+                        outgoing.appendItem(.assistant("summary for original monitor authority", sequenceIndex: outgoing.nextSequenceIndex))
+                        outgoing.runState = .completed
+                    }
+                    await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
+                    let originalID = try XCTUnwrap(vm.providerSwitchPreview?.id)
+                    await vm.generateProviderSwitchHandover(originalID)
+                    try await AsyncTestWait.waitUntil("summary before stable instruction change") { vm.providerSwitchPreview?.id != originalID && vm.providerSwitchPreview?.building == false }
+                    let settled = try XCTUnwrap(vm.providerSwitchPreview)
+                    XCTAssertNotNil(settled.generatedSummary)
+                    vm.agentSessionLinkPublishPromptInventory(.init(
+                        observerSessionID: endpoint.sessionID, linkSetRevision: 2,
+                        items: drift == "membership" ? [] : [.init(targetSessionID: lane.targetSessionID, displayName: lane.displayName, capabilityNames: drift == "grant" ? ["poll"] : ["poll", "read"], reference: drift == "reference" ? .init(linkID: lane.reference.linkID, generation: lane.reference.generation + 1) : lane.reference)]
+                    ), to: endpoint)
+                    vm.updateBindingsFromSession(session)
+                    try await AsyncTestWait.waitUntil("summary invalidated by stable \(drift)") { vm.providerSwitchPreview?.id != settled.id && vm.providerSwitchPreview?.building == false }
+                    let current = try XCTUnwrap(vm.providerSwitchPreview)
+                    XCTAssertNotEqual(current.instructions, settled.instructions)
+                    XCTAssertEqual(current.sourceRevision, settled.sourceRevision)
+                    XCTAssertEqual(current.cutoff, settled.cutoff)
+                    XCTAssertNil(current.generatedSummary, drift)
+                    XCTAssertNil(current.choices.first { $0.mode == .summary }?.carrier, drift)
+                    XCTAssertEqual(generations, 1)
+                    XCTAssertTrue(session.items.contains { $0.kind == .assistant && $0.text == "summary for original monitor authority" })
+                }
+            }
+        }
+
+        func testGeneratedSummaryRefitBudgetsFullOwedInstructionsAndWithholdsOversizedCarrier() async throws {
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                let (endpoint, lane) = try summaryMonitorContext(fixture)
+                var notices = AgentSessionLinkPassiveStatusNotices(observerEndpoint: endpoint)
+                notices.enable(samples: [lane], linkSetRevision: 1)
+                vm.agentSessionLinkPublishPassiveStatusNotices(notices.snapshot, to: endpoint)
+                vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("summary-full-budget.json") }
+                var generations = 0
+                vm.test_providerSwitchGeneration = { outgoing, _, _ in
+                    generations += 1
+                    outgoing.appendItem(.assistant("bounded summary", sequenceIndex: outgoing.nextSequenceIndex))
+                    outgoing.runState = .completed
+                }
+                await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
+                let originalID = try XCTUnwrap(vm.providerSwitchPreview?.id)
+                await vm.generateProviderSwitchHandover(originalID)
+                try await AsyncTestWait.waitUntil("summary before full instruction boundary") { vm.providerSwitchPreview?.id != originalID && vm.providerSwitchPreview?.building == false }
+                let settled = try XCTUnwrap(vm.providerSwitchPreview)
+                let carrier = try XCTUnwrap(settled.choices.first { $0.mode == .summary }?.carrier)
+                let budget = try XCTUnwrap(settled.budget)
+                let inputAllowance = budget.inputTokens + budget.remainingCarrierTokens - AgentProviderHandover.estimate(AgentProviderHandover.render(carrier)) - 32
+                vm.storeDraftText(for: session.tabID, String(repeating: "d", count: Int(inputAllowance / AgentProviderHandover.estimate("d"))))
+                vm.updateBindingsFromSession(session)
+                try await AsyncTestWait.waitUntil("summary near capacity without notice") { vm.providerSwitchPreview?.id != settled.id && vm.providerSwitchPreview?.building == false }
+                let fitting = try XCTUnwrap(vm.providerSwitchPreview)
+                XCTAssertNotNil(fitting.choices.first { $0.mode == .summary }?.carrier)
+                XCTAssertTrue(try XCTUnwrap(fitting.budget).fits(carrier))
+                let finished = AgentSessionLinkPassiveStatusNotices.Sample(reference: lane.reference, targetEndpoint: lane.targetEndpoint, targetSessionID: lane.targetSessionID, displayName: lane.displayName, status: .idle, idleForSend: true, latestVisibleAssistantPreview: String(repeating: "N", count: 280))
+                notices.reconcile(samples: [finished], linkSetRevision: 1, deliverable: true)
+                XCTAssertEqual(notices.snapshot.entries.count, 1)
+                vm.agentSessionLinkPublishPassiveStatusNotices(notices.snapshot, to: endpoint)
+                vm.updateBindingsFromSession(session)
+                try await AsyncTestWait.waitUntil("summary exceeds full current instruction budget") { vm.providerSwitchPreview?.id != fitting.id && vm.providerSwitchPreview?.building == false }
+                let current = try XCTUnwrap(vm.providerSwitchPreview)
+                let currentBudget = try XCTUnwrap(current.budget)
+                XCTAssertGreaterThan(currentBudget.instructionTokens, try XCTUnwrap(fitting.budget).instructionTokens)
+                XCTAssertFalse(currentBudget.fits(carrier))
+                XCTAssertEqual(current.generatedSummary?.text, "bounded summary", "Keep existing internal retention semantics")
+                XCTAssertNil(current.choices.first { $0.mode == .summary }?.carrier)
+                XCTAssertEqual(current.choices.first { $0.mode == .summary }?.unavailable, "the summary is too large")
+                vm.providerSwitchPreview?.selected = .summary
+                let applied = await vm.applyProviderSwitch(current.id)
+                XCTAssertFalse(applied)
+                XCTAssertNil(session.pendingHandoff.payload, "No overbudget carrier may become sendable")
+                XCTAssertTrue(session.items.contains { $0.kind == .assistant && $0.text == "bounded summary" })
+                XCTAssertEqual(generations, 1)
+            }
+        }
+
         func testGenerationSettlementInvalidatesSourceConfigurationDriftWithoutAutomaticRetry() async throws {
             GlobalSettingsStore.installApplicationModelIdentityPolicy()
             for timing in ["during", "queued"] {
@@ -1402,6 +1543,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                         vm.interviewFirst = true
                         vm.updateBindingsFromSession(session)
                         vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("settlement-composition.json") }
+                        let instructionEndpoint = drift == "instructions" ? try summaryMonitorContext(fixture).0 : nil
                         var generations = 0
                         var conclusionID: UUID?
                         vm.test_providerSwitchGeneration = { [unowned vm] outgoing, _, _ in
@@ -1420,10 +1562,9 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                             case "interview":
                                 vm.interviewFirst = false
                             default:
-                                var state = AgentSelfCompactState()
-                                _ = state.reserve(note: "new source instruction", idempotencyKey: "settlement-instruction", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes)
-                                state.active?.phase = .parked
-                                outgoing.selfCompactState = state
+                                if let instructionEndpoint {
+                                    vm.agentSessionLinkPublishPromptInventory(.init(observerSessionID: instructionEndpoint.sessionID, linkSetRevision: 2, items: []), to: instructionEndpoint)
+                                }
                             }
                             XCTAssertEqual(outgoing.sourceItemsRevision, revision)
                             vm.updateBindingsFromSession(outgoing)
@@ -2693,6 +2834,17 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             for fixture in fixtures.reversed() {
                 await cleanup(fixture)
             }
+        }
+
+        private func summaryMonitorContext(_ fixture: Fixture) throws -> (DomainAgentSessionLinkEndpointIdentity, AgentSessionLinkPassiveStatusNotices.Sample) {
+            let endpoint = try XCTUnwrap(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.sourceTabID))
+            let target = DomainAgentSessionLinkEndpointIdentity(windowID: 99, workspaceID: UUID(), tabID: UUID(), sessionID: UUID(), persistentBindingGeneration: UUID(), bindingTransitionGeneration: 1)
+            let reference = DomainAgentSessionLinkReference(linkID: UUID(), generation: 1)
+            fixture.viewModel.agentSessionLinkPublishPromptInventory(.init(
+                observerSessionID: endpoint.sessionID, linkSetRevision: 1,
+                items: [.init(targetSessionID: target.sessionID, displayName: "Summary lane", capabilityNames: ["poll", "read"], reference: reference)]
+            ), to: endpoint)
+            return (endpoint, .init(reference: reference, targetEndpoint: target, targetSessionID: target.sessionID, displayName: "Summary lane", status: .running))
         }
 
         private func publishSwitchWake(_ fixture: Fixture, endpoint: DomainAgentSessionLinkEndpointIdentity) throws {

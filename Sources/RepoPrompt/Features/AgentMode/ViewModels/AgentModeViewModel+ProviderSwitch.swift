@@ -163,7 +163,7 @@ extension AgentModeViewModel {
 
     /// Existing prompt owners author all these strings. Rendering current inventory in full is
     /// conservative for a pending fresh context and neither reserves nor acknowledges a claim.
-    func providerSwitchInstructionStrings(_ session: TabSession, includeSupplement: Bool = true, destination: AgentProviderKind? = nil) -> [String] {
+    func providerSwitchInstructionStrings(_ session: TabSession, includeSupplement: Bool = true, destination: AgentProviderKind? = nil, includeOwedContent: Bool = true) -> [String] {
         let agent = destination ?? session.selectedAgent
         let prompt = SystemPromptService.agentModePrompt(
             agentKind: agent, taskLabelKind: session.mcpControlContext?.taskLabelKind,
@@ -172,20 +172,26 @@ extension AgentModeViewModel {
         let packagedPrompt = agent.usesClaudeNativeRuntime
             ? ClaudeCompatiblePluginBridge.providerBoundUserMessage("", instructions: prompt, delivery: ClaudeAgentToolPreferences.agentModePromptDelivery()) : ""
         var strings = [packagedPrompt.isEmpty ? prompt : packagedPrompt]
-        if let note = session.selfCompactState.parkedNote { strings.append(note.frame) }
+        if includeOwedContent, let note = session.selfCompactState.parkedNote { strings.append(note.frame) }
         var supplement = ""
         if includeSupplement, let context = agentSessionLinkPromptContext(for: session), context.epoch.allowsSupplement {
             let baseline = AgentSessionLinkPrompts.rendered(.init(
                 membershipKind: context.inventory.isEmpty ? nil : .inventory,
-                inventory: context.inventory, passiveNotices: context.passiveNotices,
+                inventory: context.inventory, passiveNotices: includeOwedContent ? context.passiveNotices : nil,
                 toolReference: context.epoch.toolReference
             ))
-            supplement = AgentSessionLinkRuntimeBridge.shared.localInputDecoration(
+            supplement = includeOwedContent ? (AgentSessionLinkRuntimeBridge.shared.localInputDecoration(
                 observer: context.epoch.endpoint, inventory: context.inventory, baseline: baseline
-            )?.fragment ?? baseline.fragment
+            )?.fragment ?? baseline.fragment) : baseline.fragment
         }
         strings.append(supplement)
         return strings
+    }
+
+    /// Summary provenance excludes host-owned one-shot delivery content, not stable instructions
+    /// or monitor authority. Full actual instructions still own every preview currency/fit check.
+    private func providerSwitchInstructionProvenance(_ session: TabSession, destination: AgentProviderKind) -> [String] {
+        providerSwitchInstructionStrings(session, destination: destination, includeOwedContent: false)
     }
 
     static func providerSwitchStartRefusal(_ session: TabSession) -> AgentSessionLinkSendFailure {
@@ -601,6 +607,7 @@ extension AgentModeViewModel {
         var sourceRevision: Int
         var draftRevision: UInt64
         var instructions: [String]
+        let instructionProvenance: [String]
         var cutoff: UUID?
         var projection: AgentProviderHandover.Projection?
         var budget: AgentProviderHandover.Budget?
@@ -755,7 +762,9 @@ extension AgentModeViewModel {
             sourceParameters: session.acpModelParameterSelections,
             composition: providerSwitchComposition(session, destination: agent), sourceRevision: session.sourceItemsRevision,
             draftRevision: session.draftMutationGeneration,
-            instructions: providerSwitchInstructionStrings(session, destination: agent), generatedSummary: retainingSummary, updated: updated
+            instructions: providerSwitchInstructionStrings(session, destination: agent),
+            instructionProvenance: providerSwitchInstructionProvenance(session, destination: agent),
+            generatedSummary: retainingSummary, updated: updated
         )
     }
 
@@ -784,14 +793,14 @@ extension AgentModeViewModel {
     private func providerSwitchGenerationSourceIsCurrent(_ preview: ProviderSwitchPreview) -> Bool {
         guard providerSwitchPreviewIsCurrent(preview, content: false) else { return false }
         let composition = providerSwitchComposition(preview.session, destination: preview.destination)
-        // Only draft/workflow changes may refit the result. includesInterview is derived from
-        // history: Generate's own first assistant changes it without changing the preference.
+        // Draft/workflow and owed one-shot content may refit the result. includesInterview is
+        // derived from history: Generate's first assistant does not change the preference.
         return composition.computerUseArmed == preview.composition.computerUseArmed
             && composition.interviewPreference == preview.composition.interviewPreference
             && composition.includeCleanupGuidance == preview.composition.includeCleanupGuidance
             && composition.images == preview.composition.images
             && composition.taggedFiles == preview.composition.taggedFiles
-            && providerSwitchInstructionStrings(preview.session, destination: preview.destination) == preview.instructions
+            && providerSwitchInstructionProvenance(preview.session, destination: preview.destination) == preview.instructionProvenance
     }
 
     func providerSwitchDiscardBlocker(_ preview: ProviderSwitchPreview) -> String? {
@@ -983,7 +992,7 @@ extension AgentModeViewModel {
                 && composition.interviewPreference == preview.composition.interviewPreference
                 && composition.includeCleanupGuidance == preview.composition.includeCleanupGuidance
                 && composition.images == preview.composition.images && composition.taggedFiles == preview.composition.taggedFiles
-                && providerSwitchInstructionStrings(preview.session, destination: preview.destination) == preview.instructions
+                && providerSwitchInstructionProvenance(preview.session, destination: preview.destination) == preview.instructionProvenance
             await openProviderSwitchPreview(agent: preview.destination, model: preview.model, tabID: preview.session.tabID, updated: true, cursorParameterIntent: preview.cursorParameterIntent, retainingSummary: canRetain ? preview.generatedSummary : nil)
         }
     }
