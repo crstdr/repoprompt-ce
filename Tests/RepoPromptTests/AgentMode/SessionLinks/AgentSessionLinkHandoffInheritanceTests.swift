@@ -1404,7 +1404,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                         vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("settlement-composition.json") }
                         var generations = 0
                         var conclusionID: UUID?
-                        vm.test_providerSwitchGeneration = { outgoing, _, _ in
+                        vm.test_providerSwitchGeneration = { [unowned vm] outgoing, _, _ in
                             generations += 1
                             let conclusion = AgentChatItem.assistant("summary under original instructions", sequenceIndex: outgoing.nextSequenceIndex)
                             outgoing.appendItem(conclusion)
