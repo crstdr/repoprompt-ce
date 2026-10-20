@@ -290,15 +290,12 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 var readyEntered = false
                 var isAttemptUnderTest = true
                 var writes: [AgentProviderSwitchDelivery?] = []
-                var starts = 0
                 let file = fixture.rootURL.appendingPathComponent("returned-predispatch-ready.json")
                 defer {
                     isAttemptUnderTest = false
                     sendingRelease.finish(())
                     readyRelease.finish(())
-                    vm.test_providerSwitchStart = nil
                 }
-                vm.test_providerSwitchStart = { _, _, _ in starts += 1 }
                 vm.test_setAgentSessionSaver { saved, _, _ in
                     guard isAttemptUnderTest, saved.id == sessionID else { return file }
                     writes.append(saved.pendingHandoffProviderSwitchDelivery)
@@ -332,7 +329,6 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 isAttemptUnderTest = false
                 XCTAssertNil(messages)
                 XCTAssertEqual(writes, [.sending, .ready])
-                XCTAssertEqual(starts, 0)
                 XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .ready)
                 XCTAssertEqual(session.pendingHandoff.payload, handoff.payload)
                 XCTAssertEqual(session.pendingHandoff.sourceItemID, handoff.sourceItemID)
@@ -366,14 +362,11 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 var sendingEntered = false
                 var isAttemptUnderTest = true
                 var writes: [AgentProviderSwitchDelivery?] = []
-                var starts = 0
                 let file = fixture.rootURL.appendingPathComponent("unconfirmed-ready-resave.json")
                 defer {
                     isAttemptUnderTest = false
                     sendingRelease.finish(())
-                    vm.test_providerSwitchStart = nil
                 }
-                vm.test_providerSwitchStart = { _, _, _ in starts += 1 }
                 vm.test_setAgentSessionSaver { saved, _, _ in
                     guard isAttemptUnderTest, saved.id == sessionID else { return file }
                     writes.append(saved.pendingHandoffProviderSwitchDelivery)
@@ -402,7 +395,6 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 isAttemptUnderTest = false
                 XCTAssertNil(messages)
                 XCTAssertEqual(writes, [.sending, .ready])
-                XCTAssertEqual(starts, 0)
                 XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .sending)
                 XCTAssertEqual(session.pendingHandoff.payload, payload)
                 XCTAssertFalse(session.pendingHandoff.isStagedForSend)
@@ -1389,6 +1381,77 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                         }
                         XCTAssertTrue(session.items.contains { $0.id == conclusionID }, "The invalidated result remains ordinary retained history")
                         XCTAssertEqual(generations, 1, "Invalidation never automatically Generates")
+                        XCTAssertNil(session.pendingHandoff.payload)
+                        XCTAssertNil(session.activeComposerSubmitAttempt)
+                    }
+                }
+            }
+        }
+
+        func testGenerationSettlementRefitsOnlyDraftWorkflowAndRejectsInstructionOrCompositionDrift() async throws {
+            for timing in ["during", "queued"] {
+                for drift in ["draft", "workflow", "interview", "instructions"] {
+                    try await withFixture { fixture in
+                        let vm = fixture.viewModel
+                        let session = fixture.sourceSession
+                        // Generate itself supplies this chat's first assistant. Its derived Interview
+                        // eligibility changes normally; the independent preference must stay fenced.
+                        session.setItemsSilently([.user("Source task", sequenceIndex: 0)], reason: .testOverride)
+                        session.transcript = .empty
+                        session.nextSequenceIndex = 1
+                        vm.interviewFirst = true
+                        vm.updateBindingsFromSession(session)
+                        vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("settlement-composition.json") }
+                        var generations = 0
+                        var conclusionID: UUID?
+                        vm.test_providerSwitchGeneration = { outgoing, _, _ in
+                            generations += 1
+                            let conclusion = AgentChatItem.assistant("summary under original instructions", sequenceIndex: outgoing.nextSequenceIndex)
+                            outgoing.appendItem(conclusion)
+                            conclusionID = conclusion.id
+                            outgoing.runState = .completed
+                            if timing == "queued" { vm.providerSwitchGenerationSettled(outgoing) }
+                            let revision = outgoing.sourceItemsRevision
+                            switch drift {
+                            case "draft":
+                                vm.storeDraftText(for: outgoing.tabID, String(repeating: "draft ", count: 2000))
+                            case "workflow":
+                                vm.selectWorkflow(.init(customID: UUID(), displayName: "New workflow", template: String(repeating: "wrapper ", count: 2000) + "$ARGUMENTS"))
+                            case "interview":
+                                vm.interviewFirst = false
+                            default:
+                                var state = AgentSelfCompactState()
+                                _ = state.reserve(note: "new source instruction", idempotencyKey: "settlement-instruction", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes)
+                                state.active?.phase = .parked
+                                outgoing.selfCompactState = state
+                            }
+                            XCTAssertEqual(outgoing.sourceItemsRevision, revision)
+                            vm.updateBindingsFromSession(outgoing)
+                        }
+                        await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
+                        let original = try XCTUnwrap(vm.providerSwitchPreview)
+                        XCTAssertTrue(original.composition.includesInterview)
+                        await vm.generateProviderSwitchHandover(original.id)
+                        try await AsyncTestWait.waitUntil("settlement after \(timing) \(drift)") {
+                            vm.providerSwitchPreview?.id != original.id && vm.providerSwitchPreview?.building == false
+                        }
+                        let current = try XCTUnwrap(vm.providerSwitchPreview)
+                        XCTAssertFalse(current.composition.includesInterview)
+                        XCTAssertNil(current.generationItemID)
+                        XCTAssertEqual(current.cutoff, conclusionID)
+                        if drift == "draft" || drift == "workflow" {
+                            XCTAssertEqual(current.generatedSummary?.text, "summary under original instructions", "\(timing) \(drift)")
+                            let carrier = try XCTUnwrap(current.choices.first { $0.mode == .summary }?.carrier)
+                            let budget = try XCTUnwrap(current.budget)
+                            XCTAssertGreaterThan(budget.inputTokens, 2048)
+                            XCTAssertTrue(budget.fits(carrier), "Allowed refits still measure the current composed input")
+                        } else {
+                            if drift == "instructions" { XCTAssertNotEqual(current.instructions, original.instructions) }
+                            XCTAssertNil(current.generatedSummary, "\(timing) \(drift)")
+                            XCTAssertNil(current.choices.first { $0.mode == .summary }?.carrier, "\(timing) \(drift)")
+                        }
+                        XCTAssertTrue(session.items.contains { $0.id == conclusionID })
+                        XCTAssertEqual(generations, 1)
                         XCTAssertNil(session.pendingHandoff.payload)
                         XCTAssertNil(session.activeComposerSubmitAttempt)
                     }

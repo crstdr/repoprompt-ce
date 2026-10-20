@@ -781,6 +781,19 @@ extension AgentModeViewModel {
             ))
     }
 
+    private func providerSwitchGenerationSourceIsCurrent(_ preview: ProviderSwitchPreview) -> Bool {
+        guard providerSwitchPreviewIsCurrent(preview, content: false) else { return false }
+        let composition = providerSwitchComposition(preview.session, destination: preview.destination)
+        // Only draft/workflow changes may refit the result. includesInterview is derived from
+        // history: Generate's own first assistant changes it without changing the preference.
+        return composition.computerUseArmed == preview.composition.computerUseArmed
+            && composition.interviewPreference == preview.composition.interviewPreference
+            && composition.includeCleanupGuidance == preview.composition.includeCleanupGuidance
+            && composition.images == preview.composition.images
+            && composition.taggedFiles == preview.composition.taggedFiles
+            && providerSwitchInstructionStrings(preview.session, destination: preview.destination) == preview.instructions
+    }
+
     func providerSwitchDiscardBlocker(_ preview: ProviderSwitchPreview) -> String? {
         guard providerSwitchPreviewIsCurrent(preview) else { return AgentSessionLinkSendFailure.providerHandoverNeedsReview.message }
         if providerSwitchMutation != nil { return AgentSessionLinkSendFailure.targetBusy.message }
@@ -1097,7 +1110,7 @@ extension AgentModeViewModel {
         guard let turn = session.transcript.turns.first(where: { $0.request?.id == rowID }),
               turn.completedAt != nil, !(turn.terminalState?.isActive ?? false) else { return }
         providerSwitchPreview?.generationFinished = true
-        guard providerSwitchPreviewIsCurrent(preview, content: false) else {
+        guard providerSwitchGenerationSourceIsCurrent(preview) else {
             refreshProviderSwitchPreviewAfterDrift(preview)
             return
         }
@@ -1112,7 +1125,7 @@ extension AgentModeViewModel {
                   sessions[session.tabID] === session, session.currentRestorationBindingToken == preview.binding,
                   workspaceManager?.activeWorkspaceID == preview.workspaceID,
                   session.pendingHandoff == preview.originalHandoff else { return }
-            guard providerSwitchPreviewIsCurrent(preview, content: false) else {
+            guard providerSwitchGenerationSourceIsCurrent(preview) else {
                 refreshProviderSwitchPreviewAfterDrift(preview)
                 return
             }
@@ -1121,7 +1134,7 @@ extension AgentModeViewModel {
                   current.originalHandoff == preview.originalHandoff, !current.isReview,
                   session.sourceItemsRevision == settledRevision, current.binding == preview.binding,
                   current.projection != nil, current.budget != nil else { return }
-            guard providerSwitchPreviewIsCurrent(preview, content: false) else {
+            guard providerSwitchGenerationSourceIsCurrent(preview) else {
                 refreshProviderSwitchPreviewAfterDrift(current)
                 return
             }
