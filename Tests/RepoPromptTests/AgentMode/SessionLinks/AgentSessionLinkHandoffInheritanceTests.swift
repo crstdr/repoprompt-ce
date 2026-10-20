@@ -1324,7 +1324,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 vm.agentSessionLinkPublishPassiveStatusNotices(notices.snapshot, to: endpoint)
                 vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("owed-summary.json") }
                 var generations = 0
-                vm.test_providerSwitchGeneration = { outgoing, _, request in
+                vm.test_providerSwitchGeneration = { [unowned vm] outgoing, _, request in
                     generations += 1
                     let decorated = vm.agentSessionLinkDecoratedProviderText(request, session: outgoing, dispatchID: .claudeNativeSend(UUID()))
                     do {
@@ -1361,6 +1361,27 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 XCTAssertEqual(notices.snapshot.entries.count, 1, "Refitting must not acknowledge newly owed content")
                 XCTAssertEqual(generations, 1)
                 XCTAssertNil(session.pendingHandoff.payload)
+            }
+        }
+
+        func testParkedFrameRemainsInFullPreviewInstructionsButNotSummaryProvenance() async throws {
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
+                let baseline = try XCTUnwrap(vm.providerSwitchPreview)
+                var state = AgentSelfCompactState()
+                _ = state.reserve(note: "parked continuation evidence", idempotencyKey: "preview-frame", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes)
+                state.active?.phase = .parked
+                session.selfCompactState = state
+                let frame = try XCTUnwrap(session.selfCompactState.parkedNote?.frame)
+                await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
+                let parked = try XCTUnwrap(vm.providerSwitchPreview)
+                XCTAssertTrue(parked.instructions.contains(frame))
+                XCTAssertEqual(parked.instructions.filter { $0 != frame }, baseline.instructions)
+                XCTAssertEqual(parked.instructionProvenance, baseline.instructionProvenance)
+                XCTAssertFalse(parked.instructionProvenance.contains(frame))
+                XCTAssertNotNil(vm.providerSwitchPreviewBlocker(parked), "A parked note still blocks Generate")
             }
         }
 
@@ -1561,10 +1582,11 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                                 vm.selectWorkflow(.init(customID: UUID(), displayName: "New workflow", template: String(repeating: "wrapper ", count: 2000) + "$ARGUMENTS"))
                             case "interview":
                                 vm.interviewFirst = false
+                            case "instructions":
+                                guard let instructionEndpoint else { return XCTFail("Missing stable membership endpoint") }
+                                vm.agentSessionLinkPublishPromptInventory(.init(observerSessionID: instructionEndpoint.sessionID, linkSetRevision: 2, items: []), to: instructionEndpoint)
                             default:
-                                if let instructionEndpoint {
-                                    vm.agentSessionLinkPublishPromptInventory(.init(observerSessionID: instructionEndpoint.sessionID, linkSetRevision: 2, items: []), to: instructionEndpoint)
-                                }
+                                XCTFail("Unexpected drift case: \(drift)")
                             }
                             XCTAssertEqual(outgoing.sourceItemsRevision, revision)
                             vm.updateBindingsFromSession(outgoing)
