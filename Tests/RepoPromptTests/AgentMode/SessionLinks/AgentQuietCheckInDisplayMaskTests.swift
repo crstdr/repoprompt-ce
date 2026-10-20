@@ -1412,6 +1412,59 @@ final class AgentQuietRetainedViewFeasibilityTests: XCTestCase {
         XCTAssertTrue(try AgentTranscriptIO.buildHandoffTranscriptItems(from: restored, upToRowID: XCTUnwrap(quiet.last?.id)).contains { $0.text == "Quiet closing 100" })
     }
 
+    func testW1SummaryOnlyCompactionPreservesCertifiedResultAndLocalQuietness() throws {
+        for path in ["single-result", "current-source-alignment"] {
+            let session = AgentTabSession(tabID: id(999))
+            let ordinary = ordinaryRows(base: 0, toolCount: 2)
+            var quiet = quietRows(base: 100, wakeID: id(900))
+            let raw = #"{"status":"success","output":"Synthetic raw tool payload that must not reappear as an audit card","exit_code":0}"#
+            quiet[0].toolName = "read_file"
+            quiet[1].toolName = "read_file"
+            quiet[1].text = raw
+            quiet[1].toolResultJSON = raw
+            session.setItemsSilently(ordinary + quiet, reason: .persistedSessionHydration)
+            session.transcript = AgentTranscriptIO.buildTranscript(from: session.items, terminalState: .completed)
+            let baseline = try XCTUnwrap(AgentTranscriptIO.buildTranscript(from: ordinary, terminalState: .completed).turns.first)
+            AgentTranscriptIO.test_installQuietLocalBaseline(baseline, in: &session.transcript)
+            let resultIndex = ordinary.count + 1
+            let resultID = quiet[1].id
+            let payloadRevision = try XCTUnwrap(session.ephemeralToolResultPayloadRevisionByItemID[resultID])
+            let sourceRevision = session.sourceItemsRevision
+            let sanitized = try XCTUnwrap(AgentToolResultPersistencePolicy.sanitizedToolResult(for: session.items[resultIndex]))
+            XCTAssertTrue(sanitized.shouldRetainEphemeralRawPayload, "Fixture must exercise real summary-only compaction")
+            XCTAssertNotEqual(sanitized.resultJSON, raw)
+            let before = AgentTranscriptProjectionBuilder.build(from: session.transcript, excludingQuiet: true)
+            XCTAssertFalse(before.workingRows.contains { $0.id == resultID })
+
+            if path == "single-result" {
+                var compacted = session.items[resultIndex]
+                compacted.text = sanitized.text
+                compacted.toolResultJSON = sanitized.resultJSON
+                compacted.toolIsError = sanitized.toolIsError
+                XCTAssertTrue(session.replaceItemSilentlyForRetentionCompaction(at: resultIndex, with: compacted, retainedRawPayload: raw))
+            } else {
+                session.compactSummaryOnlyToolResultsAndAlignEphemeralPayloadMap()
+            }
+
+            XCTAssertEqual(session.sourceItemsRevision, sourceRevision + 1, path)
+            XCTAssertEqual(session.items[resultIndex].toolResultJSON, sanitized.resultJSON, path)
+            XCTAssertTrue(try AgentTranscriptToolNormalizer.isSummaryOnly(raw: XCTUnwrap(session.items[resultIndex].toolResultJSON)), path)
+            XCTAssertEqual(session.items[resultIndex].quietCheckInWakeID, id(900), path)
+            XCTAssertEqual(session.ephemeralToolResultPayloadByItemID[resultID], raw, path)
+            XCTAssertEqual(session.ephemeralToolResultPayloadRevisionByItemID[resultID], payloadRevision, path)
+            let rebuilt = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(
+                existingTranscript: session.transcript, workingItems: session.items,
+                earliestChangedIndex: resultIndex, terminalState: .completed
+            )
+            let canonicalResult = try XCTUnwrap(rebuilt.allActivities.first { $0.id == resultID })
+            XCTAssertEqual(canonicalResult.quietCheckInWakeID, id(900), path)
+            let local = AgentTranscriptProjectionBuilder.build(from: rebuilt, excludingQuiet: true)
+            XCTAssertFalse(local.workingRows.contains { $0.id == resultID }, path)
+            XCTAssertTrue(local.workingBlocks.allSatisfy { !Set($0.activityIDs).contains(resultID) }, "Certified audit card must not reappear: \(path)")
+            XCTAssertEqual(local.workingRows.map(\.id), before.workingRows.map(\.id), path)
+        }
+    }
+
     func testW1ChangedSourceInvalidatesButRetentionCopiesPreserveMembership() throws {
         for operation in ["replace", "mutate", "last", "batch", "direct", "repair"] {
             let session = AgentTabSession(tabID: id(999))
