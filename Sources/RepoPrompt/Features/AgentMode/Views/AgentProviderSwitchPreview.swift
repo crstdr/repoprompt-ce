@@ -1,7 +1,32 @@
 import SwiftUI
 
-/// Small observed host outside the equatable composer: no new composer props/store authority.
-struct AgentProviderSwitchPresentation: View {
+/// Keep the populated composer as a stable sheet host even when no session/banner exists.
+struct AgentProviderSwitchPresentation<Content: View>: View {
+    @ObservedObject var viewModel: AgentModeViewModel
+    let tabID: UUID?
+    let content: Content
+
+    var body: some View {
+        VStack(spacing: 8) {
+            if let tabID, let session = viewModel.sessions[tabID] {
+                AgentProviderSwitchBanner(viewModel: viewModel, session: session)
+            }
+            content
+        }
+        .sheet(isPresented: Binding(
+            get: {
+                guard let tabID, let session = viewModel.sessions[tabID],
+                      let preview = viewModel.providerSwitchPreview else { return false }
+                return preview.session === session
+            },
+            set: { if !$0 { viewModel.cancelProviderSwitchPreview() } }
+        )) {
+            AgentProviderSwitchPreview(viewModel: viewModel)
+        }
+    }
+}
+
+private struct AgentProviderSwitchBanner: View {
     @ObservedObject var viewModel: AgentModeViewModel
     @ObservedObject var session: AgentTabSession
 
@@ -33,12 +58,6 @@ struct AgentProviderSwitchPresentation: View {
                 .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
                 .padding(.horizontal, 24)
             }
-        }
-        .sheet(isPresented: Binding(
-            get: { viewModel.providerSwitchPreview?.session === session },
-            set: { if !$0 { viewModel.cancelProviderSwitchPreview() } }
-        )) {
-            AgentProviderSwitchPreview(viewModel: viewModel)
         }
     }
 }
