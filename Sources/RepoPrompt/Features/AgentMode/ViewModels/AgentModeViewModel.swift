@@ -15488,34 +15488,37 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let canonicalVisibleRowCount = projectionCounts.canonicalVisibleRowCount
         #if DEBUG
             if AgentTranscriptDebugInstrumentation.isEnabled, let previousBaseProjection {
-                let previousRows = previousBaseProjection.archivedRows + previousBaseProjection.workingRows
-                let newRows = baseProjection.archivedRows + baseProjection.workingRows
-                let previousBlocks = previousBaseProjection.archivedBlocks + previousBaseProjection.workingBlocks
-                let newBlocks = baseProjection.archivedBlocks + baseProjection.workingBlocks
-                let previousRowSemanticDigest = AgentTranscriptDebugInstrumentation.itemSemanticSignature(previousRows)
-                let newRowSemanticDigest = AgentTranscriptDebugInstrumentation.itemSemanticSignature(newRows)
-                let previousRowIdentityDigest = AgentTranscriptDebugInstrumentation.itemIdentitySignature(previousRows)
-                let newRowIdentityDigest = AgentTranscriptDebugInstrumentation.itemIdentitySignature(newRows)
-                let previousBlockSemanticDigest = AgentTranscriptDebugInstrumentation.blockSemanticSignature(previousBlocks)
-                let newBlockSemanticDigest = AgentTranscriptDebugInstrumentation.blockSemanticSignature(newBlocks)
-                let previousBlockIdentityDigest = AgentTranscriptDebugInstrumentation.blockIdentitySignature(previousBlocks)
-                let newBlockIdentityDigest = AgentTranscriptDebugInstrumentation.blockIdentitySignature(newBlocks)
-                AgentTranscriptDebugInstrumentation.emitProjectionIdentity(.init(
-                    previousRowCount: previousRows.count,
-                    newRowCount: newRows.count,
-                    previousBlockCount: previousBlocks.count,
-                    newBlockCount: newBlocks.count,
-                    rowSemanticDigest: newRowSemanticDigest,
-                    previousRowSemanticDigest: previousRowSemanticDigest,
-                    rowIdentityDigest: newRowIdentityDigest,
-                    previousRowIdentityDigest: previousRowIdentityDigest,
-                    blockSemanticDigest: newBlockSemanticDigest,
-                    previousBlockSemanticDigest: previousBlockSemanticDigest,
-                    blockIdentityDigest: newBlockIdentityDigest,
-                    previousBlockIdentityDigest: previousBlockIdentityDigest,
-                    rowIdentityDrift: newRowSemanticDigest == previousRowSemanticDigest && newRowIdentityDigest != previousRowIdentityDigest,
-                    blockIdentityDrift: newBlockSemanticDigest == previousBlockSemanticDigest && newBlockIdentityDigest != previousBlockIdentityDigest
-                ))
+                // Keep identity hashing lazy when only other metrics are requested.
+                AgentTranscriptDebugInstrumentation.emitProjectionIdentity({
+                    let previousRows = previousBaseProjection.archivedRows + previousBaseProjection.workingRows
+                    let newRows = baseProjection.archivedRows + baseProjection.workingRows
+                    let previousBlocks = previousBaseProjection.archivedBlocks + previousBaseProjection.workingBlocks
+                    let newBlocks = baseProjection.archivedBlocks + baseProjection.workingBlocks
+                    let previousRowSemanticDigest = AgentTranscriptDebugInstrumentation.itemSemanticSignature(previousRows)
+                    let newRowSemanticDigest = AgentTranscriptDebugInstrumentation.itemSemanticSignature(newRows)
+                    let previousRowIdentityDigest = AgentTranscriptDebugInstrumentation.itemIdentitySignature(previousRows)
+                    let newRowIdentityDigest = AgentTranscriptDebugInstrumentation.itemIdentitySignature(newRows)
+                    let previousBlockSemanticDigest = AgentTranscriptDebugInstrumentation.blockSemanticSignature(previousBlocks)
+                    let newBlockSemanticDigest = AgentTranscriptDebugInstrumentation.blockSemanticSignature(newBlocks)
+                    let previousBlockIdentityDigest = AgentTranscriptDebugInstrumentation.blockIdentitySignature(previousBlocks)
+                    let newBlockIdentityDigest = AgentTranscriptDebugInstrumentation.blockIdentitySignature(newBlocks)
+                    return .init(
+                        previousRowCount: previousRows.count,
+                        newRowCount: newRows.count,
+                        previousBlockCount: previousBlocks.count,
+                        newBlockCount: newBlocks.count,
+                        rowSemanticDigest: newRowSemanticDigest,
+                        previousRowSemanticDigest: previousRowSemanticDigest,
+                        rowIdentityDigest: newRowIdentityDigest,
+                        previousRowIdentityDigest: previousRowIdentityDigest,
+                        blockSemanticDigest: newBlockSemanticDigest,
+                        previousBlockSemanticDigest: previousBlockSemanticDigest,
+                        blockIdentityDigest: newBlockIdentityDigest,
+                        previousBlockIdentityDigest: previousBlockIdentityDigest,
+                        rowIdentityDrift: newRowSemanticDigest == previousRowSemanticDigest && newRowIdentityDigest != previousRowIdentityDigest,
+                        blockIdentityDrift: newBlockSemanticDigest == previousBlockSemanticDigest && newBlockIdentityDigest != previousBlockIdentityDigest
+                    )
+                }())
             }
         #endif
         #if DEBUG || EDIT_FLOW_PERF
