@@ -458,6 +458,9 @@ extension AgentModeViewModel {
         // of the coordinator's own pre-dispatch decisions, which provably retracts nothing.
         guard attempt.phase != .dispatching || reason.definitivelyNoPhysicalCall else { return }
         if attempt.phase == .cancelledBeforeDispatch, !reason.definitivelyNoPhysicalCall { return }
+        AgentSessionLinkAutoWakeDiagnostics.record(.cancellation(
+            observer: endpoint.sessionID, wake: attempt.wakeID, phase: attempt.phase, reason: reason
+        ))
         if attempt.phase == .preparingDispatch, !reason.definitivelyNoPhysicalCall {
             // Preparation owns the only finalizer that can prove the transport was never called.
             // Mark cancellation intent, but do not cancel that finalizer out from under the attempt.
@@ -823,6 +826,9 @@ extension AgentModeViewModel {
             // consult it: the physical call may already have happened, so retracting the identity
             // here would report "no call" for a turn the provider is running.
             guard agentSessionLinkAutoWakeAttemptIsStillEligible(attempt, session: session) else {
+                AgentSessionLinkAutoWakeDiagnostics.record(.cancellation(
+                    observer: attempt.observerEndpoint.sessionID, wake: attempt.wakeID, phase: attempt.phase, reason: .eligibilityLost
+                ))
                 if let claim = agentSessionLinkPromptClaimStore.pendingClaim(
                     dispatchID: effectiveID,
                     observerSessionID: attempt.observerEndpoint.sessionID
@@ -839,6 +845,9 @@ extension AgentModeViewModel {
                 dispatchID: effectiveID,
                 observerSessionID: attempt.observerEndpoint.sessionID
             ) else {
+                AgentSessionLinkAutoWakeDiagnostics.record(.cancellation(
+                    observer: attempt.observerEndpoint.sessionID, wake: attempt.wakeID, phase: attempt.phase, reason: .requiredClaimUnavailable
+                ))
                 attempt.task?.cancel()
                 session.oversight.pendingAutoWake = nil
                 requestUIRefresh(tabID: session.tabID)
@@ -850,6 +859,9 @@ extension AgentModeViewModel {
                 attempt: attempt,
                 session: session
             ) else {
+                AgentSessionLinkAutoWakeDiagnostics.record(.cancellation(
+                    observer: attempt.observerEndpoint.sessionID, wake: attempt.wakeID, phase: attempt.phase, reason: .requiredClaimUnavailable
+                ))
                 agentSessionLinkPromptClaimStore.abandon(claim)
                 attempt.task?.cancel()
                 session.oversight.pendingAutoWake = nil
@@ -997,10 +1009,17 @@ extension AgentModeViewModel {
             // occurrence fingerprint. The purposeful-attention fence must not turn that pre-existing
             // status behavior into a definite no-call merely because the rendered line gained
             // fresher presentation detail.
-            return context.inventory.items.contains {
+            let admitted = context.inventory.items.contains {
                 $0.targetSessionID == entry.targetSessionID
                     && ($0.reference == nil || $0.reference == entry.reference)
             }
+            if admitted {
+                entry.recordAdmission(
+                    observer: attempt.observerEndpoint.sessionID, wake: attempt.wakeID,
+                    manual: attempt.isManual, cutoff: delivered.settledThrough
+                )
+            }
+            return admitted
         }
         if hasRenderedStatusBasis {
             return true

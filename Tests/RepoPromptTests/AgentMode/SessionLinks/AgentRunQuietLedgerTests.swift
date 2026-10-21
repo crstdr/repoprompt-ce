@@ -275,3 +275,28 @@ extension AgentRunQuietLedgerTests {
         }
     }
 }
+
+extension AgentRunQuietLedgerTests {
+    @MainActor
+    func testSealDiagnosticsReplayQuietOccurrenceAndReplyRefusalOnce() {
+        let recorder = QuietCheckInDiagnosticRecorder()
+        AgentSessionLinkAutoWakeDiagnostics.$testObserver.withValue({ recorder.record($0) }) {
+            for outcome: AgentSessionLinkAutoWakeDiagnostics.SealOutcome in [.quiet, .occurrence, .sourceRangeOrReply] {
+                var fixture = AgentQuietCheckInFixture()
+                fixture.begin()
+                if outcome == .occurrence { fixture.ledger.noteOccurrence(owner: fixture.owner) }
+                let rows = fixture.rows([outcome == .sourceRangeOrReply ? "work" : "[ack]"])
+                let seal = fixture.seal(rows)
+                XCTAssertEqual(seal?.isQuiet, outcome == .quiet)
+                XCTAssertEqual(recorder.events.last, .seal(
+                    source: fixture.owner.binding.persistentSessionID!, attempt: fixture.owner.attemptID,
+                    outcome: outcome, facts: seal?.facts, occurrence: outcome == .occurrence
+                ))
+                let count = recorder.events.count
+                XCTAssertEqual(fixture.seal(rows), seal)
+                XCTAssertEqual(recorder.events.count, count, "idempotent seal must not report a second verdict")
+            }
+        }
+        XCTAssertEqual(recorder.events.count, 3)
+    }
+}
