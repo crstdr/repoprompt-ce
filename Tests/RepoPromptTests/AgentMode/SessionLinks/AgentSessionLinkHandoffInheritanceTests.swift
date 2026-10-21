@@ -1,7 +1,9 @@
+import AppKit
 import Combine
 import Foundation
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
+import SwiftUI
 import XCTest
 @_spi(TestSupport) @testable import RepoPromptApp
 
@@ -141,6 +143,271 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
     }
 
     #if DEBUG
+        func testColdClaudePickerActionPresentsReviewBeforeAnyProviderDispatch() async throws {
+            _ = NSApplication.shared
+            XCTAssertFalse(AppLaunchConfiguration.current.forcesMCPAutoStart)
+            let previousPerfOverride = AgentModePerfDiagnostics.debugProcessOverrideEnabled
+            AgentModePerfDiagnostics.setDebugProcessOverrideEnabled(true)
+            defer { AgentModePerfDiagnostics.setDebugProcessOverrideEnabled(previousPerfOverride) }
+            for additionalWindow in [false, true] {
+                var providerConstructions = 0
+                var fixtures: [Fixture] = []
+                do {
+                    if additionalWindow {
+                        try await fixtures.append(makeFixture(pickerProviderConstruction: { providerConstructions += 1 }))
+                    }
+                    let fixture = try await makeFixture(pickerProviderConstruction: { providerConstructions += 1 })
+                    fixtures.append(fixture)
+                    let vm = fixture.viewModel
+                    let session = fixture.sourceSession
+                    session.selectedAgent = .claudeCode
+                    session.selectedModelRaw = AgentModel.claudeOpus55.rawValue
+                    session.setItemsSilently([.user("Hi", sequenceIndex: 0), .assistant("Hello", sequenceIndex: 1)], reason: .testOverride)
+                    session.transcript = .empty
+                    session.nextSequenceIndex = 2
+                    session.runState = .completed
+                    vm.updateBindingsFromSession(session)
+                    let sourceModel = session.selectedModelRaw
+                    let binding = session.currentRestorationBindingToken
+                    let workspaceID = fixture.window.workspaceManager.activeWorkspaceID
+                    XCTAssertNotNil(binding)
+                    XCTAssertNotNil(workspaceID)
+                    XCTAssertTrue(vm.workspaceManager === fixture.window.workspaceManager)
+                    XCTAssertTrue(vm.sessions[session.tabID] === session)
+                    XCTAssertEqual(vm.currentTabID, session.tabID)
+                    XCTAssertNil(session.pendingHandoff.providerSwitchDelivery)
+                    XCTAssertFalse(vm.ui.composer.props.areModelControlsDisabled)
+                    let input = AgentInputBar(
+                        agentModeVM: vm, composerUI: vm.ui.composer, statusPillsUI: vm.ui.statusPills,
+                        openContextDrawerFiles: {}, oracleViewModel: fixture.window.oracleViewModel,
+                        promptManager: fixture.window.promptManager, workspaceSearchService: fixture.window.workspaceSearchService,
+                        selectionCoordinator: fixture.window.selectionCoordinator, runtimeVM: AgentRuntimeSidebarViewModel(),
+                        windowID: fixture.window.windowID, currentTabID: session.tabID,
+                        resetTextFieldTrigger: .constant(false), composerBottomInset: .constant(0), transcriptBottomClearance: .constant(0)
+                    )
+                    // Inspect the real body value, not a copied action or direct preview helper.
+                    let composer = try XCTUnwrap(findPickerView(in: input.body, as: AgentComposerView.self))
+                    XCTAssertFalse(composer.actions.canSelectAgentInCurrentChat(.codexExec))
+                    let destinationModel = AgentModel.gpt6SolHigh.rawValue
+                    let window = NSWindow(contentRect: NSRect(x: -10000, y: -10000, width: 900, height: 700), styleMask: [.titled], backing: .buffered, defer: false)
+                    window.isReleasedWhenClosed = false
+                    window.animationBehavior = .none
+                    var inputAppeared = false
+                    let composerBodiesBeforeMount = (AgentModePerfDiagnostics.debugStateSnapshot(lineLimit: 1)["counters"] as? [String: Int])?["ui.body.composer"] ?? 0
+                    let host = NSHostingView(rootView: AnyView(
+                        input
+                            .environment(\.agentModePerfRecorder, AppAgentModePerfRecorder())
+                            .onAppear { inputAppeared = true }
+                    ))
+                    window.contentView = host
+                    window.orderFront(nil)
+                    host.layoutSubtreeIfNeeded()
+                    defer {
+                        if let sheet = window.attachedSheet { window.endSheet(sheet) }
+                        window.orderOut(nil)
+                        window.close()
+                    }
+                    // A real picker is used only after its composer has mounted. Observe that
+                    // lifecycle boundary without priming a sheet or delaying production code.
+                    try await AsyncTestWait.waitUntil("production InputBar appeared", timeout: 2) {
+                        inputAppeared && host.window === window
+                    }
+                    host.layoutSubtreeIfNeeded()
+                    host.displayIfNeeded()
+                    try await AsyncTestWait.waitUntil("instrumented composer native editor mounted", timeout: 2) {
+                        self.findPickerEditor(in: host)?.window === window
+                    }
+                    let settled = expectation(description: "Mounted composer render settles")
+                    RunLoop.main.perform {
+                        MainActor.assumeIsolated {
+                            host.layoutSubtreeIfNeeded()
+                            host.displayIfNeeded()
+                            settled.fulfill()
+                        }
+                    }
+                    await fulfillment(of: [settled], timeout: 2)
+                    let composerBodiesBefore = (AgentModePerfDiagnostics.debugStateSnapshot(lineLimit: 1)["counters"] as? [String: Int])?["ui.body.composer"] ?? 0
+                    XCTAssertGreaterThan(composerBodiesBefore, composerBodiesBeforeMount, "Mounting the real composer must increment the counter.")
+                    let composerRevision = vm.ui.composer.revision
+                    let publicationCount = 10
+                    var sidebarPublications = 0
+                    let sidebarObservation = vm.$sessionSidebarSearchText.dropFirst().sink { _ in sidebarPublications += 1 }
+                    defer { sidebarObservation.cancel() }
+                    for publication in 0 ..< publicationCount {
+                        vm.sessionSidebarSearchText = "unrelated sidebar search \(publication)"
+                        let rendered = expectation(description: "Sidebar publication \(publication) reaches hosted render")
+                        RunLoop.main.perform {
+                            MainActor.assumeIsolated {
+                                host.layoutSubtreeIfNeeded()
+                                host.displayIfNeeded()
+                                rendered.fulfill()
+                            }
+                        }
+                        await fulfillment(of: [rendered], timeout: 2)
+                    }
+                    let composerBodiesAfter = (AgentModePerfDiagnostics.debugStateSnapshot(lineLimit: 1)["counters"] as? [String: Int])?["ui.body.composer"] ?? 0
+                    XCTAssertEqual(sidebarPublications, publicationCount, "Distinct writes must really publish on the observed VM.")
+                    XCTAssertEqual(vm.ui.composer.revision, composerRevision, "Sidebar searches must not change composer inputs.")
+                    XCTContext.runActivity(named: "Unrelated VM publications: \(sidebarPublications); composer bodies: \(composerBodiesBefore) → \(composerBodiesAfter)") { _ in
+                        XCTAssertEqual(composerBodiesAfter, composerBodiesBefore, "The observed presentation wrapper must preserve the equatable composer boundary.")
+                    }
+                    XCTAssertNil(window.attachedSheet)
+                    var previewEvents: [String] = []
+                    var previewWasInstalled = false
+                    let observation = vm.$providerSwitchPreview.sink { preview in
+                        if let preview {
+                            previewWasInstalled = true
+                            previewEvents.append(preview.building ? "building" : "ready")
+                        } else { previewEvents.append("nil") }
+                    }
+                    defer { observation.cancel() }
+                    XCTAssertEqual(vm.currentTabID, session.tabID)
+                    XCTAssertFalse(vm.ui.composer.props.areModelControlsDisabled)
+                    composer.actions.selectAgentModel(.codexExec, destinationModel)
+                    XCTAssertEqual(session.selectedAgent, .claudeCode)
+                    XCTAssertEqual(session.selectedModelRaw, sourceModel)
+                    XCTAssertEqual(session.currentRestorationBindingToken, binding)
+                    XCTAssertEqual(fixture.window.workspaceManager.activeWorkspaceID, workspaceID)
+                    XCTAssertNil(session.pendingHandoff.providerSwitchDelivery)
+                    XCTAssertEqual(providerConstructions, 0)
+                    XCTAssertNil(session.agentTask)
+                    XCTAssertNil(session.activeRunOwnership)
+                    XCTAssertNil(session.codexController)
+                    XCTAssertNil(session.claudeController)
+                    var presented = false
+                    do {
+                        try await AsyncTestWait.waitUntil("production picker review sheet appears", timeout: 2) { window.attachedSheet != nil }
+                        presented = true
+                    } catch {}
+                    let productionEvents = previewEvents
+                    let installedInProduction = previewWasInstalled
+                    let ownerStillMatches = vm.sessions[session.tabID] === session
+                        && session.currentRestorationBindingToken == binding
+                        && fixture.window.workspaceManager.activeWorkspaceID == workspaceID
+                    if !presented {
+                        // Same observation/binding/sheet content with a persistent presentation leaf.
+                        // A passing control is necessary before attributing absence to the presenter.
+                        host.rootView = AnyView(PickerStablePresentationControl(viewModel: vm, session: session))
+                        host.layoutSubtreeIfNeeded()
+                        composer.actions.selectAgentModel(.codexExec, destinationModel)
+                        try await AsyncTestWait.waitUntil("stable-anchor headless presentation control", timeout: 2) {
+                            window.attachedSheet != nil && vm.providerSwitchPreview?.building == false
+                        }
+                    }
+                    XCTAssertTrue(installedInProduction, "The real callback must install its preview; events=\(productionEvents)")
+                    XCTAssertTrue(ownerStillMatches)
+                    XCTAssertEqual(vm.providerSwitchPreview?.destination, .codexExec)
+                    XCTAssertEqual(session.selectedAgent, .claudeCode)
+                    XCTAssertEqual(session.selectedModelRaw, sourceModel)
+                    XCTAssertEqual(providerConstructions, 0)
+                    XCTAssertTrue(presented, "The production InputBar picker must display Review with no pending handover; additionalWindow=\(additionalWindow)")
+                    vm.cancelProviderSwitchPreview()
+                    try await AsyncTestWait.waitUntil("production picker Review closes", timeout: 2) {
+                        vm.providerSwitchPreview == nil && window.attachedSheet == nil
+                    }
+                } catch {
+                    for fixture in fixtures.reversed() {
+                        await cleanup(fixture)
+                    }
+                    throw error
+                }
+                for fixture in fixtures.reversed() {
+                    await cleanup(fixture)
+                }
+            }
+        }
+
+        func testMountedComposerKeepsNativeEditorAcrossSessionLookupTransitions() async throws {
+            _ = NSApplication.shared
+            var providerConstructions = 0
+            let fixture = try await makeFixture(pickerProviderConstruction: { providerConstructions += 1 })
+            do {
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                vm.test_removeSession(tabID: session.tabID)
+                XCTAssertNil(vm.sessions[session.tabID])
+                let input = AgentInputBar(
+                    agentModeVM: vm, composerUI: vm.ui.composer, statusPillsUI: vm.ui.statusPills,
+                    openContextDrawerFiles: {}, oracleViewModel: fixture.window.oracleViewModel,
+                    promptManager: fixture.window.promptManager, workspaceSearchService: fixture.window.workspaceSearchService,
+                    selectionCoordinator: fixture.window.selectionCoordinator, runtimeVM: AgentRuntimeSidebarViewModel(),
+                    windowID: fixture.window.windowID, currentTabID: session.tabID,
+                    resetTextFieldTrigger: .constant(false), composerBottomInset: .constant(0), transcriptBottomClearance: .constant(0)
+                )
+                // Render the actual body at each lookup boundary with the same cached composer
+                // props/tab ID. Draft restoration may materialize a runtime during mounting.
+                let host = NSHostingView(rootView: AnyView(input.body))
+                let window = NSWindow(contentRect: NSRect(x: -10000, y: -10000, width: 900, height: 700), styleMask: [.titled], backing: .buffered, defer: false)
+                window.isReleasedWhenClosed = false
+                window.animationBehavior = .none
+                window.contentView = host
+                window.orderFront(nil)
+                defer { window.orderOut(nil)
+                    window.close()
+                }
+                try await AsyncTestWait.waitUntil("production composer native editor mounted", timeout: 2) {
+                    self.findPickerEditor(in: host)?.window === window
+                }
+                let originalEditor = try XCTUnwrap(findPickerEditor(in: host))
+                for sessionPresent in [true, false, true] {
+                    if sessionPresent { vm.test_replaceSessionForDeferredHydration(tabID: session.tabID, with: session) }
+                    else { vm.test_removeSession(tabID: session.tabID) }
+                    XCTAssertEqual(vm.sessions[session.tabID] != nil, sessionPresent)
+                    host.rootView = AnyView(input.body)
+                    let rendered = expectation(description: "Session lookup render reaches hosted composer")
+                    RunLoop.main.perform {
+                        MainActor.assumeIsolated {
+                            host.layoutSubtreeIfNeeded()
+                            host.displayIfNeeded()
+                            rendered.fulfill()
+                        }
+                    }
+                    await fulfillment(of: [rendered], timeout: 2)
+                    let editor = try XCTUnwrap(findPickerEditor(in: host))
+                    XCTAssertTrue(editor === originalEditor, "Session lookup presence=\(sessionPresent) must not replace the native composer")
+                    XCTAssertTrue(editor.window === window)
+                    XCTAssertNil(window.attachedSheet, "Absent preview must never present, including nil session/nil preview")
+                    XCTAssertNil(vm.providerSwitchPreview)
+                    XCTAssertEqual(providerConstructions, 0)
+                }
+            } catch {
+                await cleanup(fixture)
+                throw error
+            }
+            await cleanup(fixture)
+        }
+
+        private func findPickerEditor(in view: NSView) -> ImageAwareTextView? {
+            if let editor = view as? ImageAwareTextView { return editor }
+            for child in view.subviews {
+                if let editor = findPickerEditor(in: child) { return editor }
+            }
+            return nil
+        }
+
+        private struct PickerStablePresentationControl: View {
+            @ObservedObject var viewModel: AgentModeViewModel
+            @ObservedObject var session: AgentTabSession
+
+            var body: some View {
+                Color.clear.sheet(isPresented: Binding(
+                    get: { viewModel.providerSwitchPreview?.session === session },
+                    set: { if !$0 { viewModel.cancelProviderSwitchPreview() } }
+                )) { AgentProviderSwitchPreview(viewModel: viewModel) }
+            }
+        }
+
+        private func findPickerView<T>(in value: Any, as type: T.Type, depth: Int = 0) -> T? {
+            if let result = value as? T { return result }
+            guard depth < 12 else { return nil }
+            let mirror = Mirror(reflecting: value)
+            guard mirror.displayStyle != .class else { return nil }
+            for child in mirror.children {
+                if let result = findPickerView(in: child.value, as: type, depth: depth + 1) { return result }
+            }
+            return nil
+        }
+
         func testSwitchExpandedSkillAndTaggedFileRefusalsRetainClaimedComposer() async throws {
             for skill in [true, false] {
                 try await withFixture { fixture in
@@ -2932,20 +3199,28 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
         await cleanup(fixture)
     }
 
-    private func makeFixture(computerUseReady: Bool = false) async throws -> Fixture {
+    private func makeFixture(computerUseReady: Bool = false, pickerProviderConstruction: (() -> Void)? = nil) async throws -> Fixture {
         let rootURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("AgentSessionLinkHandoffInheritanceTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
 
-        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
-        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let previousAutoStart = pickerProviderConstruction == nil ? GlobalSettingsStore.shared.mcpAutoStart() : nil
+        if previousAutoStart != nil { GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false) }
         let window: WindowState
         #if DEBUG
-            if computerUseReady {
+            if computerUseReady || pickerProviderConstruction != nil {
                 window = WindowState(agentModeViewModelFactory: { windowID, prompt, manager, server in
+                    let claudeFactory: ClaudeAgentModeCoordinator.ClaudeControllerFactory? = pickerProviderConstruction == nil ? nil : { _, _, _, _ in
+                        pickerProviderConstruction?()
+                        preconditionFailure("Picker must never construct a native provider")
+                    }
                     let vm = AgentModeViewModel(
                         testWindowID: windowID,
-                        codexControllerFactory: { _, _, _, _, _, _ in preconditionFailure("Parity fixture must stop before provider transport") },
+                        codexControllerFactory: { _, _, _, _, _, _ in
+                            pickerProviderConstruction?()
+                            preconditionFailure("Fixture must stop before provider transport")
+                        },
+                        claudeControllerFactory: claudeFactory,
                         testMCPServer: server,
                         testWorkspaceFileContextStore: prompt.workspaceFileContextStore,
                         testCodexComputerUseCompanionReady: { true }, testCodexComputerUseReservedEntryExists: { false }
@@ -2959,7 +3234,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             window = WindowState()
         #endif
         WindowStatesManager.shared.registerWindowState(window)
-        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        if let previousAutoStart { GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false) }
         await window.workspaceManager.awaitInitialized()
 
         let defaultsDomain = "ProviderSwitchTests.\(UUID())"

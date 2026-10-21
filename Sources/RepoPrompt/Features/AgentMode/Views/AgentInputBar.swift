@@ -94,33 +94,32 @@ struct AgentInputBar: View {
         #if DEBUG
             let _ = perfRecorder.increment("ui.body.inputBar")
         #endif
-        VStack(spacing: 8) {
-            if let currentTabID, let session = agentModeVM.sessions[currentTabID] {
-                AgentProviderSwitchPresentation(viewModel: agentModeVM, session: session)
+        AgentProviderSwitchPresentation(viewModel: agentModeVM, tabID: currentTabID, content: composer)
+            .overlay(alignment: .bottom) {
+                statusPills
+                    .padding(.bottom, Self.footerHeight + ComposerChrome<EmptyView, EmptyView>.baseBarHeight + composerBottomInset - 8)
             }
-            AgentComposerView(
-                props: composerUI.props,
-                placeholderText: composerPlaceholderText,
-                actions: composerActions,
-                promptManager: promptManager,
-                workspaceSearchService: workspaceSearchService,
-                selectionCoordinator: selectionCoordinator,
-                windowID: windowID,
-                currentTabID: currentTabID,
-                repromptViewModel: agentModeVM,
-                repromptStore: agentModeVM.repromptUIStore,
-                pendingSubmissionStore: composerUI,
-                resetTextFieldTrigger: $resetTextFieldTrigger,
-                composerBottomInset: $composerBottomInset,
-                transcriptBottomClearance: $transcriptBottomClearance,
-                isFocused: _isFocused
-            )
-            .equatable()
-        }
-        .overlay(alignment: .bottom) {
-            statusPills
-                .padding(.bottom, Self.footerHeight + ComposerChrome<EmptyView, EmptyView>.baseBarHeight + composerBottomInset - 8)
-        }
+    }
+
+    private var composer: some View {
+        AgentComposerView(
+            props: composerUI.props,
+            placeholderText: composerPlaceholderText,
+            actions: composerActions,
+            promptManager: promptManager,
+            workspaceSearchService: workspaceSearchService,
+            selectionCoordinator: selectionCoordinator,
+            windowID: windowID,
+            currentTabID: currentTabID,
+            repromptViewModel: agentModeVM,
+            repromptStore: agentModeVM.repromptUIStore,
+            pendingSubmissionStore: composerUI,
+            resetTextFieldTrigger: $resetTextFieldTrigger,
+            composerBottomInset: $composerBottomInset,
+            transcriptBottomClearance: $transcriptBottomClearance,
+            isFocused: _isFocused
+        )
+        .equatable()
     }
 
     private var composerActions: AgentComposerActions {
