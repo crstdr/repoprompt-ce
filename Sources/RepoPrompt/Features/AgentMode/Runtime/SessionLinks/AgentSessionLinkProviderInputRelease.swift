@@ -50,14 +50,20 @@ enum AgentSessionLinkProviderInputRelease {
         isPending: (AgentSessionLinkOutboundPromptClaim) -> Bool,
         consume: (AgentSessionLinkLocalInputDecoration) -> Bool
     ) -> ReleasedDispatchContext {
-        guard let original, let decoration = original.localInput else {
-            return ReleasedDispatchContext(claim: original, fragment: original?.fragment, mustAbortDispatch: false, disclosedLocalInputs: false)
+        guard let original else {
+            return ReleasedDispatchContext(claim: nil, fragment: nil, mustAbortDispatch: false, disclosedLocalInputs: false)
+        }
+        if original.localInput == nil, !original.routineQuietCheckIn {
+            return ReleasedDispatchContext(claim: original, fragment: original.fragment, mustAbortDispatch: false, disclosedLocalInputs: false)
         }
         let outcome = current()
         guard !outcome.mustAbortDispatch else {
             return ReleasedDispatchContext(claim: nil, fragment: nil, mustAbortDispatch: true, disclosedLocalInputs: false)
         }
         let chosen = outcome.claim
+        guard let decoration = original.localInput else {
+            return ReleasedDispatchContext(claim: chosen, fragment: chosen?.fragment, mustAbortDispatch: false, disclosedLocalInputs: false)
+        }
         if chosen == original, proof.claim == original, proof.authorized,
            !Task.isCancelled, isPending(original), consume(decoration)
         {

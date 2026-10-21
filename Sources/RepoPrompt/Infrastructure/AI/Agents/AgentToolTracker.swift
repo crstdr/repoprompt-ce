@@ -150,6 +150,10 @@ final class AgentToolEventDeliveryMailbox: @unchecked Sendable {
     }
 
     #if DEBUG
+        func idleWaiterCountForTesting() -> Int {
+            lock.withLock { idleContinuations.count }
+        }
+
         func queuedOperationCountForTesting() -> Int {
             lock.lock()
             defer { lock.unlock() }
@@ -491,6 +495,10 @@ final class AgentToolTrackingController {
     #if DEBUG
         func waitForPendingEventDeliveriesForTesting() async {
             await waitForPendingEventDeliveries()
+        }
+
+        var pendingEventDeliveryWaiterCountForTesting: Int {
+            eventDeliveryMailbox.idleWaiterCountForTesting()
         }
 
         /// A deterministic suspension of this existing FIFO, not an observer-completion fence.

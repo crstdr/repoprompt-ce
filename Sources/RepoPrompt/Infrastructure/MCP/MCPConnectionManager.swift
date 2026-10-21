@@ -1883,7 +1883,7 @@ actor ServerNetworkManager {
         let hasActiveOutboundLink: Bool?
         let expectedSurface: Data?
         let returnedSurface: Data?
-        let returnedCatalog: Data?
+        let returnedCatalog: [String: [MCP.Tool]]?
         let projectionRevision: UInt64
 
         var routeToken: AgentSessionLinkRunCatalogRouteToken? {
@@ -1946,6 +1946,11 @@ actor ServerNetworkManager {
 
     private nonisolated let codeStructureSettlementRegistry = MCPCodeStructureSettlementRegistry()
     private nonisolated let toolCardOwnershipLedger = MCPToolCardOwnershipLedger()
+
+    /// The outer observer path owns this indexed key until its callbacks have been enqueued.
+    nonisolated func hasPendingToolCardObservations(windowID: Int, runID: UUID) -> Bool {
+        toolCardOwnershipLedger.hasOwners(windowID: windowID, runID: runID)
+    }
 
     /// The registry remains the lease owner. This actor keeps only the identity
     /// of a warning projected into each window, so healthy calls do not hop to
@@ -3267,6 +3272,7 @@ actor ServerNetworkManager {
         var additionalGrants: Set<String> {
             var grants: Set<String> = []
             if hasAnyActiveLink || hasActivatedOverseer { grants.insert(MCPWindowToolName.agentSessionLink) }
+            if hasActiveOutboundLink { grants.insert(MCPWindowToolName.selfNoop) }
             if canListBecomeOverseer { grants.insert(MCPWindowToolName.becomeOverseer) }
             if isSessionAdminEligible { grants.insert(MCPWindowToolName.sessionAdmin) }
             return grants
@@ -3532,7 +3538,7 @@ actor ServerNetworkManager {
         initialRouteToken: AgentSessionLinkRunCatalogRouteToken?,
         returnedSessionLinkPresence: Bool,
         returnedSurface: Data? = nil,
-        returnedCatalog: Data? = nil,
+        returnedCatalog: [String: [MCP.Tool]]? = nil,
         catalogStartRevision: UInt64? = nil
     ) async {
         let runID = initialRouteToken?.runID ?? runIDByConnectionID[connectionID]
@@ -3646,7 +3652,7 @@ actor ServerNetworkManager {
         hasActiveOutboundLink: Bool?,
         expectedSurface: Data? = nil,
         returnedSurface: Data? = nil,
-        returnedCatalog: Data? = nil,
+        returnedCatalog: [String: [MCP.Tool]]? = nil,
         supersedesWaiters: Bool
     ) async -> AgentSessionLinkRunCatalogProjection {
         runCatalogProjectionRevision &+= 1
@@ -13524,7 +13530,7 @@ actor ServerNetworkManager {
                 initialRouteToken: sessionLinkGrantSnapshot?.routeToken,
                 returnedSessionLinkPresence: returnedSessionLinkPresence,
                 returnedSurface: AgentSessionLinkCatalogSurface.fingerprint(tools),
-                returnedCatalog: try? JSONEncoder().encode(tools),
+                returnedCatalog: Dictionary(grouping: tools, by: \.name),
                 catalogStartRevision: catalogStartRevision
             )
             connectionLog("Returning \(tools.count) available tools for \(connectionID)")
@@ -13960,6 +13966,7 @@ actor ServerNetworkManager {
                     toolName == MCPWindowToolName.agentSessionLink
                         || toolName == MCPWindowToolName.becomeOverseer
                         || toolName == MCPWindowToolName.sessionAdmin
+                        || toolName == MCPWindowToolName.selfNoop
                 )
                     ? await liveSessionLinkGrantSnapshot(connectionID: connectionID, modelOnly: isMemoryOnlyModelCall)
                     : nil
@@ -14068,6 +14075,7 @@ actor ServerNetworkManager {
                     toolName == MCPWindowToolName.agentSessionLink
                         || toolName == MCPWindowToolName.becomeOverseer
                         || toolName == MCPWindowToolName.sessionAdmin
+                        || toolName == MCPWindowToolName.selfNoop
                 )
                     ? await liveSessionLinkGrantSnapshot(connectionID: connectionID, modelOnly: isMemoryOnlyModelCall)
                     : nil

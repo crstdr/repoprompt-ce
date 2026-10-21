@@ -597,6 +597,70 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             }
         }
 
+        func testW2RegisteredNoopKeepsFinalQuietFactsWhenHostCallbacksAreQueued() async throws {
+            for kind in [AgentProviderKind.claudeCode, .codexExec] {
+                for delayed in [false, true] {
+                    try await MCPSharedServerTestLease.shared.withLease { _ in
+                        try await self.exerciseLiveDiscovery(w0fProvider: kind, w2Probe: .terminal(delayed: delayed, nativeResult: true))
+                    }
+                }
+            }
+        }
+
+        func testW2ClosingTextAfterAcceptedBodySurvivesQueuedCanonicalRows() async throws {
+            for kind in [AgentProviderKind.claudeCode, .codexExec] {
+                for delayed in [false, true] {
+                    try await MCPSharedServerTestLease.shared.withLease { _ in
+                        try await self.exerciseLiveDiscovery(w0fProvider: kind, w2Probe: .terminal(delayed: delayed, nativeResult: true, closing: true))
+                    }
+                }
+            }
+        }
+
+        func testW2LeadingTextRemainsOrdinaryWithQueuedDeclaration() async throws {
+            for kind in [AgentProviderKind.claudeCode, .codexExec] {
+                try await MCPSharedServerTestLease.shared.withLease { _ in
+                    try await self.exerciseLiveDiscovery(w0fProvider: kind, w2Probe: .terminal(delayed: true, nativeResult: true, leading: true))
+                }
+            }
+        }
+
+        func testW2RunServiceStopDuringQueuedObservationCutSettlesExactlyOnce() async throws {
+            for kind in [AgentProviderKind.claudeCode, .codexExec] {
+                try await MCPSharedServerTestLease.shared.withLease { _ in
+                    try await self.exerciseLiveDiscovery(w0fProvider: kind, w2Probe: .terminal(delayed: true, nativeResult: true, closing: true, cancel: true))
+                }
+            }
+        }
+
+        func testW2RegisteredNoopWithoutNativeResultRemainsOrdinaryAfterQueuedHostDrain() async throws {
+            for kind in [AgentProviderKind.claudeCode, .codexExec] {
+                try await MCPSharedServerTestLease.shared.withLease { _ in
+                    try await self.exerciseLiveDiscovery(w0fProvider: kind, w2Probe: .terminal(delayed: true, nativeResult: false))
+                }
+            }
+        }
+
+        func testW2SameRouteCatalogWithdrawalDuringLocalProofRemovesActualSentHint() async throws {
+            for withdraw in [false, true] {
+                try await MCPSharedServerTestLease.shared.withLease { _ in
+                    try await self.exerciseLiveDiscovery(w0fProvider: .claudeCode, w2Probe: .hint(withdraw: withdraw))
+                }
+            }
+        }
+
+        func testW2ProductionCatalogProofHandoffCostWithActualAndTenfoldCatalog() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { _ in
+                try await self.exerciseLiveDiscovery(w0fProvider: .claudeCode, w2Probe: .catalogCost)
+            }
+        }
+
+        private enum W2Probe {
+            case terminal(delayed: Bool, nativeResult: Bool, closing: Bool = false, leading: Bool = false, cancel: Bool = false)
+            case hint(withdraw: Bool)
+            case catalogCost
+        }
+
         private enum ProofMutation {
             case unrelatedRoute
             case exactConnectionPolicyABA
@@ -610,7 +674,8 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
 
         private func exerciseLiveDiscovery(
             activate: Bool = false, inbound: Bool = false, originalQualificationFamilyABA: Bool = false,
-            proofMutation: ProofMutation? = nil, w0fProvider: AgentProviderKind? = nil
+            proofMutation: ProofMutation? = nil, w0fProvider: AgentProviderKind? = nil,
+            w2Probe: W2Probe? = nil
         ) async throws {
             try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
             let manager = ServerNetworkManager.shared
@@ -998,6 +1063,18 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 XCTAssertEqual(turnAtVisibleCatalog, heldTurn, "The refreshed catalog must be observable on the same uninterrupted provider turn")
                 XCTAssertTrue(after.contains(MCPWindowToolName.agentSessionLink))
                 XCTAssertTrue(after.contains(MCPWindowToolName.becomeOverseer), "Targeted bootstrap remains discoverable in the continuing flow")
+                if let w2Probe {
+                    switch w2Probe {
+                    case let .terminal(delayed, nativeResult, closing, leading, cancel):
+                        try await w2RegisteredTerminal(window: window, session: observer, connection: connection, runID: runID, delayed: delayed, nativeResult: nativeResult, closing: closing, leading: leading, cancel: cancel)
+                    case let .hint(withdraw):
+                        try await w2CatalogProof(window: window, session: observer, provider: provider, endpoint: endpoint, route: route, runID: runID, withdraw: withdraw)
+                    case .catalogCost:
+                        try await w2CatalogCost(window: window, session: observer, provider: provider, endpoint: endpoint, runID: runID, inactiveTabID: targetTab)
+                    }
+                    await cleanup()
+                    return
+                }
                 if let w0fProvider {
                     try await w0fRepairControls(manager: manager, provider: provider, window: window, observer: observer, endpoint: endpoint, route: route, runID: runID, kind: w0fProvider, codex: codex, codexRecorder: codexRecorder)
                     await cleanup()
@@ -1285,6 +1362,10 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             return try XCTUnwrap(result["tools"] as? [[String: Any]])
         }
 
+        func callSelfNoop() async throws -> PersistentMCPTestRPCResponse {
+            try await XCTUnwrap(connection).callTool(name: MCPWindowToolName.selfNoop, arguments: [:], timeoutSeconds: 2)
+        }
+
         func listLinks() async throws -> PersistentMCPTestRPCResponse {
             try await XCTUnwrap(connection).callTool(name: MCPWindowToolName.agentSessionLink, arguments: ["op": "list", "_rawJSON": true], timeoutSeconds: 2)
         }
@@ -1317,12 +1398,398 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
         nonisolated static func w0fReturnedShape(copies: Int = 1, permissiveSchema: Bool = false) -> @Sendable ([MCP.Tool], Bool) -> [MCP.Tool] {
             { tools, outbound in
                 guard outbound, tools.contains(where: { $0.name == MCPWindowToolName.agentSessionLink }) else { return tools }
-                let candidate = w0fTool()
+                guard let candidate = tools.first(where: { $0.name == MCPWindowToolName.selfNoop }) else { return tools }
                 let returned = permissiveSchema
                     ? MCP.Tool(name: candidate.name, description: candidate.description, inputSchema: .object(["type": .string("object")]))
                     : candidate
-                return tools + Array(repeating: returned, count: copies)
+                return tools.filter { $0.name != MCPWindowToolName.selfNoop } + Array(repeating: returned, count: copies)
             }
+        }
+
+        func assertW2Acknowledgement(_ content: [[String: Any]]) throws {
+            XCTAssertEqual(content.count, 1)
+            XCTAssertEqual(content.first?["type"] as? String, "text")
+            let text = try XCTUnwrap(content.first?["text"] as? String)
+            XCTAssertTrue(text.hasPrefix("```json\n"))
+            XCTAssertTrue(text.hasSuffix("\n```"))
+            let body = String(text.dropFirst("```json\n".count).dropLast("\n```".count))
+            let decoded = try JSONDecoder().decode(Value.self, from: Data(body.utf8))
+            XCTAssertEqual(decoded, .object(["result": .string("done")]), "Exact body, decoded through unchanged generic MCP envelope")
+        }
+
+        /// Actual registered body + normal native ingress and production terminal hooks. The only
+        /// eligibility input supplied by this fixture is the routine wake's origin qualification.
+        func w2RegisteredTerminal(
+            window: WindowState, session: AgentTabSession, connection: PersistentMCPTestEndpoint,
+            runID: UUID, delayed: Bool, nativeResult: Bool, closing: Bool, leading: Bool, cancel: Bool
+        ) async throws {
+            let vm = window.agentModeViewModel
+            let manager = ServerNetworkManager.shared
+            let claude = session.selectedAgent == .claudeCode
+            vm.test_initializeRunService()
+            session.appendItem(.user("routine fixture origin", sequenceIndex: session.nextSequenceIndex))
+            let owner = session.beginRunAttempt(source: "W2.registered-native-terminal")
+            let handler = vm.test_claudeCoordinator.testToolTrackingHandler(for: session)
+            let codex = vm.test_codexCoordinator
+            let decoder = CodexNativeSessionController(client: CodexAppServerClient(), runID: runID, tabID: session.tabID, windowID: window.windowID, workspacePaths: .uniform(nil))
+            let thread = "w2-exact-thread"
+            let turn = "w2-exact-turn"
+            let raw = claude ? "toolu_w2_queued_host" : "w2_original_native_call_string"
+            let mailbox = TestReleaseFence(name: "before first registered noop host callback")
+            var translator = ClaudeSDKNDJSONTranslator()
+            var nativeTask: Task<Void, Never>?
+            var terminalTask: Task<Void, Never>?
+            var nativeIDs: [UUID] = []
+            var nativeDelivered: XCTestExpectation?
+            let terminalDelivered = AsyncStream<Void>.makeStream()
+            if claude {
+                await handler.startTracking(runID: runID, session: session, clientNameHint: nil)
+            } else {
+                session.codexController = decoder
+                session.codexConversationID = thread
+                session.codexPendingTurnKind = .user
+                await decoder.test_installThreadState(threadID: thread, authoritativeTurnID: turn, routingTurnID: turn)
+                await codex.test_handleCodexNativeEvent(.turnStarted(turnID: turn), session: session, sourceController: decoder)
+                await codex.testStartCodexToolTracking(for: session, runID: runID)
+                let events = decoder.events
+                nativeTask = Task {
+                    for await event in events {
+                        await codex.test_handleCodexNativeEvent(event, session: session, sourceController: decoder)
+                        switch event {
+                        case let .toolCall(_, id, _, _), let .toolResult(_, id, _, _, _, _):
+                            if let id { nativeIDs.append(id) }
+                            nativeDelivered?.fulfill()
+                        case .turnCompleted: terminalDelivered.continuation.yield(())
+                        default: break
+                        }
+                    }
+                }
+            }
+            session.quietLedger.markRoutineWake(owner: owner, wakeID: UUID())
+            func flush() async {
+                if claude { await handler.waitForPendingEventDeliveries() }
+                else { await codex.testFlushCodexToolTracking(for: session) }
+            }
+            func native(result: Bool) async throws {
+                if claude {
+                    let block: [String: Any] = result
+                        ? ["type": "tool_result", "tool_use_id": raw, "content": [["type": "text", "text": "{\"result\":\"done\"}"]]]
+                        : ["type": "tool_use", "id": raw, "name": "mcp__\(MCPIntegrationHelper.repoPromptMCPServerName)__self_noop", "input": [:]]
+                    let data = try JSONSerialization.data(withJSONObject: ["type": result ? "user" : "assistant", "message": ["content": [block]]])
+                    for stream in translator.parseNDJSONLine(data) {
+                        if stream.type == "tool_result" { XCTAssertNil(stream.toolIsError, "Host-owned error verdict is intentionally not inferred by the translator") }
+                        if let id = stream.toolInvocationID { nativeIDs.append(id) }
+                        await vm.test_handleStreamResult(stream, session: session, runID: runID, runAttemptID: owner.attemptID)
+                    }
+                } else {
+                    let delivered = expectation(description: "registered noop native representation")
+                    nativeDelivered = delivered
+                    await decoder.test_handleNotification(method: result ? "item/completed" : "item/started", params: [
+                        "threadId": .string(thread), "turnId": .string(turn), "item": .object([
+                            "type": .string("mcpToolCall"), "id": .string(raw),
+                            "server": .string(MCPIntegrationHelper.repoPromptMCPServerName), "tool": .string("self_noop"),
+                            "arguments": .object([:]), "status": .string(result ? "completed" : "inProgress"),
+                            "result": result ? .object(["content": .array([.object(["type": .string("text"), "text": .string("{\"result\":\"done\"}")])])]) : .null
+                        ])
+                    ])
+                    await fulfillment(of: [delivered], timeout: 5)
+                    nativeDelivered = nil
+                }
+            }
+            func assistantText(_ text: String) async throws {
+                if claude {
+                    let data = try JSONSerialization.data(withJSONObject: ["type": "assistant", "message": ["content": [["type": "text", "text": text]]]])
+                    for stream in translator.parseNDJSONLine(data) {
+                        await vm.test_handleStreamResult(stream, session: session, runID: runID, runAttemptID: owner.attemptID)
+                    }
+                } else {
+                    await codex.test_handleCodexNativeEvent(.assistantDelta(text), session: session, sourceController: decoder)
+                }
+            }
+            func cleanup() async {
+                mailbox.release()
+                await terminalTask?.value
+                await decoder.shutdown()
+                await nativeTask?.value
+                terminalDelivered.continuation.finish()
+                if claude { await handler.stopTracking(for: session) }
+                else { await codex.testStopCodexToolTracking(for: session) }
+            }
+            do {
+                if leading { try await assistantText("leading output before declaration") }
+                try await native(result: false)
+                if delayed {
+                    if claude { handler.enqueueEventDeliveryBarrierForTesting { await mailbox.enterAndWait() } }
+                    else { codex.testEnqueueCodexToolTrackingBarrier(for: session) { await mailbox.enterAndWait() } }
+                    guard await mailbox.waitUntilEntered() else { throw CancellationError() }
+                }
+                let metadata: [String: Any] = claude ? ["claudecode/toolUseId": raw] : ["callId": raw, "threadId": thread, "itemId": "not-a-host-UUID"]
+                let response = try await connection.client.request(method: "tools/call", params: ["name": "self_noop", "arguments": [:], "_meta": metadata])
+                let result = try XCTUnwrap(try MCPExportWatchdogIntegrationTests.responseObject(from: response)["result"] as? [String: Any])
+                XCTAssertNotEqual(result["isError"] as? Bool, true, response.rawJSON)
+                let content = try XCTUnwrap(result["content"] as? [[String: Any]])
+                try assertW2Acknowledgement(content)
+                let hostID = session.quietLedger.acceptedDeclarationInvocationID(owner: owner)
+                XCTAssertEqual(hostID == nil, leading, "Leading text irreversibly prevents acceptance")
+                XCTAssertEqual(session.quietLedger.declarationBodyEntryCardinality(owner: owner), 1)
+                if let hostID { XCTAssertTrue(nativeIDs.allSatisfy { $0 != hostID }) }
+                XCTAssertFalse(window.mcpServer.hasActiveToolExecutions(runID: runID))
+                XCTAssertFalse(manager.hasPendingToolCardObservations(windowID: window.windowID, runID: runID))
+                if nativeResult { try await native(result: true) }
+                XCTAssertEqual(nativeIDs.count, nativeResult ? 2 : 1)
+                if !delayed { await flush() }
+                if closing { try await assistantText("allowed closing output after accepted body") }
+                XCTAssertEqual(session.quietLedger.hasOrdinaryOccurrence(owner: owner), leading, "Temporal ingress distinguishes leading text from allowed closing output")
+                let complete = hostID.map { id in claude ? handler.hasCompleteExactAssociation(hostInvocationID: id, owner: owner, session: session) : session.quietLedger.codexAssociationIsComplete(owner: owner, hostID: id, runID: runID, threadID: thread) } ?? false
+                let rowDiagnostics = session.items.map { "\($0.sequenceIndex):\($0.kind):\($0.toolInvocationID == hostID):\($0.isStreaming)" }
+                print("W2_PRE_TERMINAL provider=\(session.selectedAgent.rawValue) delayed=\(delayed) occurrence=\(session.quietLedger.hasOrdinaryOccurrence(owner: owner)) complete=\(complete) start=\(String(describing: session.quietLedger.startKey(owner: owner))) rows=\(rowDiagnostics)")
+                terminalTask = Task {
+                    if claude {
+                        let id = UUID()
+                        session.claudeExpectedTurnIDs.insert(id)
+                        let stream = AsyncStream<NativeAgentRuntimeEvent> { c in
+                            c.yield(.turnCompleted(turnID: id, status: .completed))
+                            c.finish()
+                        }
+                        _ = await vm.test_consumeClaudeTerminalEvents(stream, session: session, runID: runID, owner: owner)
+                    } else {
+                        await decoder.test_handleNotification(method: "turn/completed", params: ["threadId": .string(thread), "turn": .object(["id": .string(turn), "status": .string("completed")])])
+                        for await _ in terminalDelivered.stream {
+                            break
+                        }
+                    }
+                }
+                if delayed {
+                    try await AsyncTestWait.waitUntil("terminal reaches the queued observation cut or conservative leading-text settlement") {
+                        (claude ? handler.pendingEventDeliveryWaiterCountForTesting : codex.testCodexToolTrackingWaiterCount(for: session)) > 0 || session.lastTerminalCommitRevision != nil
+                    }
+                    if !leading { XCTAssertNil(session.lastTerminalCommitRevision, "Must drain queued host evidence before deciding eligibility") }
+                    if cancel {
+                        print("W2_CANCEL_CUT provider=\(session.selectedAgent.rawValue) phase=\(session.terminalCommitInProgress) revision=\(session.lastTerminalCommitRevision != nil) drain=\(session.providerTerminalDrainGeneration)")
+                        await vm.cancelAgentRun(tabID: session.tabID, completion: .terminalPublished)
+                    }
+                    mailbox.release()
+                }
+                await terminalTask?.value
+                XCTAssertEqual(session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: nativeResult && !leading && !cancel ? 0 : 1), "\(session.selectedAgent) delayed=\(delayed) nativeResult=\(nativeResult) closing=\(closing) leading=\(leading) cancel=\(cancel)")
+                XCTAssertNotNil(session.lastTerminalCommitRevision)
+                if cancel {
+                    XCTAssertEqual(session.lastTerminalCommitRevision?.terminalState, .cancelled)
+                    XCTAssertEqual(session.lastTerminalCommitRevision?.ownership, owner)
+                    XCTAssertNil(session.activeRunOwnership)
+                    XCTAssertFalse(session.terminalCommitInProgress)
+                    let revision = session.lastTerminalCommitRevision
+                    await vm.cancelAgentRun(tabID: session.tabID, completion: .terminalPublished)
+                    XCTAssertEqual(session.lastTerminalCommitRevision, revision, "Duplicate Stop must not create a second terminal revision")
+                    XCTAssertEqual(session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: 1))
+                }
+                if closing { XCTAssertTrue(session.items.contains { $0.text.contains("allowed closing output after accepted body") }, "Buffered output survives terminal/cancellation settlement") }
+                XCTAssertTrue(session.items.allSatisfy { $0.quietCheckInWakeID == nil }, "W3 remains excluded")
+                print("W2_REGISTERED_TERMINAL provider=\(session.selectedAgent.rawValue) delayed=\(delayed) nativeResult=\(nativeResult) settled=\(session.quietLedger.facts?.settledThrough ?? 0) ordinary=\(session.quietLedger.facts?.ordinaryThrough ?? 0)")
+                await cleanup()
+            } catch { await cleanup()
+                throw error
+            }
+        }
+
+        func w2RoutineClaim(
+            window: WindowState, session: AgentTabSession, endpoint: DomainAgentSessionLinkEndpointIdentity,
+            localRead: Bool
+        ) throws -> (AgentRunOwnership, AgentSessionLinkPromptDispatchID, AgentSessionLinkOutboundPromptClaim) {
+            let vm = window.agentModeViewModel
+            session.runState = .idle
+            let inventory = try XCTUnwrap(vm.agentSessionLinkPromptInventoryBySessionID[endpoint.sessionID])
+            let wake = UUID()
+            let snapshot = AgentSessionLinkPassiveStatusNotices.Snapshot(observerEndpoint: endpoint, queueEpoch: UUID(), queueRevision: 1, linkSetRevision: inventory.inventory.linkSetRevision, isEnabled: true, isDeliverable: true, entries: [], unacknowledgedOverflowCount: 1, overflowProduced: 1)
+            vm.agentSessionLinkPublishPassiveStatusNotices(snapshot, to: endpoint)
+            session.oversight.pendingAutoWake = .init(wakeID: wake, observerEndpoint: endpoint, queueEpoch: snapshot.queueEpoch, queueRevision: 1, wakeFingerprint: nil, admissionBasis: .routineStatusOrOverflow, attemptedFingerprint: nil, physicalOutcome: .notAttempted, phase: .preparingDispatch, task: nil)
+            if localRead {
+                vm.test_agentSessionLinkLocalInputDecoration = { baseline in
+                    .init(fragment: baseline.fragment + "\n<user_input>proof gate fixture</user_input>", markupDeltaBytes: 49, requirements: [])
+                }
+            }
+            let dispatch = AgentSessionLinkPromptDispatchID.autoWake(wakeID: wake)
+            let claim = try XCTUnwrap(vm.agentSessionLinkPromptClaimOutcome(for: session, dispatchID: dispatch).claim)
+            XCTAssertTrue(claim.routineQuietCheckIn)
+            XCTAssertTrue(claim.fragment.contains("Nothing needed? Call self_noop."))
+            let owner = session.beginRunAttempt(source: "W2.production-proof-fixture")
+            session.quietLedger.markRoutineWake(owner: owner, wakeID: wake)
+            session.oversight.pendingAutoWake?.phase = .dispatching
+            session.runState = .running
+            return (owner, dispatch, claim)
+        }
+
+        func w2CatalogProof(
+            window: WindowState, session: AgentTabSession, provider: HeldDiscoveryProvider,
+            endpoint: DomainAgentSessionLinkEndpointIdentity, route: AgentSessionLinkRunCatalogRouteToken,
+            runID: UUID, withdraw: Bool
+        ) async throws {
+            let vm = window.agentModeViewModel
+            let manager = ServerNetworkManager.shared
+            let gate = TestReleaseFence(name: "production local-read proof before final catalog fence")
+            let nativeBefore = await provider.heldTurnSnapshot
+            let generation = session.codexControllerGeneration
+            let repair = session.codexSessionLinkCatalogRepairCycle
+            let (_, dispatch, original) = try w2RoutineClaim(window: window, session: session, endpoint: endpoint, localRead: true)
+            let frozenProjection = try XCTUnwrap(vm.agentSessionLinkRunCatalogProjectionByEndpoint[endpoint])
+            vm.test_agentSessionLinkLocalInputReadProof = { _ in await gate.enterAndWait()
+                return false
+            }
+            let proofTask = Task { await vm.agentSessionLinkProveProviderInput(for: session, claim: original) }
+            var catalogTask: Task<Set<String>, Error>?
+            func cleanup() async {
+                gate.release()
+                _ = await proofTask.value
+                await manager.debugResumeRunCatalogPublicationBeforeMainActor()
+                _ = await catalogTask?.result
+                await manager.debugSetReturnedCatalogToolsForTesting(nil)
+                vm.test_agentSessionLinkLocalInputDecoration = nil
+                vm.test_agentSessionLinkLocalInputReadProof = nil
+                session.oversight.pendingAutoWake = nil
+            }
+            do {
+                guard await gate.waitUntilEntered() else { throw CancellationError() }
+                if withdraw {
+                    await manager.debugSetReturnedCatalogToolsForTesting(Self.w0fReturnedShape(copies: 0))
+                    await manager.debugSuspendNextRunCatalogPublicationBeforeMainActor()
+                    catalogTask = Task { try await provider.listTools() }
+                    try await AsyncTestWait.waitUntil("server catalog withdrawn before MainActor publication") { await manager.debugIsRunCatalogPublicationBeforeMainActorSuspended() }
+                    let latest = try await w0fProjection(manager, runID)
+                    XCTAssertEqual(latest.routeToken, route)
+                    XCTAssertFalse(latest.containsReturnedTool(Self.w0fTool()))
+                    XCTAssertEqual(vm.agentSessionLinkRunCatalogProjectionByEndpoint[endpoint], frozenProjection, "Mirror intentionally lags the authoritative observation")
+                }
+                gate.release()
+                let proof = await proofTask.value
+                let released = vm.agentSessionLinkHandoffProviderInput(for: session, dispatchID: dispatch, claim: original, proof: proof)
+                XCTAssertFalse(released.mustAbortDispatch, "Missing optional noop support never blocks ordinary delivery")
+                let capturing = AgentSessionLinkCapturingHeadlessProvider()
+                _ = try await capturing.streamAgentMessage(released.message(AgentMessage(systemPrompt: "fixture", userMessage: "routine")), runID: runID)
+                let messages = await capturing.messages
+                XCTAssertEqual(messages.count, 1)
+                XCTAssertEqual(messages[0].userMessage.contains("Nothing needed? Call self_noop."), !withdraw)
+                XCTAssertEqual(released.claim?.routineQuietCheckIn, !withdraw)
+                if withdraw {
+                    let stillHeld = await manager.debugIsRunCatalogPublicationBeforeMainActorSuspended()
+                    XCTAssertTrue(stillHeld, "The send did not wait for mirror publication/repair")
+                }
+                let nativeAfter = await provider.heldTurnSnapshot
+                XCTAssertEqual(nativeBefore, nativeAfter)
+                XCTAssertEqual(session.codexControllerGeneration, generation)
+                XCTAssertEqual(session.codexSessionLinkCatalogRepairCycle, repair)
+                print("W2_PRODUCTION_HINT withdraw=\(withdraw) messages=\(messages.count) routine=\(released.claim?.routineQuietCheckIn == true)")
+                await cleanup()
+            } catch { await cleanup()
+                throw error
+            }
+        }
+
+        /// Debug dispatch-preparation budget, not an importer or end-to-end provider benchmark.
+        /// Separately vary catalog bytes and unrelated history; fixture construction is untimed.
+        func w2CatalogCost(
+            window: WindowState, session: AgentTabSession, provider: HeldDiscoveryProvider,
+            endpoint: DomainAgentSessionLinkEndpointIdentity, runID: UUID, inactiveTabID: UUID
+        ) async throws {
+            let manager = ServerNetworkManager.shared
+            let vm = window.agentModeViewModel
+            // Isolate dispatch preparation from unrelated active-transcript UI rebuilds. This is a
+            // valid second tab in the same fixture window, not a rendering/importer benchmark.
+            vm.test_setCurrentTabIDOverride(inactiveTabID)
+            defer { vm.test_setCurrentTabIDOverride(nil) }
+            let baseline = try await w0fProjection(manager, runID)
+            let actualTools = try Array(XCTUnwrap(baseline.returnedCatalog).values.joined())
+            let clock = ContinuousClock()
+            func ms(_ duration: Duration) -> Double {
+                Double(duration.components.seconds) * 1000 + Double(duration.components.attoseconds) / 1e15
+            }
+            func stats(_ values: [Double]) -> [String: Double] {
+                let ordered = values.sorted()
+                return ["median": (ordered[19] + ordered[20]) / 2, "p95": ordered[37], "max": ordered[39]]
+            }
+            let repairBefore = session.codexSessionLinkCatalogRepairCycle
+            let generationBefore = session.codexControllerGeneration
+            // Three comparisons, not a Cartesian matrix: catalog growth and history growth isolated.
+            for (factor, historyCount) in [(1, 0), (10, 0), (1, 10000)] {
+                if let owner = session.activeRunOwnership { _ = session.endRunAttempt(ifCurrent: owner, source: "W2.cost-fixture-reset") }
+                session.oversight.pendingAutoWake = nil
+                await manager.debugSetReturnedCatalogToolsForTesting { _, _ in
+                    var expanded = actualTools
+                    if factor > 1 {
+                        for copyIndex in 1 ..< factor {
+                            expanded += actualTools.map { tool in
+                                MCP.Tool(name: "w2_cost_\(copyIndex)__\(tool.name)", description: tool.description, inputSchema: tool.inputSchema, annotations: tool.annotations)
+                            }
+                        }
+                    }
+                    return expanded
+                }
+                _ = try await provider.listTools()
+                let projection = try await w0fProjection(manager, runID)
+                let returned = try XCTUnwrap(projection.returnedCatalog)
+                // Footprint encoding is evidence-only, outside all production-path timing.
+                let catalog = try JSONEncoder().encode(Array(returned.values.joined()))
+                let toolCount = returned.values.reduce(0) { $0 + $1.count }
+                XCTAssertEqual(toolCount, actualTools.count * factor)
+                session.setItemsSilently((0 ..< historyCount).map { .assistant("unrelated fixture history", sequenceIndex: $0) }, reason: .persistedSessionHydration)
+                let (owner, dispatch, original) = try w2RoutineClaim(window: window, session: session, endpoint: endpoint, localRead: false)
+                var claimMS: [Double] = [], proofMS: [Double] = [], handoffMS: [Double] = [], totalMS: [Double] = [], syncMS: [Double] = []
+                let sourceRevision = session.sourceItemsRevision
+                var rebuilds = 0, projectionBuilds = 0
+                defer { AgentTranscriptDebugInstrumentation.reset() }
+                for sample in 0 ..< 45 {
+                    if sample == 5 {
+                        AgentTranscriptDebugInstrumentation.configure(.init(rebuildHandler: { _ in rebuilds += 1 }, projectionBuildHandler: { _ in projectionBuilds += 1 }))
+                    }
+                    let start = clock.now
+                    let outcome = vm.agentSessionLinkPromptClaimOutcome(for: session, dispatchID: dispatch)
+                    let claimedAt = clock.now
+                    let proof = await vm.agentSessionLinkProveProviderInput(for: session, claim: outcome.claim)
+                    let provedAt = clock.now
+                    let released = vm.agentSessionLinkHandoffProviderInput(for: session, dispatchID: dispatch, claim: outcome.claim, proof: proof)
+                    let finished = clock.now
+                    XCTAssertFalse(released.mustAbortDispatch)
+                    XCTAssertEqual(released.claim, original)
+                    XCTAssertTrue(released.fragment?.contains("Nothing needed? Call self_noop.") == true)
+                    if sample >= 5 {
+                        claimMS.append(ms(start.duration(to: claimedAt)))
+                        proofMS.append(ms(claimedAt.duration(to: provedAt)))
+                        handoffMS.append(ms(provedAt.duration(to: finished)))
+                        totalMS.append(ms(start.duration(to: finished)))
+                        syncMS.append(ms(start.duration(to: claimedAt)) + ms(provedAt.duration(to: finished)))
+                    }
+                }
+                AgentTranscriptDebugInstrumentation.reset()
+                XCTAssertEqual(rebuilds, 0, "Catalog proof/handoff must not rebuild transcript history")
+                XCTAssertEqual(projectionBuilds, 0)
+                XCTAssertEqual(session.sourceItemsRevision, sourceRevision)
+                let total = stats(totalMS), synchronous = stats(syncMS)
+                // Predeclared local Debug budgets: actual catalog total p95 < ~11% of W0's supplied
+                // 466ms wake context; 10x stress bounded separately. Not new production limits.
+                XCTAssertLessThanOrEqual(total["p95"]!, factor == 1 ? 50 : 250)
+                XCTAssertLessThanOrEqual(synchronous["p95"]!, factor == 1 ? 25 : 125)
+                XCTAssertLessThanOrEqual(total["max"]!, 1000)
+                let record: [String: Any] = [
+                    "catalog_factor": factor, "catalog_tools": toolCount, "catalog_bytes": catalog.count,
+                    "unrelated_history_rows": historyCount, "observer_tab_active": false, "samples": 40, "warmups": 5,
+                    "claim_ms": stats(claimMS), "proof_ms": stats(proofMS), "handoff_ms": stats(handoffMS),
+                    "total_ms": total, "sync_claim_plus_handoff_ms": synchronous,
+                    "full_decodes_per_positive_path_source_derived": 0,
+                    "decoded_bytes_40_samples_source_derived": 0,
+                    "exact_name_lookups_per_positive_path_source_derived": 4,
+                    "observed_transcript_rebuilds": rebuilds, "observed_projection_builds": projectionBuilds,
+                    "redundant_observation_encodes_per_tools_list_source_derived": 0,
+                    "budget_total_p95_ms": factor == 1 ? 50 : 250,
+                    "budget_sync_p95_ms": factor == 1 ? 25 : 125,
+                    "budget_total_max_ms": 1000
+                ]
+                try print("W2_CATALOG_COST " + (JSONSerialization.data(withJSONObject: record, options: [.sortedKeys])).base64EncodedString())
+                vm.abandonAgentSessionLinkPromptClaim(original)
+                _ = session.endRunAttempt(ifCurrent: owner, source: "W2.cost-fixture-end")
+            }
+            XCTAssertEqual(session.codexSessionLinkCatalogRepairCycle, repairBefore)
+            XCTAssertEqual(session.codexControllerGeneration, generationBefore)
+            await manager.debugSetReturnedCatalogToolsForTesting(nil)
+            session.oversight.pendingAutoWake = nil
         }
 
         func w0fProjection(_ manager: ServerNetworkManager, _ runID: UUID) async throws -> AgentSessionLinkRunCatalogProjection {
@@ -1337,12 +1804,28 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             codex: LifecycleNoopCodexController, codexRecorder: LifecycleRecorder
         ) async throws {
             let owner = observer.beginRunAttempt(source: "W0f.catalog-proof")
+            let wireDefinitions = try await provider.definitions()
+            let wireTools = try JSONDecoder().decode([MCP.Tool].self, from: JSONSerialization.data(withJSONObject: wireDefinitions))
             let positive = try await w0fProjection(manager, runID)
+            XCTAssertEqual(positive.returnedCatalog, Dictionary(grouping: wireTools, by: \.name), "The single typed observation slot preserves every actual returned definition and duplicate")
             let nativeBefore = await provider.heldTurnSnapshot
             let codexBefore = codexRecorder.events
             let generation = observer.codexControllerGeneration
             XCTAssertEqual(positive.expectedSurface, positive.returnedSurface)
             XCTAssertTrue(positive.containsReturnedTool(Self.w0fTool()))
+            let actualTools = try Array(XCTUnwrap(positive.returnedCatalog).values.joined())
+            let actualDefinition = try XCTUnwrap(actualTools.first { $0.name == MCPWindowToolName.selfNoop })
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+            let wireDefinition = try XCTUnwrap(wireTools.first { $0.name == MCPWindowToolName.selfNoop })
+            XCTAssertEqual(actualDefinition, wireDefinition)
+            let producedDefinition = try encoder.encode(wireDefinition)
+            // The existing W0 fixture is the exact pinned fork trial definition. Use the same
+            // real MCP.Tool encoder, without assuming empty-annotation wire behavior.
+            let trialDefinition = try encoder.encode(Self.w0fTool())
+            XCTAssertEqual(producedDefinition, trialDefinition)
+            print("W2_TRIAL_DEFINITION " + trialDefinition.base64EncodedString())
+            print("W2_ACTUAL_DEFINITION " + producedDefinition.base64EncodedString())
 
             /// W0-only consumer. No product hint, dispatch admission or terminal decision is wired.
             func hint(_ sample: AgentSessionLinkRunCatalogProjection, owner capturedOwner: AgentRunOwnership) async -> String? {
@@ -1368,6 +1851,14 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             }
             let supportedHint = await hint(positive, owner: owner)
             XCTAssertEqual(supportedHint, "Nothing needed? Call self_noop.")
+            let acknowledgement = try await provider.callSelfNoop()
+            let callObject = try MCPExportWatchdogIntegrationTests.responseObject(from: acknowledgement)
+            let callResult = try XCTUnwrap(callObject["result"] as? [String: Any])
+            XCTAssertNotEqual(callResult["isError"] as? Bool, true)
+            let content = try XCTUnwrap(callResult["content"] as? [[String: Any]])
+            try assertW2Acknowledgement(content)
+            XCTAssertEqual(observer.quietLedger.declarationBodyEntryCardinality(owner: owner), 1, "The real registration packet reaches the current caller body")
+            XCTAssertNil(observer.quietLedger.acceptedDeclarationInvocationID(owner: owner), "A non-routine advertised caller is acknowledged, not quiet")
             // The returned catalog is not permission to borrow another attempt or route.
             let successor = observer.beginRunAttempt(source: "W0f.catalog-proof.successor")
             let oldAttemptHint = await hint(positive, owner: owner)

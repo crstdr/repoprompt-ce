@@ -30,9 +30,10 @@ struct AgentSessionLinkRunCatalogProjection: Equatable {
     /// Exact serialized oversight-family definitions; nil is unknown, an empty array is withdrawal.
     let expectedSurface: Data?
     let returnedSurface: Data?
-    /// Actual client-shaped tools/list response. Evidence only, separate from repair fingerprints.
-    /// Cleared on invalidation, teardown or overlapping publication; never persisted.
-    let returnedCatalog: Data?
+    /// Actual client-shaped returned definitions, grouped by exact name once at observation ingress.
+    /// Preserve all values and duplicates in this same immutable slot; no support cache or registry.
+    /// Evidence only, separate from repair fingerprints; cleared on invalidation/overlap/teardown.
+    let returnedCatalog: [String: [MCP.Tool]]?
 
     init(
         runID: UUID,
@@ -43,7 +44,7 @@ struct AgentSessionLinkRunCatalogProjection: Equatable {
         hasActiveOutboundLink: Bool? = true,
         expectedSurface: Data? = nil,
         returnedSurface: Data? = nil,
-        returnedCatalog: Data? = nil
+        returnedCatalog: [String: [MCP.Tool]]? = nil
     ) {
         self.runID = runID
         self.routeToken = routeToken
@@ -59,11 +60,8 @@ struct AgentSessionLinkRunCatalogProjection: Equatable {
     /// Positive definition evidence, not a role, dispatch grant or attempt authorization.
     /// The server query qualifies the latest revision and exact live route before using it.
     func containsReturnedTool(_ definition: MCP.Tool) -> Bool {
-        guard let returnedCatalog,
-              let tools = try? JSONDecoder().decode([MCP.Tool].self, from: returnedCatalog)
-        else { return false }
-        let matches = tools.filter { $0.name == definition.name }
-        return matches.count == 1 && matches[0] == definition
+        guard let matches = returnedCatalog?[definition.name], matches.count == 1 else { return false }
+        return matches[0] == definition
     }
 
     var isReady: Bool {

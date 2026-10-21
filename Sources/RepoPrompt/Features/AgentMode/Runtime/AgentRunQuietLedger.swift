@@ -139,7 +139,7 @@ struct AgentRunQuietLedger {
         attempt?.hasOccurrence = true
     }
 
-    /// Body entry, before validation/refusal. Registration and canonical deduplication do not count.
+    /// Body entry, before quiet eligibility checks. Registration and canonical deduplication do not count.
     @discardableResult
     mutating func enterDeclarationBody(owner: AgentRunOwnership, hostInvocationID: UUID) -> Bool {
         guard isOpen(owner: owner) else { return false }
@@ -153,7 +153,7 @@ struct AgentRunQuietLedger {
     }
 
     /// The caller supplies its captured registration origin and independently resolved live endpoint.
-    /// No production caller/tool registration is added by W0.
+    /// Acceptance records intent only; the terminal observation cut independently proves completion.
     @discardableResult
     mutating func acceptDeclarationBody(
         owner: AgentRunOwnership,
@@ -175,6 +175,18 @@ struct AgentRunQuietLedger {
         }
         attempt?.acceptedDeclarationInvocationID = hostInvocationID
         return true
+    }
+
+    func routineWakeID(owner: AgentRunOwnership) -> UUID? {
+        attempt?.owner == owner ? attempt?.routineWakeID : nil
+    }
+
+    func acceptedDeclarationInvocationID(owner: AgentRunOwnership) -> UUID? {
+        attempt?.owner == owner ? attempt?.acceptedDeclarationInvocationID : nil
+    }
+
+    func hasOrdinaryOccurrence(owner: AgentRunOwnership) -> Bool {
+        attempt?.owner != owner || attempt?.hasOccurrence != false
     }
 
     func declarationBodyEntryCardinality(owner: AgentRunOwnership) -> UInt8? {
@@ -276,9 +288,15 @@ struct AgentRunQuietLedger {
         else { noteOccurrence(owner: owner)
             return false
         }
-        // The normal Codex terminal drain retires its active turn before queued result delivery.
-        // Only a previously observed call may supply that retired turn, never an orphan result.
-        let turnID = currentTurnID ?? (isResult ? attempt?.codexAssociation?.turnID : nil)
+        // Normal terminal drain retires the active turn before queued host delivery. A delayed
+        // first host call may use only this attempt's accepted H and already exact native call +
+        // result as its retired-turn witness. The association below still joins raw call/thread/run;
+        // neither a signature nor an orphan host/native result can manufacture that proof.
+        let nativePair = attempt?.codexAssociation
+        let exactRetiredCall = !isResult && attempt?.acceptedDeclarationInvocationID == hostID
+            && nativePair?.nativeCallSeen == true && nativePair?.nativeResultSeen == true
+            && nativePair?.invalid == false
+        let turnID = currentTurnID ?? ((isResult || exactRetiredCall) ? nativePair?.turnID : nil)
         guard var pair = codexAssociation(
             owner: owner,
             runID: runID,
@@ -342,28 +360,65 @@ struct AgentRunQuietLedger {
            classifiesQuietCheckIn, terminalState == .completed, !hasSuccessor,
            !current.hasOccurrence, current.rangeIsComplete,
            AgentSessionLinkPrompts.supportsQuietCheckIn(current.provider),
-           let wakeID = current.routineWakeID,
-           case let .quiet(hiddenIDs) = AgentQuietCheckInClassifier.classify(
-               rows: rows,
-               startKey: current.startKey,
-               endKey: endKey,
-               rangeIsComplete: rangeIsComplete,
-               routineWakeID: wakeID,
-               hostMarkerIDs: hostMarkerIDs
-           )
+           current.routineWakeID != nil,
+           declarationRangeIsComplete(owner: owner, endKey: endKey, rangeIsComplete: rangeIsComplete, rows: rows)
         {
             quiet = true
-            var changed = false
-            for id in hiddenIDs {
-                if id == wakeID, current.markerProducerFinished, !hostMarkerIDs.contains(wakeID) { continue }
-                changed = hiddenSourceIDs.insert(id).inserted || changed
-            }
-            if changed { displayMaskRevision &+= 1 }
+            // W2 classifies only. Production member stamping/publication is W3; provisional and
+            // closing-message display is W4. No sentinel or local mask supplies declaration proof.
         }
         advance(quiet: quiet)
         let seal = Seal(ownership: owner, isQuiet: quiet, facts: facts)
         attempt?.seal = seal
         return seal
+    }
+
+    /// Use the canonical tool identity rule on the bounded attempt source, without rebuilding a
+    /// transcript. Call/result echoes of one explicit invocation count once, independently of body
+    /// cardinality. Missing/heuristically acquired identity cannot be repaired here.
+    private func declarationRangeIsComplete(
+        owner: AgentRunOwnership, endKey: Int, rangeIsComplete: Bool,
+        rows: some Collection<AgentChatItem>
+    ) -> Bool {
+        guard let current = attempt, current.owner == owner, rangeIsComplete,
+              let accepted = current.acceptedDeclarationInvocationID,
+              current.startKey >= 0, endKey >= current.startKey else { return false }
+        var expectedKey = current.startKey
+        var sawEnd = false
+        var sourceIDs: Set<UUID> = []
+        var executions: Set<UUID> = []
+        var sawResult = false
+        for row in rows {
+            guard !sawEnd, row.sequenceIndex == expectedKey, row.sequenceIndex <= endKey,
+                  !row.isStreaming, sourceIDs.insert(row.id).inserted else { return false }
+            sawEnd = row.sequenceIndex == endKey
+            if !sawEnd {
+                let (next, overflow) = expectedKey.addingReportingOverflow(1)
+                guard !overflow else { return false }
+                expectedKey = next
+            }
+            switch row.kind {
+            case .toolCall, .toolResult:
+                guard AgentTranscriptToolNormalizer.normalizedToolName(row.toolName) == MCPWindowToolName.selfNoop,
+                      let invocationID = row.toolInvocationID, invocationID == accepted,
+                      row.toolIsError != true else { return false }
+                executions.insert(invocationID)
+                if row.kind == .toolResult, row.toolResultJSON != nil { sawResult = true }
+            case .assistant, .assistantInline:
+                // Semantic ingress irreversibly latches text before accepted body intent. Queued
+                // host callbacks can materialize canonical H after allowed closing text; source-row
+                // order is not a second temporal authority. Range/identity/result checks still apply.
+                break
+            case .thinking:
+                break
+            case .system:
+                guard hostMarkerIDs.contains(row.id),
+                      row.text == AgentLaneUpdateDisplayAttribution.canonicalSystemText else { return false }
+            case .user, .error:
+                return false
+            }
+        }
+        return sawEnd && sawResult && declarationMaySeal(owner: owner, canonicalInvocations: Array(executions))
     }
 
     /// Call from the successful central lifecycle end with its captured authoritative owner.

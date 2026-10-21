@@ -1,4 +1,5 @@
 import Foundation
+import MCP
 import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 
@@ -749,10 +750,12 @@ extension AgentModeViewModel {
                let reserved = agentSessionLinkPromptClaimStore.pendingClaim(dispatchID: effectiveID, observerSessionID: context.epoch.endpoint.sessionID)
             {
                 reserved.routineQuietCheckIn
+                    && selfNoopHintIsCurrent(for: session)
             } else {
                 attempt.admissionBasis == .routineStatusOrOverflow
                     && agentSessionLinkAutoWakeRoute(session) == .idleFollowUp
                     && AgentSessionLinkPrompts.supportsQuietCheckIn(context.epoch.providerContext)
+                    && selfNoopHintIsCurrent(for: session)
             }
         } else {
             false
@@ -878,10 +881,30 @@ extension AgentModeViewModel {
         )
     }
 
+    func selfNoopHintIsCurrent(for session: TabSession) -> Bool {
+        guard ToolAvailabilityStore.shared.isEnabled(MCPWindowToolName.selfNoop),
+              let endpoint = agentSessionLinkObserverEndpoint(tabID: session.tabID),
+              let projection = agentSessionLinkRunCatalogProjectionByEndpoint[endpoint],
+              let route = projection.routeToken, route.runID == session.runID,
+              route.observerEndpoint == endpoint,
+              hasCurrentRunCatalogRouteTokenInCurrentMCPServer(route, tabID: session.tabID),
+              projection.containsReturnedTool(Self.selfNoopCatalogDefinition) else { return false }
+        if let owner = session.activeRunOwnership,
+           session.quietLedger.hasOrdinaryOccurrence(owner: owner) { return false }
+        return true
+    }
+
+    static var selfNoopCatalogDefinition: MCP.Tool {
+        let definition = AgentSelfNoopTool.definition
+        return MCP.Tool(name: definition.name, description: definition.description, inputSchema: definition.inputSchema)
+    }
+
     func agentSessionLinkProveProviderInput(
         for session: TabSession, claim: AgentSessionLinkOutboundPromptClaim?
     ) async -> AgentSessionLinkProviderInputRelease.Proof {
-        await AgentSessionLinkProviderInputRelease.prove(claim) { decoration in
+        let owner = session.activeRunOwnership
+        let projection = claim?.observerEndpoint.flatMap { agentSessionLinkRunCatalogProjectionByEndpoint[$0] }
+        let proof = await AgentSessionLinkProviderInputRelease.prove(claim) { decoration in
             guard let observer = claim?.observerEndpoint,
                   self.sessions[session.tabID] === session else { return false }
             #if DEBUG
@@ -889,6 +912,26 @@ extension AgentModeViewModel {
             #endif
             return await AgentSessionLinkRuntimeBridge.shared.proveLocalInputRead(decoration, observer: observer)
         }
+        // The server's final actor-local observation read is the catalog proof's linearization
+        // point. Keep this the last await: a withdrawal during optional local-read proof must not
+        // survive through a lagging MainActor mirror. Later server mutations linearize after this
+        // proof; this is not a cross-actor atomic send/observation transaction.
+        var supportsDeclaration = claim?.routineQuietCheckIn != true
+        if claim?.routineQuietCheckIn == true, let projection, let route = projection.routeToken {
+            supportsDeclaration = await ServerNetworkManager.shared.hasCurrentReturnedTool(
+                Self.selfNoopCatalogDefinition, routeToken: route, projectionRevision: projection.projectionRevision
+            )
+        }
+        let currentProjection = claim?.observerEndpoint.flatMap { agentSessionLinkRunCatalogProjectionByEndpoint[$0] }
+        if claim?.routineQuietCheckIn == true, let owner,
+           session.isCurrentRunAttemptForCurrentBinding(owner),
+           !supportsDeclaration || !selfNoopHintIsCurrent(for: session)
+           || currentProjection?.projectionRevision != projection?.projectionRevision
+           || currentProjection?.routeToken != projection?.routeToken
+        {
+            session.quietLedger.noteOccurrence(owner: owner)
+        }
+        return proof
     }
 
     func agentSessionLinkHandoffProviderInput(

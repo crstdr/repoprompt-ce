@@ -295,6 +295,7 @@ extension AgentModeRunService.Hooks {
                     usage.finalizeNonCodexTurnUsage(session, nil, nil, nil)
                 },
                 cancelPendingInteractions: { reviewReason in
+                    if session.hasOwnPendingQuietInteraction { session.noteAcceptedTaskInput() }
                     interactions.cancelPendingQuestion(session)
                     interactions.cancelPendingApproval(session)
                     interactions.cancelPendingApplyEditsReview(session, reviewReason)

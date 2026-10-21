@@ -561,7 +561,9 @@ final class ClaudeIntegratedAgentModeRunner {
         shouldShutdownSession: Bool = false
     ) async -> AgentRunTerminalCommitRevision? {
         await terminalCommitBarrier.commit(.init(
-            binding: hooks.bindTerminalSession(session),
+            binding: claudeCoordinator.bindingQuietDeclarationObservations(
+                hooks.bindTerminalSession(session), session: session, owner: ownership, runID: runID
+            ),
             ownership: ownership,
             expectedRunID: runID,
             terminalState: terminalState,

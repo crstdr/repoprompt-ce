@@ -12,6 +12,14 @@ import XCTest
 #if DEBUG
     @MainActor
     final class MCPExportWatchdogIntegrationTests: XCTestCase {
+        func testW2ProductionTerminalObservationHooksPreserveTheResponseAndMailboxCut() async throws {
+            for claude in [true, false] {
+                for mutation in ["none", "premature", "outer"] {
+                    try await proveW0TerminalCut(claude: claude, mutation: mutation, productionCut: true)
+                }
+            }
+        }
+
         func testW0ClaudeNormalTerminalRevalidatesExactResponseMailboxAndOwnershipCut() async throws {
             for mutation in ["none", "premature", "veto", "drain", "owner", "active", "outer", "reentry"] {
                 try await proveW0TerminalCut(claude: true, mutation: mutation)
@@ -45,13 +53,17 @@ import XCTest
         /// The fake provider awaits the REAL socket response before its native result/terminal.
         /// Negative premature completion deliberately breaks that fence. Membership is injected;
         /// the ordinary read_file declaration is not registered/certified as self_noop.
-        private func proveW0TerminalCut(claude: Bool, mutation: String) async throws {
+        private func proveW0TerminalCut(claude: Bool, mutation: String, productionCut: Bool = false) async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease, domainRuntime: AppDomainRuntimeComposition.shared.runtime)
                 let endpoint = try fixture.endpointA()
                 let manager = fixture.networkManager
                 let server = fixture.contextA.window.mcpServer
-                let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
+                let harness = AgentSessionLinkRunnerHarness(
+                    headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() },
+                    testWindowID: productionCut ? fixture.contextA.window.windowID : 1,
+                    testMCPServer: productionCut ? server : nil
+                )
                 let session = harness.makeSession(agent: claude ? .claudeCode : .codexExec)
                 session.testInstallPersistentSessionBinding(sessionID: UUID())
                 let runID = UUID()
@@ -91,7 +103,7 @@ import XCTest
                 let outer = TestReleaseFence(name: "W0 terminal outer observer")
                 let sibling = TestReleaseFence(name: "W0 terminal sibling active")
                 let lateOuter = TestReleaseFence(name: "W0 second outer observer")
-                let flushEntered = expectation(description: "terminal entered observation flush")
+                let flushEntered: XCTestExpectation? = productionCut ? nil : expectation(description: "terminal entered observation flush")
                 var context: ToolInvocationContext?
                 var responseReturned = false
                 var sealEligibility: [Bool] = []
@@ -285,30 +297,32 @@ import XCTest
                     XCTAssertTrue(manager.debugHasPendingToolCardObservations(windowID: fixture.contextA.window.windowID, runID: runID))
                     XCTAssertFalse(responseReturned)
                     session.test_observeQuietSealEligibility = { sealEligibility.append($0) }
-                    session.test_flushQuietToolObservations = {
-                        flushEntered.fulfill()
-                        // Native terminal alone, no-active, or an idle FIFO is insufficient.
-                        guard !server.hasActiveToolExecutions(runID: runID),
-                              !manager.debugHasPendingToolCardObservations(windowID: fixture.contextA.window.windowID, runID: runID),
-                              claude ? handler.hasExactNativeResult(hostInvocationID: hostID, owner: owner, session: session)
-                              : session.quietLedger.codexAssociationHasNativeResult(owner: owner, hostID: hostID, runID: session.runID, threadID: session.codexConversationID)
-                        else { return false }
-                        await flush()
-                        return true
-                    }
-                    session.test_quietToolObservationsAreComplete = {
-                        let ids = session.items.filter { $0.kind == .toolCall || $0.kind == .toolResult }.compactMap(\.toolInvocationID)
-                        let identityComplete = claude
-                            ? handler.hasCompleteExactAssociation(hostInvocationID: hostID, owner: owner, session: session)
-                            : session.quietLedger.codexAssociationIsComplete(owner: owner, hostID: hostID, runID: session.runID, threadID: session.codexConversationID)
-                        return identityComplete && !server.hasActiveToolExecutions(runID: runID)
-                            && !manager.debugHasPendingToolCardObservations(windowID: fixture.contextA.window.windowID, runID: runID)
-                            && session.quietLedger.declarationMaySeal(owner: owner, canonicalInvocations: ids)
+                    if !productionCut {
+                        session.test_flushQuietToolObservations = {
+                            flushEntered?.fulfill()
+                            // Native terminal alone, no-active, or an idle FIFO is insufficient.
+                            guard !server.hasActiveToolExecutions(runID: runID),
+                                  !manager.debugHasPendingToolCardObservations(windowID: fixture.contextA.window.windowID, runID: runID),
+                                  claude ? handler.hasExactNativeResult(hostInvocationID: hostID, owner: owner, session: session)
+                                  : session.quietLedger.codexAssociationHasNativeResult(owner: owner, hostID: hostID, runID: session.runID, threadID: session.codexConversationID)
+                            else { return false }
+                            await flush()
+                            return true
+                        }
+                        session.test_quietToolObservationsAreComplete = {
+                            let ids = session.items.filter { $0.kind == .toolCall || $0.kind == .toolResult }.compactMap(\.toolInvocationID)
+                            let identityComplete = claude
+                                ? handler.hasCompleteExactAssociation(hostInvocationID: hostID, owner: owner, session: session)
+                                : session.quietLedger.codexAssociationIsComplete(owner: owner, hostID: hostID, runID: session.runID, threadID: session.codexConversationID)
+                            return identityComplete && !server.hasActiveToolExecutions(runID: runID)
+                                && !manager.debugHasPendingToolCardObservations(windowID: fixture.contextA.window.windowID, runID: runID)
+                                && session.quietLedger.declarationMaySeal(owner: owner, canonicalInvocations: ids)
+                        }
                     }
                     if mutation == "premature" {
                         terminalTask = startTerminal()
                         await terminalTask?.value
-                        await fulfillment(of: [flushEntered], timeout: 5)
+                        if let flushEntered { await fulfillment(of: [flushEntered], timeout: 5) }
                         XCTAssertEqual(sealEligibility, [false], "Successful native terminal cannot cover an outer observer not yet returned")
                         let settledFacts = session.quietLedger.facts
                         outer.release()
@@ -347,7 +361,12 @@ import XCTest
                             await decoder.test_handleNotification(method: "thread/futureMetadata/updated", params: ["threadId": .string("w0-thread"), "metadata": .object([:])])
                         }
                         terminalTask = startTerminal()
-                        await fulfillment(of: [flushEntered], timeout: 5)
+                        if let flushEntered { await fulfillment(of: [flushEntered], timeout: 5) }
+                        else {
+                            try await AsyncTestWait.waitUntil("production terminal awaits its existing mailbox before phase acquisition") {
+                                (claude ? handler.pendingEventDeliveryWaiterCountForTesting : codex.testCodexToolTrackingWaiterCount(for: session)) > 0
+                            }
+                        }
                         if !["missing-key", "malformed-key", "mismatch", "wrong-thread", "native-wrong-thread", "wrong-turn", "orphan", "overlap", "unknown-status", "native-error"].contains(mutation) {
                             XCTAssertTrue(sealEligibility.isEmpty, "Returned response only enqueues completion; terminal must await FIFO")
                         }

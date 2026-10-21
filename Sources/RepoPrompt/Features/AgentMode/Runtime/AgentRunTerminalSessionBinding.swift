@@ -49,7 +49,7 @@ struct AgentRunTerminalSessionBinding {
 
     let tabID: UUID
     let lifecycle: AgentRunAttemptLifecycle
-    let hooks: Hooks
+    var hooks: Hooks
 
     private let ownershipValidator: @MainActor (AgentRunOwnership, UUID?) -> Bool
     private let providerDrainGenerationProvider: @MainActor () -> UInt64

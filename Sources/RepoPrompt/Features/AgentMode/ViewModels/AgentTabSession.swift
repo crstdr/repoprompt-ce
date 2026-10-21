@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import MCP
 import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 import RepoPromptSettingsCore
@@ -2193,8 +2194,34 @@ final class AgentTabSession: ObservableObject {
         quietLedger.noteOccurrence(owner: owner)
     }
 
+    var hasOwnPendingQuietInteraction: Bool {
+        let snapshot = AgentModeViewModel.agentSessionLinkDeliveryReadinessSnapshot(
+            session: self, endpointMatchesGrant: true, isClosing: false
+        )
+        return snapshot.hasWaitingPrompt || snapshot.hasPendingAskUser || snapshot.hasPendingUserInputRequest
+            || snapshot.hasPendingApproval || snapshot.hasPendingPermissionsRequest
+            || snapshot.hasPendingMCPElicitationRequest || snapshot.hasPendingApplyEditsReview
+            || snapshot.hasPendingWorktreeMergeReview || hasActiveCodexHookGateOperation
+    }
+
     func noteAcceptedStream(_ result: AIStreamResult, owner: AgentRunOwnership) {
         guard isCurrentRunAttemptForCurrentBinding(owner) else { return }
+        if result.type == "content" || result.type == "final_content" {
+            quietLedger.noteDeclarationAssistantText(owner: owner, text: result.text ?? "")
+        }
+        if result.type == "tool_call" || result.type == "tool_result",
+           selectedAgent == .claudeCode,
+           MCPIntegrationHelper.canonicalRepoPromptToolName(result.toolName) == MCPWindowToolName.selfNoop,
+           result.toolInvocationID != nil,
+           ToolInvocationContext.candidateClaudeToolUseID(result.claudeToolUseID.map(MCP.Value.string)) != nil,
+           // The Claude translator intentionally leaves host-owned error verdicts nil. The
+           // exact successful host result remains mandatory at the terminal association fence.
+           result.type == "tool_call" || result.toolIsError != true,
+           quietLedger.routineWakeID(owner: owner) != nil
+        {
+            // The normal tracker must still resolve the exact host/native join before terminal.
+            return
+        }
         #if DEBUG
             if result.type == "tool_call" || result.type == "tool_result",
                test_quietDeclarationMembership?(result) == true { return }
@@ -2208,6 +2235,7 @@ final class AgentTabSession: ObservableObject {
             test_observeQuietSealEligibility?(normal)
         #endif
         guard isCurrentRunAttemptForCurrentBinding(owner) else { return }
+        if hasOwnPendingQuietInteraction { quietLedger.noteOccurrence(owner: owner) }
         // Only positively routine candidates need a range. No history materialization or stored
         // array offset: binary-search the already ordered live suffix. Missing retained rows fail open.
         let start = normal && terminalState == .completed && !hasSuccessor ? quietLedger.candidateStartKey(owner: owner) : nil

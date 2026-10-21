@@ -1218,6 +1218,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             _ = runService
         }
 
+        func test_consumeClaudeTerminalEvents(
+            _ events: AsyncStream<NativeAgentRuntimeEvent>, session: TabSession,
+            runID: UUID, owner: AgentRunOwnership
+        ) async -> AgentRunTerminalCommitRevision? {
+            await runService.test_consumeClaudeTerminalEvents(events, session: session, runID: runID, owner: owner)
+        }
+
         func test_startFollowUpRun(
             for session: TabSession,
             initialMessage: String

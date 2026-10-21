@@ -9638,6 +9638,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
         guard expectedOwnership == nil || expectedOwnership == ownership else { return }
         let expectedRunID = session.runID
+        if session.hasOwnPendingQuietInteraction { session.quietLedger.noteOccurrence(owner: ownership) }
         drainCodexTerminalOutput(session, turnStatus: turnStatus)
 
         clearCodexRecoveryAttempt(
@@ -9683,8 +9684,38 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         } else {
             .deleteFiles
         }
+        var terminalBinding = terminalSessionBinder(session)
+        #if DEBUG
+            let usesInjectedCut = session.test_flushQuietToolObservations != nil
+        #else
+            let usesInjectedCut = false
+        #endif
+        if !usesInjectedCut {
+            terminalBinding.hooks.flushQuietToolObservations = { [weak self, weak session] in
+                guard let self, let session, let runID = expectedRunID,
+                      session.isCurrentRunAttemptForCurrentBinding(ownership, expectedRunID: runID),
+                      session.quietLedger.acceptedDeclarationInvocationID(owner: ownership) != nil,
+                      !activeToolQuery(runID),
+                      !ServerNetworkManager.shared.hasPendingToolCardObservations(windowID: windowID, runID: runID),
+                      let tracker = toolTrackingByTabID[session.tabID] else { return false }
+                // Host-call identity may itself be waiting in this already-enqueued FIFO. Exact
+                // native result and complete host association remain mandatory at the second cut.
+                await tracker.waitForPendingEventDeliveries()
+                return true
+            }
+            terminalBinding.hooks.quietToolObservationsAreComplete = { [weak self, weak session] in
+                guard let self, let session, let runID = expectedRunID,
+                      session.isCurrentRunAttemptForCurrentBinding(ownership, expectedRunID: runID),
+                      let id = session.quietLedger.acceptedDeclarationInvocationID(owner: ownership),
+                      !activeToolQuery(runID),
+                      !ServerNetworkManager.shared.hasPendingToolCardObservations(windowID: windowID, runID: runID) else { return false }
+                return session.quietLedger.codexAssociationIsComplete(
+                    owner: ownership, hostID: id, runID: runID, threadID: session.codexConversationID
+                ) && session.quietLedger.declarationMaySeal(owner: ownership, canonicalInvocations: [id])
+            }
+        }
         let request = AgentRunTerminalCommitBarrier.Request(
-            binding: terminalSessionBinder(session),
+            binding: terminalBinding,
             ownership: ownership,
             expectedRunID: expectedRunID,
             terminalState: terminalState,
@@ -9802,6 +9833,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             return
         }
         if let ownership = session.activeRunOwnership {
+            switch event {
+            case let .assistantDelta(text), let .canonicalAssistantDelta(text, _):
+                session.quietLedger.noteDeclarationAssistantText(owner: ownership, text: text)
+            case let .assistantCompleted(payload):
+                session.quietLedger.noteDeclarationAssistantText(owner: ownership, text: payload.text)
+            default: break
+            }
             var provisionalDeclaration = false
             let nativeTool: (String, UUID?, CodexNativeSessionController.MCPToolIdentity?, Bool, Bool)? = switch event {
             case let .toolCall(name, id, _, identity): (name, id, identity, false, false)
@@ -9821,8 +9859,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     isResult: isResult,
                     isError: isError
                 )
+                provisionalDeclaration = exact && !isError
+                    && MCPIntegrationHelper.canonicalRepoPromptToolName(name) == MCPWindowToolName.selfNoop
                 #if DEBUG
-                    if let identity, exact { provisionalDeclaration = session.test_codexQuietDeclarationMembership?(identity) == true }
+                    if let identity, exact, session.test_codexQuietDeclarationMembership?(identity) == true { provisionalDeclaration = true }
                 #endif
             }
             let progress: (kind: AgentRunLivenessSignalKind, stage: AgentRunLifecycleStage, retryIntent: AgentRunRetryIntent) = switch event {
@@ -11384,6 +11424,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
 
         func testStartCodexToolTracking(for session: AgentTabSession, runID: UUID) async {
             await startCodexToolTracking(for: session, runID: runID)
+        }
+
+        func testCodexToolTrackingWaiterCount(for session: AgentTabSession) -> Int {
+            toolTrackingByTabID[session.tabID]?.pendingEventDeliveryWaiterCountForTesting ?? 0
         }
 
         func testFlushCodexToolTracking(for session: AgentTabSession) async {

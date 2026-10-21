@@ -174,4 +174,197 @@
             ))
         }
     }
+
+    @MainActor
+    final class AgentSelfNoopTests: XCTestCase {
+        @MainActor
+        private final class Fixture {
+            let window = WindowState()
+            let workspace: WorkspaceManagerViewModel
+            let session: AgentTabSession
+            let owner: AgentRunOwnership
+            let endpoint: DomainAgentSessionLinkEndpointIdentity
+            let context: ToolInvocationContext
+            let wakeID = UUID()
+            var origin: AgentSelfMCPCallOrigin
+            var returnedEndpoint: DomainAgentSessionLinkEndpointIdentity?
+            var beforeMetadata: () async -> Void = {}
+
+            init(routine: Bool = true) throws {
+                let tabID = UUID()
+                workspace = AgentSessionLinkEndpointTestSupport.installWorkspace(on: window.agentModeViewModel, tabID: tabID, name: "Self noop body")
+                session = window.agentModeViewModel.session(for: tabID)
+                session.selectedAgent = .claudeCode
+                session.hasLoadedPersistedState = true
+                _ = try XCTUnwrap(window.agentModeViewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: session, updateWorkspaceMetadata: true))
+                session.recordRestorationAuthoritative(.persistedPayloadApplied)
+                session.installRunID(UUID())
+                session.runState = .running
+                owner = session.beginRunAttempt(source: "self-noop-body-test")
+                endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(window.agentModeViewModel, tabID: tabID)
+                context = .trustedLocal(toolName: MCPWindowToolName.selfNoop, metadata: .init(connectionID: UUID(), clientName: "self-noop-test", windowID: window.windowID))
+                origin = try .init(endpoint: endpoint, runID: XCTUnwrap(session.runID), runAttemptID: owner.attemptID)
+                returnedEndpoint = endpoint
+                if routine { session.quietLedger.markRoutineWake(owner: owner, wakeID: wakeID) }
+            }
+
+            func body() async throws -> Value {
+                let captured = origin
+                let service = AgentSelfMCPToolService(
+                    captureRequestMetadata: {
+                        await self.beforeMetadata()
+                        return self.context.metadata
+                    },
+                    requireTargetWindow: { self.window },
+                    resolveObserverEndpoint: { _, _ in self.returnedEndpoint },
+                    captureCallOrigin: { captured },
+                    readSelf: { _, _, _ in nil },
+                    scheduleCompact: { _, _, _, _, _ in .unavailable }
+                )
+                return try await MCPInvocationContextBridge.withInvocation(context) {
+                    try await service.executeNoop(args: [:])
+                }
+            }
+
+            func appendDeclaration(invocationID: UUID? = nil) {
+                session.appendItem(.toolCall(name: "self_noop", invocationID: invocationID ?? context.invocationID, argsJSON: "{}", sequenceIndex: session.nextSequenceIndex))
+                session.appendItem(.toolResult(name: "self_noop", invocationID: invocationID ?? context.invocationID, resultJSON: "{\"result\":\"done\"}", isError: false, sequenceIndex: session.nextSequenceIndex))
+            }
+
+            func seal() -> AgentRunQuietFacts? {
+                session.sealQuietCheckIn(owner: owner, terminalState: .completed, normal: true, hasSuccessor: false)
+                return session.quietLedger.facts
+            }
+        }
+
+        func testBodyAlwaysAcknowledgesCallWhileEligibilityAndBodyCountRemainIndependent() async throws {
+            for variant in ["eligible", "not-routine", "duplicate", "stale-origin", "stale-endpoint", "own-prompt", "leading-text"] {
+                let f = try Fixture(routine: variant != "not-routine")
+                if variant == "stale-origin" { f.origin = .init(endpoint: f.endpoint, runID: UUID(), runAttemptID: UUID()) }
+                if variant == "stale-endpoint" { f.returnedEndpoint = nil }
+                if variant == "own-prompt" { f.session.waitingPrompt = "Own pending question" }
+                if variant == "leading-text" { f.session.noteAcceptedStream(.init(type: "content", text: "Before declaration"), owner: f.owner) }
+                let result = try await f.body()
+                XCTAssertEqual(result, .object(["result": .string("done")]), variant)
+                if variant == "duplicate" {
+                    let repeated = try await f.body()
+                    XCTAssertEqual(repeated, result)
+                    XCTAssertEqual(f.session.quietLedger.declarationBodyEntryCardinality(owner: f.owner), 2)
+                }
+                f.appendDeclaration()
+                XCTAssertEqual(f.seal()?.ordinaryThrough, variant == "eligible" ? 0 : 1, variant)
+                XCTAssertTrue(f.session.items.allSatisfy { $0.quietCheckInWakeID == nil }, "Production stamps belong to W3")
+                XCTAssertTrue(f.session.quietLedger.hiddenSourceIDs.isEmpty, "Closing-message hiding belongs to W4")
+            }
+        }
+
+        func testClosingTextAfterDeclarationIncludingEmptyOutputRepromptNeedsNoFinalChannel() async throws {
+            let f = try Fixture()
+            let acknowledgement = try await f.body()
+            XCTAssertEqual(acknowledgement, AgentSelfNoopTool.acknowledgement)
+            f.appendDeclaration()
+            // The ordinary Claude re-prompt may produce content rather than a distinct final channel.
+            f.session.noteAcceptedStream(.init(type: "content", text: ""), owner: f.owner)
+            f.session.noteAcceptedStream(.init(type: "content", text: "Nothing further is needed."), owner: f.owner)
+            f.session.appendItem(.assistant("Nothing further is needed.", sequenceIndex: f.session.nextSequenceIndex))
+            XCTAssertEqual(f.seal()?.ordinaryThrough, 0)
+            XCTAssertTrue(f.session.items.allSatisfy { $0.quietCheckInWakeID == nil })
+        }
+
+        func testNoDeclarationOrMissingCanonicalIdentityAndFurtherToolsStayOrdinary() async throws {
+            for variant in ["silence", "ack", "missing-id", "extra-canonical", "other-tool", "input", "unknown"] {
+                let f = try Fixture()
+                if variant == "ack" {
+                    f.session.appendItem(.assistant("[ack]", sequenceIndex: f.session.nextSequenceIndex))
+                } else if variant != "silence" {
+                    _ = try await f.body()
+                    f.appendDeclaration()
+                    switch variant {
+                    case "missing-id":
+                        f.session.mutateItem(at: 0) { $0.toolInvocationID = nil }
+                    case "extra-canonical":
+                        f.session.appendItem(.toolResult(name: "self_noop", invocationID: UUID(), resultJSON: "{\"result\":\"done\"}", isError: false, sequenceIndex: f.session.nextSequenceIndex))
+                    case "other-tool":
+                        f.session.noteAcceptedStream(.init(type: "tool_call", text: nil, toolName: "read_file", toolInvocationID: UUID()), owner: f.owner)
+                    case "input": f.session.noteAcceptedTaskInput()
+                    default: f.session.noteAcceptedStream(.init(type: "event", text: "unknown semantic output"), owner: f.owner)
+                    }
+                }
+                XCTAssertEqual(f.seal()?.ordinaryThrough, 1, variant)
+            }
+        }
+
+        func testTwoHundredDeclarationSealsWithLongUnrelatedHistoryStayBounded() throws {
+            // Exercise the actual W2 ledger pass over exact attempt slices. Full host/source refresh
+            // work is an inherited W0/W1 boundary, not a component timing measurement.
+            let binding = AgentRunBindingIdentity(tabID: UUID(), persistentSessionID: UUID(), persistentBindingGeneration: UUID(), bindingTransitionGeneration: 1)
+            let endpoint = try DomainAgentSessionLinkEndpointIdentity(
+                windowID: 1, workspaceID: UUID(), tabID: binding.tabID, sessionID: XCTUnwrap(binding.persistentSessionID),
+                persistentBindingGeneration: binding.persistentBindingGeneration, bindingTransitionGeneration: binding.bindingTransitionGeneration
+            )
+            let runID = UUID()
+            var ledger = AgentRunQuietLedger()
+            var history = (0 ..< 10000).map { AgentChatItem.assistant("Ordinary retained history", sequenceIndex: $0) }
+            history.append(.user("Current request", sequenceIndex: history.count))
+            let start = ContinuousClock.now
+            for _ in 0 ..< 200 {
+                let owner = AgentRunOwnership(binding: binding)
+                let firstKey = history.count
+                ledger.begin(owner: owner, startKey: firstKey, provider: .claudeCode)
+                ledger.markRoutineWake(owner: owner, wakeID: UUID())
+                let invocationID = UUID()
+                XCTAssertTrue(ledger.enterDeclarationBody(owner: owner, hostInvocationID: invocationID))
+                XCTAssertTrue(try ledger.acceptDeclarationBody(
+                    owner: owner, hostInvocationID: invocationID, wakeID: XCTUnwrap(ledger.routineWakeID(owner: owner)),
+                    origin: .init(endpoint: endpoint, runID: runID, runAttemptID: owner.attemptID),
+                    currentEndpoint: endpoint, currentRunID: runID
+                ))
+                history.append(.toolCall(name: "self_noop", invocationID: invocationID, argsJSON: "{}", sequenceIndex: firstKey))
+                history.append(.toolResult(name: "self_noop", invocationID: invocationID, resultJSON: "{\"result\":\"done\"}", isError: false, sequenceIndex: firstKey + 1))
+                ledger.noteDeclarationAssistantText(owner: owner, text: "Closing")
+                history.append(.assistant("Closing", sequenceIndex: firstKey + 2))
+                XCTAssertEqual(ledger.settle(
+                    owner: owner, terminalState: .completed, classifiesQuietCheckIn: true,
+                    endKey: firstKey + 2, rangeIsComplete: true, rows: history.suffix(3)
+                )?.isQuiet, true)
+                XCTAssertTrue(ledger.end(owner: owner, authoritativeOwner: owner))
+            }
+            XCTAssertEqual(ledger.facts?.settledThrough, 200)
+            XCTAssertEqual(ledger.facts?.ordinaryThrough, 0)
+            let elapsed = start.duration(to: .now)
+            XCTAssertLessThan(elapsed, .seconds(30), "W2 component fake budget; not an importer benchmark")
+            print("W2_CLASSIFICATION_SCALE wakes=200 unrelatedRows=10000 elapsed=\(elapsed)")
+        }
+
+        func testBodyEntryBeforeSuspensionCannotEraseSiblingOrBorrowSuccessor() async throws {
+            for replaceOwner in [false, true] {
+                let f = try Fixture()
+                let gate = TestReleaseFence(name: "self-noop metadata")
+                f.beforeMetadata = { await gate.enterAndWait() }
+                let task = Task { try await f.body() }
+                guard await gate.waitUntilEntered() else { gate.release()
+                    _ = try? await task.value
+                    return
+                }
+                XCTAssertEqual(f.session.quietLedger.declarationBodyEntryCardinality(owner: f.owner), 1)
+                XCTAssertNil(f.session.quietLedger.acceptedDeclarationInvocationID(owner: f.owner))
+                if replaceOwner {
+                    _ = f.session.endRunAttempt(ifCurrent: f.owner, source: "self-noop successor")
+                    let successor = f.session.beginRunAttempt(source: "self-noop successor")
+                    f.session.quietLedger.markRoutineWake(owner: successor, wakeID: UUID())
+                } else { f.session.noteAcceptedTaskInput() }
+                gate.release()
+                let acknowledgement = try await task.value
+                XCTAssertEqual(acknowledgement, AgentSelfNoopTool.acknowledgement)
+                if replaceOwner {
+                    let successor = try XCTUnwrap(f.session.activeRunOwnership)
+                    XCTAssertNil(f.session.quietLedger.acceptedDeclarationInvocationID(owner: successor))
+                    XCTAssertEqual(f.session.quietLedger.declarationBodyEntryCardinality(owner: successor), 0)
+                } else {
+                    f.appendDeclaration()
+                    XCTAssertEqual(f.seal()?.ordinaryThrough, 1)
+                }
+            }
+        }
+    }
 #endif

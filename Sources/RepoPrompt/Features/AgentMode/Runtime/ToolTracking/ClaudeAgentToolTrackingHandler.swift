@@ -1127,6 +1127,10 @@ final class ClaudeAgentToolTrackingHandler {
     }
 
     #if DEBUG
+        var pendingEventDeliveryWaiterCountForTesting: Int {
+            trackingController.pendingEventDeliveryWaiterCountForTesting
+        }
+
         func enqueueEventDeliveryBarrierForTesting(_ operation: @escaping @Sendable () async -> Void) {
             trackingController.enqueueEventDeliveryBarrierForTesting(operation)
         }

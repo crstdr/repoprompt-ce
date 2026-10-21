@@ -4600,8 +4600,8 @@ extension AgentSessionLinkPromptClaimStoreTests {
             let routine = try XCTUnwrap(store.claim(dispatchID: dispatch, epoch: epoch, inventory: live, passiveNotices: batch, routineQuietCheckIn: true, render: render))
             let supports = provider == .codexExec || provider == .claudeCode
             XCTAssertEqual(routine.routineQuietCheckIn, supports)
-            XCTAssertEqual(routine.fragment.contains("Nothing needed? Reply [ack]."), provider == .claudeCode)
-            if provider != .claudeCode { XCTAssertEqual(routine.fragment, ordinary.fragment) }
+            XCTAssertEqual(routine.fragment.contains("Nothing needed? Call self_noop."), supports)
+            if !supports { XCTAssertEqual(routine.fragment, ordinary.fragment) }
             XCTAssertEqual(renderedBits, supports ? [false, true] : [false])
             XCTAssertEqual(Set([ordinary, routine]).count, supports ? 2 : 1)
             let retry = store.claim(dispatchID: dispatch, epoch: epoch, inventory: live, passiveNotices: batch, routineQuietCheckIn: true, render: render)
@@ -4647,7 +4647,7 @@ extension AgentSessionLinkPromptClaimStoreTests {
 
 extension AgentSessionLinkPromptClaimStoreTests {
     func testQuietCopyWholeEnvelopesAcrossProvidersBasesGuidanceAndBudgetFreezeRenderedReceipts() throws {
-        let literal = "Nothing needed? Reply [ack]."
+        let literal = "Nothing needed? Call self_noop."
         let modes = ["routine", "overflow", "attention", "manual", "periodic", "natural", "task", "piggyback", "waiting"]
         for provider in AgentSessionLinkPromptProviderContext.allCases {
             for reminder in [false, true] {
@@ -4735,7 +4735,7 @@ extension AgentSessionLinkPromptClaimStoreTests {
                         }
                         let before = try makeClaim(offersQuiet: false)
                         let after = try makeClaim(offersQuiet: basis == "routine" || basis == "overflow" || basis == "attention")
-                        let qualifies = provider == .claudeCode && (basis == "routine" || basis == "overflow")
+                        let qualifies = AgentSessionLinkPrompts.supportsQuietCheckIn(provider) && (basis == "routine" || basis == "overflow")
                         XCTAssertEqual(
                             after.fragment.components(separatedBy: literal).count - 1,
                             qualifies ? 1 : 0,
@@ -4767,6 +4767,12 @@ extension AgentSessionLinkPromptClaimStoreTests {
                         ]
                         let data = try JSONSerialization.data(withJSONObject: measurement, options: [.sortedKeys])
                         print("QUIET_C4_ENVELOPE " + data.base64EncodedString())
+                        if qualifies, !reminder, !nearCap, basis == "routine" {
+                            let range = try XCTUnwrap(after.fragment.range(of: literal))
+                            let hint = String(after.fragment[range])
+                            print("W2_TRIAL_HINT " + Data(literal.utf8).base64EncodedString())
+                            print("W2_ACTUAL_HINT " + Data(hint.utf8).base64EncodedString())
+                        }
                     }
                 }
             }

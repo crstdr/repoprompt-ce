@@ -1610,6 +1610,59 @@ final class AgentQuietRetainedViewFeasibilityTests: XCTestCase {
         XCTAssertEqual(AgentTranscriptProjectionBuilder.build(from: rebuilt).workingRows.map(\.id), AgentTranscriptProjectionBuilder.build(from: session.transcript).workingRows.map(\.id))
     }
 
+    func testW2QualificationStampSeamRequiresUnchangedExaminedRows() throws {
+        for changeBetweenExaminationAndStamp in [false, true] {
+            let session = AgentTabSession(tabID: id(999))
+            let ordinary = ordinaryRows(base: 0, toolCount: 2)
+            session.setItemsSilently(ordinary, reason: .persistedSessionHydration)
+            session.transcript = AgentTranscriptIO.buildTranscript(from: ordinary, terminalState: .completed)
+            let turn = try XCTUnwrap(session.transcript.turns.last)
+            let baseline = AgentTranscriptQuietLocalTurn(summary: nil, conclusionActivityID: turn.conclusionActivityID, completedAt: turn.completedAt)
+            let members = quietRows(base: 100, wakeID: id(900)).map { item in
+                var item = item
+                item.quietCheckInWakeID = nil
+                return item
+            }
+            members.forEach(session.appendItem)
+            let examined = Array(session.items.suffix(members.count))
+            let indices = Array((session.items.count - members.count) ..< session.items.count)
+            if changeBetweenExaminationAndStamp {
+                try session.mutateItem(at: XCTUnwrap(indices.last)) { $0.text = "Changed after qualification" }
+            }
+            // W2 proves the W1 caller obligation at the seam, not W3 production stamping.
+            // A fresh revision and unchanged IDs alone cannot authorize an older examination.
+            let unchanged = zip(indices, examined).allSatisfy { session.items[$0.0] == $0.1 }
+            let stamped = unchanged && session.stampQuietCheckInMembers(
+                zip(indices, examined).map { (index: $0.0, id: $0.1.id) }, wakeID: id(900),
+                turnID: turn.id, baseline: baseline, expectedSourceRevision: session.sourceItemsRevision
+            )
+            XCTAssertEqual(stamped, !changeBetweenExaminationAndStamp)
+            XCTAssertEqual(session.items.count { $0.quietCheckInWakeID != nil }, stamped ? members.count : 0)
+        }
+    }
+
+    func testW2MaskChangeCallbackDoesNotSynchronouslyRebuildTurnCaches() throws {
+        let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
+        let host = harness.host
+        let session = try harness.makeBoundSession(agent: .claudeCode)
+        XCTAssertEqual(host.currentTabID, session.tabID)
+        session.setItemsSilently(ordinaryRows(base: 0, toolCount: 2), reason: .persistedSessionHydration)
+        host.refreshDerivedTranscriptState(for: session, publishActivePresentation: false)
+        session.turnProjectionCaches.removeAll()
+        var projectionBuilds = 0
+        var rebuilds = 0
+        AgentTranscriptDebugInstrumentation.configure(.init(
+            rebuildHandler: { _ in rebuilds += 1 },
+            projectionBuildHandler: { _ in projectionBuilds += 1 }
+        ))
+        defer { AgentTranscriptDebugInstrumentation.reset() }
+        let revision = session.sourceItemsRevision
+        session.onQuietDisplayMaskChanged?(session)
+        XCTAssertEqual(projectionBuilds, 0)
+        XCTAssertEqual(rebuilds, 0)
+        XCTAssertEqual(session.sourceItemsRevision, revision)
+    }
+
     func testW1StampRejectsUnprojectedNewUserTurn() throws {
         let session = AgentTabSession(tabID: id(999))
         session.setItemsSilently(ordinaryRows(base: 0, toolCount: 2), reason: .persistedSessionHydration)
