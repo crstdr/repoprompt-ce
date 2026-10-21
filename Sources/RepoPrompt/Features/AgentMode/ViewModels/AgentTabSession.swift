@@ -2040,8 +2040,20 @@ final class AgentTabSession: ObservableObject {
         runLifecycle.claimTerminalTeardown(ownership: ownership, terminalState: terminalState)
     }
 
+    private func currentQuietBaseline() -> AgentRunQuietLedger.Baseline? {
+        guard !runState.isActive,
+              derivedTranscriptSyncState == AgentModeViewModel.makeDerivedTranscriptSyncState(
+                  for: self, projectionProtection: transcriptProjectionProtection
+              ),
+              let turn = transcript.turns.last, turn.retentionTier == .full else { return nil }
+        let local = turn.quietLocal ?? AgentTranscriptQuietLocalTurn(summary: nil, conclusionActivityID: turn.conclusionActivityID, completedAt: turn.completedAt)
+        guard local.completedAt != nil else { return nil }
+        return .init(turnID: turn.id, local: local, sourceRevision: sourceItemsRevision)
+    }
+
     @discardableResult
     func beginRunAttempt(source: String, attemptID: UUID = UUID()) -> AgentRunOwnership {
+        let baseline = currentQuietBaseline()
         // Host-specific responsibilities stay here: Codex routing resets and
         // exactly-once MCP prepared-epoch consumption. The neutral attempt
         // initialization (terminal-state reset + tracker begin) is delegated
@@ -2070,8 +2082,10 @@ final class AgentTabSession: ObservableObject {
         )
         nonCodexContentMessageID = nil
         let previousFacts = quietLedger.facts
-        quietLedger.begin(owner: ownership, startKey: nextSequenceIndex, provider: .init(agentKind: selectedAgent))
-        if previousFacts != quietLedger.facts { noteMonitorObservationInputsChanged() }
+        quietLedger.begin(owner: ownership, startKey: nextSequenceIndex, provider: .init(agentKind: selectedAgent), baseline: baseline)
+        if previousFacts != quietLedger.facts {
+            noteMonitorObservationInputsChanged()
+        }
         #if DEBUG
             perfRecorder.increment("run.lifecycle.attempt.started")
             perfRecorder.increment("run.lifecycle.attempt.started.source.\(source)")
@@ -2241,8 +2255,28 @@ final class AgentTabSession: ObservableObject {
         let start = normal && terminalState == .completed && !hasSuccessor ? quietLedger.candidateStartKey(owner: owner) : nil
         let rows = start.map { quietSourceSuffix(in: items, startKey: $0) } ?? items[items.endIndex...]
         let maskRevision = quietLedger.displayMaskRevision
+        let revision = sourceItemsRevision
+        var certified = false
+        if let baseline = quietLedger.baseline(owner: owner), let wakeID = quietLedger.routineWakeID(owner: owner),
+           quietLedger.canCertify(
+               owner: owner,
+               terminalState: terminalState,
+               normal: normal,
+               hasSuccessor: hasSuccessor,
+               endKey: nextSequenceIndex - 1,
+               rangeIsComplete: start != nil,
+               rows: rows
+           )
+        {
+            let members = rows.indices.filter { rows[$0].kind != .system || rows[$0].id == wakeID }
+            certified = stampQuietCheckInMembers(
+                members.map { (index: $0, id: rows[$0].id) }, wakeID: wakeID,
+                turnID: baseline.turnID, baseline: baseline.local, expectedSourceRevision: revision,
+                examinedRows: members.map { rows[$0] }
+            )
+        }
         quietLedger.settle(
-            owner: owner, terminalState: terminalState, classifiesQuietCheckIn: normal,
+            owner: owner, terminalState: terminalState, classifiesQuietCheckIn: certified,
             hasSuccessor: hasSuccessor, endKey: nextSequenceIndex - 1,
             rangeIsComplete: start != nil, rows: rows
         )
@@ -2926,8 +2960,8 @@ final class AgentTabSession: ObservableObject {
     }
 
     /// Commit a caller-certified exact membership batch. This is a proof *mutation* seam,
-    /// not declaration qualification: W2 must supply complete membership and the current
-    /// terminal ownership/observer cut. No production caller certifies quiet in W1.
+    /// not declaration qualification: the terminal owner supplies complete membership and the
+    /// current ownership/observer cut.
     /// Validate everything before either row stamps or the matching local inputs change.
     /// The supplied baseline is provisional until the normal rebuild recomputes it from
     /// complete source. The committed source callback, not @Published's willSet event,
@@ -2935,7 +2969,8 @@ final class AgentTabSession: ObservableObject {
     @discardableResult
     func stampQuietCheckInMembers(
         _ members: [(index: Int, id: UUID)], wakeID: UUID,
-        turnID: UUID, baseline: AgentTranscriptQuietLocalTurn, expectedSourceRevision: Int
+        turnID: UUID, baseline: AgentTranscriptQuietLocalTurn, expectedSourceRevision: Int,
+        examinedRows: [AgentChatItem]? = nil
     ) -> Bool {
         guard sourceItemsRevision == expectedSourceRevision, !members.isEmpty,
               let turnIndex = transcript.turns.indices.last,
@@ -2946,15 +2981,17 @@ final class AgentTabSession: ObservableObject {
         // must not acquire the previous turn's proof, even with a fresh source revision.
         let requestIndex = items.lastIndex { $0.kind == .user }
         guard requestIndex.map({ items[$0].id }) == transcript.turns[turnIndex].request?.id else { return false }
+        guard examinedRows == nil || examinedRows?.count == members.count else { return false }
         var indices = Set<Int>()
-        for member in members {
+        for (offset, member) in members.enumerated() {
             #if DEBUG
                 test_quietMetadataVisitedItems += 1
             #endif
             guard items.indices.contains(member.index), member.index > (requestIndex ?? -1), indices.insert(member.index).inserted,
                   items[member.index].id == member.id, items[member.index].kind != .user,
                   items[member.index].sequenceIndex > (transcript.turns[turnIndex].request?.sequenceIndex ?? Int.min),
-                  items[member.index].quietCheckInWakeID == nil else { return false }
+                  items[member.index].quietCheckInWakeID == nil,
+                  examinedRows == nil || items[member.index] == examinedRows?[offset] else { return false }
         }
         /// Main-actor synchronous transaction: callbacks and save preparation see all or none.
         func applyStamps(to source: inout [AgentChatItem]) {
@@ -3271,11 +3308,24 @@ final class AgentTabSession: ObservableObject {
         isDirty = true
     }
 
+    @discardableResult
+    func appendAcceptedHostMarker(_ marker: AgentChatItem) -> Bool {
+        guard !liveItemIDs.contains(marker.id), quietLedger.registerHostMarker(marker) else { return false }
+        appendItem(marker, certifiedWakeID: quietLedger.hiddenSourceIDs.contains(marker.id) ? marker.id : nil)
+        return true
+    }
+
     func appendItem(_ item: AgentChatItem) {
-        if item.kind == .user { noteAcceptedTaskInput() }
+        appendItem(item, certifiedWakeID: nil)
+    }
+
+    private func appendItem(_ item: AgentChatItem, certifiedWakeID: UUID?) {
+        if item.kind == .user {
+            noteAcceptedTaskInput()
+        }
         var newItem = item
         // Ordinary insertion cannot mint or resurrect proof from a captured row copy.
-        newItem.quietCheckInWakeID = nil
+        newItem.quietCheckInWakeID = certifiedWakeID
         newItem.sequenceIndex = nextSequenceIndex
         nextSequenceIndex += 1
         let candidateItems = items + [newItem]

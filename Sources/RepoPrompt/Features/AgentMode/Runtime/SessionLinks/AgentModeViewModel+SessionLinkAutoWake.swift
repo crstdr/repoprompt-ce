@@ -851,7 +851,7 @@ extension AgentModeViewModel {
             guard let fingerprint = attempt.wakeFingerprint else { return false }
             if let owner = session.activeRunOwnership, session.isCurrentRunAttemptForCurrentBinding(owner) {
                 session.quietLedger.recordPhysicalDispatch(
-                    owner: owner, wakeID: wakeID, routineQuietCheckIn: claim.routineQuietCheckIn, alreadyAcquired: false
+                    owner: owner, wakeID: wakeID, routineQuietCheckIn: claim.routineQuietCheckIn, alreadyAcquired: false, sourceRevision: session.sourceItemsRevision
                 )
             }
             attempt.phase = .dispatching
@@ -1276,8 +1276,7 @@ extension AgentModeViewModel {
             sequenceIndex: session.nextSequenceIndex,
             displayAttribution: claim.passive?.displayAttribution
         )
-        guard marker.id == wakeID, session.quietLedger.registerHostMarker(marker) else { return }
-        session.appendItem(marker)
+        guard marker.id == wakeID, session.appendAcceptedHostMarker(marker) else { return }
         session.isDirty = true
         requestUIRefresh(tabID: endpoint.tabID)
         scheduleSave(for: endpoint.tabID)

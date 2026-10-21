@@ -1,3 +1,4 @@
+import CoreFoundation
 import Foundation
 
 public struct ClaudeSDKNDJSONTranslator {
@@ -312,6 +313,14 @@ public struct ClaudeSDKNDJSONTranslator {
     private mutating func parseUserMessage(_ json: [String: Any]) -> [ClaudeProviderStreamResult] {
         let payload = (json["message"] as? [String: Any]) ?? json
         guard let content = payload["content"] as? [Any], !content.isEmpty else { return [Self.unrepresentedActivity] }
+        // Preserve positive harness evidence; only the app's accepted same-run declaration can make it neutral.
+        if let synthetic = json["isSynthetic"] as? NSNumber, CFGetTypeID(synthetic) == CFBooleanGetTypeID(), synthetic.boolValue,
+           content.count == 1, let block = content[0] as? [String: Any], block["type"] as? String == "text",
+           let text = block["text"] as? String,
+           text.utf8.elementsEqual("[Your previous response had no visible output. Please continue and produce a user-visible response.]".utf8)
+        {
+            return [ClaudeProviderStreamResult(type: "quiet_reprompt_candidate", text: nil)]
+        }
         var results: [ClaudeProviderStreamResult] = []
         for item in content {
             guard let block = item as? [String: Any],

@@ -27,12 +27,19 @@ struct AgentRunQuietLedger {
         var invalid = false
     }
 
+    struct Baseline {
+        let turnID: UUID
+        let local: AgentTranscriptQuietLocalTurn
+        let sourceRevision: Int
+    }
+
     private struct Attempt {
         let owner: AgentRunOwnership
         let serial: UInt64?
         let startKey: Int
         let provider: AgentSessionLinkPromptProviderContext
         let openingFacts: AgentRunQuietFacts?
+        var baseline: Baseline?
         var routineWakeID: UUID?
         var markerProducerFinished = false
         var hasOccurrence = false
@@ -83,6 +90,9 @@ struct AgentRunQuietLedger {
             ["running", "idle"].contains(result.text?.lowercased() ?? "")
         case "system":
             ["Agent initialized", "Agent completed", "Agent cancelled"].contains(result.text ?? "")
+        case "quiet_reprompt_candidate":
+            current.provider == .claudeCode && candidateStartKey(owner: owner) != nil
+                && current.declarationBodyEntries == 1 && current.acceptedDeclarationInvocationID != nil
         case "event":
             false // Unknown activity is never evidence of silence, even without text.
         case "status":
@@ -98,15 +108,17 @@ struct AgentRunQuietLedger {
     }
 
     /// Only the authoritative begin funnel calls this. Re-entry cannot clear accepted occurrences.
-    mutating func begin(owner: AgentRunOwnership, startKey: Int, provider: AgentSessionLinkPromptProviderContext) {
+    mutating func begin(owner: AgentRunOwnership, startKey: Int, provider: AgentSessionLinkPromptProviderContext, baseline: Baseline? = nil) {
         guard attempt?.owner != owner, lastEndedOwner != owner else { return }
         if let previous = attempt, previous.seal == nil { advance(quiet: false) }
         let serial = facts.flatMap { value -> UInt64? in
             let (next, overflow) = value.settledThrough.addingReportingOverflow(1)
             return overflow ? nil : next
         }
-        if serial == nil { facts = nil }
-        attempt = Attempt(owner: owner, serial: serial, startKey: startKey, provider: provider, openingFacts: facts)
+        if serial == nil {
+            facts = nil
+        }
+        attempt = Attempt(owner: owner, serial: serial, startKey: startKey, provider: provider, openingFacts: facts, baseline: baseline)
     }
 
     /// Qualification (idleFollowUp, no attention, first physical acquisition, no replay) belongs to
@@ -121,13 +133,16 @@ struct AgentRunQuietLedger {
     }
 
     /// The existing winning transport fence is the authority; no dispatch/owner journal is kept.
-    mutating func recordPhysicalDispatch(owner: AgentRunOwnership, wakeID: UUID, routineQuietCheckIn: Bool, alreadyAcquired: Bool) {
+    mutating func recordPhysicalDispatch(owner: AgentRunOwnership, wakeID: UUID, routineQuietCheckIn: Bool, alreadyAcquired: Bool, sourceRevision: Int? = nil) {
         guard let current = attempt, current.owner == owner, current.seal == nil else { return }
         if alreadyAcquired {
             // Same-owner/same-wake reentry is idempotent. An acquired replay onto any other owner
             // cannot borrow the prior owner's origin, even when its frozen claim still qualifies.
             if current.routineWakeID != wakeID { noteOccurrence(owner: owner) }
         } else if routineQuietCheckIn, AgentSessionLinkPrompts.supportsQuietCheckIn(current.provider) {
+            if current.baseline?.sourceRevision != sourceRevision {
+                attempt?.baseline = nil
+            }
             markRoutineWake(owner: owner, wakeID: wakeID)
         } else {
             noteOccurrence(owner: owner)
@@ -341,6 +356,18 @@ struct AgentRunQuietLedger {
         attempt?.rangeIsComplete = false
     }
 
+    func baseline(owner: AgentRunOwnership) -> Baseline? {
+        attempt?.owner == owner ? attempt?.baseline : nil
+    }
+
+    func canCertify(owner: AgentRunOwnership, terminalState: AgentSessionRunState, normal: Bool, hasSuccessor: Bool, endKey: Int, rangeIsComplete: Bool, rows: some Collection<AgentChatItem>) -> Bool {
+        guard let current = attempt, current.owner == owner, current.seal == nil else { return false }
+        return facts != nil && current.serial != nil && normal && terminalState == .completed && !hasSuccessor
+            && !current.hasOccurrence && current.rangeIsComplete
+            && AgentSessionLinkPrompts.supportsQuietCheckIn(current.provider) && current.routineWakeID != nil
+            && declarationRangeIsComplete(owner: owner, endKey: endKey, rangeIsComplete: rangeIsComplete, rows: rows)
+    }
+
     /// Synchronous terminal-barrier operation. Default false until each native ingress is qualified.
     /// The caller has already passed its second exact ownership/drain guard; there is no await here.
     @discardableResult
@@ -354,18 +381,23 @@ struct AgentRunQuietLedger {
         rows: some Collection<AgentChatItem>
     ) -> Seal? {
         guard let current = attempt, current.owner == owner else { return nil }
-        if let seal = current.seal { return seal }
-        var quiet = false
-        if facts != nil, current.serial != nil,
-           classifiesQuietCheckIn, terminalState == .completed, !hasSuccessor,
-           !current.hasOccurrence, current.rangeIsComplete,
-           AgentSessionLinkPrompts.supportsQuietCheckIn(current.provider),
-           current.routineWakeID != nil,
-           declarationRangeIsComplete(owner: owner, endKey: endKey, rangeIsComplete: rangeIsComplete, rows: rows)
+        if let seal = current.seal {
+            return seal
+        }
+        let quiet = canCertify(
+            owner: owner,
+            terminalState: terminalState,
+            normal: classifiesQuietCheckIn,
+            hasSuccessor: hasSuccessor,
+            endKey: endKey,
+            rangeIsComplete: rangeIsComplete,
+            rows: rows
+        )
+        if quiet, let wakeID = current.routineWakeID,
+           hostMarkerIDs.contains(wakeID) || !current.markerProducerFinished,
+           hiddenSourceIDs.insert(wakeID).inserted
         {
-            quiet = true
-            // W2 classifies only. Production member stamping/publication is W3; provisional and
-            // closing-message display is W4. No sentinel or local mask supplies declaration proof.
+            displayMaskRevision &+= 1
         }
         advance(quiet: quiet)
         let seal = Seal(ownership: owner, isQuiet: quiet, facts: facts)

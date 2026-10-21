@@ -199,8 +199,12 @@
                 _ = try XCTUnwrap(window.agentModeViewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: session, updateWorkspaceMetadata: true))
                 session.recordRestorationAuthoritative(.persistedPayloadApplied)
                 session.installRunID(UUID())
-                session.runState = .running
+                session.appendItem(.user("Existing ordinary request", sequenceIndex: 0))
+                session.appendItem(.assistant("Existing ordinary conclusion", sequenceIndex: 1))
+                session.runState = .completed
+                window.agentModeViewModel.refreshDerivedTranscriptState(for: session, publishActivePresentation: false)
                 owner = session.beginRunAttempt(source: "self-noop-body-test")
+                session.runState = .running
                 endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(window.agentModeViewModel, tabID: tabID)
                 context = .trustedLocal(toolName: MCPWindowToolName.selfNoop, metadata: .init(connectionID: UUID(), clientName: "self-noop-test", windowID: window.windowID))
                 origin = try .init(endpoint: endpoint, runID: XCTUnwrap(session.runID), runAttemptID: owner.attemptID)
@@ -253,8 +257,8 @@
                 }
                 f.appendDeclaration()
                 XCTAssertEqual(f.seal()?.ordinaryThrough, variant == "eligible" ? 0 : 1, variant)
-                XCTAssertTrue(f.session.items.allSatisfy { $0.quietCheckInWakeID == nil }, "Production stamps belong to W3")
-                XCTAssertTrue(f.session.quietLedger.hiddenSourceIDs.isEmpty, "Closing-message hiding belongs to W4")
+                XCTAssertEqual(f.session.items.count(where: { $0.quietCheckInWakeID == f.wakeID }), variant == "eligible" ? 2 : 0)
+                XCTAssertEqual(f.session.quietLedger.hiddenSourceIDs.contains(f.wakeID), variant == "eligible")
             }
         }
 
@@ -268,7 +272,7 @@
             f.session.noteAcceptedStream(.init(type: "content", text: "Nothing further is needed."), owner: f.owner)
             f.session.appendItem(.assistant("Nothing further is needed.", sequenceIndex: f.session.nextSequenceIndex))
             XCTAssertEqual(f.seal()?.ordinaryThrough, 0)
-            XCTAssertTrue(f.session.items.allSatisfy { $0.quietCheckInWakeID == nil })
+            XCTAssertEqual(f.session.items.count(where: { $0.quietCheckInWakeID == f.wakeID }), 3)
         }
 
         func testNoDeclarationOrMissingCanonicalIdentityAndFurtherToolsStayOrdinary() async throws {
@@ -281,7 +285,7 @@
                     f.appendDeclaration()
                     switch variant {
                     case "missing-id":
-                        f.session.mutateItem(at: 0) { $0.toolInvocationID = nil }
+                        f.session.mutateItem(at: 2) { $0.toolInvocationID = nil }
                     case "extra-canonical":
                         f.session.appendItem(.toolResult(name: "self_noop", invocationID: UUID(), resultJSON: "{\"result\":\"done\"}", isError: false, sequenceIndex: f.session.nextSequenceIndex))
                     case "other-tool":

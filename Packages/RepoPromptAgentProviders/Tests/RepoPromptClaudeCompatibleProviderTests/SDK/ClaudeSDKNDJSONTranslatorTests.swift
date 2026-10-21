@@ -3,6 +3,32 @@ import Foundation
 import XCTest
 
 final class ClaudeSDKNDJSONTranslatorTests: XCTestCase {
+    func testExactSyntheticRepromptPreservesPositiveEvidenceThroughBothEntryPoints() throws {
+        let text = "[Your previous response had no visible output. Please continue and produce a user-visible response.]"
+        let singleton: [[String: Any]] = [["type": "text", "text": text]]
+        let cases: [(String, [String: Any], String)] = [
+            ("exact", ["type": "user", "isSynthetic": true, "message": ["content": singleton]], "quiet_reprompt_candidate"),
+            ("no flag", ["type": "user", "message": ["content": singleton]], "event"),
+            ("isMeta only", ["type": "user", "isMeta": true, "message": ["content": singleton]], "event"),
+            ("numeric flag", ["type": "user", "isSynthetic": 1, "message": ["content": singleton]], "event"),
+            ("different", ["type": "user", "isSynthetic": true, "message": ["content": [["type": "text", "text": "other"]]]], "event"),
+            ("extra text", ["type": "user", "isSynthetic": true, "message": ["content": [["type": "text", "text": text + " "]]]], "event"),
+            ("two blocks", ["type": "user", "isSynthetic": true, "message": ["content": singleton + singleton]], "event"),
+            ("forged type", ["type": "quiet_reprompt_candidate", "isSynthetic": true, "message": ["content": singleton]], "event")
+        ]
+        for (label, frame, expected) in cases {
+            let data = try JSONSerialization.data(withJSONObject: frame)
+            var lineTranslator = ClaudeSDKNDJSONTranslator()
+            let line = lineTranslator.parseNDJSONLine(data)
+            let payload = try JSONDecoder().decode([String: ClaudeProviderJSONValue].self, from: data)
+            var dtoTranslator = ClaudeSDKNDJSONTranslator()
+            let dto = dtoTranslator.parseStreamPayload(payload)
+            XCTAssertEqual(line.map(\.type), dto.map(\.type), label)
+            XCTAssertFalse(line.isEmpty, label)
+            XCTAssertTrue(line.allSatisfy { $0.type == expected && $0.text == nil }, label)
+        }
+    }
+
     func testNativeStringIdentityIsRetainedWithoutReplacingTranslatorUUIDsForIdenticalCalls() throws {
         var translator = ClaudeSDKNDJSONTranslator()
         var ids: [UUID] = []

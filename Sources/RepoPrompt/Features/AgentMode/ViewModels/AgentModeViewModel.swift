@@ -1214,8 +1214,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             await runService.test_publishNaturalCompletion(session)
         }
 
-        func test_initializeRunService() {
-            _ = runService
+        func test_initializeRunService(
+            mcpServerEnabler: MCPServerEnabler? = nil,
+            connectionPolicyInstaller: ConnectionPolicyInstaller? = nil,
+            expectedPIDPolicyArmer: ((MCPBootstrapLeaseSpec) async -> Bool)? = nil
+        ) {
+            if mcpServerEnabler == nil, connectionPolicyInstaller == nil, expectedPIDPolicyArmer == nil {
+                _ = runService
+            } else {
+                precondition(sessions.values.allSatisfy { $0.activeRunOwnership == nil })
+                runService = makeRunService(mcpServerEnabler: mcpServerEnabler, connectionPolicyInstaller: connectionPolicyInstaller, expectedPIDPolicyArmer: expectedPIDPolicyArmer)
+            }
         }
 
         func test_consumeClaudeTerminalEvents(
@@ -3222,14 +3231,18 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return false
     }
 
-    private func makeRunService() -> AgentModeRunService {
+    private func makeRunService(
+        mcpServerEnabler: MCPServerEnabler? = nil,
+        connectionPolicyInstaller: ConnectionPolicyInstaller? = nil,
+        expectedPIDPolicyArmer: ((MCPBootstrapLeaseSpec) async -> Bool)? = nil
+    ) -> AgentModeRunService {
         let dependencies = AgentModeRunService.Dependencies(
             windowID: windowID,
             headlessProviderFactory: headlessProviderFactory,
             acpProviderFactory: acpProviderFactory,
             acpControllerFactory: acpControllerFactory,
-            connectionPolicyInstaller: connectionPolicyInstaller,
-            expectedPIDPolicyArmer: { spec in
+            connectionPolicyInstaller: connectionPolicyInstaller ?? self.connectionPolicyInstaller,
+            expectedPIDPolicyArmer: expectedPIDPolicyArmer ?? { spec in
                 guard spec.requiresExpectedAgentPID, let clientName = spec.clientName else {
                     return !spec.requiresExpectedAgentPID
                 }
@@ -3239,7 +3252,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     windowID: spec.windowID
                 )
             },
-            mcpServerEnabler: mcpServerEnabler,
+            mcpServerEnabler: mcpServerEnabler ?? self.mcpServerEnabler,
             workspacePathProvider: { [weak self] session in
                 guard let self else { return nil }
                 return try effectiveWorkspacePath(for: session)
@@ -15111,7 +15124,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
-    private func makeDerivedTranscriptSyncState(
+    static func makeDerivedTranscriptSyncState(
         for session: TabSession,
         projectionProtection: AgentTranscriptProjectionProtection
     ) -> DerivedTranscriptSyncState {
@@ -15129,7 +15142,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         for session: TabSession,
         projectionProtection: AgentTranscriptProjectionProtection
     ) {
-        session.derivedTranscriptSyncState = makeDerivedTranscriptSyncState(
+        session.derivedTranscriptSyncState = Self.makeDerivedTranscriptSyncState(
             for: session,
             projectionProtection: projectionProtection
         )
@@ -15251,7 +15264,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         for session: TabSession,
         projectionProtection: AgentTranscriptProjectionProtection
     ) -> Bool {
-        session.derivedTranscriptSyncState == makeDerivedTranscriptSyncState(
+        session.derivedTranscriptSyncState == Self.makeDerivedTranscriptSyncState(
             for: session,
             projectionProtection: projectionProtection
         )

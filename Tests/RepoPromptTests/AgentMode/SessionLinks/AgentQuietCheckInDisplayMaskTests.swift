@@ -1610,7 +1610,7 @@ final class AgentQuietRetainedViewFeasibilityTests: XCTestCase {
         XCTAssertEqual(AgentTranscriptProjectionBuilder.build(from: rebuilt).workingRows.map(\.id), AgentTranscriptProjectionBuilder.build(from: session.transcript).workingRows.map(\.id))
     }
 
-    func testW2QualificationStampSeamRequiresUnchangedExaminedRows() throws {
+    func testW3QualificationStampSeamRequiresUnchangedExaminedRows() throws {
         for changeBetweenExaminationAndStamp in [false, true] {
             let session = AgentTabSession(tabID: id(999))
             let ordinary = ordinaryRows(base: 0, toolCount: 2)
@@ -1629,12 +1629,11 @@ final class AgentQuietRetainedViewFeasibilityTests: XCTestCase {
             if changeBetweenExaminationAndStamp {
                 try session.mutateItem(at: XCTUnwrap(indices.last)) { $0.text = "Changed after qualification" }
             }
-            // W2 proves the W1 caller obligation at the seam, not W3 production stamping.
-            // A fresh revision and unchanged IDs alone cannot authorize an older examination.
-            let unchanged = zip(indices, examined).allSatisfy { session.items[$0.0] == $0.1 }
-            let stamped = unchanged && session.stampQuietCheckInMembers(
+            // A fresh revision and unchanged IDs cannot authorize changed examined content.
+            let stamped = session.stampQuietCheckInMembers(
                 zip(indices, examined).map { (index: $0.0, id: $0.1.id) }, wakeID: id(900),
-                turnID: turn.id, baseline: baseline, expectedSourceRevision: session.sourceItemsRevision
+                turnID: turn.id, baseline: baseline, expectedSourceRevision: session.sourceItemsRevision,
+                examinedRows: examined
             )
             XCTAssertEqual(stamped, !changeBetweenExaminationAndStamp)
             XCTAssertEqual(session.items.count { $0.quietCheckInWakeID != nil }, stamped ? members.count : 0)
