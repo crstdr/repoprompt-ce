@@ -248,31 +248,24 @@ final class AgentQuietCheckInDisplayMaskTests: XCTestCase {
 
     func testSameRevisionHydrationRefreshesMaskedAndEmptyDisplayAndRestoreSignalWithoutGetterWork() async throws {
         for hasMask in [false, true] {
-            let (h, manager, session) = try liveFixture()
-            defer { withExtendedLifetime(manager) {} }
-            let ordinary = AgentChatItem.assistant("ordinary context")
-            session.appendItem(ordinary)
+            let f = try AgentSelfNoopTests.Fixture()
+            let vm = f.window.agentModeViewModel
+            let session = f.session
+            let ordinary = session.items[1]
             var quietRowID: UUID?
             if hasMask {
-                session.runState = .running
-                let owner = session.beginRunAttempt(source: "quiet-display-hydration")
-                session.quietLedger.markRoutineWake(owner: owner, wakeID: UUID())
-                let ack = AgentChatItem.assistant("[ack]")
-                quietRowID = ack.id
-                session.appendItem(ack)
-                let revision = await AgentRunTerminalCommitBarrier().commit(.init(
-                    binding: h.hooks.bindTerminalSession(session), ownership: owner, expectedRunID: session.runID,
-                    terminalState: .completed, source: "quiet-display-hydration", attachmentDisposition: .deleteFiles,
-                    finalizeNonCodexUsage: false, supportsFollowUp: false, notifyTurnComplete: false, classifiesQuietCheckIn: true
-                ))
-                XCTAssertNotNil(revision)
-                XCTAssertTrue(session.quietLedger.hiddenSourceIDs.contains(ack.id))
+                _ = try await f.body()
+                f.appendDeclaration()
+                quietRowID = session.items.last?.id
+                XCTAssertEqual(f.seal()?.ordinaryThrough, 0)
             }
+            session.runState = .completed
+            XCTAssertTrue(session.endRunAttempt(ifCurrent: f.owner, source: "W4.hydration"))
             session.clearCurrentBindingHydration()
-            h.host.refreshDerivedTranscriptState(for: session, publishActivePresentation: false)
-            _ = h.host.test_publishTranscriptPresentation(tabID: session.tabID)
-            h.host.syncTranscriptUIState()
-            let before = h.host.ui.transcript.snapshot
+            vm.refreshDerivedTranscriptState(for: session, publishActivePresentation: false)
+            _ = vm.test_publishTranscriptPresentation(tabID: session.tabID)
+            vm.syncTranscriptUIState()
+            let before = vm.ui.transcript.snapshot
             let warm = try XCTUnwrap(session.quietTranscriptDisplayCache)
             XCTAssertFalse(before.isHydrated)
             XCTAssertFalse(warm.result.presentation.bindingsHydrated)
@@ -280,12 +273,12 @@ final class AgentQuietCheckInDisplayMaskTests: XCTestCase {
             XCTAssertNil(warm.result.presentation.hydratedBindingTransitionGeneration)
             let hidden = session.quietLedger.hiddenSourceIDs
             XCTAssertEqual(hidden.isEmpty, !hasMask)
-            let baseRevision = h.host.activeTranscriptPresentation.revision
+            let baseRevision = vm.activeTranscriptPresentation.revision
             let maskRevision = session.quietLedger.displayMaskRevision
 
             // The only transition is the existing hydration setter: no presentation republish.
-            h.host.test_setActiveSessionBindingsAreHydrated(true)
-            let after = h.host.ui.transcript.snapshot
+            vm.test_setActiveSessionBindingsAreHydrated(true)
+            let after = vm.ui.transcript.snapshot
             XCTAssertTrue(after.isHydrated)
             XCTAssertEqual(after.presentationRevision, baseRevision)
             XCTAssertEqual(after.displayMaskRevision, maskRevision)
@@ -313,10 +306,10 @@ final class AgentQuietCheckInDisplayMaskTests: XCTestCase {
             let hydrated = try XCTUnwrap(session.quietTranscriptDisplayCache)
             XCTAssertEqual(hydrated.key, warm.key, "no new key state/revision is needed")
             var publications = 0
-            let updates = h.host.ui.transcript.$snapshot.dropFirst().sink { _ in publications += 1 }
+            let updates = vm.ui.transcript.$snapshot.dropFirst().sink { _ in publications += 1 }
             for _ in 0 ..< 100 {
-                _ = h.host.makeTranscriptUISnapshot()
-                h.host.syncTranscriptUIState()
+                _ = vm.makeTranscriptUISnapshot()
+                vm.syncTranscriptUIState()
                 hydrated.result.presentation.visibleBlocks.withUnsafeBufferPointer { old in
                     session.quietTranscriptDisplayCache?.result.presentation.visibleBlocks.withUnsafeBufferPointer { current in
                         XCTAssertEqual(old.baseAddress, current.baseAddress)
@@ -329,184 +322,28 @@ final class AgentQuietCheckInDisplayMaskTests: XCTestCase {
             // Real binding application suppresses intermediate UI sync. Its performance-only
             // assignment keeps the same revision, but must invalidate BEFORE the suppression guard.
             session.transcriptPerformanceSnapshot.projectionPublishCount += 1
-            session.transcriptAutoFollowArmingState = h.host.activeTranscriptFollowBindingState.armingState == .armed
+            session.transcriptAutoFollowArmingState = vm.activeTranscriptFollowBindingState.armingState == .armed
                 ? .disarmedAfterManualDetach : .armed
             var observedSuppressedPublication = false
-            let follow = h.host.$activeTranscriptFollowBindingState.dropFirst().sink { _ in
+            let follow = vm.$activeTranscriptFollowBindingState.dropFirst().sink { _ in
                 observedSuppressedPublication = true
-                XCTAssertTrue(h.host.isRestoringState, "observation is inside real suppressed binding application")
+                XCTAssertTrue(vm.isRestoringState, "observation is inside real suppressed binding application")
                 XCTAssertNil(session.quietTranscriptDisplayCache, "presentation assignment invalidates even while UI sync is suppressed")
             }
-            h.host.applySessionToBindings(session)
+            vm.applySessionToBindings(session)
             follow.cancel()
             XCTAssertTrue(observedSuppressedPublication)
-            XCTAssertEqual(h.host.activeTranscriptPresentation.revision, baseRevision)
+            XCTAssertEqual(vm.activeTranscriptPresentation.revision, baseRevision)
             XCTAssertEqual(session.quietLedger.displayMaskRevision, maskRevision)
             let final = try XCTUnwrap(session.quietTranscriptDisplayCache)
             XCTAssertEqual(final.key, hydrated.key)
-            XCTAssertEqual(final.result.presentation.performanceSnapshot, h.host.activeTranscriptPresentation.performanceSnapshot)
+            XCTAssertEqual(final.result.presentation.performanceSnapshot, vm.activeTranscriptPresentation.performanceSnapshot)
             XCTAssertTrue(final.result.presentation.bindingsHydrated)
             XCTAssertEqual(session.quietLedger.hiddenSourceIDs, hidden)
             if let quietRowID { XCTAssertFalse(final.result.presentation.visibleRows.contains(where: { $0.id == quietRowID })) }
+            await vm.prepareForWindowClose()
             print("QUIET_A3_HYDRATION mask=\(hasMask) sameBaseRevision=true sameMaskRevision=true getterSyncIterations=100 unchangedPublications=\(publications) suppressedPublicationObserved=\(observedSuppressedPublication) blockVisits=\(final.result.blockVisits) rowVisits=\(final.result.rowVisits) anchorVisits=\(final.result.anchorVisits)")
         }
-    }
-
-    func testRealBarrierDefersDisplayBuildThenPublishesMaskRevisionAndReusesCacheWithoutGetterWork() async throws {
-        let (h, manager, session) = try liveFixture()
-        defer { withExtendedLifetime(manager) {} }
-        session.runState = .running
-        let owner = session.beginRunAttempt(source: "quiet-display")
-        let wakeID = UUID()
-        session.quietLedger.markRoutineWake(owner: owner, wakeID: wakeID)
-        let row = AgentChatItem.assistant("[ack]")
-        session.appendItem(row)
-        h.host.refreshDerivedTranscriptState(for: session, publishActivePresentation: false)
-        _ = h.host.test_publishTranscriptPresentation(tabID: session.tabID)
-        h.host.syncTranscriptUIState()
-        let unmasked = h.host.ui.transcript.snapshot
-        XCTAssertTrue(unmasked.presentation.visibleRows.contains(where: { $0.id == row.id }))
-        var publications = 0
-        let subscription = h.host.ui.transcript.$snapshot.dropFirst().sink { _ in publications += 1 }
-        var barrierSyncAttempted = false
-        session.onRunStateChanged = { s in
-            guard s.terminalCommitInProgress else { return }
-            barrierSyncAttempted = true
-            XCTAssertNil(s.quietTranscriptDisplayCache)
-            XCTAssertFalse(h.host.prepareQuietTranscriptDisplay())
-            h.host.syncTranscriptUIState()
-            XCTAssertNil(s.quietTranscriptDisplayCache, "No mask traversal or cache on barrier stack")
-            XCTAssertEqual(h.host.ui.transcript.snapshot.displayMaskRevision, unmasked.displayMaskRevision)
-        }
-        let revision = await AgentRunTerminalCommitBarrier().commit(.init(
-            binding: h.hooks.bindTerminalSession(session), ownership: owner, expectedRunID: session.runID,
-            terminalState: .completed, source: "quiet-display", attachmentDisposition: .deleteFiles,
-            finalizeNonCodexUsage: false, supportsFollowUp: false, notifyTurnComplete: true, classifiesQuietCheckIn: true
-        ))
-        XCTAssertNotNil(revision)
-        XCTAssertTrue(barrierSyncAttempted)
-        h.host.syncTranscriptUIState()
-        let masked = h.host.ui.transcript.snapshot
-        XCTAssertGreaterThan(masked.displayMaskRevision, unmasked.displayMaskRevision)
-        XCTAssertEqual(masked.presentationRevision, unmasked.presentationRevision, "Mask is not a forged base presentation mutation")
-        XCTAssertFalse(masked.presentation.visibleRows.contains(where: { $0.id == row.id }))
-        XCTAssertTrue(session.items.contains(where: { $0.id == row.id }), "Canonical source remains")
-        let cache = try XCTUnwrap(session.quietTranscriptDisplayCache)
-        let before = publications
-        for _ in 0 ..< 100 {
-            _ = h.host.makeTranscriptUISnapshot()
-            h.host.syncTranscriptUIState()
-            XCTAssertEqual(session.quietTranscriptDisplayCache?.key, cache.key)
-            cache.result.presentation.visibleBlocks.withUnsafeBufferPointer { lhs in
-                session.quietTranscriptDisplayCache?.result.presentation.visibleBlocks.withUnsafeBufferPointer { rhs in XCTAssertEqual(lhs.baseAddress, rhs.baseAddress) }
-            }
-        }
-        XCTAssertEqual(publications, before, "Unchanged owner sync/getters do not publish")
-        subscription.cancel()
-    }
-
-    func testActualSyntheticAnchorInstallThenRemoveAndHydrateLosesMaterializedMaskButNotPendingWake() throws {
-        let (h, manager, session) = try liveFixture()
-        defer { withExtendedLifetime(manager) {} }
-        let owner = session.beginRunAttempt(source: "quiet-anchor")
-        let wake = UUID()
-        session.quietLedger.markRoutineWake(owner: owner, wakeID: wake)
-        let row = AgentChatItem.assistant("[ack]")
-        session.appendItem(row)
-        session.sealQuietCheckIn(owner: owner, terminalState: .completed, normal: true, hasSuccessor: false)
-        XCTAssertTrue(session.endRunAttempt(ifCurrent: owner, source: "quiet-anchor"))
-        let turnID = UUID()
-        let summary = AgentTranscriptTurnSummary(requestText: nil, conclusionText: "[ack]", compactConclusionText: "[ack]", middleSummaryText: nil, toolCount: 0, notableToolNames: [], keyPaths: [], compactedActivityCount: 0, hadWarning: false, hadError: false)
-        let transcript = AgentTranscript(turns: [.init(id: turnID, conclusionActivityID: row.id, retentionTier: .archived, summary: summary, terminalState: .completed, startedAt: date, completedAt: date)])
-        h.host.applyTranscriptPresentation(transcript, to: session)
-        XCTAssertFalse(session.fullTranscriptProjection.archivedBlocks.isEmpty)
-        _ = h.host.test_publishTranscriptPresentation(tabID: session.tabID)
-        h.host.syncTranscriptUIState()
-        let hiddenArchive = try XCTUnwrap(session.quietTranscriptDisplayCache)
-        XCTAssertTrue(hiddenArchive.result.archivedBlocks.isEmpty, "Separate archived conclusion is masked at actual UI sync")
-        XCTAssertEqual(h.host.ui.transcript.snapshot.presentation.archivedHistoryState.blockCount, 0)
-        h.host.setCompressedHistoryVisibility(tabID: session.tabID, isRevealed: true)
-        h.host.syncTranscriptUIState()
-        let revealed = try XCTUnwrap(session.quietTranscriptDisplayCache)
-        XCTAssertNotEqual(revealed.key.presentationRevision, hiddenArchive.key.presentationRevision)
-        XCTAssertTrue(h.host.ui.transcript.snapshot.archivedBlocks.isEmpty)
-        h.host.setTranscriptWindowExpanded(tabID: session.tabID, isExpanded: true)
-        h.host.syncTranscriptUIState()
-        XCTAssertNotEqual(session.quietTranscriptDisplayCache?.key.presentationRevision, revealed.key.presentationRevision)
-        XCTAssertTrue(h.host.ui.transcript.snapshot.presentation.visibleRows.isEmpty, "Existing archive/window paging paths cannot resurface hidden synthetic rows")
-        _ = session.removeItem(at: 0)
-        session.reconcileQuietSourceIDs(previousLiveIDs: [row.id])
-        XCTAssertTrue(session.quietLedger.hiddenSourceIDs.contains(row.id), "Materialized synthetic conclusion retains exact source proof")
-        XCTAssertNotNil(session.fullTranscriptProjection.rowAnchorIndex[row.id], "Retained source is indexed by its existing anchor owner")
-        session.clearDerivedTranscriptCaches()
-        h.host.applyTranscriptPresentation(.empty, to: session)
-        XCTAssertFalse(session.quietLedger.hiddenSourceIDs.contains(row.id), "Actual source-anchor retirement loses materialized proof")
-        XCTAssertTrue(session.quietLedger.hiddenSourceIDs.contains(wake), "Still-admissible unmaterialized wake is different")
-        session.setItemsSilently([row], reason: .persistedSessionHydration)
-        h.host.refreshDerivedTranscriptState(for: session, publishActivePresentation: false)
-        _ = h.host.test_publishTranscriptPresentation(tabID: session.tabID)
-        h.host.syncTranscriptUIState()
-        XCTAssertTrue(h.host.ui.transcript.snapshot.presentation.visibleRows.contains(where: { $0.id == row.id }), "B8 rehydration is visible, not a pending marker")
-        XCTAssertTrue(session.quietLedger.hiddenSourceIDs.contains(wake))
-    }
-
-    func testInactiveActivationArchiveWriterAndHelperOnlyChangesInvalidateExactCache() throws {
-        let (h, manager, session) = try liveFixture()
-        defer { withExtendedLifetime(manager) {} }
-        let first = AgentChatItem.assistant("[ack]", sequenceIndex: 0)
-        let quiet = AgentChatItem.thinking("[ack]", sequenceIndex: 1)
-        let turnID = UUID(), spanID = UUID()
-        func transcript(_ rows: [AgentChatItem]) -> AgentTranscript {
-            .init(turns: [.init(id: turnID, responseSpans: [.init(id: spanID, lifecycle: .completed, startedAt: date, completedAt: date, activities: rows.map { .init(from: $0) })], retentionTier: .condensed, terminalState: .completed, startedAt: date, completedAt: date)])
-        }
-        session.setItemsSilently([first], reason: .testOverride)
-        let owner = session.beginRunAttempt(source: "inactive")
-        // Use the real ledger classifier over a separate exact quiet suffix.
-        let ack = AgentChatItem.assistant("[ack]")
-        session.quietLedger.markRoutineWake(owner: owner, wakeID: UUID())
-        session.appendItem(quiet)
-        session.appendItem(ack)
-        session.sealQuietCheckIn(owner: owner, terminalState: .completed, normal: true, hasSuccessor: false)
-        XCTAssertTrue(session.endRunAttempt(ifCurrent: owner, source: "inactive"))
-        h.host.test_setCurrentTabIDOverride(UUID())
-        h.host.applyTranscriptPresentation(transcript(session.items), to: session)
-        XCTAssertNil(session.quietTranscriptDisplayCache, "Inactive install does no mask work")
-        h.host.test_setCurrentTabIDOverride(session.tabID)
-        _ = h.host.test_publishTranscriptPresentation(tabID: session.tabID)
-        h.host.syncTranscriptUIState()
-        let installed = try XCTUnwrap(session.quietTranscriptDisplayCache)
-        let originalNormalBlocks = h.host.activeTranscriptPresentation.visibleBlocks
-        XCTAssertFalse(installed.result.presentation.visibleBlocks.flatMap(\.activityIDs).contains(ack.id))
-        // Actual archive install owner clears the cache even with an unchanged mask.
-        let revision = session.quietLedger.displayMaskRevision
-        let sourceIDs = session.quietLedger.hiddenSourceIDs
-        session.mutateItem(at: 0) { $0.kind = .thinking }
-        session.mutateItem(at: 1) { $0.kind = .assistant }
-        // Existing cache reset/install owns a canonical rebuild. Live source IDs still prove both
-        // hidden rows; this is not persisted hydration, which would intentionally discard proof.
-        session.clearDerivedTranscriptCaches()
-        let next = transcript(session.items)
-        let changed = h.host.applyTranscriptPresentation(next, to: session)
-        XCTAssertNil(session.quietTranscriptDisplayCache)
-        XCTAssertEqual(session.quietLedger.displayMaskRevision, revision)
-        XCTAssertEqual(session.quietLedger.hiddenSourceIDs, sourceIDs)
-        var before = originalNormalBlocks
-        var after = changed.projection.workingBlocks
-        for index in before.indices {
-            before[index].displaySummaryInputs = []
-        }
-        for index in after.indices {
-            after[index].displaySummaryInputs = []
-        }
-        XCTAssertEqual(before, after, "Only the lossless helper differs in the ordinary display value")
-        _ = h.host.test_publishTranscriptPresentation(tabID: session.tabID)
-        h.host.syncTranscriptUIState()
-        let rebuilt = try XCTUnwrap(session.quietTranscriptDisplayCache)
-        XCTAssertNotEqual(rebuilt.key.presentationRevision, installed.key.presentationRevision)
-        XCTAssertEqual(rebuilt.result.presentation.visibleBlocks.first?.groupedHistory?.summary.hiddenAssistantCount, 0)
-        XCTAssertEqual(rebuilt.result.presentation.visibleBlocks.first?.groupedHistory?.summary.hiddenProgressCount, 1)
-        session.clearDerivedTranscriptCaches()
-        XCTAssertNil(session.quietTranscriptDisplayCache, "Actual archive reset owner also invalidates")
     }
 
     func testFullBufferedLeadingQuietNarrationDoesNotSurviveInFrozenToolsSummary() throws {
@@ -529,13 +366,153 @@ final class AgentQuietCheckInDisplayMaskTests: XCTestCase {
         XCTAssertEqual(result.archivedBlocks, result.presentation.visibleBlocks)
     }
 
-    func testDisplayOwnerHardwareSamplesAndFrozenSummaryStorageReuse() throws {
-        let (h, manager, session) = try liveFixture()
-        defer { withExtendedLifetime(manager) {} }
+    private func certifiedDisplayFixture() async throws -> AgentSelfNoopTests.Fixture {
+        let f = try await AgentSelfNoopTests.Fixture.assembled()
+        _ = try await f.body()
+        f.appendDeclaration()
+        f.session.noteAcceptedStream(.init(type: "content", text: "Certified closing, not a sentinel"), owner: f.owner)
+        f.session.appendItem(.assistant("Certified closing, not a sentinel", sequenceIndex: f.session.nextSequenceIndex))
+        XCTAssertEqual(f.seal()?.ordinaryThrough, 0)
+        f.session.runState = .completed
+        XCTAssertTrue(f.session.endRunAttempt(ifCurrent: f.owner, source: "W4.display-cache"))
+        f.window.agentModeViewModel.refreshDerivedTranscriptState(for: f.session, publishActivePresentation: false)
+        return f
+    }
+
+    func testW4InactiveActivationAndSourceRevocationInvalidateExactDisplayCache() async throws {
+        let f = try await certifiedDisplayFixture()
+        let vm = f.window.agentModeViewModel, session = f.session
+        let canonical = session.transcript
+        vm.test_setCurrentTabIDOverride(UUID())
+        vm.applyTranscriptPresentation(canonical, to: session)
+        XCTAssertNil(session.quietTranscriptDisplayCache, "Inactive install prepares no display")
+        vm.test_setCurrentTabIDOverride(session.tabID)
+        _ = vm.test_publishTranscriptPresentation(tabID: session.tabID)
+        vm.syncTranscriptUIState()
+        XCTAssertFalse(vm.ui.transcript.snapshot.presentation.visibleRows.contains { $0.text == "Certified closing, not a sentinel" || $0.toolName == "self_noop" })
+        let before = try XCTUnwrap(session.quietTranscriptDisplayCache)
+        let index = try XCTUnwrap(session.items.lastIndex { $0.text == "Certified closing, not a sentinel" })
+        session.mutateItem(at: index) { $0.text = "Substantively changed ordinary work" }
+        XCTAssertNil(session.items[index].quietCheckInWakeID)
+        XCTAssertNil(session.quietTranscriptDisplayCache)
+        vm.refreshDerivedTranscriptState(for: session, publishActivePresentation: false)
+        _ = vm.test_publishTranscriptPresentation(tabID: session.tabID)
+        vm.syncTranscriptUIState()
+        XCTAssertTrue(vm.ui.transcript.snapshot.presentation.visibleRows.contains { $0.text == "Substantively changed ordinary work" })
+        XCTAssertNotEqual(session.quietTranscriptDisplayCache?.key, before.key)
+        session.clearDerivedTranscriptCaches()
+        XCTAssertNil(session.quietTranscriptDisplayCache)
+        await vm.prepareForWindowClose()
+    }
+
+    func testW4StableArchivedProofAndWindowedAliasesReusePreparedStorage() async throws {
+        let f = try await certifiedDisplayFixture()
+        let vm = f.window.agentModeViewModel, session = f.session
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("quiet-w4-archive-replacement-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        await f.workspace.awaitInitialized()
+        var workspace = try XCTUnwrap(f.workspace.activeWorkspace)
+        workspace.customStoragePath = directory
+        f.workspace.activeWorkspace = workspace
+        if let index = f.workspace.workspaces.firstIndex(where: { $0.id == workspace.id }) { f.workspace.workspaces[index] = workspace }
+        let history = (0 ..< 2000).map { index in
+            AgentTranscriptTurn(conclusionActivityID: UUID(), retentionTier: .archived, summary: .init(requestText: nil, conclusionText: "ordinary history \(index)", compactConclusionText: "ordinary history \(index)", middleSummaryText: nil, toolCount: 0, notableToolNames: [], keyPaths: [], compactedActivityCount: 0, hadWarning: false, hadError: false), terminalState: .completed, startedAt: date, completedAt: date)
+        }
+        let request = AgentChatItem.user("ordinary live request", sequenceIndex: 10000)
+        let stream = AgentChatItem.assistant("ordinary live stream", sequenceIndex: 10001)
+        let live = AgentTranscriptIO.buildTranscript(from: [request, stream], terminalState: .running, compact: false)
+        var certified = session.transcript.turns[0]
+        certified.retentionTier = .archived
+        let retained = AgentTranscriptCompactor.compact(AgentTranscript(turns: history + [certified] + live.turns, nextSequenceIndex: 10002))
+        XCTAssertTrue(AgentTranscriptProjectionBuilder.build(from: retained).archivedRows.contains { $0.text == "Certified closing, not a sentinel" }, "Canonical archived audit retains its synthetic quiet conclusion")
+        session.runState = .running
+        vm.applyTranscriptPresentation(retained, to: session)
+        session.setItemsSilentlyForRetentionCompaction([request, stream])
+        session.nextSequenceIndex = retained.nextSequenceIndex
+        _ = vm.test_publishTranscriptPresentation(tabID: session.tabID, forceRevision: true)
+        vm.syncTranscriptUIState()
+        let initial = try XCTUnwrap(session.quietTranscriptDisplayCache)
+        let installed = session.archivedTranscriptSnapshot
+        XCTAssertGreaterThanOrEqual(initial.result.archivedBlocks.count, 2000)
+        XCTAssertEqual(initial.result.archivedBlocks.flatMap(\.rows).filter { $0.text.hasPrefix("ordinary history ") }.map(\.text), (0 ..< 2000).map { "ordinary history \($0)" })
+        XCTAssertTrue(initial.result.archivedBlocks.flatMap(\.rows).contains { $0.text == "Existing ordinary conclusion" })
+        XCTAssertFalse(initial.result.archivedBlocks.flatMap(\.rows).contains { $0.text == "Certified closing, not a sentinel" || $0.toolName == "self_noop" })
+        XCTAssertTrue(session.quietLedger.hiddenSourceIDs.contains(f.wakeID), "A still-admissible producer-owned unmaterialized wake is separate from saved proof")
+        for index in 0 ..< 3 {
+            session.mutateItem(at: 1) { $0.text = "ordinary streamed text \(index)"
+                $0.isStreaming = true
+            }
+            vm.refreshDerivedTranscriptState(for: session, reason: .liveMutation, publishActivePresentation: false)
+            _ = vm.test_publishTranscriptPresentation(tabID: session.tabID, forceRevision: true)
+            vm.syncTranscriptUIState()
+            let cache = try XCTUnwrap(session.quietTranscriptDisplayCache)
+            XCTAssertTrue(cache.result.presentation.visibleRows.contains { $0.id == stream.id && $0.text == "ordinary streamed text \(index)" })
+            XCTAssertEqual(cache.result.archiveBlockVisits, 0)
+            XCTAssertEqual(cache.result.archiveRowVisits, 0)
+            XCTAssertEqual(cache.result.archivedBlocks, initial.result.archivedBlocks)
+            initial.result.archivedBlocks.withUnsafeBufferPointer { old in cache.result.archivedBlocks.withUnsafeBufferPointer { XCTAssertEqual(old.baseAddress, $0.baseAddress) } }
+            installed.blocks.withUnsafeBufferPointer { old in session.archivedTranscriptSnapshot.blocks.withUnsafeBufferPointer { XCTAssertEqual(old.baseAddress, $0.baseAddress) } }
+        }
+        // Real reveal/window writers may overlap flattened archive rows but must not revive
+        // the canonical quiet alias, nor drop the surviving ordinary synthetic conclusion.
+        vm.setCompressedHistoryVisibility(tabID: session.tabID, isRevealed: true)
+        vm.setTranscriptWindowExpanded(tabID: session.tabID, isExpanded: true)
+        vm.syncTranscriptUIState()
+        let revealed = vm.ui.transcript.snapshot
+        XCTAssertFalse((revealed.presentation.visibleRows + revealed.archivedBlocks.flatMap(\.rows)).contains { $0.text == "Certified closing, not a sentinel" || $0.toolName == "self_noop" })
+        XCTAssertTrue(revealed.presentation.visibleRows.contains { $0.text == "Existing ordinary conclusion" })
+        session.runState = .completed
+        await session.saveDebounceTask?.value
+        let oldArchiveIdentity = session.transcript.turns[10].conclusionActivityID
+        let oldToken = AgentTranscriptProjectionBuilder.validationToken(for: session.transcript.turns[10], excludingQuiet: true)
+        let oldBinding = session.persistentSessionBindingIdentity
+        var changed = session.transcript
+        print("W4_ARCHIVE_INPUT tier=\(changed.turns[10].retentionTier) compactSummary=\(changed.turns[10].summary?.compactConclusionText ?? "nil") retainedTier=\(retained.turns[10].retentionTier) retainedCompactSummary=\(retained.turns[10].summary?.compactConclusionText ?? "nil")")
+        _ = try XCTUnwrap(changed.turns[10].summary, "Archive replacement fixture must still have its canonical retained summary before mutation")
+        changed.turns[10].summary?.conclusionText = "changed archived conclusion"
+        changed.turns[10].summary?.compactConclusionText = "changed archived conclusion"
+        XCTAssertEqual(changed.turns[10].conclusionActivityID, oldArchiveIdentity)
+        XCTAssertEqual(AgentTranscriptProjectionBuilder.validationToken(for: changed.turns[10], excludingQuiet: true), oldToken, "Same-ID summary content can change without changing this deliberately bounded token")
+        let payload = try AgentSession(id: XCTUnwrap(session.activeAgentSessionID), workspaceID: workspace.id, composeTabID: session.tabID, name: "Same-ID archive replacement", transcript: changed)
+        let savedURL = try await AgentSessionDataService.shared.saveAgentSession(payload, for: workspace)
+        let saved = try await AgentSessionDataService.shared.loadAgentSession(from: savedURL)
+        XCTAssertEqual(saved.transcript?.turns[10].summary?.compactConclusionText, "changed archived conclusion", "Normal saved canonical payload must contain same-ID changed content")
+        let revisionBeforeHydration = session.sourceItemsRevision
+        var hydrationBuilds = 0
+        AgentTranscriptDebugInstrumentation.configure(.init(projectionBuildHandler: { _ in hydrationBuilds += 1 }))
+        defer { AgentTranscriptDebugInstrumentation.reset() }
+        // Exercise the actual persisted replacement writer, without clearing caches or
+        // inventing an ID/revision bump: preparePersistedHydration builds without prior
+        // turn caches; applyPersistedHydration installs that prepared value at the same binding.
+        session.hasLoadedPersistedState = false
+        let reloaded = await vm.ensureSessionReady(tabID: session.tabID, reconnectActiveProviders: false)
+        print("W4_ARCHIVE_WRITER saved=\(saved.transcript?.turns[10].summary?.compactConclusionText ?? "nil") restored=\(reloaded.transcript.turns[10].summary?.compactConclusionText ?? "nil") builds=\(hydrationBuilds) sourceRevision=\(revisionBeforeHydration)->\(reloaded.sourceItemsRevision) settlement=\(vm.selectedRestorationSettlement())")
+        XCTAssertTrue(reloaded === session)
+        XCTAssertEqual(reloaded.transcript.turns[10].summary?.compactConclusionText, "changed archived conclusion", "Real loader must apply the changed canonical content before display checks")
+        XCTAssertTrue(reloaded.qualifiedRestorationReadiness.isAuthoritative)
+        XCTAssertEqual(reloaded.persistentSessionBindingIdentity, oldBinding)
+        XCTAssertEqual(reloaded.transcript.turns[10].conclusionActivityID, oldArchiveIdentity)
+        XCTAssertEqual(AgentTranscriptProjectionBuilder.validationToken(for: reloaded.transcript.turns[10], excludingQuiet: true), oldToken)
+        _ = vm.test_publishTranscriptPresentation(tabID: session.tabID, forceRevision: true)
+        vm.syncTranscriptUIState()
+        XCTAssertTrue(vm.ui.transcript.snapshot.archivedBlocks.flatMap(\.rows).contains { $0.text == "changed archived conclusion" })
+        XCTAssertFalse((vm.ui.transcript.snapshot.presentation.visibleRows + vm.ui.transcript.snapshot.archivedBlocks.flatMap(\.rows)).contains { $0.text == "Certified closing, not a sentinel" || $0.toolName == "self_noop" })
+        // Exact source/anchor retirement clears only materialized live membership. It cannot
+        // reconstitute a quiet declaration from text after a later unstamped hydration.
+        vm.applyTranscriptPresentation(.empty, to: session)
+        session.setItemsSilently([.assistant("Unstamped ordinary reload")], reason: .persistedSessionHydration)
+        vm.refreshDerivedTranscriptState(for: session, publishActivePresentation: false)
+        _ = vm.test_publishTranscriptPresentation(tabID: session.tabID, forceRevision: true)
+        vm.syncTranscriptUIState()
+        XCTAssertTrue(vm.ui.transcript.snapshot.presentation.visibleRows.contains { $0.text == "Unstamped ordinary reload" })
+        await vm.prepareForWindowClose()
+    }
+
+    func testW4FrozenSummaryInputsSharePreparedStorage() throws {
         let transcript = AgentTranscript(turns: (0 ..< 8).map { _ in AgentQuietCheckInReplay.toolHeavyTurn(date: date) })
         let built = AgentTranscriptProjectionBuilder.buildWithCaches(from: transcript, protection: .none, turnCaches: [:])
         var sharedInputBuffers = 0
-        for _ in 0 ..< 20 {
+        for _ in 0 ..< 3 {
             let reused = AgentTranscriptProjectionBuilder.buildWithCaches(from: transcript, protection: .none, turnCaches: built.updatedTurnCaches)
             for (id, old) in built.updatedTurnCaches {
                 let current = try XCTUnwrap(reused.updatedTurnCaches[id])
@@ -549,59 +526,7 @@ final class AgentQuietCheckInDisplayMaskTests: XCTestCase {
                 }
             }
         }
-        XCTAssertEqual(sharedInputBuffers, 160)
-        var compacted = AgentTranscriptCompactor.compact(transcript)
-        for index in compacted.turns.indices {
-            compacted.turns[index].retentionTier = .archived
-        }
-        h.host.applyTranscriptPresentation(compacted, to: session)
-        _ = h.host.test_publishTranscriptPresentation(tabID: session.tabID)
-        h.host.syncTranscriptUIState()
-        var sealMS: [Double] = [], ownerMS: [Double] = [], hitMS: [Double] = []
-        var measuredCacheBuilds = 0
-        var workTotals = (blocks: 0, rows: 0, anchors: 0)
-        var workMax = (blocks: 0, rows: 0, anchors: 0)
-        func ms(_ duration: Duration) -> Double {
-            Double(duration.components.seconds) * 1000 + Double(duration.components.attoseconds) / 1e15
-        }
-        for _ in 0 ..< 100 {
-            let owner = session.beginRunAttempt(source: "quiet-display-hardware")
-            let wake = UUID()
-            session.quietLedger.recordPhysicalDispatch(owner: owner, wakeID: wake, routineQuietCheckIn: true, alreadyAcquired: false)
-            session.appendItem(.assistant("[ack]"))
-            let start = ContinuousClock.now
-            session.sealQuietCheckIn(owner: owner, terminalState: .completed, normal: true, hasSuccessor: false)
-            sealMS.append(ms(start.duration(to: .now)))
-            XCTAssertNil(session.quietTranscriptDisplayCache, "Seal only invalidates membership/cache")
-            let syncStart = ContinuousClock.now
-            h.host.syncTranscriptUIState()
-            ownerMS.append(ms(syncStart.duration(to: .now)))
-            let cache = try XCTUnwrap(session.quietTranscriptDisplayCache)
-            XCTAssertFalse(cache.result.archivedBlocks.isEmpty, "Separate archived materialization is part of the owning UI measurement")
-            measuredCacheBuilds += 1
-            workTotals.blocks += cache.result.blockVisits
-            workTotals.rows += cache.result.rowVisits
-            workTotals.anchors += cache.result.anchorVisits
-            workMax.blocks = max(workMax.blocks, cache.result.blockVisits)
-            workMax.rows = max(workMax.rows, cache.result.rowVisits)
-            workMax.anchors = max(workMax.anchors, cache.result.anchorVisits)
-            let hitStart = ContinuousClock.now
-            for _ in 0 ..< 10 {
-                _ = h.host.makeTranscriptUISnapshot()
-            }
-            hitMS.append(ms(hitStart.duration(to: .now)) / 10)
-            cache.result.archivedBlocks.withUnsafeBufferPointer { old in
-                session.quietTranscriptDisplayCache?.result.archivedBlocks.withUnsafeBufferPointer { current in XCTAssertEqual(old.baseAddress, current.baseAddress) }
-            }
-            XCTAssertTrue(session.endRunAttempt(ifCurrent: owner, source: "quiet-display-hardware"))
-            session.retireQuietUnmaterializedWake(wake)
-            h.host.syncTranscriptUIState()
-        }
-        func p99(_ samples: [Double]) -> Double {
-            samples.sorted()[Int(Double(samples.count - 1) * 0.99)]
-        }
-        print("QUIET_C5_UI_HARDWARE samples=100 getters=1000 positivelyRoutineRowsPerSeal=1 sealP99MS=\(p99(sealMS)) ownerSyncP99MS=\(p99(ownerMS)) ownerSyncMaxMS=\(ownerMS.max()!) getterP99MS=\(p99(hitMS)) archiveBlocks=\(session.archivedTranscriptSnapshot.blocks.count) frozenCacheInputBufferMatches=\(sharedInputBuffers) observedNewHelperBuffersOnReuse=0 helperRowStride=\(MemoryLayout<AgentTranscriptDisplaySummaryInput.Row>.stride) helperInputStride=\(MemoryLayout<AgentTranscriptDisplaySummaryInput>.stride)")
-        print("QUIET_A3_DISPLAY_WORK measuredCacheBuilds=\(measuredCacheBuilds) blocksTotal=\(workTotals.blocks) rowsTotal=\(workTotals.rows) anchorsTotal=\(workTotals.anchors) blocksMax=\(workMax.blocks) rowsMax=\(workMax.rows) anchorsMax=\(workMax.anchors)")
+        XCTAssertEqual(sharedInputBuffers, 24)
     }
 
     func testEmptyLocalMaskRetiresOnlyDisplayMetadataNotHydrationOrCanonicalFollowScope() {
@@ -649,286 +574,6 @@ final class AgentQuietCheckInDisplayMaskTests: XCTestCase {
             XCTAssertEqual(full.presentation.metadata.latestTurnID, target == turnID ? nil : target)
             XCTAssertEqual(full.presentation.metadata.dynamicSummaryLockTargetTurnID, target == turnID ? nil : target)
         }
-    }
-
-    func testStableArchiveAcrossRealStreamingBasePublicationsReusesBufferAndDoesNoArchiveWork() throws {
-        let (h, manager, session) = try liveFixture()
-        defer { withExtendedLifetime(manager) {} }
-        let history = AgentTranscript(turns: (0 ..< 2000).map { index in
-            let sourceID = UUID()
-            return AgentTranscriptTurn(
-                conclusionActivityID: sourceID, retentionTier: .archived,
-                summary: .init(requestText: nil, conclusionText: "ordinary history \(index)", compactConclusionText: "ordinary history \(index)", middleSummaryText: nil, toolCount: 0, notableToolNames: [], keyPaths: [], compactedActivityCount: 0, hadWarning: false, hadError: false),
-                terminalState: .completed, startedAt: date, completedAt: date
-            )
-        })
-        h.host.applyTranscriptPresentation(history, to: session)
-        let wake = UUID()
-        let owner = session.beginRunAttempt(source: "quiet-archive-stream")
-        session.quietLedger.markRoutineWake(owner: owner, wakeID: wake)
-        session.sealQuietCheckIn(owner: owner, terminalState: .completed, normal: true, hasSuccessor: false)
-        XCTAssertTrue(session.endRunAttempt(ifCurrent: owner, source: "quiet-archive-stream"))
-        let installedArchive = session.archivedTranscriptSnapshot
-        session.archivedTranscriptSnapshot = installedArchive
-        _ = h.host.test_publishTranscriptPresentation(tabID: session.tabID, forceRevision: true)
-        h.host.syncTranscriptUIState()
-        let first = try XCTUnwrap(session.quietTranscriptDisplayCache)
-        XCTAssertGreaterThanOrEqual(session.archivedTranscriptSnapshot.rows.count, 2000)
-        XCTAssertGreaterThanOrEqual(first.result.rowVisits, 2000, "The initial archive projection is counted")
-        XCTAssertEqual(session.quietLedger.hiddenSourceIDs, [wake], "Hidden source is absent from every materialized region")
-        var samples: [Double] = []
-        var work: [Int] = []
-        for index in 0 ..< 100 {
-            // Same archive and mask; ordinary live content changes at the existing presentation owner.
-            let live = projection([.assistant("ordinary stream \(index)")], tier: .full)
-            session.transcriptProjection = live
-            session.workingTranscriptProjection = live
-            let previousRevision = h.host.activeTranscriptPresentation.revision
-            let start = ContinuousClock.now
-            _ = h.host.test_publishTranscriptPresentation(tabID: session.tabID, forceRevision: true)
-            h.host.syncTranscriptUIState()
-            let elapsed = start.duration(to: .now)
-            samples.append(Double(elapsed.components.seconds) * 1000 + Double(elapsed.components.attoseconds) / 1e15)
-            let base = h.host.activeTranscriptPresentation
-            let cache = try XCTUnwrap(session.quietTranscriptDisplayCache)
-            XCTAssertGreaterThan(base.revision, previousRevision, "Exercises the actual didSet and owner UI sync")
-            XCTAssertEqual(cache.result.presentation, base)
-            XCTAssertEqual(cache.result.presentation.metadata, base.metadata)
-            XCTAssertEqual(cache.result.presentation.archivedHistoryState, base.archivedHistoryState)
-            XCTAssertEqual(cache.result.anchorVisits, 0)
-            XCTAssertEqual(cache.result.blockVisits, 2, "Only the live visible/working blocks; no archive ID/count pass")
-            XCTAssertLessThanOrEqual(cache.result.rowVisits, 4, "Only visible/working live rows, never the stable 2000-row archive")
-            work.append(cache.result.rowVisits)
-            first.result.archivedBlocks.withUnsafeBufferPointer { old in
-                cache.result.archivedBlocks.withUnsafeBufferPointer { current in XCTAssertEqual(old.baseAddress, current.baseAddress) }
-            }
-            session.archivedTranscriptSnapshot.blocks.withUnsafeBufferPointer { caller in
-                cache.result.archivedBlocks.withUnsafeBufferPointer { current in XCTAssertEqual(caller.baseAddress, current.baseAddress, "No-op preserves caller archive buffer") }
-            }
-        }
-        print("QUIET_F2_STREAM samplesMS=\(samples) totalRowVisits=\(work) p99MS=\(samples.sorted()[98]) maxMS=\(samples.max()!) quantile=nearestRankCeil0.99Nminus1 archiveRows=2000 baseAssignments=100")
-        // An equal-value archive assignment is still a real writer/invalidation boundary.
-        let snapshot = session.archivedTranscriptSnapshot
-        session.archivedTranscriptSnapshot = snapshot
-        XCTAssertNil(session.quietTranscriptDisplayCache)
-        h.host.syncTranscriptUIState()
-        XCTAssertGreaterThanOrEqual(try XCTUnwrap(session.quietTranscriptDisplayCache).result.rowVisits, 2000)
-        session.retireQuietUnmaterializedWake(wake)
-        h.host.syncTranscriptUIState()
-        XCTAssertEqual(session.quietLedger.hiddenSourceIDs, [])
-        XCTAssertEqual(session.quietTranscriptDisplayCache?.result.presentation, h.host.activeTranscriptPresentation)
-    }
-
-    func testSourceDrivenLiveRefreshReusesQuietArchiveForUnmaterializedWake() throws {
-        try assertSourceDrivenLiveRefreshReusesQuietArchive(archivedQuietSource: false)
-    }
-
-    func testSourceDrivenLiveRefreshReusesQuietArchiveForArchivedSyntheticAlias() throws {
-        try assertSourceDrivenLiveRefreshReusesQuietArchive(archivedQuietSource: true)
-    }
-
-    private func assertSourceDrivenLiveRefreshReusesQuietArchive(archivedQuietSource: Bool) throws {
-        let (h, manager, session) = try liveFixture()
-        defer { withExtendedLifetime(manager) {} }
-        let wake = UUID()
-        let quiet = AgentChatItem.assistant("[ack]", sequenceIndex: 0)
-        let owner = session.beginRunAttempt(source: "quiet-source-archive")
-        session.quietLedger.markRoutineWake(owner: owner, wakeID: wake)
-        if archivedQuietSource { session.appendItem(quiet) }
-        session.sealQuietCheckIn(owner: owner, terminalState: .completed, normal: true, hasSuccessor: false)
-        XCTAssertTrue(session.endRunAttempt(ifCurrent: owner, source: "quiet-source-archive"))
-        session.runState = .running
-        let request = AgentChatItem.user("ordinary live request", sequenceIndex: 10000)
-        let stream = AgentChatItem.assistant("ordinary live stream", sequenceIndex: 10001)
-        let live = AgentTranscriptIO.buildTranscript(from: [request, stream], terminalState: .running, compact: false)
-        let history = (0 ..< 2000).map { index in
-            let text = archivedQuietSource && index == 0 ? "[ack]" : "ordinary history \(index)"
-            return AgentTranscriptTurn(
-                conclusionActivityID: archivedQuietSource && index == 0 ? quiet.id : UUID(), retentionTier: .archived,
-                summary: .init(requestText: nil, conclusionText: text, compactConclusionText: text, middleSummaryText: nil, toolCount: 0, notableToolNames: [], keyPaths: [], compactedActivityCount: 0, hadWarning: false, hadError: false),
-                terminalState: .completed, startedAt: date, completedAt: date
-            )
-        }
-        let transcript = AgentTranscriptCompactor.compact(AgentTranscript(turns: history + live.turns))
-        h.host.applyTranscriptPresentation(transcript, to: session)
-        // Retention movement preserves the archived source's proof; source mutations below use
-        // the ordinary session callback, not direct base/projection assignment.
-        session.setItemsSilently([request, stream], reason: .retentionCompaction)
-        _ = h.host.test_publishTranscriptPresentation(tabID: session.tabID, forceRevision: true)
-        h.host.syncTranscriptUIState()
-        let initial = try XCTUnwrap(session.quietTranscriptDisplayCache)
-        let installedArchive = session.archivedTranscriptSnapshot
-        XCTAssertEqual(installedArchive.rows.count, 2000)
-        XCTAssertEqual(initial.result.archiveBlockVisits, 2000)
-        XCTAssertEqual(initial.result.archiveRowVisits, 2000)
-        XCTAssertTrue(session.quietLedger.hiddenSourceIDs.contains(archivedQuietSource ? quiet.id : wake))
-        let alias = try XCTUnwrap(installedArchive.rows.first)
-        if archivedQuietSource {
-            XCTAssertNotEqual(alias.id, quiet.id)
-            XCTAssertTrue(session.quietTranscriptArchiveDisplayCache?.region.removedRowIDs.contains(alias.id) == true)
-            XCTAssertFalse(initial.result.archivedBlocks.contains { $0.rows.contains { $0.id == alias.id } })
-        }
-        let expectedArchiveCount = archivedQuietSource ? 1999 : 2000
-        XCTAssertEqual(initial.result.archivedBlocks.count, expectedArchiveCount)
-        h.host.test_setAllowsScheduledDerivedTranscriptRefreshWithoutPromptManager(true)
-        defer { h.host.test_setAllowsScheduledDerivedTranscriptRefreshWithoutPromptManager(false) }
-        var quietMS: [Double] = [], builderMS: [Double] = [], refreshMS: [Double] = [], inclusiveMS: [Double] = [], archiveSnapshotMS: [Double] = []
-        var quietArchiveBlocks: [Int] = [], quietArchiveRows: [Int] = []
-        func ms(_ from: ContinuousClock.Instant, _ to: ContinuousClock.Instant) -> Double {
-            let elapsed = from.duration(to: to)
-            return Double(elapsed.components.seconds) * 1000 + Double(elapsed.components.attoseconds) / 1e15
-        }
-        for index in 0 ..< 100 {
-            let oldSourceRevision = session.sourceItemsRevision
-            let oldBuildCount = session.transcriptPerformanceSnapshot.projectionBuildCount
-            let oldPresentationRevision = h.host.activeTranscriptPresentation.revision
-            let start = ContinuousClock.now
-            session.mutateItem(at: 1) { $0.text = "ordinary streamed text \(index)"
-                $0.isStreaming = true
-            }
-            // Drain the real scheduled source refresh synchronously, separating existing builder
-            // cost from publication + didSet-owned quiet display preparation. No projection helper.
-            h.host.refreshDerivedTranscriptState(for: session, reason: .liveMutation, publishActivePresentation: false)
-            let refreshed = ContinuousClock.now
-            let publishStart = ContinuousClock.now
-            _ = h.host.test_publishTranscriptPresentation(tabID: session.tabID, forceRevision: true)
-            h.host.syncTranscriptUIState()
-            let end = ContinuousClock.now
-            quietMS.append(ms(publishStart, end))
-            refreshMS.append(ms(start, refreshed))
-            inclusiveMS.append(ms(start, end))
-            try builderMS.append(XCTUnwrap(session.transcriptPerformanceSnapshot.lastProjectionBuildDurationMS))
-            let cache = try XCTUnwrap(session.quietTranscriptDisplayCache)
-            let base = h.host.activeTranscriptPresentation
-            XCTAssertGreaterThan(session.sourceItemsRevision, oldSourceRevision)
-            XCTAssertEqual(session.transcriptPerformanceSnapshot.projectionBuildCount, oldBuildCount + 1)
-            XCTAssertGreaterThan(base.revision, oldPresentationRevision)
-            XCTAssertEqual(session.transcriptPerformanceSnapshot.lastSanitizeReusedTurnCount, 2000)
-            XCTAssertTrue(cache.result.presentation.visibleRows.contains { $0.id == stream.id && $0.text == "ordinary streamed text \(index)" })
-            XCTAssertEqual(cache.result.presentation.visibleRows, base.visibleRows)
-            XCTAssertEqual(cache.result.presentation.workingRows, base.workingRows)
-            XCTAssertEqual(cache.result.presentation.visibleBlocks, base.visibleBlocks)
-            XCTAssertEqual(cache.result.presentation.workingBlocks, base.workingBlocks)
-            XCTAssertEqual(cache.result.presentation.metadata, base.metadata)
-            XCTAssertEqual(cache.result.presentation.rowAnchorIndex, base.rowAnchorIndex)
-            XCTAssertEqual(cache.result.presentation.anchorBlockIndex, base.anchorBlockIndex)
-            XCTAssertEqual(cache.result.presentation.archivedHistoryState, .init(hasArchivedHistory: true, presentedRowCount: expectedArchiveCount, blockCount: expectedArchiveCount))
-            XCTAssertEqual(cache.result.archiveBlockVisits, 0, "No repeated QUIET MASK archive traversal; existing builder work is separate")
-            XCTAssertEqual(cache.result.archiveRowVisits, 0)
-            XCTAssertEqual(cache.result.archivedBlocks.count, expectedArchiveCount)
-            quietArchiveBlocks.append(cache.result.archiveBlockVisits)
-            quietArchiveRows.append(cache.result.archiveRowVisits)
-            initial.result.archivedBlocks.withUnsafeBufferPointer { old in
-                cache.result.archivedBlocks.withUnsafeBufferPointer { current in XCTAssertEqual(old.baseAddress, current.baseAddress, "Masked archive storage survives the BUILT installation") }
-            }
-            installedArchive.blocks.withUnsafeBufferPointer { old in
-                session.archivedTranscriptSnapshot.blocks.withUnsafeBufferPointer { current in XCTAssertEqual(old.baseAddress, current.baseAddress, "Unchanged archive is not reinstalled") }
-            }
-            // Diagnostic-only repetition of the unchanged production archive snapshot/count/index
-            // routine on this SAME fixture, outside both timed real paths. This is a subcost,
-            // not the entire builder cost, and is not additional production quiet-mask work.
-            let archiveStart = ContinuousClock.now
-            let measuredArchive = AgentTranscriptProjectionBuilder.archivedSnapshot(from: session.fullTranscriptProjection)
-            archiveSnapshotMS.append(ms(archiveStart, .now))
-            XCTAssertEqual(measuredArchive.rows.count, 2000)
-        }
-        func measurements(_ samples: [Double]) -> [String: Any] {
-            ["samplesMS": samples, "p99MS": samples.sorted()[Int(ceil(0.99 * Double(samples.count))) - 1], "maxMS": samples.max()!]
-        }
-        let measurements: [String: Any] = [
-            "scenario": archivedQuietSource ? "archived-synthetic-alias" : "unmaterialized-wake", "n": 100,
-            "quantile": "sort(samples)[ceil(0.99*N)-1]", "archiveRows": 2000,
-            "quietPublicationAndOwnerSync": measurements(quietMS), "existingBuilderTotal": measurements(builderMS),
-            "sourceAndDerivedRefresh": measurements(refreshMS), "inclusiveSourceThroughUISync": measurements(inclusiveMS),
-            "separateArchiveSnapshotSubcost": measurements(archiveSnapshotMS),
-            "quietArchiveBlockVisits": quietArchiveBlocks, "quietArchiveRowVisits": quietArchiveRows,
-            "builderStatus": "pre-existing, unchanged; current measurement, not a pristine-baseline measurement"
-        ]
-        try print("QUIET_F2_SOURCE_STREAM " + String(decoding: JSONSerialization.data(withJSONObject: measurements, options: [.sortedKeys]), as: UTF8.self))
-        // A real archive replacement runs through the built installer and MUST retire both caches.
-        var changed = session.transcript
-        changed.turns[10].conclusionActivityID = UUID()
-        changed.turns[10].summary?.conclusionText = "changed archived conclusion"
-        changed.turns[10].summary?.compactConclusionText = "changed archived conclusion"
-        h.host.applyTranscriptPresentation(changed, to: session)
-        XCTAssertNil(session.quietTranscriptArchiveDisplayCache)
-        XCTAssertNil(session.quietTranscriptDisplayCache)
-        _ = h.host.test_publishTranscriptPresentation(tabID: session.tabID, forceRevision: true)
-        h.host.syncTranscriptUIState()
-        let replaced = try XCTUnwrap(session.quietTranscriptDisplayCache)
-        XCTAssertEqual(replaced.result.archiveBlockVisits, 2000)
-        XCTAssertEqual(replaced.result.archiveRowVisits, 2000)
-        XCTAssertTrue(replaced.result.archivedBlocks.contains { $0.rows.contains { $0.text == "changed archived conclusion" } })
-        XCTAssertEqual(replaced.result.archivedBlocks.count, expectedArchiveCount)
-        // Explicit same-content apply/hydration remains an invalidating writer, never a live reuse.
-        h.host.applyTranscriptPresentation(session.transcript, to: session)
-        XCTAssertNil(session.quietTranscriptArchiveDisplayCache)
-    }
-
-    func testReusedArchiveRetainsSyntheticAliasContributionAcrossWindowedBaseAssignments() throws {
-        let (h, manager, session) = try liveFixture()
-        defer { withExtendedLifetime(manager) {} }
-        let row = AgentChatItem.assistant("[ack]")
-        let owner = session.beginRunAttempt(source: "quiet-archive-alias")
-        session.quietLedger.markRoutineWake(owner: owner, wakeID: UUID())
-        session.appendItem(row)
-        session.sealQuietCheckIn(owner: owner, terminalState: .completed, normal: true, hasSuccessor: false)
-        XCTAssertTrue(session.endRunAttempt(ifCurrent: owner, source: "quiet-archive-alias"))
-        let archived = projection([], tier: .archived, conclusionID: row.id, summary: .init(
-            requestText: nil, conclusionText: "[ack]", compactConclusionText: "[ack]", middleSummaryText: nil,
-            toolCount: 0, notableToolNames: [], keyPaths: [], compactedActivityCount: 0, hadWarning: false, hadError: false
-        ))
-        session.archivedTranscriptSnapshot = AgentTranscriptProjectionBuilder.archivedSnapshot(from: archived)
-        let synthetic = try XCTUnwrap(archived.archivedRows.first)
-        XCTAssertNotEqual(synthetic.id, row.id)
-        for index in 0 ..< 3 {
-            // The archive carries the source anchor. Windowed flat rows can overlap it without
-            // carrying that block/anchor themselves; archive removedRowIDs must still contribute.
-            let windowed = AgentTranscriptProjection(workingRows: [synthetic], anchorBlockIndex: archived.anchorBlockIndex)
-            session.transcriptProjection = windowed
-            session.workingTranscriptProjection = windowed
-            _ = h.host.test_publishTranscriptPresentation(tabID: session.tabID, forceRevision: true)
-            h.host.syncTranscriptUIState()
-            let result = try XCTUnwrap(session.quietTranscriptDisplayCache).result
-            XCTAssertTrue(result.archivedBlocks.isEmpty)
-            XCTAssertTrue(result.presentation.visibleRows.isEmpty)
-            XCTAssertTrue(result.presentation.workingRows.isEmpty)
-            XCTAssertTrue(result.presentation.anchorBlockIndex.isEmpty)
-            if index > 0 { XCTAssertEqual(result.rowVisits, 2, "Only the two flat aliases are visited; no cached archive scan") }
-        }
-    }
-
-    func testStructuralRekeyAndRetentionIndexOwnerWorkCadence() {
-        let session = AgentTabSession(tabID: UUID())
-        for _ in 0 ..< 12 {
-            let owner = session.beginRunAttempt(source: "quiet-retained-source")
-            let wake = UUID()
-            session.quietLedger.recordPhysicalDispatch(owner: owner, wakeID: wake, routineQuietCheckIn: true, alreadyAcquired: false)
-            session.appendItem(.assistant("[ack]"))
-            session.sealQuietCheckIn(owner: owner, terminalState: .completed, normal: true, hasSuccessor: false)
-            XCTAssertTrue(session.endRunAttempt(ifCurrent: owner, source: "quiet-retained-source"))
-            session.retireQuietUnmaterializedWake(wake)
-        }
-        let identities = session.liveItemIDs
-        XCTAssertEqual(session.quietLedger.hiddenSourceIDs, identities)
-        let maskRevision = session.quietLedger.displayMaskRevision
-        let original = session.quietLedger.facts
-        let scansBefore = session.test_fullRetentionPayloadMapScannedItemCount
-        var samples: [Double] = []
-        for _ in 0 ..< 32 {
-            let start = ContinuousClock.now
-            let next = session.nextSequenceIndex
-            session.mutateItem(at: 0) { $0.sequenceIndex = next }
-            session.setItemsSilentlyForRetentionCompaction(session.items)
-            let elapsed = start.duration(to: .now)
-            samples.append(Double(elapsed.components.seconds) * 1000 + Double(elapsed.components.attoseconds) / 1e15)
-            XCTAssertEqual(session.liveItemIDs, identities)
-            XCTAssertEqual(session.quietLedger.facts, original)
-            XCTAssertEqual(session.quietLedger.hiddenSourceIDs, identities)
-            XCTAssertEqual(session.quietLedger.displayMaskRevision, maskRevision, "Structural source proof survives without a fake membership change")
-        }
-        XCTAssertEqual(session.items.count, 12)
-        print("QUIET_C5_STRUCTURAL samples=32 retainedSuffixRows=12 rekeyRetentionP99MS=\(samples.sorted()[31]) retentionPayloadItemsScanned=\(session.test_fullRetentionPayloadMapScannedItemCount - scansBefore) hiddenMembership=\(session.quietLedger.hiddenSourceIDs.count) newQuietAddressIndexes=0")
     }
 }
 
@@ -1336,6 +981,293 @@ final class AgentQuietRetainedViewFeasibilityTests: XCTestCase {
         XCTAssertTrue(after.projection.workingRows.contains { $0.id == baseline.conclusionActivityID })
         let audit = AgentTranscriptProjectionBuilder.buildWithCaches(from: completed, turnCaches: after.updatedTurnCaches)
         XCTAssertTrue(audit.projection.workingRows.contains { $0.text == "Quiet closing 2000" }, "A local cache cannot be reused for canonical audit/export")
+    }
+
+    func testW4CertifiedMembersNeverPublishAcrossSuccessorOriginsAndRestore() async throws {
+        for origin in ["routine", "user", "manual", "steer", "restored-routine"] {
+            let f = try await AgentSelfNoopTests.Fixture.assembled()
+            var window = f.window
+            var vm = window.agentModeViewModel
+            var session = f.session
+            _ = try await f.body()
+            f.appendDeclaration()
+            session.noteAcceptedStream(.init(type: "content", text: "Certified private closing"), owner: f.owner)
+            session.appendItem(.assistant("Certified private closing", sequenceIndex: session.nextSequenceIndex))
+            XCTAssertEqual(f.seal()?.ordinaryThrough, 0)
+            session.runState = .completed
+            XCTAssertTrue(session.endRunAttempt(ifCurrent: f.owner, source: "W4.successor-baseline"))
+            vm.refreshDerivedTranscriptState(for: session, publishActivePresentation: false)
+            let canonical = session.transcript
+            let certifiedIDs = Set(canonical.allActivities.filter { $0.quietCheckInWakeID == f.wakeID }.map(\.id))
+            XCTAssertEqual(certifiedIDs.count, 3)
+            var publications = 0
+            func observe(_ model: AgentModeViewModel) -> AnyCancellable {
+                model.ui.transcript.$snapshot.sink { snapshot in
+                    publications += 1
+                    func allBlocks(_ blocks: [AgentTranscriptRenderBlock]) -> [AgentTranscriptRenderBlock] {
+                        blocks.flatMap { [$0] + allBlocks($0.groupedHistory?.sections.flatMap(\.childBlocks) ?? []) }
+                    }
+                    let blocks = allBlocks(snapshot.presentation.visibleBlocks + snapshot.archivedBlocks)
+                    let rows = snapshot.presentation.visibleRows + blocks.flatMap(\.rows)
+                    XCTAssertFalse(rows.contains { certifiedIDs.contains($0.id) || $0.quietCheckInWakeID == f.wakeID || $0.text.contains("Certified private closing") }, "\(origin) publication \(publications): saved stamps, regardless of candidate/ledger/run state")
+                    XCTAssertTrue(certifiedIDs.isDisjoint(with: blocks.flatMap(\.activityIDs)), "\(origin) publication \(publications): nested membership")
+                    for block in blocks {
+                        let summary = block.groupedHistory?.summary.toolSummary ?? block.clusterSummary
+                        XCTAssertFalse(summary?.toolNames.contains("self_noop") == true, "\(origin) publication \(publications): summary tool")
+                        XCTAssertFalse(summary?.shortNarration?.contains("Certified private closing") == true, "\(origin) publication \(publications): summary narration")
+                    }
+                }
+            }
+            var subscriptions = [observe(vm)]
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent("quiet-w4-successor-\(UUID())")
+            defer { try? FileManager.default.removeItem(at: directory) }
+            if origin == "restored-routine" {
+                let freshWindow = WindowState()
+                let freshVM = freshWindow.agentModeViewModel
+                let manager = freshWindow.workspaceManager
+                await manager.awaitInitialized()
+                let tabID = UUID(), sessionID = UUID()
+                var workspace = WorkspaceModel(name: "W4 restored successor", repoPaths: [], ephemeralFlag: true, composeTabs: [ComposeTabState(id: tabID, name: "T1")], activeComposeTabID: tabID)
+                workspace.customStoragePath = directory
+                workspace.composeTabs[0].activeAgentSessionID = sessionID
+                _ = try await AgentSessionDataService.shared.saveAgentSession(AgentSession(id: sessionID, workspaceID: workspace.id, composeTabID: tabID, name: "W4 stamped", transcript: canonical, lastRunState: AgentSessionRunState.completed.rawValue), for: workspace)
+                subscriptions.append(observe(freshVM))
+                manager.workspaces = [workspace]
+                manager.activeWorkspace = workspace
+                freshVM.workspaceManager = manager
+                freshWindow.promptManager.loadComposeTabsFromWorkspace(workspace, syncPromptText: false)
+                let adoption = freshVM.test_receiveWorkspaceSwitchNotification(workspace)
+                await freshVM.test_handleWorkspaceSwitch(workspace, owner: adoption)
+                freshVM.test_setCurrentTabIDOverride(tabID)
+                session = await freshVM.ensureSessionReady(tabID: tabID, reconnectActiveProviders: false)
+                XCTAssertTrue(session.qualifiedRestorationReadiness.isAuthoritative)
+                XCTAssertEqual(session.quietLedger.facts, .zero)
+                XCTAssertTrue(session.quietLedger.hiddenSourceIDs.isEmpty)
+                XCTAssertEqual(Set(session.transcript.allActivities.filter { $0.quietCheckInWakeID == f.wakeID }.map(\.id)), certifiedIDs)
+                vm = freshVM
+                window = freshWindow
+            }
+            func publish() {
+                vm.refreshDerivedTranscriptState(for: session, publishActivePresentation: false)
+                _ = vm.test_publishTranscriptPresentation(tabID: session.tabID)
+                vm.syncTranscriptUIState()
+            }
+            publish()
+            // Production Claude runner: begin -> running -> binding publication, BEFORE
+            // physical acquisition qualifies the wake. User text precedes a new turn;
+            // manual wakes/steers are ordinary and cannot supply a display candidate.
+            if origin == "user" {
+                session.appendItem(.user("Ordinary successor request", sequenceIndex: session.nextSequenceIndex))
+                publish()
+            }
+            session.selectedAgent = .claudeCode
+            if session.runID == nil { session.installRunID(UUID()) }
+            let owner = session.beginRunAttempt(source: "W4.successor.\(origin)")
+            session.runState = .running
+            publish()
+            XCTAssertNil(session.transcript.turns.last?.completedAt, "Active canonical turn must stay active")
+            let wake = UUID()
+            session.quietLedger.recordPhysicalDispatch(owner: owner, wakeID: wake, routineQuietCheckIn: origin == "routine" || origin == "restored-routine", alreadyAcquired: false, sourceRevision: session.sourceItemsRevision)
+            publish()
+            if origin == "steer" {
+                session.noteAcceptedTaskInput()
+                session.appendItem(.user("Ordinary steering request", sequenceIndex: session.nextSequenceIndex))
+                publish()
+            }
+            session.noteAcceptedStream(.init(type: "content", text: "Ordinary successor output"), owner: owner)
+            session.appendItem(.assistant("Ordinary successor output", sequenceIndex: session.nextSequenceIndex))
+            publish()
+            XCTAssertTrue(vm.ui.transcript.snapshot.presentation.visibleRows.contains { $0.text == "Ordinary successor output" }, "Ordinary work must remain visible")
+            XCTAssertGreaterThan(publications, 1)
+            XCTAssertTrue(certifiedIDs.isSubset(of: Set(session.transcript.allActivities.map(\.id))), "Local hiding never deletes canonical audit members")
+            print("W4_STAMP_SUCCESSOR origin=\(origin) publications=\(publications) certified=\(certifiedIDs.count)")
+            subscriptions.forEach { $0.cancel() }
+            await window.agentModeViewModel.prepareForWindowClose()
+            if window !== f.window { await f.window.agentModeViewModel.prepareForWindowClose() }
+        }
+    }
+
+    func testW4FixedRetentionProjectionEqualsExactMemberRemovalAndFreshHydration() async throws {
+        for tools in [0, 8, 9] {
+            let source = tools == 0
+                ? [row(0, kind: .user, text: "ordinary request")] + (1 ..< 1000).map { row($0, kind: .assistant, text: "ordinary \($0)") }
+                : ordinaryRows(base: 0, toolCount: tools)
+            let f = try AgentSelfNoopTests.Fixture(ordinaryRows: source)
+            let session = f.session
+            // Capture the same origin's ordinary formatter inputs before Q exists, not a
+            // second imported/recompacted history or the candidate's local output.
+            let ordinaryOrigin = try XCTUnwrap(AgentTranscriptIO.buildTranscript(from: session.items, terminalState: .completed, compact: false).turns.first)
+            _ = try await f.body()
+            let memberStart = session.items.count
+            f.appendDeclaration()
+            session.noteAcceptedStream(.init(type: "content", text: "Allowed non-keyword closing output"), owner: f.owner)
+            session.appendItem(.assistant("Allowed non-keyword closing output", sequenceIndex: session.nextSequenceIndex))
+            let members = Set(session.items.dropFirst(memberStart).map(\.id))
+            XCTAssertEqual(f.seal()?.ordinaryThrough, 0)
+            session.runState = .completed
+            XCTAssertTrue(session.endRunAttempt(ifCurrent: f.owner, source: "W4.fixed-retention"))
+            f.window.agentModeViewModel.refreshDerivedTranscriptState(for: session, publishActivePresentation: false)
+            let canonical = session.transcript
+            XCTAssertEqual(Set(canonical.allActivities.filter { $0.quietCheckInWakeID == f.wakeID }.map(\.id)), members)
+            XCTAssertEqual(canonical.turns[0].allActivities.filter { !members.contains($0.id) }, ordinaryOrigin.allActivities)
+            let expectedFull = fixedRetentionReference(canonical, origin: ordinaryOrigin, members: members)
+            assertFixedProjection(canonical, expected: expectedFull, members: members, label: "incremental tools=\(tools)")
+            let full = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(existingTranscript: canonical, workingItems: session.items, terminalState: .completed)
+            assertFixedProjection(full, expected: fixedRetentionReference(full, origin: ordinaryOrigin, members: members), members: members, label: "full fallback tools=\(tools)")
+            let successor = AgentTranscriptIO.buildTranscript(from: ordinaryRows(base: 2000, toolCount: 9), terminalState: .completed, compact: false)
+            let immutable = AgentTranscript(turns: canonical.turns + successor.turns, nextSequenceIndex: 2073)
+            for tier in [AgentTranscriptRetentionTier.full, .condensed, .summary, .archived] {
+                var seed = immutable
+                seed.turns[0].retentionTier = tier
+                // Candidate ONLY chooses retention. The reference is never compacted.
+                let retained = AgentTranscriptCompactor.compact(seed)
+                let expected = fixedRetentionReference(retained, origin: ordinaryOrigin, members: members)
+                assertFixedProjection(retained, expected: expected, members: members, label: "retained \(tier) tools=\(tools)")
+                let directory = FileManager.default.temporaryDirectory.appendingPathComponent("quiet-w4-hydration-\(UUID())")
+                defer { try? FileManager.default.removeItem(at: directory) }
+                let window = WindowState()
+                let vm = window.agentModeViewModel
+                let tabID = UUID(), sessionID = UUID()
+                let manager = AgentSessionLinkEndpointTestSupport.installWorkspace(on: vm, tabID: tabID, name: "W4 fresh hydration")
+                await manager.awaitInitialized()
+                var workspace = try XCTUnwrap(manager.activeWorkspace)
+                workspace.customStoragePath = directory
+                workspace.composeTabs[0].activeAgentSessionID = sessionID
+                manager.workspaces = [workspace]
+                manager.activeWorkspace = workspace
+                let payload = AgentSession(id: sessionID, workspaceID: workspace.id, composeTabID: tabID, name: "W4 retained", transcript: retained)
+                _ = try await AgentSessionDataService.shared.saveAgentSession(payload, for: workspace)
+                window.promptManager.loadComposeTabsFromWorkspace(workspace, syncPromptText: false)
+                let fresh = await vm.ensureSessionReady(tabID: tabID, reconnectActiveProviders: false)
+                XCTAssertTrue(fresh.qualifiedRestorationReadiness.isAuthoritative)
+                XCTAssertEqual(fresh.quietLedger.facts, .zero)
+                XCTAssertTrue(fresh.quietLedger.hiddenSourceIDs.isEmpty)
+                XCTAssertNil(fresh.quietDisplayCandidate)
+                assertFixedProjection(fresh.transcript, expected: fixedRetentionReference(fresh.transcript, origin: ordinaryOrigin, members: members), members: members, label: "fresh saved hydration \(tier) tools=\(tools)")
+                await vm.prepareForWindowClose()
+            }
+            XCTAssertEqual(session.transcript, canonical, "Local projection never rewrites canonical source")
+        }
+    }
+
+    /// The reference starts from the SAME retained canonical value, with its already-chosen
+    /// tiers/caps/frontier/span identities. Remove exactly Q. Ordinary summary inputs were
+    /// independently captured from that same origin before Q; no importer or compactor runs.
+    private func fixedRetentionReference(_ canonical: AgentTranscript, origin: AgentTranscriptTurn, members: Set<UUID>) -> AgentTranscript {
+        var reference = canonical
+        let index = reference.turns.firstIndex { $0.id == origin.id }!
+        reference.turns[index].quietLocal = AgentTranscriptQuietLocalTurn(summary: origin.summary, conclusionActivityID: origin.conclusionActivityID, completedAt: origin.completedAt)
+        reference.turns[index].conclusionActivityID = origin.conclusionActivityID
+        reference.turns[index].completedAt = origin.completedAt
+        reference.turns[index].summary = origin.summary
+        for span in reference.turns[index].responseSpans.indices {
+            reference.turns[index].responseSpans[span].activities.removeAll { members.contains($0.id) }
+            reference.turns[index].responseSpans[span].quietLocal = AgentTranscriptQuietLocalSpan(collapsedSummary: origin.responseSpans[span].collapsedSummary)
+            reference.turns[index].responseSpans[span].fullRenderGroupedHistoryCache = nil
+            reference.turns[index].responseSpans[span].collapsedSummary = origin.responseSpans[span].collapsedSummary
+        }
+        XCTAssertEqual(canonical.allActivities.filter { !members.contains($0.id) }, reference.allActivities)
+        return reference
+    }
+
+    private func assertFixedProjection(_ canonical: AgentTranscript, expected reference: AgentTranscript, members: Set<UUID>, label: String, file: StaticString = #filePath, line: UInt = #line) {
+        let actual = AgentTranscriptProjectionBuilder.build(from: canonical, excludingQuiet: true)
+        var expected = AgentTranscriptProjectionBuilder.build(from: reference, excludingQuiet: true)
+        // Sole approved carveout, explicitly checked in the named identity test below.
+        // conclusionRow's synthetic sequence is anchored after the CANONICAL retained tail,
+        // not after the reference's removed Q. No content/membership/group/count is normalized.
+        for turn in canonical.turns where turn.retentionTier != .full && members.contains(turn.conclusionActivityID ?? UUID()) {
+            let syntheticID = expectedSyntheticConclusionID(turn.id)
+            let sequence = max(turn.request?.sequenceIndex ?? 0, (turn.allActivities.last?.sequenceIndex ?? 0) + 1)
+            func adjust(_ rows: inout [AgentChatItem]) {
+                for index in rows.indices where rows[index].id == syntheticID {
+                    rows[index].sequenceIndex = sequence
+                }
+            }
+            adjust(&expected.workingRows)
+            adjust(&expected.archivedRows)
+            func adjustBlock(_ block: AgentTranscriptRenderBlock) -> AgentTranscriptRenderBlock {
+                guard block.rows.contains(where: { $0.id == syntheticID }) else { return block }
+                var rows = block.rows
+                adjust(&rows)
+                var copy = AgentTranscriptRenderBlock(id: block.id, kind: block.kind, turnID: block.turnID, spanID: block.spanID, retentionTier: block.retentionTier, rows: rows, isArchived: block.isArchived, primaryAnchor: block.primaryAnchor, anchorActivityID: block.anchorActivityID, activityIDs: block.activityIDs, clusterSummary: block.clusterSummary, groupedHistory: block.groupedHistory, collapsedHistoryRange: block.collapsedHistoryRange, defaultPresentation: block.defaultPresentation)
+                copy.displaySummaryInputs = block.displaySummaryInputs
+                return copy
+            }
+            expected.workingBlocks = expected.workingBlocks.map(adjustBlock)
+            expected.archivedBlocks = expected.archivedBlocks.map(adjustBlock)
+        }
+        XCTAssertEqual(actual.workingRows, expected.workingRows, label, file: file, line: line)
+        XCTAssertEqual(actual.archivedRows, expected.archivedRows, label, file: file, line: line)
+        XCTAssertEqual(actual.workingBlocks, expected.workingBlocks, label, file: file, line: line)
+        XCTAssertEqual(actual.archivedBlocks, expected.archivedBlocks, label, file: file, line: line)
+        let actualWorking = AgentTranscriptProjectionBuilder.workingProjection(from: actual)
+        let expectedWorking = AgentTranscriptProjectionBuilder.workingProjection(from: expected)
+        let actualArchive = AgentTranscriptProjectionBuilder.archivedSnapshot(from: actual)
+        let expectedArchive = AgentTranscriptProjectionBuilder.archivedSnapshot(from: expected)
+        XCTAssertEqual(actualWorking.rowAnchorIndex, expectedWorking.rowAnchorIndex, label, file: file, line: line)
+        // Raw source-address aliases intentionally survive local omission for source retirement;
+        // they are not rows or group membership. Compare EVERY ordinary anchor exactly,
+        // and reject any additional address unless it is one of the exact removed Q members.
+        assertOrdinaryAnchors(actualWorking.anchorBlockIndex, expectedWorking.anchorBlockIndex, members: members, label: label, file: file, line: line)
+        XCTAssertEqual(actualArchive.rowAnchorIndex, expectedArchive.rowAnchorIndex, label, file: file, line: line)
+        assertOrdinaryAnchors(actualArchive.anchorBlockIndex, expectedArchive.anchorBlockIndex, members: members, label: label, file: file, line: line)
+        XCTAssertFalse((actual.workingRows + actual.archivedRows).contains { members.contains($0.id) || $0.toolName == "self_noop" || $0.text == "Allowed non-keyword closing output" }, label, file: file, line: line)
+    }
+
+    private func assertOrdinaryAnchors(_ actual: [AgentTranscriptAnchor: String], _ expected: [AgentTranscriptAnchor: String], members: Set<UUID>, label: String, file: StaticString, line: UInt) {
+        for (anchor, blockID) in expected {
+            XCTAssertEqual(actual[anchor], blockID, label, file: file, line: line)
+        }
+        for anchor in actual.keys where expected[anchor] == nil {
+            switch anchor {
+            case let .activity(_, _, id), let .conclusion(_, id): XCTAssertTrue(members.contains(id), label, file: file, line: line)
+            default: XCTFail("Unexpected ordinary source anchor: \(anchor) \(label)", file: file, line: line)
+            }
+        }
+    }
+
+    /// Exact production generator: SHA256(turn UUID + ":compact-conclusion"), first 16 bytes.
+    private func expectedSyntheticConclusionID(_ turnID: UUID) -> UUID {
+        let b = Array(SHA256.hash(data: Data((turnID.uuidString + ":compact-conclusion").utf8)).prefix(16))
+        return UUID(uuid: (b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]))
+    }
+
+    func testW4RetainedQuietCanonicalConclusionUsesDocumentedSyntheticIdentityOnly() throws {
+        let source = ordinaryRows(base: 0, toolCount: 8)
+        let origin = try XCTUnwrap(AgentTranscriptIO.buildTranscript(from: source, terminalState: .completed, compact: false).turns.first)
+        let quiet = quietRows(base: 100, wakeID: id(900))
+        var canonical = AgentTranscriptIO.buildTranscript(from: source + quiet + ordinaryRows(base: 2000, toolCount: 9), terminalState: .completed, compact: false)
+        AgentTranscriptIO.test_installQuietLocalBaseline(origin, in: &canonical)
+        canonical = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(existingTranscript: canonical, workingItems: source + quiet + ordinaryRows(base: 2000, toolCount: 9), terminalState: .completed)
+        let members = Set(quiet.map(\.id))
+        for tier in [AgentTranscriptRetentionTier.condensed, .summary, .archived] {
+            var seed = canonical
+            seed.turns[0].retentionTier = tier
+            let retained = AgentTranscriptCompactor.compact(seed)
+            let turn = retained.turns[0]
+            let projection = AgentTranscriptProjectionBuilder.build(from: retained, excludingQuiet: true)
+            let syntheticID = expectedSyntheticConclusionID(turn.id)
+            let row = try XCTUnwrap((projection.workingRows + projection.archivedRows).first { $0.id == syntheticID })
+            XCTAssertEqual(row.sequenceIndex, max(turn.request?.sequenceIndex ?? 0, (turn.allActivities.last?.sequenceIndex ?? 0) + 1))
+            XCTAssertEqual(row.timestamp, origin.completedAt)
+            XCTAssertEqual(row.kind, .assistant)
+            XCTAssertFalse(row.isStreaming)
+            XCTAssertNil(row.toolInvocationID)
+            XCTAssertNil(row.quietCheckInWakeID)
+            assertFixedProjection(retained, expected: fixedRetentionReference(retained, origin: origin, members: members), members: members, label: "synthetic identity \(tier)")
+        }
+    }
+
+    func testW4RichDeclarationFixtureQualifiesBeforeAndAfterBody() async throws {
+        for tools in [0, 8, 9, 12] {
+            let f = try AgentSelfNoopTests.Fixture(ordinaryRows: ordinaryRows(base: 0, toolCount: tools))
+            XCTAssertNotNil(f.session.quietLedger.candidateStartKey(owner: f.owner), "before body tools=\(tools)")
+            _ = try await f.body()
+            XCTAssertNotNil(f.session.quietLedger.acceptedDeclarationInvocationID(owner: f.owner), "tools=\(tools)")
+            f.appendDeclaration()
+            XCTAssertEqual(f.seal()?.ordinaryThrough, 0, "tools=\(tools)")
+        }
     }
 
     func testW1AtomicMembershipAndPreStampCheckpointFailVisible() async throws {

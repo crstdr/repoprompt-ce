@@ -319,7 +319,7 @@ public struct ClaudeSDKNDJSONTranslator {
            let text = block["text"] as? String,
            text.utf8.elementsEqual("[Your previous response had no visible output. Please continue and produce a user-visible response.]".utf8)
         {
-            return [ClaudeProviderStreamResult(type: "quiet_reprompt_candidate", text: nil)]
+            return [ClaudeProviderStreamResult(type: "harness_empty_output_reprompt_candidate", text: nil)]
         }
         var results: [ClaudeProviderStreamResult] = []
         for item in content {

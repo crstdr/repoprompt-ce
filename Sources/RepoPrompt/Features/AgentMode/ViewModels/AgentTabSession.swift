@@ -39,8 +39,23 @@ final class AgentQuietMarkerProducerLifetime: @unchecked Sendable {
 @MainActor
 final class AgentTabSession: ObservableObject {
     let tabID: UUID
-    var quietLedger = AgentRunQuietLedger()
-    var nonCodexContentMessageID: String?
+    var quietLedger = AgentRunQuietLedger() {
+        didSet {
+            guard oldValue.displayCandidate != quietLedger.displayCandidate else { return }
+            // Candidate loss may have no source mutation (Stop, uncertainty, successor).
+            // Reuse the existing UI refresh owner; never build from this callback.
+            derivedTranscriptSyncState = nil
+            quietTranscriptDisplayCache = nil
+            onQuietDisplayMaskChanged?(self)
+        }
+    }
+
+    var quietDisplayCandidate: AgentRunQuietLedger.DisplayCandidate? {
+        guard let candidate = quietLedger.displayCandidate,
+              isCurrentRunAttemptForCurrentBinding(candidate.owner) else { return nil }
+        return candidate
+    }
+
     let perfRecorder: any AgentModePerfRecording
     private var suppressSourceItemsChanged = false
 
@@ -2080,7 +2095,6 @@ final class AgentTabSession: ObservableObject {
             ),
             attemptID: attemptID
         )
-        nonCodexContentMessageID = nil
         let previousFacts = quietLedger.facts
         quietLedger.begin(owner: ownership, startKey: nextSequenceIndex, provider: .init(agentKind: selectedAgent), baseline: baseline)
         if previousFacts != quietLedger.facts {

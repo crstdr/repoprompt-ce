@@ -1132,7 +1132,7 @@ final actor ClaudeNativeProcessSessionController {
         stdoutFramer.feed(data, onDiagnostic: { [self] diagnostic in
             switch diagnostic {
             case let .overflow(droppedBytes, retainedBytes):
-                emitQuietUncertainty("Provider stream overflow")
+                emitSemanticUncertainty("Provider stream overflow")
                 writeRawEventLogRecord(kind: "framer.overflow", payload: [
                     "droppedBytes": droppedBytes,
                     "retainedBytes": retainedBytes
@@ -1157,7 +1157,7 @@ final actor ClaudeNativeProcessSessionController {
             guard let inbound = try ClaudeSDKProtocolCodec.decodeLine(lineData) else { return }
             routeInboundMessage(inbound)
         } catch let codecError as ClaudeSDKProtocolCodec.CodecError {
-            emitQuietUncertainty("Provider stream recovery")
+            emitSemanticUncertainty("Provider stream recovery")
             if case .invalidJSON = codecError {
                 if recoverConcatenatedInboundMessagesIfNeeded(from: lineData)
                     || recoverEmbeddedInboundTailIfNeeded(from: lineData)
@@ -1513,7 +1513,7 @@ final actor ClaudeNativeProcessSessionController {
         }
         let streamResults = translator.parseNDJSONLine(data)
         if !streamResults.contains(where: { $0.type == "event" }), Self.hasUnattributedAssistantMessage(payload) {
-            emitQuietUncertainty("Unclassified provider activity")
+            emitSemanticUncertainty("Unclassified provider activity")
         }
         #if DEBUG
             if ClaudeReasoningExtractionFeature.isEnabled {
@@ -1582,7 +1582,7 @@ final actor ClaudeNativeProcessSessionController {
             }
 
             if Self.shouldSuppressUserFacingStreamResult(result) {
-                emitQuietUncertainty("Suppressed provider activity")
+                emitSemanticUncertainty("Suppressed provider activity")
                 writeRawEventLogRecord(kind: "translator.streamResultSuppressed", payload: logPayload)
                 continue
             }
@@ -1655,7 +1655,7 @@ final actor ClaudeNativeProcessSessionController {
         guard generation == authoritativeIdleFallbackGeneration else { return }
         authoritativeIdleFallbackTask = nil
         guard !pendingAuthoritativeTurnStatuses.isEmpty else { return }
-        emitQuietUncertainty("Provider completion recovery")
+        emitSemanticUncertainty("Provider completion recovery")
         let status = pendingAuthoritativeTurnStatuses.removeFirst()
         guard hasPendingTurnIDs else {
             assertionFailure("[ClaudeController] idle fallback with no pending turn IDs — possible protocol drift")
@@ -1680,7 +1680,7 @@ final actor ClaudeNativeProcessSessionController {
         // already established the correct turn outcome; only idle was missing.
         for status in pendingAuthoritativeTurnStatuses {
             guard hasPendingTurnIDs else { break }
-            emitQuietUncertainty("Provider completion recovery")
+            emitSemanticUncertainty("Provider completion recovery")
             let turnID = dequeueTurnID()
             emit(.turnCompleted(turnID: turnID, status: status))
         }
@@ -1689,7 +1689,7 @@ final actor ClaudeNativeProcessSessionController {
 
     /// Preserve negative evidence before transport/UI suppression, on the qualified first-party
     /// Agent Mode path only. Existing compatible and prompt-only event streams stay unchanged.
-    private func emitQuietUncertainty(_ reason: String) {
+    private func emitSemanticUncertainty(_ reason: String) {
         guard config.runtimeVariant == .standard, config.toolContext == .agentRun else { return }
         emit(.stream(AIStreamResult(type: "event", text: reason)))
     }
@@ -2064,7 +2064,7 @@ final actor ClaudeNativeProcessSessionController {
     private func handleControlRequest(_ request: ClaudeSDKProtocolCodec.ControlRequest) {
         // Tool/interaction intent remains activity even when existing policy auto-approves it,
         // cannot build a UI approval, or rejects an unknown subtype. Authority is unchanged.
-        emitQuietUncertainty("Provider control request")
+        emitSemanticUncertainty("Provider control request")
         writeRawEventLogRecord(kind: "control.request.received", payload: [
             "requestID": request.requestID,
             "subtype": request.subtype,

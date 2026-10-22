@@ -2389,6 +2389,29 @@ enum AgentTranscriptIO {
         return compact ? AgentTranscriptCompactor.compact(transcript, protection: protection) : transcript
     }
 
+    /// Stage only the current final source unit, before any grouping/counting/anchor work.
+    /// The returned value is display input only; the caller retains the canonical transcript.
+    static func stagingQuietCandidate(
+        _ candidate: AgentRunQuietLedger.DisplayCandidate?, in transcript: AgentTranscript
+    ) -> AgentTranscript {
+        guard let candidate, let index = transcript.turns.indices.last,
+              transcript.turns[index].id == candidate.turnID,
+              transcript.turns[index].retentionTier == .full else { return transcript }
+        var local = transcript
+        for spanIndex in local.turns[index].responseSpans.indices {
+            local.turns[index].responseSpans[spanIndex].activities.removeAll {
+                $0.sequenceIndex >= candidate.startKey && ($0.itemKind != .system || $0.id == candidate.wakeID)
+            }
+            local.turns[index].responseSpans[spanIndex].fullRenderGroupedHistoryCache = nil
+        }
+        local.turns[index].summary = candidate.local.summary
+        local.turns[index].quietLocal = candidate.local
+        local.turns[index].conclusionActivityID = candidate.local.conclusionActivityID
+        local.turns[index].completedAt = candidate.local.completedAt
+        local.turns[index].terminalState = .completed
+        return local
+    }
+
     /// A shallow view at the existing projection boundary. Activities stay canonical; the
     /// leaf/descriptor passes exclude certified members while doing their normal work.
     fileprivate static func quietLocalProjectionTurn(_ turn: AgentTranscriptTurn) -> AgentTranscriptTurn {
@@ -2409,8 +2432,10 @@ enum AgentTranscriptIO {
             return ordinary
         }
         var local = turn
+        // Saved certification excludes the canonical quiet conclusion even while a
+        // successor is active or not yet qualified. Do not complete that active turn.
+        local.conclusionActivityID = baseline.conclusionActivityID
         if turn.isCompleted {
-            local.conclusionActivityID = baseline.conclusionActivityID
             local.completedAt = baseline.completedAt
         }
         local.summary = baseline.summary
@@ -7035,7 +7060,7 @@ enum AgentTranscriptProjectionBuilder {
                     context: context
                 )
             case .archived:
-                compactedBlocks(for: turn, archived: archived)
+                compactedBlocks(for: turn, archived: archived, excludingQuiet: context.excludingQuiet)
             }
         }
         return unsortedBlocks.enumerated().sorted { lhs, rhs in
@@ -7885,7 +7910,7 @@ enum AgentTranscriptProjectionBuilder {
         return blocks
     }
 
-    private static func compactedBlocks(for turn: AgentTranscriptTurn, archived: Bool) -> [AgentTranscriptRenderBlock] {
+    private static func compactedBlocks(for turn: AgentTranscriptTurn, archived: Bool, excludingQuiet: Bool = false) -> [AgentTranscriptRenderBlock] {
         var blocks: [AgentTranscriptRenderBlock] = []
         if let request = turn.request {
             blocks.append(.init(
@@ -7901,7 +7926,7 @@ enum AgentTranscriptProjectionBuilder {
         // Recovery diagnostics precede the summarized work; emit before the summary
         // block so all surfaces agree on request → diagnostics → summary → conclusion.
         blocks.append(contentsOf: recoveryDiagnosticBlocks(for: turn, archived: archived))
-        if let summaryRow = middleSummaryRow(for: turn) {
+        if let summaryRow = middleSummaryRow(for: turn, excludingQuiet: excludingQuiet) {
             blocks.append(.init(
                 id: summaryBlockID(summaryRow.id),
                 kind: .middleSummary,
@@ -8730,15 +8755,36 @@ enum AgentTranscriptProjectionBuilder {
         }
     }
 
-    private static func middleSummaryRow(for turn: AgentTranscriptTurn) -> AgentChatItem? {
+    private static func middleSummaryRow(for turn: AgentTranscriptTurn, excludingQuiet: Bool = false) -> AgentChatItem? {
         guard let summary = turn.summary,
               let text = summary.middleSummaryText?.trimmingCharacters(in: .whitespacesAndNewlines),
               !text.isEmpty
         else {
             return nil
         }
-        let requestSequence = turn.request?.sequenceIndex ?? (turn.allActivities.first?.sequenceIndex ?? 0)
-        let conclusionSequence = conclusionRow(for: turn)?.sequenceIndex ?? (turn.allActivities.last?.sequenceIndex ?? requestSequence + 1)
+        let requestSequence: Int
+        let conclusionSequence: Int
+        if excludingQuiet, turn.quietLocal != nil {
+            // Local summary ordering uses the same retained ordinary source coordinates as
+            // exact member removal. The conclusion row itself may still synthesize its
+            // documented canonical-tail identity. Fold stamp checks into this existing
+            // coordinate-selection pass, without flattened source copies or sizing changes.
+            var firstSequence: Int?
+            var lastSequence: Int?
+            var retainedConclusionSequence: Int?
+            for span in turn.responseSpans {
+                for activity in span.activities where activity.quietCheckInWakeID == nil {
+                    if firstSequence == nil { firstSequence = activity.sequenceIndex }
+                    lastSequence = activity.sequenceIndex
+                    if activity.id == turn.conclusionActivityID { retainedConclusionSequence = activity.sequenceIndex }
+                }
+            }
+            requestSequence = turn.request?.sequenceIndex ?? firstSequence ?? 0
+            conclusionSequence = retainedConclusionSequence ?? max(turn.request?.sequenceIndex ?? 0, (lastSequence ?? 0) + 1)
+        } else {
+            requestSequence = turn.request?.sequenceIndex ?? (turn.allActivities.first?.sequenceIndex ?? 0)
+            conclusionSequence = conclusionRow(for: turn)?.sequenceIndex ?? (turn.allActivities.last?.sequenceIndex ?? requestSequence + 1)
+        }
         let sequenceIndex = min(conclusionSequence - 1, requestSequence + 1)
         return AgentChatItem(
             id: summary.middleSummaryItemID,

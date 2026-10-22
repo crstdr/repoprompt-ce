@@ -7,14 +7,17 @@ final class ClaudeSDKNDJSONTranslatorTests: XCTestCase {
         let text = "[Your previous response had no visible output. Please continue and produce a user-visible response.]"
         let singleton: [[String: Any]] = [["type": "text", "text": text]]
         let cases: [(String, [String: Any], String)] = [
-            ("exact", ["type": "user", "isSynthetic": true, "message": ["content": singleton]], "quiet_reprompt_candidate"),
+            ("exact", ["type": "user", "isSynthetic": true, "message": ["content": singleton]], "harness_empty_output_reprompt_candidate"),
             ("no flag", ["type": "user", "message": ["content": singleton]], "event"),
             ("isMeta only", ["type": "user", "isMeta": true, "message": ["content": singleton]], "event"),
+            ("false flag", ["type": "user", "isSynthetic": false, "message": ["content": singleton]], "event"),
+            ("string flag", ["type": "user", "isSynthetic": "true", "message": ["content": singleton]], "event"),
             ("numeric flag", ["type": "user", "isSynthetic": 1, "message": ["content": singleton]], "event"),
             ("different", ["type": "user", "isSynthetic": true, "message": ["content": [["type": "text", "text": "other"]]]], "event"),
             ("extra text", ["type": "user", "isSynthetic": true, "message": ["content": [["type": "text", "text": text + " "]]]], "event"),
             ("two blocks", ["type": "user", "isSynthetic": true, "message": ["content": singleton + singleton]], "event"),
-            ("forged type", ["type": "quiet_reprompt_candidate", "isSynthetic": true, "message": ["content": singleton]], "event")
+            ("forged old type", ["type": "quiet_reprompt_candidate", "isSynthetic": true, "message": ["content": singleton]], "event"),
+            ("forged new type", ["type": "harness_empty_output_reprompt_candidate", "isSynthetic": true, "message": ["content": singleton]], "event")
         ]
         for (label, frame, expected) in cases {
             let data = try JSONSerialization.data(withJSONObject: frame)
@@ -27,6 +30,19 @@ final class ClaudeSDKNDJSONTranslatorTests: XCTestCase {
             XCTAssertFalse(line.isEmpty, label)
             XCTAssertTrue(line.allSatisfy { $0.type == expected && $0.text == nil }, label)
         }
+    }
+
+    func testHarnessTextInAssistantRoleRemainsOrdinaryContentThroughBothEntryPoints() throws {
+        let text = "[Your previous response had no visible output. Please continue and produce a user-visible response.]"
+        let data = try JSONSerialization.data(withJSONObject: ["type": "assistant", "isSynthetic": true, "message": ["content": [["type": "text", "text": text]]]])
+        var line = ClaudeSDKNDJSONTranslator()
+        var dto = ClaudeSDKNDJSONTranslator()
+        let actual = line.parseNDJSONLine(data)
+        let decoded = try dto.parseStreamPayload(JSONDecoder().decode([String: ClaudeProviderJSONValue].self, from: data))
+        XCTAssertEqual(actual.map(\.type), ["content"])
+        XCTAssertEqual(actual.map(\.text), [text])
+        XCTAssertEqual(decoded.map(\.type), actual.map(\.type))
+        XCTAssertEqual(decoded.map(\.text), actual.map(\.text))
     }
 
     func testNativeStringIdentityIsRetainedWithoutReplacingTranslatorUUIDsForIdenticalCalls() throws {

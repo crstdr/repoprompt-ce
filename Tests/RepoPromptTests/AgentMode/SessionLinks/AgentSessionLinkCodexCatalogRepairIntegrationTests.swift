@@ -651,6 +651,31 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             }
         }
 
+        func testW4ProvisionalDeclarationNeverAppearsInAnyPublishedSnapshot() async throws {
+            for delayed in [false, true] {
+                try await MCPSharedServerTestLease.shared.withLease { _ in
+                    try await self.exerciseLiveDiscovery(w0fProvider: .claudeCode, w2Probe: .terminal(delayed: delayed, nativeResult: true, closing: true), w4Display: true)
+                }
+            }
+        }
+
+        func testW4RepeatWakePreservesEveryPublishedBlockAndSummary() async throws {
+            for tools in [0, 8, 9] {
+                try await MCPSharedServerTestLease.shared.withLease { _ in
+                    try await self.exerciseLiveDiscovery(w0fProvider: .claudeCode, w2Probe: .repeatDisplay(tools: tools))
+                }
+            }
+        }
+
+        func testW4OrdinaryPromotionReleasesStagedRowsWithoutHidingSiblings() async throws {
+            let probes: [W2Probe] = [.terminal(delayed: true, nativeResult: false, closing: true), .terminal(delayed: true, nativeResult: true, leading: true), .terminal(delayed: true, nativeResult: true, closing: true, cancel: true)]
+            for probe in probes {
+                try await MCPSharedServerTestLease.shared.withLease { _ in
+                    try await self.exerciseLiveDiscovery(w0fProvider: .claudeCode, w2Probe: probe, w4Display: true)
+                }
+            }
+        }
+
         func testW3SilentUndeclaredCloseRemainsOrdinary() async throws {
             for kind in [AgentProviderKind.claudeCode, .codexExec] {
                 try await MCPSharedServerTestLease.shared.withLease { _ in
@@ -746,6 +771,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
 
         private enum W2Probe {
             case coldCatalogOverlap
+            case repeatDisplay(tools: Int)
             case scale(stamps: Bool, diagnostic: Bool)
             case lateMarker
             case inactiveBaseline(stale: Bool)
@@ -770,7 +796,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
         private func exerciseLiveDiscovery(
             activate: Bool = false, inbound: Bool = false, originalQualificationFamilyABA: Bool = false,
             proofMutation: ProofMutation? = nil, w0fProvider: AgentProviderKind? = nil,
-            w2Probe: W2Probe? = nil, w3Ring: Bool = false, w3Reprompt: Bool = false
+            w2Probe: W2Probe? = nil, w3Ring: Bool = false, w3Reprompt: Bool = false, w4Display: Bool = false
         ) async throws {
             try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
             let manager = ServerNetworkManager.shared
@@ -1165,6 +1191,12 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 }
                 if let w2Probe {
                     switch w2Probe {
+                    case let .repeatDisplay(tools):
+                        try await w2RegisteredTerminal(window: window, session: observer, connection: connection, runID: runID, delayed: false, nativeResult: true, closing: true, leading: false, cancel: false, w4BaselineTools: tools)
+                        let turnID = try XCTUnwrap(observer.transcript.turns.last?.id)
+                        XCTAssertTrue(observer.items.contains { $0.quietCheckInWakeID != nil }, "W1 must already hold a real terminal certificate")
+                        try await w2RegisteredTerminal(window: window, session: observer, connection: connection, runID: runID, delayed: true, nativeResult: true, closing: true, leading: false, cancel: false, w4Display: true, w4Repeat: true)
+                        XCTAssertEqual(observer.transcript.turns.last?.id, turnID, "W2 continues the same canonical turn")
                     case .coldCatalogOverlap:
                         try await w3ColdCatalogOverlap(window: window, session: observer, target: target, connection: connection, provider: provider)
                     case let .scale(stamps, diagnostic):
@@ -1178,7 +1210,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                     case .undeclared:
                         try await w2RegisteredTerminal(window: window, session: observer, connection: connection, runID: runID, delayed: false, nativeResult: false, closing: false, leading: false, cancel: false, w3Undeclared: true)
                     case let .terminal(delayed, nativeResult, closing, leading, cancel, corrupt):
-                        try await w2RegisteredTerminal(window: window, session: observer, connection: connection, runID: runID, delayed: delayed, nativeResult: nativeResult, closing: closing, leading: leading, cancel: cancel, corrupt: corrupt)
+                        try await w2RegisteredTerminal(window: window, session: observer, connection: connection, runID: runID, delayed: delayed, nativeResult: nativeResult, closing: closing, leading: leading, cancel: cancel, corrupt: corrupt, w4Display: w4Display)
                     case let .hint(withdraw):
                         try await w2CatalogProof(window: window, session: observer, provider: provider, endpoint: endpoint, route: route, runID: runID, withdraw: withdraw)
                     case .catalogCost:
@@ -1709,7 +1741,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
         func w2RegisteredTerminal(
             window: WindowState, session: AgentTabSession, connection: PersistentMCPTestEndpoint,
             runID: UUID, delayed: Bool, nativeResult: Bool, closing: Bool, leading: Bool, cancel: Bool,
-            w3Owner: AgentRunOwnership? = nil, w3Undeclared: Bool = false, w3Reprompt: Bool = false, corrupt: Bool = false, repromptPhase: String? = nil, expectOrdinary: Bool = false, w3Provider: HeldDiscoveryProvider? = nil, scaleControl: Bool? = nil, scaleDiagnostic: Bool = false, unqualifiedOrigin: Bool = false
+            w3Owner: AgentRunOwnership? = nil, w3Undeclared: Bool = false, w3Reprompt: Bool = false, corrupt: Bool = false, repromptPhase: String? = nil, expectOrdinary: Bool = false, w3Provider: HeldDiscoveryProvider? = nil, scaleControl: Bool? = nil, scaleDiagnostic: Bool = false, unqualifiedOrigin: Bool = false, w4Display: Bool = false, w4Repeat: Bool = false, w4BaselineTools: Int = 0
         ) async throws {
             let vm = window.agentModeViewModel
             let manager = ServerNetworkManager.shared
@@ -1723,16 +1755,51 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             }
             vm.test_initializeRunService()
             let openingFacts = try XCTUnwrap(session.quietLedger.facts)
-            let openingTerminalRevision = session.lastTerminalCommitRevision
-            if w3Owner == nil {
+            if w3Owner == nil, !w4Repeat {
                 session.appendItem(.user("routine fixture origin", sequenceIndex: session.nextSequenceIndex))
+                for _ in 0 ..< w4BaselineTools {
+                    let invocation = UUID()
+                    // Native ingress completes one canonical row in place. A separate raw
+                    // call row would remain pending and the real terminal finalizer would
+                    // rewrite it during W1, correctly invalidating that synthetic range.
+                    session.appendItem(.toolResult(name: "read_file", invocationID: invocation, argsJSON: #"{"path":"example.swift"}"#, resultJSON: #"{"content":"ordinary"}"#, isError: false, sequenceIndex: session.nextSequenceIndex))
+                }
                 session.appendItem(.assistant("ordinary baseline conclusion", sequenceIndex: session.nextSequenceIndex))
+                if w4BaselineTools > 0 {
+                    session.runState = .running
+                    vm.refreshDerivedTranscriptState(for: session, publishActivePresentation: false)
+                }
                 session.runState = .completed
                 vm.refreshDerivedTranscriptState(for: session, publishActivePresentation: false)
+                if w4BaselineTools > 0 {
+                    XCTAssertEqual(Set(session.items.filter { $0.toolName == "read_file" }.compactMap(\.toolInvocationID)).count, w4BaselineTools)
+                    XCTAssertFalse(session.items.contains { $0.kind == .toolCall }, "Completed ordinary baseline has no unfinished native tool row")
+                }
             }
+            if w4Repeat {
+                vm.refreshDerivedTranscriptState(for: session, publishActivePresentation: false)
+                _ = vm.test_publishTranscriptPresentation(tabID: session.tabID)
+                vm.syncTranscriptUIState()
+            }
+            let repeatBaseline = vm.ui.transcript.snapshot
+            var repeatPublications = 0
+            // Compare whole value trees, not just leaf membership: Equatable includes
+            // summary-only groups, nested sections, counts, narration and tool state.
+            let repeatSubscription = w4Repeat ? vm.ui.transcript.$snapshot.sink { snapshot in
+                repeatPublications += 1
+                XCTAssertEqual(snapshot.presentation.visibleRows, repeatBaseline.presentation.visibleRows, "Repeat W2 publication \(repeatPublications): exact rows")
+                XCTAssertEqual(snapshot.presentation.visibleBlocks, repeatBaseline.presentation.visibleBlocks, "Repeat W2 publication \(repeatPublications): complete blocks/summaries")
+                XCTAssertEqual(snapshot.archivedBlocks, repeatBaseline.archivedBlocks, "Repeat W2 publication \(repeatPublications): archived blocks/summaries")
+            } : nil
+            defer { repeatSubscription?.cancel() }
             let owner = w3Owner ?? session.beginRunAttempt(source: "W2.registered-native-terminal")
             let attemptStart = try XCTUnwrap(session.quietLedger.startKey(owner: owner))
+            let openingTerminalRevision = session.lastTerminalCommitRevision
+            let preparedRevision = session.sourceItemsRevision
             session.runState = .running
+            if w4BaselineTools > 0 || w4Repeat {
+                XCTAssertEqual(session.sourceItemsRevision, preparedRevision, "Prepared fixture must not structurally change when the attempt becomes running")
+            }
             let handler = vm.test_claudeCoordinator.testToolTrackingHandler(for: session)
             let codex = vm.test_codexCoordinator
             let decoder = CodexNativeSessionController(client: CodexAppServerClient(), runID: runID, tabID: session.tabID, windowID: window.windowID, workspacePaths: .uniform(nil))
@@ -1775,12 +1842,51 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 XCTAssertEqual(session.quietLedger.routineWakeID(owner: owner) == nil, unqualifiedOrigin, "The assembled caller supplies its actual qualified or overlap-disqualified owner")
             }
             let ownedWake = session.quietLedger.routineWakeID(owner: owner)
+            var w4Published = 0
+            let w4CanonicalBefore = session.items
+            let w4Subscription = w4Display ? vm.ui.transcript.$snapshot.sink { snapshot in
+                guard session.quietDisplayCandidate != nil else { return }
+                w4Published += 1
+                func allBlocks(_ blocks: [AgentTranscriptRenderBlock]) -> [AgentTranscriptRenderBlock] {
+                    blocks.flatMap { [$0] + allBlocks($0.groupedHistory?.sections.flatMap(\.childBlocks) ?? []) }
+                }
+                let blocks = allBlocks(snapshot.presentation.visibleBlocks + snapshot.archivedBlocks)
+                let rows = snapshot.presentation.visibleRows + blocks.flatMap(\.rows)
+                XCTAssertFalse(rows.contains { $0.sequenceIndex >= attemptStart && ($0.kind != .system || $0.id == ownedWake) }, "No provisional source member in any published snapshot")
+                XCTAssertFalse(blocks.flatMap(\.activityIDs).contains { id in
+                    session.items.contains { $0.id == id && $0.sequenceIndex >= attemptStart && ($0.kind != .system || $0.id == ownedWake) }
+                }, "No nested group membership or narration carrier")
+            } : nil
+            defer { w4Subscription?.cancel() }
+            func w4Publish() {
+                guard w4Display else { return }
+                vm.refreshDerivedTranscriptState(for: session, publishActivePresentation: false)
+                _ = vm.test_publishTranscriptPresentation(tabID: session.tabID)
+                vm.syncTranscriptUIState()
+            }
+            w4Publish()
+            if w4Display, !w4Repeat {
+                let wake = try XCTUnwrap(ownedWake)
+                XCTAssertTrue(session.appendAcceptedHostMarker(.laneUpdateAutoWake(wakeID: wake, acceptedAt: Date(), sequenceIndex: session.nextSequenceIndex)))
+                w4Publish()
+                let foreign = AgentChatItem.laneUpdateAutoWake(wakeID: UUID(), acceptedAt: Date(), sequenceIndex: session.nextSequenceIndex)
+                XCTAssertTrue(session.appendAcceptedHostMarker(foreign))
+                w4Publish()
+                XCTAssertTrue(vm.ui.transcript.snapshot.presentation.visibleRows.contains { $0.id == foreign.id }, "A foreign ordinary marker never joins the staged range")
+                await vm.test_handleStreamResult(.init(type: "reasoning", text: "Provisional private reasoning"), session: session, runID: runID, runAttemptID: owner.attemptID)
+                w4Publish()
+                vm.test_setCurrentTabIDOverride(UUID())
+                vm.refreshDerivedTranscriptState(for: session, publishActivePresentation: false)
+                vm.test_setCurrentTabIDOverride(session.tabID)
+                w4Publish()
+            }
             let foreignMembers = session.items.filter { $0.sequenceIndex >= attemptStart && $0.kind == .system && $0.id != ownedWake }
             func flush() async {
                 if claude { await handler.waitForPendingEventDeliveries() }
                 else { await codex.testFlushCodexToolTracking(for: session) }
             }
             func native(result: Bool) async throws {
+                defer { w4Publish() }
                 if claude {
                     let block: [String: Any] = result
                         ? ["type": "tool_result", "tool_use_id": raw, "content": [["type": "text", "text": "{\"result\":\"done\"}"]]]
@@ -1807,6 +1913,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 }
             }
             func assistantText(_ text: String) async throws {
+                defer { w4Publish() }
                 if claude {
                     let data = try JSONSerialization.data(withJSONObject: ["type": "assistant", "message": ["content": [["type": "text", "text": text]]]])
                     for stream in translator.parseNDJSONLine(data) {
@@ -1904,7 +2011,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                     try await harnessReprompt()
                 }
                 if closing {
-                    try await assistantText("allowed closing output after accepted body")
+                    try await assistantText(w4Repeat ? "allowed closing output after accepted body W2" : "allowed closing output after accepted body")
                 }
                 XCTAssertEqual(session.quietLedger.hasOrdinaryOccurrence(owner: owner), leading || repromptPhase != nil || unqualifiedOrigin, "Temporal ingress distinguishes missing origin/leading text from allowed closing output")
                 let complete = hostID.map { id in claude ? handler.hasCompleteExactAssociation(hostInvocationID: id, owner: owner, session: session) : session.quietLedger.codexAssociationIsComplete(owner: owner, hostID: id, runID: runID, threadID: thread) } ?? false
@@ -1968,6 +2075,23 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 }
                 XCTAssertEqual(session.quietLedger.facts, .init(settledThrough: openingFacts.settledThrough + 1, ordinaryThrough: nativeResult && !leading && !cancel && !w3Undeclared && !corrupt && repromptPhase == nil && !expectOrdinary ? openingFacts.ordinaryThrough : openingFacts.settledThrough + 1), "\(session.selectedAgent) delayed=\(delayed) nativeResult=\(nativeResult) closing=\(closing) leading=\(leading) cancel=\(cancel)")
                 XCTAssertNotNil(session.lastTerminalCommitRevision)
+                if w4Display {
+                    w4Publish()
+                    XCTAssertGreaterThan(w4Published, 0)
+                    if w4Repeat {
+                        XCTAssertGreaterThan(repeatPublications, 1)
+                        XCTAssertEqual(session.transcript.turns.last?.retentionTier, .full)
+                        XCTAssertNil(session.quietDisplayCandidate, "W2 must finish through durable certification, not a still-held candidate")
+                        print("W4_REPEAT_DISPLAY tools=\(Set(session.items.filter { $0.toolName == "read_file" }.compactMap(\.toolInvocationID)).count) publications=\(repeatPublications) spans=\(session.transcript.turns.last?.responseSpans.count ?? 0)")
+                    }
+                    XCTAssertEqual(Array(session.items.prefix(w4CanonicalBefore.count)), w4CanonicalBefore, "Local staging cannot rewrite ordinary source")
+                    let expected = AgentModeViewModel.buildTranscriptPresentation(
+                        from: session.transcript, sourceItems: session.items, selectedAgent: session.selectedAgent,
+                        previousPerformanceSnapshot: .empty
+                    )
+                    XCTAssertEqual(vm.ui.transcript.snapshot.presentation.visibleRows, expected.projection.workingRows, "Terminal releases actual ordinary work, or uses durable certified omission")
+                    XCTAssertEqual(vm.ui.transcript.snapshot.presentation.visibleBlocks, expected.projection.workingBlocks)
+                }
                 XCTAssertNotEqual(session.lastTerminalCommitRevision, openingTerminalRevision)
                 if cancel {
                     XCTAssertEqual(session.lastTerminalCommitRevision?.terminalState, .cancelled)
@@ -1989,6 +2113,9 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 }
                 XCTAssertEqual(stamped.isEmpty, !shouldStamp, "Production terminal must stamp exactly qualified members")
                 if shouldStamp {
+                    if w4Repeat {
+                        XCTAssertTrue(stamped.contains { $0.text == "allowed closing output after accepted body W2" }, "The second native turn must materialize and certify its own distinct closing row")
+                    }
                     let wake = try XCTUnwrap(stamped.first?.quietCheckInWakeID)
                     XCTAssertTrue(stamped.allSatisfy { $0.quietCheckInWakeID == wake })
                     XCTAssertFalse(stamped.contains { $0.kind == .user || $0.text == "ordinary baseline conclusion" })

@@ -178,9 +178,9 @@
     @MainActor
     final class AgentSelfNoopTests: XCTestCase {
         @MainActor
-        private final class Fixture {
-            let window = WindowState()
-            let workspace: WorkspaceManagerViewModel
+        final class Fixture {
+            let window: WindowState
+            var workspace: WorkspaceManagerViewModel
             let session: AgentTabSession
             let owner: AgentRunOwnership
             let endpoint: DomainAgentSessionLinkEndpointIdentity
@@ -190,26 +190,62 @@
             var returnedEndpoint: DomainAgentSessionLinkEndpointIdentity?
             var beforeMetadata: () async -> Void = {}
 
-            init(routine: Bool = true) throws {
-                let tabID = UUID()
-                workspace = AgentSessionLinkEndpointTestSupport.installWorkspace(on: window.agentModeViewModel, tabID: tabID, name: "Self noop body")
+            init(routine: Bool = true, ordinaryRows: [AgentChatItem]? = nil, preparedWindow: WindowState? = nil, preparedTabID: UUID? = nil) throws {
+                let window = preparedWindow ?? WindowState()
+                self.window = window
+                let tabID = preparedTabID ?? UUID()
+                workspace = preparedWindow != nil ? window.workspaceManager : AgentSessionLinkEndpointTestSupport.installWorkspace(on: window.agentModeViewModel, tabID: tabID, name: "Self noop body")
                 session = window.agentModeViewModel.session(for: tabID)
                 session.selectedAgent = .claudeCode
                 session.hasLoadedPersistedState = true
                 _ = try XCTUnwrap(window.agentModeViewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: session, updateWorkspaceMetadata: true))
                 session.recordRestorationAuthoritative(.persistedPayloadApplied)
                 session.installRunID(UUID())
-                session.appendItem(.user("Existing ordinary request", sequenceIndex: 0))
-                session.appendItem(.assistant("Existing ordinary conclusion", sequenceIndex: 1))
+                for row in ordinaryRows ?? [.user("Existing ordinary request", sequenceIndex: 0), .assistant("Existing ordinary conclusion", sequenceIndex: 1)] {
+                    session.appendItem(row)
+                }
+                // Imported test tool payloads must first pass the normal active retention
+                // writer, before a physical attempt owns the source range. Otherwise
+                // the first running publication structurally reconciles that raw fixture.
+                if ordinaryRows != nil {
+                    let imported = session.items
+                    session.runState = .running
+                    window.agentModeViewModel.refreshDerivedTranscriptState(for: session, publishActivePresentation: false)
+                    print("W4_FIXTURE normalizedImportedRows=\(zip(imported, session.items).count(where: { $0.0 != $0.1 })) beforeAttempt=true")
+                }
                 session.runState = .completed
                 window.agentModeViewModel.refreshDerivedTranscriptState(for: session, publishActivePresentation: false)
                 owner = session.beginRunAttempt(source: "self-noop-body-test")
+                let preparedRevision = session.sourceItemsRevision
                 session.runState = .running
+                if ordinaryRows != nil { XCTAssertEqual(session.sourceItemsRevision, preparedRevision, "Imported fixture must be normalized before opening an attempt") }
                 endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(window.agentModeViewModel, tabID: tabID)
                 context = .trustedLocal(toolName: MCPWindowToolName.selfNoop, metadata: .init(connectionID: UUID(), clientName: "self-noop-test", windowID: window.windowID))
                 origin = try .init(endpoint: endpoint, runID: XCTUnwrap(session.runID), runAttemptID: owner.attemptID)
                 returnedEndpoint = endpoint
                 if routine { session.quietLedger.markRoutineWake(owner: owner, wakeID: wakeID) }
+            }
+
+            /// Use the actual window manager and existing workspace-adoption owner BEFORE
+            /// creating/binding/beginning the session. A VM-only endpoint manager does not
+            /// establish the pane owner needed by window readers and published hydration.
+            static func assembled() async throws -> Fixture {
+                let window = WindowState()
+                let manager = window.workspaceManager
+                let vm = window.agentModeViewModel
+                await manager.awaitInitialized()
+                let tabID = UUID()
+                let model = WorkspaceModel(name: "W4 assembled fake", repoPaths: [], ephemeralFlag: true, composeTabs: [ComposeTabState(id: tabID, name: "T1")], activeComposeTabID: tabID)
+                manager.workspaces = [model]
+                manager.activeWorkspace = model
+                vm.workspaceManager = manager
+                window.promptManager.loadComposeTabsFromWorkspace(model, syncPromptText: false)
+                let adoption = vm.test_receiveWorkspaceSwitchNotification(model)
+                await vm.test_handleWorkspaceSwitch(model, owner: adoption)
+                await vm.test_waitForSessionListCacheRefresh()
+                vm.test_setCurrentTabIDOverride(tabID)
+                XCTAssertEqual(vm.currentPaneOwner?.workspaceID, model.id)
+                return try Fixture(preparedWindow: window, preparedTabID: tabID)
             }
 
             func body() async throws -> Value {
@@ -276,10 +312,10 @@
         }
 
         func testNoDeclarationOrMissingCanonicalIdentityAndFurtherToolsStayOrdinary() async throws {
-            for variant in ["silence", "ack", "missing-id", "extra-canonical", "other-tool", "input", "unknown"] {
+            for variant in ["silence", "ack", "other-keyword", "missing-id", "extra-canonical", "other-tool", "input", "unknown"] {
                 let f = try Fixture()
-                if variant == "ack" {
-                    f.session.appendItem(.assistant("[ack]", sequenceIndex: f.session.nextSequenceIndex))
+                if variant == "ack" || variant == "other-keyword" {
+                    f.session.appendItem(.assistant(variant == "ack" ? "[ack]" : "quiet / done / NOOP", sequenceIndex: f.session.nextSequenceIndex))
                 } else if variant != "silence" {
                     _ = try await f.body()
                     f.appendDeclaration()

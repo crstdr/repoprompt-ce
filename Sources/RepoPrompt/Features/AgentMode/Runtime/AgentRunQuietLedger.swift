@@ -63,8 +63,20 @@ struct AgentRunQuietLedger {
         facts = initialFacts
     }
 
-    func usesQuietMessageBoundaries(owner: AgentRunOwnership) -> Bool {
-        candidateStartKey(owner: owner) != nil && attempt?.provider == .claudeCode
+    /// A transient input to local projection, derived from the sole attempt authority.
+    /// It is never a certificate and never enters canonical source or persistence.
+    struct DisplayCandidate: Equatable {
+        let owner: AgentRunOwnership
+        let startKey: Int
+        let wakeID: UUID
+        let turnID: UUID
+        let local: AgentTranscriptQuietLocalTurn
+    }
+
+    var displayCandidate: DisplayCandidate? {
+        guard let current = attempt, let start = candidateStartKey(owner: current.owner),
+              let wakeID = current.routineWakeID, let baseline = current.baseline else { return nil }
+        return .init(owner: current.owner, startKey: start, wakeID: wakeID, turnID: baseline.turnID, local: baseline.local)
     }
 
     func candidateStartKey(owner: AgentRunOwnership) -> Int? {
@@ -90,7 +102,7 @@ struct AgentRunQuietLedger {
             ["running", "idle"].contains(result.text?.lowercased() ?? "")
         case "system":
             ["Agent initialized", "Agent completed", "Agent cancelled"].contains(result.text ?? "")
-        case "quiet_reprompt_candidate":
+        case "harness_empty_output_reprompt_candidate":
             current.provider == .claudeCode && candidateStartKey(owner: owner) != nil
                 && current.declarationBodyEntries == 1 && current.acceptedDeclarationInvocationID != nil
         case "event":

@@ -14207,6 +14207,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
 
         if scopes.contains(.transcriptRuntime) {
+            // Deferred owner-side catch-up, never on the ledger/mask callback stack.
+            // In particular an occurrence can release staged rows without adding text.
+            if !session.terminalCommitInProgress {
+                _ = withActiveUISyncSuppressed {
+                    catchUpDerivedTranscriptForActiveBindingIfNeeded(for: session, reason: .liveMutation)
+                }
+            }
             #if DEBUG
                 perfRecorder.increment("ui.refresh.flush.scope.transcriptRuntime", tabID: session.tabID)
             #endif
@@ -14880,7 +14887,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             projectionProtection: projectionProtection,
             isCompressedHistoryRevealed: session.isCompressedHistoryRevealed,
             isColdLoad: reason == .coldLoad,
-            trustedIncrementalFinalTurnStartSequenceIndex: trustedIncrementalFinalTurnStartSequenceIndex
+            trustedIncrementalFinalTurnStartSequenceIndex: trustedIncrementalFinalTurnStartSequenceIndex,
+            quietDisplayCandidate: session.quietDisplayCandidate
         )
         let fullDetailTurnEnvelopeChanged = AgentTranscriptIO.fullDetailTurnEnvelopeChanged(
             from: existingTranscript,
@@ -15305,7 +15313,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         projectionProtection: AgentTranscriptProjectionProtection = .none,
         isCompressedHistoryRevealed: Bool = false,
         isColdLoad: Bool = false,
-        trustedIncrementalFinalTurnStartSequenceIndex: Int? = nil
+        trustedIncrementalFinalTurnStartSequenceIndex: Int? = nil,
+        quietDisplayCandidate: AgentRunQuietLedger.DisplayCandidate? = nil
     ) -> BuiltTranscriptPresentation {
         let processingContext = AgentToolResultProcessingContext()
         #if DEBUG || EDIT_FLOW_PERF
@@ -15409,7 +15418,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 sanitizedActivityCount: sanitizeMetrics.sanitizedActivityCount
             )
         )
-        let projectionReusableTurnCount = AgentTranscriptIO.validatedReusableFrozenPrefixTurnCount(in: sanitizedTranscript) ?? 0
+        let localDisplayTranscript = AgentTranscriptIO.stagingQuietCandidate(quietDisplayCandidate, in: sanitizedTranscript)
+        let projectionReusableTurnCount = AgentTranscriptIO.validatedReusableFrozenPrefixTurnCount(in: localDisplayTranscript) ?? 0
         let baseProjection: AgentTranscriptProjection
         let updatedTurnProjectionCaches: [UUID: AgentTranscriptTurnProjectionCache]
         if projectionReusableTurnCount > 0,
@@ -15421,7 +15431,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 performanceSnapshot.projectionReuseAttemptCount += 1
             #endif
             if let reusedProjection = AgentTranscriptProjectionBuilder.buildReusingFrozenPrefix(
-                from: sanitizedTranscript,
+                from: localDisplayTranscript,
                 previousTranscript: previousSanitizedTranscript,
                 previousProjection: previousBaseProjection,
                 previousProtection: previousProjectionProtection,
@@ -15432,7 +15442,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             ) {
                 baseProjection = reusedProjection
                 updatedTurnProjectionCaches = AgentTranscriptProjectionBuilder.updatedTurnCaches(
-                    for: sanitizedTranscript,
+                    for: localDisplayTranscript,
                     projection: reusedProjection,
                     protection: projectionProtection,
                     existingTurnCaches: previousTurnProjectionCaches,
@@ -15444,7 +15454,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 #endif
             } else {
                 let buildResult = AgentTranscriptProjectionBuilder.buildWithCaches(
-                    from: sanitizedTranscript,
+                    from: localDisplayTranscript,
                     protection: projectionProtection,
                     turnCaches: previousTurnProjectionCaches,
                     context: processingContext,
@@ -15459,7 +15469,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
         } else {
             let buildResult = AgentTranscriptProjectionBuilder.buildWithCaches(
-                from: sanitizedTranscript,
+                from: localDisplayTranscript,
                 protection: projectionProtection,
                 turnCaches: previousTurnProjectionCaches,
                 context: processingContext,
@@ -15812,7 +15822,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             previousProjectionProtection: session.transcriptProjectionProtection,
             projectionProtection: projectionProtection,
             isCompressedHistoryRevealed: session.isCompressedHistoryRevealed,
-            isColdLoad: isColdLoad
+            isColdLoad: isColdLoad,
+            quietDisplayCandidate: session.quietDisplayCandidate
         )
         applyBuiltTranscriptPresentation(
             builtPresentation,
@@ -21850,15 +21861,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                   let owner = session.activeRunOwnership,
                   session.isCurrentRunAttemptForCurrentBinding(owner) else { return }
             session.noteAcceptedStream(result, owner: owner)
-            let usesMessageIdentity = session.quietLedger.usesQuietMessageBoundaries(owner: owner)
-            let startsNewMessage = usesMessageIdentity && result.contentMessageID != nil && result.contentMessageID != session.nonCodexContentMessageID
-            if usesMessageIdentity, result.type == "content" || result.type == "final_content",
-               let messageID = result.contentMessageID, messageID != session.nonCodexContentMessageID
-            {
-                flushPendingAssistantDelta(session)
-                endActiveAssistantSegment(session)
-                session.nonCodexContentMessageID = messageID
-            }
             var shouldUpdateBindings = false
             switch result.type {
             case "content":
@@ -21880,7 +21882,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 // interleaved, which can prematurely finalize the streaming segment.
                 // Walk past system items but stop at tool calls, user messages, etc.
                 let tailAssistantIndex: Int? = {
-                    guard !startsNewMessage else { return nil }
                     if let streamingAssistantIndex = self.resumableStreamingAssistantIndexAcrossTrailingUserInterjections(in: session) {
                         return streamingAssistantIndex
                     }
