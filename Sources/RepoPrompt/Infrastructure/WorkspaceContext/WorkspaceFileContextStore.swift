@@ -3213,6 +3213,7 @@ actor WorkspaceFileContextStore {
         private var codemapTargetedReadyFreezeCountForTesting = 0
         private var codemapFullRootGraphFreezeCountForTesting = 0
         private var filesInRootRequestCountForTesting = 0
+        private var indexDeltaPathsExistForTesting = false
         private var appliedIndexRecordLookupRequestCountForTesting = 0
         private var appliedIndexRecordLookupRequestedRecordCountForTesting = 0
         private var appliedIndexRootSnapshotRequestCountForTesting = 0
@@ -7325,6 +7326,17 @@ actor WorkspaceFileContextStore {
                 publicationCorrelation: nil,
                 diagnosticRootToken: state.service.diagnosticRootToken
             )
+        }
+
+        /// Exercise canonical mutation/publication without disk probes or watcher
+        /// scheduling in the measured interval. This actor-isolated scope never suspends.
+        func applyIndexDeltasWithFakeDiskForTesting(rootID: UUID, deltas: [FileSystemDelta]) throws {
+            let root = try state(for: rootID).root
+            let prepared = deltas.compactMap { FileSystemDeltaPreparation.prepare($0, inRoot: root.standardizedFullPath) }
+            precondition(!indexDeltaPathsExistForTesting)
+            indexDeltaPathsExistForTesting = true
+            defer { indexDeltaPathsExistForTesting = false }
+            applyPreparedIndexDeltaMutations(rootID: rootID, deltas: prepared)
         }
 
         func replayFileSystemPublicationForInvalidationDiagnosticsForTesting(
@@ -20686,6 +20698,9 @@ actor WorkspaceFileContextStore {
     }
 
     private func regularFileAppearsPresentOnDisk(root: WorkspaceRootRecord, relativePath: String) -> Bool {
+        #if DEBUG
+            if indexDeltaPathsExistForTesting { return true }
+        #endif
         let fullPath = StandardizedPath.join(standardizedRoot: root.standardizedFullPath, standardizedRelativePath: StandardizedPath.relative(relativePath))
         var isDirectory = ObjCBool(false)
         guard FileManager.default.fileExists(atPath: fullPath, isDirectory: &isDirectory), !isDirectory.boolValue else { return false }
@@ -20697,6 +20712,9 @@ actor WorkspaceFileContextStore {
     }
 
     private func directoryAppearsPresentOnDisk(root: WorkspaceRootRecord, relativePath: String) -> Bool {
+        #if DEBUG
+            if indexDeltaPathsExistForTesting { return true }
+        #endif
         let fullPath = StandardizedPath.join(standardizedRoot: root.standardizedFullPath, standardizedRelativePath: StandardizedPath.relative(relativePath))
         var isDirectory = ObjCBool(false)
         guard FileManager.default.fileExists(atPath: fullPath, isDirectory: &isDirectory), isDirectory.boolValue else { return false }
@@ -21141,6 +21159,13 @@ actor WorkspaceFileContextStore {
         var removedFolderPaths: [String] = []
         var modifiedFileIDs: [UUID] = []
         var modifiedFolderIDs: [UUID] = []
+        let hasFileAdds = deltas.contains { prepared in
+            if case .fileAdded = prepared.delta { true } else { false }
+        }
+        // Content-only publications must not pay for a root folder inventory.
+        var existingFolderPaths = hasFileAdds
+            ? Set(rootStatesByID[rootID]!.folderIDsByRelativePath.keys)
+            : Set<String>()
         for prepared in deltas {
             let relativePath = prepared.relativePath
             switch prepared.delta {
@@ -21151,17 +21176,19 @@ actor WorkspaceFileContextStore {
                 if let existingFile {
                     invalidateSearchContent(existingFile)
                 }
-                let existingFolderPaths = Set(rootStatesByID[rootID].map { Array($0.folderIDsByRelativePath.keys) } ?? [])
                 indexFile(relativePath: relativePath, root: root)
                 if let file = file(rootID: rootID, relativePath: relativePath) {
                     // Publish existing records too: file-system deltas may have already
                     // indexed the catalog while UI replay still has optimistic UUIDs.
                     // Treating add as an upsert lets subscribers reconcile to store IDs.
                     upsertedFiles.append(file)
+                    let parentFolders = discoverableParentFolders(for: relativePath, rootID: rootID)
                     if !existed {
-                        upsertedFolders.append(contentsOf: newlyIndexedParentFolders(for: relativePath, rootID: rootID, existingFolderPaths: existingFolderPaths))
+                        let newFolders = parentFolders.filter { !existingFolderPaths.contains($0.standardizedRelativePath) }
+                        upsertedFolders.append(contentsOf: newFolders)
+                        existingFolderPaths.formUnion(newFolders.map(\.standardizedRelativePath))
                     }
-                    upsertedFolders.append(contentsOf: discoverableParentFolders(for: relativePath, rootID: rootID))
+                    upsertedFolders.append(contentsOf: parentFolders)
                 }
             case .folderAdded:
                 guard directoryAppearsPresentOnDisk(root: root, relativePath: relativePath) else { continue }
@@ -21170,6 +21197,8 @@ actor WorkspaceFileContextStore {
                     // Same upsert semantics as files: repeated folder add deltas are
                     // harmless and allow UI identity reconciliation.
                     upsertedFolders.append(folder)
+                    existingFolderPaths.insert(folder.standardizedRelativePath)
+                    existingFolderPaths.formUnion(discoverableParentFolders(for: relativePath, rootID: rootID).map(\.standardizedRelativePath))
                 }
             case .fileRemoved:
                 if let oldFile = file(rootID: rootID, relativePath: relativePath) {
@@ -21184,6 +21213,11 @@ actor WorkspaceFileContextStore {
                 if let oldFolder = folder(rootID: rootID, relativePath: relativePath) {
                     let oldFolderWasDiscoverable = isDiscoverableFolderID(oldFolder.id)
                     let removal = removeFolderTree(relativePath: relativePath, rootID: rootID)
+                    if !relativePath.isEmpty {
+                        existingFolderPaths = existingFolderPaths.filter {
+                            $0 != relativePath && !$0.hasPrefix(relativePath + "/")
+                        }
+                    }
                     removedFileIDs.append(contentsOf: removal.fileIDs)
                     removedFolderIDs.append(contentsOf: removal.folderIDs.isEmpty && oldFolderWasDiscoverable ? [oldFolder.id] : removal.folderIDs)
                     removedFilePaths.append(contentsOf: removal.filePaths)
@@ -22999,12 +23033,13 @@ actor WorkspaceFileContextStore {
     }
 
     private func indexFile(relativePath: String, root: WorkspaceRootRecord, managedOnly: Bool = false) {
-        guard var state = rootStatesByID[root.id] else { return }
-        let existingFolderPaths = Set(state.folderIDsByRelativePath.keys)
+        guard rootStatesByID[root.id] != nil else { return }
+        let existingFolderPaths = managedOnly
+            ? Set(rootStatesByID[root.id]!.folderIDsByRelativePath.keys)
+            : Set<String>()
         var stagedIndexes = RootIndexBuffers()
-        indexFiles([FSItemDTO(relativePath: relativePath, isDirectory: false, hierarchy: relativePath.split(separator: "/").count)], root: root, state: &state, indexes: &stagedIndexes)
+        indexFiles([FSItemDTO(relativePath: relativePath, isDirectory: false, hierarchy: relativePath.split(separator: "/").count)], root: root, state: &rootStatesByID[root.id]!, indexes: &stagedIndexes)
         commit(stagedIndexes)
-        rootStatesByID[root.id] = state
         if let file = file(rootID: root.id, relativePath: relativePath) {
             if managedOnly {
                 if managedOnlyFileIDs.insert(file.id).inserted {

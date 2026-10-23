@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptFileSystem
 import RepoPromptFoundation
 import XCTest
 
@@ -140,5 +141,107 @@ final class CatalogFileExtensionInventoryTests: XCTestCase {
         await store.unloadRoot(id: root.id)
         let afterUnload = await store.allLoadedFileExtensions()
         XCTAssertEqual(afterUnload, [])
+    }
+}
+
+final class CatalogBulkAddPerformanceTests: XCTestCase {
+    func testOrderedFolderRecreationAndExistingAddsPreserveCanonicalEventShape() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let store = WorkspaceFileContextStore(codemapGraphIndexBuildLaunchPolicyForTesting: .disabled)
+        let root = try await store.loadRoot(path: directory.path)
+        addTeardownBlock {
+            await store.unloadRoot(id: root.id)
+            try? FileManager.default.removeItem(at: directory)
+        }
+        try await store.applyIndexDeltasWithFakeDiskForTesting(rootID: root.id, deltas: [.fileAdded("parent/old.swift")])
+        let oldFileValue = await store.file(rootID: root.id, relativePath: "parent/old.swift")
+        let oldFile = try XCTUnwrap(oldFileValue)
+        let oldFolderValue = await store.folder(rootID: root.id, relativePath: "parent")
+        let oldFolder = try XCTUnwrap(oldFolderValue)
+        let events = await store.appliedIndexEvents()
+        var iterator = events.makeAsyncIterator()
+        try await store.applyIndexDeltasWithFakeDiskForTesting(rootID: root.id, deltas: [
+            .fileAdded("parent/old.swift"), .folderRemoved("parent"),
+            .fileAdded("parent/new.swift"), .fileAdded("parent/another.swift"),
+            .folderAdded("more/nested"), .fileAdded("more/nested/last.swift")
+        ])
+        let eventValue = await iterator.next()
+        let event = try XCTUnwrap(eventValue)
+        let snapshotValue = await store.appliedIndexRootSnapshot(rootID: root.id)
+        let snapshot = try XCTUnwrap(snapshotValue)
+        let folders = Dictionary(uniqueKeysWithValues: snapshot.folders.map { ($0.standardizedRelativePath, $0) })
+        let parent = try XCTUnwrap(folders["parent"])
+        let more = try XCTUnwrap(folders["more"])
+        let nested = try XCTUnwrap(folders["more/nested"])
+        XCTAssertNotEqual(parent.id, oldFolder.id)
+        XCTAssertEqual(event.upsertedFiles, (snapshot.files + [oldFile]).sorted { $0.standardizedRelativePath < $1.standardizedRelativePath })
+        XCTAssertEqual(event.upsertedFolders, [oldFolder, parent, parent, parent, nested, more, nested].sorted { $0.standardizedRelativePath < $1.standardizedRelativePath })
+        XCTAssertEqual(event.removedFileIDs, [oldFile.id])
+        XCTAssertEqual(event.removedFolderIDs, [oldFolder.id])
+        XCTAssertEqual(snapshot.files.map(\.standardizedRelativePath), ["more/nested/last.swift", "parent/another.swift", "parent/new.swift"])
+    }
+
+    func testBulkAddPublicationPreservesIndexesAndEventsWithinBudget() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let store = WorkspaceFileContextStore(codemapGraphIndexBuildLaunchPolicyForTesting: .disabled)
+        let root = try await store.loadRoot(path: directory.path)
+        addTeardownBlock {
+            await store.unloadRoot(id: root.id)
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let folderPaths = (0 ..< 1000).map { "folder-\($0)" }
+        try await store.applyIndexDeltasWithFakeDiskForTesting(rootID: root.id, deltas: folderPaths.map(FileSystemDelta.folderAdded))
+        let beforeValue = await store.appliedIndexRootSnapshot(rootID: root.id)
+        let before = try XCTUnwrap(beforeValue)
+        let lifetime = try await store.rootLifetimeIDForTesting(rootID: root.id)
+        let events = await store.appliedIndexEvents()
+        var iterator = events.makeAsyncIterator()
+        let filePaths = (0 ..< 20000).map { "folder-\($0 % 1000)/child/file-\($0).swift" }
+        let deltas = filePaths.map(FileSystemDelta.fileAdded)
+        let start = ContinuousClock.now
+        try await store.applyIndexDeltasWithFakeDiskForTesting(rootID: root.id, deltas: deltas)
+        let elapsed = start.duration(to: .now)
+        print("CATALOG_BULK_ADD files=20000 existingFolders=1000 newFolders=1000 duration=\(elapsed)")
+        XCTAssertLessThanOrEqual(elapsed, .seconds(2))
+
+        let eventValue = await iterator.next()
+        let event = try XCTUnwrap(eventValue)
+        let afterValue = await store.appliedIndexRootSnapshot(rootID: root.id)
+        let after = try XCTUnwrap(afterValue)
+        XCTAssertEqual(after.files.map(\.standardizedRelativePath), filePaths.sorted())
+        XCTAssertEqual(after.folders.count, before.folders.count + 1000)
+        let foldersByPath = Dictionary(uniqueKeysWithValues: after.folders.map { ($0.standardizedRelativePath, $0) })
+        for folder in before.folders {
+            XCTAssertEqual(foldersByPath[folder.standardizedRelativePath], folder)
+        }
+        // Existing behavior emits every discoverable ancestor per file, plus each
+        // newly indexed ancestor on its first add. Preserve that exact multiplicity.
+        let expectedFolderPaths = filePaths.flatMap { path -> [String] in
+            let child = (path as NSString).deletingLastPathComponent
+            return [child, (child as NSString).deletingLastPathComponent]
+        } + folderPaths.map { "\($0)/child" }
+        let expectedFolders = try expectedFolderPaths.sorted().map { try XCTUnwrap(foldersByPath[$0]) }
+        XCTAssertEqual(event, WorkspaceAppliedIndexBatchEvent(
+            rootID: root.id,
+            rootPath: root.standardizedFullPath,
+            generation: before.generation + 1,
+            rootLifetimeID: lifetime,
+            upsertedFiles: after.files,
+            upsertedFolders: expectedFolders
+        ))
+        let lookup = await store.appliedIndexRecordLookup(rootID: root.id, fileIDs: after.files.map(\.id), folderIDs: after.folders.map(\.id))
+        XCTAssertEqual(lookup?.filesByID, Dictionary(uniqueKeysWithValues: after.files.map { ($0.id, $0) }))
+        XCTAssertEqual(lookup?.foldersByID, Dictionary(uniqueKeysWithValues: after.folders.map { ($0.id, $0) }))
+
+        let first = try XCTUnwrap(after.files.first)
+        try await store.applyIndexDeltasWithFakeDiskForTesting(rootID: root.id, deltas: [.fileAdded(first.standardizedRelativePath)])
+        let upsertValue = await iterator.next()
+        let upsert = try XCTUnwrap(upsertValue)
+        XCTAssertEqual(upsert.upsertedFiles, [first], "Repeated adds reconcile to the existing canonical ID")
+        let parent = (first.standardizedRelativePath as NSString).deletingLastPathComponent
+        let ancestorPaths = [parent, (parent as NSString).deletingLastPathComponent].sorted()
+        XCTAssertEqual(upsert.upsertedFolders, try ancestorPaths.map { try XCTUnwrap(foldersByPath[$0]) })
     }
 }
