@@ -21159,13 +21159,6 @@ actor WorkspaceFileContextStore {
         var removedFolderPaths: [String] = []
         var modifiedFileIDs: [UUID] = []
         var modifiedFolderIDs: [UUID] = []
-        let hasFileAdds = deltas.contains { prepared in
-            if case .fileAdded = prepared.delta { true } else { false }
-        }
-        // Content-only publications must not pay for a root folder inventory.
-        var existingFolderPaths = hasFileAdds
-            ? Set(rootStatesByID[rootID]!.folderIDsByRelativePath.keys)
-            : Set<String>()
         for prepared in deltas {
             let relativePath = prepared.relativePath
             switch prepared.delta {
@@ -21176,19 +21169,29 @@ actor WorkspaceFileContextStore {
                 if let existingFile {
                     invalidateSearchContent(existingFile)
                 }
+                // Only ancestor membership can affect newly indexed parents.
+                // Read it from the canonical index before this add, avoiding both
+                // per-add root scans and a second inventory to maintain on removal.
+                var existingParentPaths = Set<String>()
+                if !existed {
+                    var parentPath = (relativePath as NSString).deletingLastPathComponent
+                    while !parentPath.isEmpty, parentPath != "." {
+                        if rootStatesByID[rootID]?.folderIDsByRelativePath[parentPath] != nil {
+                            existingParentPaths.insert(parentPath)
+                        }
+                        parentPath = (parentPath as NSString).deletingLastPathComponent
+                    }
+                }
                 indexFile(relativePath: relativePath, root: root)
                 if let file = file(rootID: rootID, relativePath: relativePath) {
                     // Publish existing records too: file-system deltas may have already
                     // indexed the catalog while UI replay still has optimistic UUIDs.
                     // Treating add as an upsert lets subscribers reconcile to store IDs.
                     upsertedFiles.append(file)
-                    let parentFolders = discoverableParentFolders(for: relativePath, rootID: rootID)
                     if !existed {
-                        let newFolders = parentFolders.filter { !existingFolderPaths.contains($0.standardizedRelativePath) }
-                        upsertedFolders.append(contentsOf: newFolders)
-                        existingFolderPaths.formUnion(newFolders.map(\.standardizedRelativePath))
+                        upsertedFolders.append(contentsOf: newlyIndexedParentFolders(for: relativePath, rootID: rootID, existingFolderPaths: existingParentPaths))
                     }
-                    upsertedFolders.append(contentsOf: parentFolders)
+                    upsertedFolders.append(contentsOf: discoverableParentFolders(for: relativePath, rootID: rootID))
                 }
             case .folderAdded:
                 guard directoryAppearsPresentOnDisk(root: root, relativePath: relativePath) else { continue }
@@ -21197,8 +21200,6 @@ actor WorkspaceFileContextStore {
                     // Same upsert semantics as files: repeated folder add deltas are
                     // harmless and allow UI identity reconciliation.
                     upsertedFolders.append(folder)
-                    existingFolderPaths.insert(folder.standardizedRelativePath)
-                    existingFolderPaths.formUnion(discoverableParentFolders(for: relativePath, rootID: rootID).map(\.standardizedRelativePath))
                 }
             case .fileRemoved:
                 if let oldFile = file(rootID: rootID, relativePath: relativePath) {
@@ -21213,11 +21214,6 @@ actor WorkspaceFileContextStore {
                 if let oldFolder = folder(rootID: rootID, relativePath: relativePath) {
                     let oldFolderWasDiscoverable = isDiscoverableFolderID(oldFolder.id)
                     let removal = removeFolderTree(relativePath: relativePath, rootID: rootID)
-                    if !relativePath.isEmpty {
-                        existingFolderPaths = existingFolderPaths.filter {
-                            $0 != relativePath && !$0.hasPrefix(relativePath + "/")
-                        }
-                    }
                     removedFileIDs.append(contentsOf: removal.fileIDs)
                     removedFolderIDs.append(contentsOf: removal.folderIDs.isEmpty && oldFolderWasDiscoverable ? [oldFolder.id] : removal.folderIDs)
                     removedFilePaths.append(contentsOf: removal.filePaths)
