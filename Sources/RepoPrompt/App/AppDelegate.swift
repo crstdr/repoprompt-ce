@@ -30,7 +30,11 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     private lazy var terminationSignalRouter = AppTerminationSignalRouter(
         observer: DispatchTerminationSignalObserver()
     ) {
-        NSApp.terminate(nil)
+        // terminate: with .terminateLater spins a nested run loop. Run from a main-queue
+        // callout it would hold the main queue, so the @MainActor work that replies never runs.
+        RunLoop.main.perform(inModes: [.common]) {
+            NSApp.terminate(nil)
+        }
     }
 
     /// App startup owns one explicit registration attempt; readiness only observes it.

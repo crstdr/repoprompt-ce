@@ -408,6 +408,64 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             return nil
         }
 
+        func testRepromptRewriteAndAuditSurvivePendingProviderSwitch() async throws {
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                session.selectedAgent = .openCode
+                session.selectedModelRaw = "unknown-window"
+                try installSwitch(fixture)
+                let original = "Original request"
+                let approved = "Reviewed replacement brief"
+                vm.storeDraftText(for: session.tabID, approved)
+                let claim = try composerClaim(fixture, text: approved)
+                vm.repromptDispatchOriginals[claim.attempt.id] = original
+                vm.repromptDispatchTexts[claim.attempt.id] = approved
+                vm.repromptAudits[claim.attempt.id] = .init(outcome: .approved)
+                vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("reprompt-switch.json") }
+                var dispatched: String?
+                vm.test_providerSwitchStart = { _, user, _ in dispatched = user }
+
+                let result = await vm.executeComposerSubmitAttempt(text: approved, claim: claim)
+                XCTAssertEqual(result, .submitted)
+                try await AsyncTestWait.waitUntil("rewritten switched turn dispatches") { dispatched != nil }
+                let sent = try XCTUnwrap(dispatched)
+                XCTAssertTrue(sent.contains(approved))
+                XCTAssertFalse(sent.contains(original))
+                XCTAssertEqual(session.items.last(where: { $0.kind == .user })?.text, approved)
+                XCTAssertEqual(session.automationTurnAudit.last?.reprompt?.outcome, .approved)
+                XCTAssertNil(session.activeComposerSubmitAttempt)
+            }
+        }
+
+        func testProviderSwitchHandoverAugmentationHonorsLiteralRepromptText() async throws {
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                session.selectedAgent = .openCode
+                session.selectedModelRaw = "unknown-window"
+                let directory = fixture.rootURL.appendingPathComponent(".agents/skills/literal", isDirectory: true)
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                let skillBody = "SKILL_EXPANSION_MUST_NOT_REPLACE_REPROMPT"
+                try "---\nname: literal\ndescription: Fixture\n---\n\(skillBody)".write(to: directory.appendingPathComponent("SKILL.md"), atomically: true, encoding: .utf8)
+                try installSwitch(fixture)
+                let approved = "/literal reviewed brief"
+                guard case let .success(expanded) = await vm.providerSwitchSendAdmission(session: session, input: approved),
+                      let expanded else { return XCTFail("Ordinary skill input must be admitted") }
+                XCTAssertTrue(expanded.augmentedInput.contains(skillBody), "Control must exercise real skill expansion")
+
+                guard case let .success(literal) = await vm.providerSwitchSendAdmission(session: session, input: approved, skipsSlashExpansion: true),
+                      let literal else { return XCTFail("Literal re-prompt input must be admitted") }
+                XCTAssertTrue(literal.augmentedInput.contains(approved))
+                XCTAssertFalse(literal.augmentedInput.contains(skillBody))
+                vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("literal-switch.json") }
+                let preparedHandover = await vm.prepareProviderSwitchHandoverForSend(literal, session: session, stopFence: .init(session: session))
+                let handover = try XCTUnwrap(preparedHandover)
+                XCTAssertTrue(handover.user.contains(approved))
+                XCTAssertFalse(handover.user.contains(skillBody))
+            }
+        }
+
         func testSwitchExpandedSkillAndTaggedFileRefusalsRetainClaimedComposer() async throws {
             for skill in [true, false] {
                 try await withFixture { fixture in
