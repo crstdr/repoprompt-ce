@@ -244,7 +244,7 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
         crossSessionAttribution = try c.decodeIfPresent(AgentCrossSessionAttribution.self, forKey: .crossSessionAttribution)
         laneUpdateDisplayAttribution = try c.decodeIfPresent(AgentLaneUpdateDisplayAttribution.self, forKey: .laneUpdateDisplayAttribution)?.validated
         recoveryDiagnostic = try c.decodeIfPresent(AgentTranscriptRecoveryDiagnostic.self, forKey: .recoveryDiagnostic)
-        quietCheckInWakeID = try? c.decode(UUID.self, forKey: .quietCheckInWakeID)
+        quietCheckInWakeID = try? c.decodeIfPresent(UUID.self, forKey: .quietCheckInWakeID)
     }
 
     private static func defaultRole(for item: AgentChatItem) -> AgentTranscriptActivityRole {
@@ -655,7 +655,7 @@ public struct AgentTranscriptProviderResponseSpan: Codable, Identifiable, Sendab
         completedAt = try container.decodeIfPresent(Date.self, forKey: .completedAt)
         activities = try container.decodeIfPresent([AgentTranscriptActivity].self, forKey: .activities) ?? []
         collapsedSummary = try container.decodeIfPresent(AgentTranscriptGroupedHistorySummary.self, forKey: .collapsedSummary)
-        quietLocal = try? container.decode(AgentTranscriptQuietLocalSpan.self, forKey: .quietLocal)
+        quietLocal = try? container.decodeIfPresent(AgentTranscriptQuietLocalSpan.self, forKey: .quietLocal)
         fullRenderGroupedHistoryCache = nil
     }
 
@@ -758,7 +758,7 @@ public struct AgentTranscriptTurn: Codable, Identifiable, Sendable, Equatable {
         conclusionActivityID = try container.decodeIfPresent(UUID.self, forKey: .conclusionActivityID)
         retentionTier = try container.decode(AgentTranscriptRetentionTier.self, forKey: .retentionTier)
         summary = try container.decodeIfPresent(AgentTranscriptTurnSummary.self, forKey: .summary)
-        quietLocal = try? container.decode(AgentTranscriptQuietLocalTurn.self, forKey: .quietLocal)
+        quietLocal = try? container.decodeIfPresent(AgentTranscriptQuietLocalTurn.self, forKey: .quietLocal)
         terminalState = try container.decodeIfPresent(AgentSessionRunState.self, forKey: .terminalState)
         startedAt = try container.decode(Date.self, forKey: .startedAt)
         lastActivityAt = try container.decodeIfPresent(Date.self, forKey: .lastActivityAt)

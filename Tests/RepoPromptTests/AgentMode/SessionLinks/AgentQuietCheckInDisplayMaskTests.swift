@@ -1711,7 +1711,7 @@ final class AgentQuietRetainedViewFeasibilityTests: XCTestCase {
         transcript.turns[0].retentionTier = .condensed
         transcript = AgentTranscriptCompactor.compact(transcript)
         let encoded = try JSONEncoder().encode(transcript)
-        for damage in ["missing-turn", "malformed-turn", "missing-span", "malformed-stamp", "retained-stamp"] {
+        for damage in ["missing-turn", "malformed-turn", "missing-span", "malformed-stamp", "retained-stamp", "null-proof"] {
             var payload = encoded
             if damage == "malformed-stamp" {
                 var full = AgentTranscriptIO.buildTranscript(from: ordinary + quietRows(base: 100, wakeID: id(900)), terminalState: .completed)
@@ -1725,6 +1725,17 @@ final class AgentQuietRetainedViewFeasibilityTests: XCTestCase {
             if damage == "missing-span" {
                 var spans = try XCTUnwrap(turns[0]["responseSpans"] as? [[String: Any]])
                 spans[0]["quietLocal"] = [:] as [String: Any]
+                turns[0]["responseSpans"] = spans
+            }
+            if damage == "null-proof" {
+                turns[0]["quietLocal"] = NSNull()
+                var spans = try XCTUnwrap(turns[0]["responseSpans"] as? [[String: Any]])
+                spans[0]["quietLocal"] = NSNull()
+                var activities = try XCTUnwrap(spans[0]["activities"] as? [[String: Any]])
+                for index in activities.indices {
+                    activities[index]["quietCheckInWakeID"] = NSNull()
+                }
+                spans[0]["activities"] = activities
                 turns[0]["responseSpans"] = spans
             }
             if damage == "malformed-stamp" {
@@ -1746,6 +1757,11 @@ final class AgentQuietRetainedViewFeasibilityTests: XCTestCase {
             object["turns"] = turns
             let decoded = try JSONDecoder().decode(AgentTranscript.self, from: JSONSerialization.data(withJSONObject: object))
             XCTAssertEqual(decoded.turns.count, damage == "malformed-stamp" ? 1 : 2, "Optional damage must not discard canonical audit")
+            if damage == "null-proof" {
+                XCTAssertNil(decoded.turns[0].quietLocal)
+                XCTAssertNil(decoded.turns[0].responseSpans[0].quietLocal)
+                XCTAssertTrue(decoded.turns[0].allActivities.allSatisfy { $0.quietCheckInWakeID == nil })
+            }
             if damage == "malformed-stamp" {
                 XCTAssertNil(decoded.turns[0].allActivities.first { $0.id == id(100) }?.quietCheckInWakeID)
                 XCTAssertTrue(AgentTranscriptProjectionBuilder.build(from: decoded, excludingQuiet: true).workingRows.contains { $0.id == id(100) })
