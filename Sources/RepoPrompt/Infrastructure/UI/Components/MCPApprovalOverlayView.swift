@@ -11,13 +11,11 @@ import SwiftUI
 /// Presents a modern, polished UI that blocks interaction until the user responds.
 struct MCPApprovalOverlayView: View {
     @EnvironmentObject private var server: MCPServerViewModel
+    @State private var alwaysAllow = true
     @State private var isAnimating = false
-    @State private var isResolving = false
     @State private var pulseScale: CGFloat = 1.0
 
     let clientID: String
-    let generation: UInt64
-    let executablePath: String?
 
     var body: some View {
         ZStack {
@@ -157,25 +155,8 @@ struct MCPApprovalOverlayView: View {
             // Client info card
             clientInfoCard
 
-            if let executablePath {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Requesting process (observed locally)")
-                        .font(.caption.weight(.semibold))
-                    Text(executablePath)
-                        .font(.caption.monospaced())
-                        .textSelection(.enabled)
-                    Text("Allow Session covers this running process, including reconnects and other client names it uses. Deny suppresses its requests for one minute. Choices reset when RepoPrompt quits.")
-                        .font(.caption)
-                }
-                .foregroundColor(.secondary)
-            } else {
-                Text("The launching process could not be verified. Approval applies only to this connection.")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
-            Text("Client names are self-reported.")
-                .font(.caption)
-                .foregroundColor(.secondary)
+            // Always allow toggle
+            alwaysAllowToggle
         }
         .padding(24)
     }
@@ -234,6 +215,27 @@ struct MCPApprovalOverlayView: View {
         }
     }
 
+    private var alwaysAllowToggle: some View {
+        HStack(spacing: 12) {
+            Toggle("", isOn: $alwaysAllow)
+                .toggleStyle(SwitchToggleStyle(tint: .accentColor))
+                .labelsHidden()
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Always allow this client")
+                    .font(.subheadline.weight(.medium))
+                    .foregroundColor(.primary)
+
+                Text("Skip approval for future connections")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
+            Spacer()
+        }
+        .padding(.horizontal, 4)
+    }
+
     // MARK: - Actions Section
 
     private var actionsSection: some View {
@@ -256,7 +258,7 @@ struct MCPApprovalOverlayView: View {
                 HStack(spacing: 6) {
                     Image(systemName: "checkmark")
                         .font(.system(size: 12, weight: .semibold))
-                    Text(executablePath == nil ? "Allow Once" : "Allow Session")
+                    Text(alwaysAllow ? "Always Allow" : "Allow Once")
                         .font(.subheadline.weight(.medium))
                 }
                 .frame(maxWidth: .infinity)
@@ -266,31 +268,26 @@ struct MCPApprovalOverlayView: View {
             .keyboardShortcut(.defaultAction)
         }
         .padding(20)
-        .disabled(isResolving)
     }
 
     // MARK: - Actions
 
     private func allow() async {
-        guard !isResolving else { return }
-        isResolving = true
         withAnimation(.easeInOut(duration: 0.2)) {
             isAnimating = false
         }
         // Small delay for animation
         try? await Task.sleep(nanoseconds: 150_000_000)
-        await server.resolveApproval(allow: true, generation: generation)
+        await server.resolveApproval(allow: true, alwaysAllow: alwaysAllow)
     }
 
     private func deny() async {
-        guard !isResolving else { return }
-        isResolving = true
         withAnimation(.easeInOut(duration: 0.2)) {
             isAnimating = false
         }
         // Small delay for animation
         try? await Task.sleep(nanoseconds: 150_000_000)
-        await server.resolveApproval(allow: false, generation: generation)
+        await server.resolveApproval(allow: false, alwaysAllow: false)
     }
 }
 
