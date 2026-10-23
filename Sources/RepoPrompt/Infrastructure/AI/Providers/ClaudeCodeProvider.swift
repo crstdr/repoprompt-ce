@@ -415,9 +415,10 @@ final class ClaudeCodeProvider: AIProvider {
 
     private func parseStreamJSONCompletionPayload(_ data: Data) throws -> AICompletionResult {
         // Decode complete events, not token deltas; counting both would duplicate text.
-        // Fail closed on malformed/truncated lines rather than returning a partial answer.
+        // Ignore non-JSON CLI diagnostics, but fail closed on malformed/truncated JSON events.
         let events = try data.split(separator: 0x0A).compactMap { line -> [String: Any]? in
-            if line.allSatisfy({ $0 == 0x20 || $0 == 0x09 || $0 == 0x0D }) { return nil }
+            let payload = line.drop(while: { $0 == 0x20 || $0 == 0x09 || $0 == 0x0D })
+            guard payload.first == 0x7B else { return nil }
             guard let event = try JSONSerialization.jsonObject(with: Data(line)) as? [String: Any] else {
                 throw AIProviderError.invalidResponse(detail: "Claude CLI returned unsupported JSON payload")
             }

@@ -615,6 +615,19 @@ final class OracleImageSerializationTests: XCTestCase {
         XCTAssertEqual(completion.text, first + "eRequest() {}\n```")
     }
 
+    func testClaudeStreamJSONIgnoresNonJSONStdoutDiagnostics() throws {
+        let output = """
+        [SandboxDebug] Preparing sandbox
+        {"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"text","text":"First "}]}}
+        [SandboxDebug] Sandbox ready
+        {"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"text","text":"last"}]}}
+        {"type":"result","subtype":"success","is_error":false,"result":"last"}
+        """
+
+        let completion = try ClaudeCodeProvider.test_parseStreamJSONCompletionPayload(Data(output.utf8))
+        XCTAssertEqual(completion.text, "First last")
+    }
+
     func testClaudeStreamJSONRejectsErrorsAndIncompleteOutput() throws {
         let assistant = #"{"type":"assistant","message":{"content":[{"type":"text","text":"Partial"}]}}"#
         let success = #"{"type":"result","subtype":"success","result":"Done"}"#
