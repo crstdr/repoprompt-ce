@@ -2230,13 +2230,15 @@ extension CodexResumeWedgeCommitTests {
                 await f.coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "quiet-recovery"), session: f.session, sourceController: old)
                 let owner = try XCTUnwrap(f.session.activeRunOwnership)
                 f.session.quietLedger.recordPhysicalDispatch(owner: owner, wakeID: UUID(), routineQuietCheckIn: true, alreadyAcquired: false)
-                if ack { await f.coordinator.test_handleCodexNativeEvent(.assistantDelta("[ack]"), session: f.session, sourceController: old) }
                 XCTAssertNotNil(f.session.quietLedger.candidateStartKey(owner: owner))
+                if ack { await f.coordinator.test_handleCodexNativeEvent(.assistantDelta("[ack]"), session: f.session, sourceController: old) }
+                let candidateBeforeProbe = f.session.quietLedger.candidateStartKey(owner: owner)
+                XCTAssertEqual(candidateBeforeProbe == nil, ack, "Any nonempty pre-declaration text is ordinary")
                 // First unchanged active probe is benign. Only the second admits reattachment.
                 let firstFailed = await f.coordinator.test_attemptCodexStallRecovery(session: f.session)
                 XCTAssertFalse(firstFailed)
                 XCTAssertTrue(f.factory.controllers.isEmpty)
-                XCTAssertNotNil(f.session.quietLedger.candidateStartKey(owner: owner), "a skipped probe is not recovery")
+                XCTAssertEqual(f.session.quietLedger.candidateStartKey(owner: owner), candidateBeforeProbe, "a skipped probe cannot change the prior ingress verdict")
                 let recovery = Task { await f.coordinator.test_attemptCodexStallRecovery(session: f.session) }
                 addTeardownBlock { @MainActor in
                     startup.release()

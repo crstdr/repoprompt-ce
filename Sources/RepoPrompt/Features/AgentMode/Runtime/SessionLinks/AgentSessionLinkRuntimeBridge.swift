@@ -4968,7 +4968,10 @@ final class AgentSessionLinkRuntimeBridge {
             await test_afterMonitorProjection?()
         #endif
         guard !isFrozenForTermination, self.host === host,
-              monitor.sampleOwners.allSatisfy({ chains[$0.endpoint.sessionID] === $0 }) else { return nil }
+              monitor.sampleOwners.allSatisfy({
+                  chains[$0.endpoint.sessionID] === $0.chain
+                      && ($0.chain != nil || passiveNoticesByObserver[candidate.domainEndpoint] == nil)
+              }) else { return nil }
         #if DEBUG
             for sample in monitor.statusSamples {
                 test_onPassiveSample?(sample)
@@ -5065,8 +5068,9 @@ final class AgentSessionLinkRuntimeBridge {
         /// these samples, so location, Seen, settings, sidebar-menu, and observer-role repaints cannot
         /// narrate a transition, queue passive work, or trigger Auto-wake.
         let statusSamples: [AgentSessionLinkPassiveStatusNotices.Sample]
-        /// Owner witnesses only, never a second source of snapshot/facts or a latest-frame test.
-        let sampleOwners: [TargetPublicationChain]
+        /// Initial baselining may precede chain installation; retain absence as an owner witness too.
+        /// Neither a second snapshot/facts source nor permission to rebaseline established debt.
+        let sampleOwners: [(endpoint: DomainAgentSessionLinkEndpointIdentity, chain: TargetPublicationChain?)]
     }
 
     /// The Oversee rows for one endpoint, and nothing else.
@@ -5090,7 +5094,7 @@ final class AgentSessionLinkRuntimeBridge {
 
         var outbound: [AgentMonitorPillProps.Outbound] = []
         var statusSamples: [AgentSessionLinkPassiveStatusNotices.Sample] = []
-        var sampleOwners: [TargetPublicationChain] = []
+        var sampleOwners: [(endpoint: DomainAgentSessionLinkEndpointIdentity, chain: TargetPublicationChain?)] = []
         for item in inputs.outbound.items {
             // The grant's own target incarnation, not "some live session with that UUID".
             guard let targetEndpoint = inputs.outboundTargetEndpoints[item.linkID] else {
@@ -5122,7 +5126,12 @@ final class AgentSessionLinkRuntimeBridge {
                 // may reach a queued notice. Materializing the redacted preview is why this runs only
                 // on the authoritative pass, never on a location, Seen, settings, sidebar-menu, or
                 // observer-role repaint.
-                guard let capturedChain = chains[targetEndpoint.sessionID], let capturedHost = host else { return nil }
+                guard let capturedHost = host else { return nil }
+                let capturedChain = chains[targetEndpoint.sessionID]
+                // Authority activation precedes local observation installation. The first baseline
+                // can use that exact atomic pair, but established debt still requires its live owner.
+                guard capturedChain?.endpoint == targetEndpoint
+                    || (capturedChain == nil && passiveNoticesByObserver[endpoint] == nil) else { return nil }
                 #if DEBUG
                     await test_beforePassiveObservationSnapshot?(targetEndpoint)
                 #endif
@@ -5133,10 +5142,11 @@ final class AgentSessionLinkRuntimeBridge {
                 // Obsolete ownership rejects the WHOLE observation, not just its facts. Same-owner
                 // accepted samples remain valid point-in-time pairs while a newer refresh is queued.
                 guard let envelope, envelope.endpoint == targetEndpoint,
-                      chains[targetEndpoint.sessionID] === capturedChain, capturedChain.endpoint == targetEndpoint,
+                      chains[targetEndpoint.sessionID] === capturedChain,
+                      capturedChain != nil || passiveNoticesByObserver[endpoint] == nil,
                       host === capturedHost, !isFrozenForTermination else { return nil }
                 let observation = envelope.snapshot
-                sampleOwners.append(capturedChain)
+                sampleOwners.append((targetEndpoint, capturedChain))
 
                 statusSamples.append(AgentSessionLinkPassiveStatusNotices.Sample(
                     reference: reference,

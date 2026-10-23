@@ -9676,6 +9676,29 @@ extension AgentSessionLinkRuntimeBridgeTests {
         XCTAssertEqual(fixture.bridge.test_sourcePublicationSequence(for: fixture.target.sessionID), 11, "identical nil pair remains deduplicated")
     }
 
+    func testInitialBaselineRejectsAnAbsentObservationOwnerReplacedBeforePublication() async {
+        let fixture = makeFixture()
+        guard case .added = await addLink(fixture) else { return XCTFail("add failed") }
+        let restoredBridge = AgentSessionLinkRuntimeBridge(authority: fixture.authority, host: fixture.host, toolAdvertisementInvalidator: { _ in })
+        defer { restoredBridge.freezeForTermination() }
+        var installed = false
+        var applied: [AgentSessionLinkPassiveStatusNotices.Sample] = []
+        restoredBridge.test_onPassiveSample = { applied.append($0) }
+        restoredBridge.test_afterMonitorProjection = {
+            guard !installed else { return }
+            installed = true
+            restoredBridge.test_reinstallObservation(for: fixture.target)
+        }
+        let publications = fixture.host.passiveNoticePublicationCount
+        await restoredBridge.test_refreshStatus(sessionIDs: [fixture.observer.sessionID])
+        XCTAssertTrue(installed, "The initial atomic pair must be collected before installing its local chain")
+        XCTAssertTrue(applied.isEmpty, "An absent owner is a witness, not permission to ignore a later installation")
+        XCTAssertEqual(fixture.host.passiveNoticePublicationCount, publications)
+        restoredBridge.test_afterMonitorProjection = nil
+        await restoredBridge.test_refreshStatus(sessionIDs: [fixture.observer.sessionID])
+        XCTAssertEqual(applied.count, 1, "A fresh pass may baseline under the now-current exact owner")
+    }
+
     func testW0dObsoleteObservationOwnerRejectsTheWholeEnvelopeWithoutPayingDebt() async throws {
         let fixture = makeFixture()
         fixture.host.runFacts[fixture.target.sessionID] = .zero
