@@ -18621,8 +18621,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if session.pendingHandoff.providerSwitchDelivery != nil {
             // Routing already excludes pending handoffs. Keep ordinary effort policy, then await
             // pending-switch composition while the existing composer owner retains its draft.
+            let judgingText = Self.automationJudgingText(original: text, reprompted: repromptedText)
             let choice = modelRouterSettingsStore.autoEffortEnabled()
-                ? await chooseAutoEffortForUserTurn(text: text, session: session, workflow: session.selectedWorkflow) : nil
+                ? await chooseAutoEffortForUserTurn(text: judgingText, session: session, workflow: session.selectedWorkflow, isRepromptReplacement: repromptedText != nil) : nil
             guard composerSubmitClaimIsCurrent(claim), sessions[destinationTabID] === session else {
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
@@ -18630,6 +18631,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let immediate = submitUserTurn(
                 text: text, tabID: destinationTabID, rawDraftText: claim.attempt.rawDraftSnapshot,
                 composerOrigin: .localComposer, autoEffortSelection: choice?.selection, autoEffortAudit: choice?.audit,
+                repromptedText: repromptedText,
+                repromptAudit: repromptAuditForClaim(
+                    claim,
+                    judgedText: choice?.audit.judgmentRequested == true
+                        ? (repromptedText.map { $0.count <= 4000 } == true ? .approved : .originalFallback) : nil
+                ),
                 providerSwitchClaim: claim, scheduledProviderSwitchSubmission: { pending = $0 }
             )
             let result: UserTurnSubmissionResult = if let pending {
@@ -20010,6 +20017,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                       session.pendingHandoff == capturedHandoff else { return .blocked(message: Self.staleComposerSubmitTargetMessage) }
                 let admission = await providerSwitchSendAdmission(
                     session: session, input: wrappedText, attachments: attachmentsToSend, taggedFiles: taggedFilesToSend,
+                    skipsSlashExpansion: repromptedText != nil,
                     isCurrent: { self.composerSubmitClaimIsCurrent(claim) && capturedStop.permitsStart(of: session) }
                 )
                 switch admission {

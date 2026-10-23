@@ -86,6 +86,7 @@ extension AgentModeViewModel {
         attachments: [AgentImageAttachment] = [],
         taggedFiles: [AgentTaggedFileAttachment] = [],
         skipsAugmentation: Bool = false,
+        skipsSlashExpansion: Bool = false,
         inputAlreadyIncludesSupplement: Bool = false,
         supplementalInput: String? = nil,
         autoWakeID: UUID? = nil,
@@ -110,7 +111,8 @@ extension AgentModeViewModel {
         let stopFence = AgentRunStartStopFence(session: session)
         let augmented = skipsAugmentation ? input : await augmentUserMessageForProviderSend(
             input, attachments: attachments, taggedFileAttachments: taggedFiles,
-            agent: agent, session: session, ignoresPendingHandoff: true
+            agent: agent, session: session, ignoresPendingHandoff: true,
+            skipsSlashExpansion: skipsSlashExpansion
         )
         let initial = await buildInitialThreadMessageIfNeeded(
             tabID: session.tabID, session: session, initialMessage: augmented
