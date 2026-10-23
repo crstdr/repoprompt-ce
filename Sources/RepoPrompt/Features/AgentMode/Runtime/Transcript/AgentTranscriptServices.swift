@@ -4767,7 +4767,9 @@ enum AgentTranscriptIO {
             activityCount += 1
             if activity.id == conclusionID, conclusion == nil { conclusion = activity }
             hadError = hadError || activity.itemKind == .error
-            if AgentTranscriptIO.isUserInteractionItem(activity.toItem()) {
+            if activity.itemKind == .user || activity.itemKind == .toolResult,
+               AgentTranscriptIO.isUserInteractionItem(activity.toItem())
+            {
                 lastUserInteractionAt = max(lastUserInteractionAt ?? activity.timestamp, activity.timestamp)
             }
             if var diagnostic = activity.recoveryDiagnostic {
