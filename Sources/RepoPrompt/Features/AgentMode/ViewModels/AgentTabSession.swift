@@ -601,6 +601,7 @@ final class AgentTabSession: ObservableObject {
         let createdAt: Date
         /// Claude turn completions protected by this accepted steering instruction.
         var supersedingProtectedTurnIDs: Set<UUID> = []
+        var skipsSlashExpansion = false
     }
 
     var pendingClaudeSteeringInstructions: [ClaudeSteeringInstruction] = [] {
@@ -671,6 +672,7 @@ final class AgentTabSession: ObservableObject {
         let optimisticUserItemID: UUID?
         let createdAt: Date
         var managed: ACPSteeringManagedContext?
+        var skipsSlashExpansion = false
     }
 
     /// Lifecycle disposal withdraws only rows from the exact binding that accepted the steer.

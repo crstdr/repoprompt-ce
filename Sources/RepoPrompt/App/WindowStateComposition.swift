@@ -285,6 +285,7 @@ enum WindowStateCompositionFactory {
                   let registered = WindowStatesManager.shared.window(withID: windowID) else { return nil }
             return registered.agentModeViewModel === agentModeViewModel
         }
+        agentModeViewModel.repromptService = .live(keyManager: keyManager)
         agentModeViewModel.preparedSessionRuntimes = WindowStatesManager.shared
         workspaceFilesViewModel.setSessionWorktreeBindingStatesProvider { [weak agentModeViewModel] sessionIDs in
             agentModeViewModel?.worktreeBindingStates(forAgentSessionIDs: sessionIDs) ?? [:]
