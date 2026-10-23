@@ -380,6 +380,12 @@ actor WorkspaceFileContextStore {
         var fileIDsByRelativePath: [String: UUID]
         var childFolderIDsByFolderID: [UUID: [UUID]]
         var childFileIDsByFolderID: [UUID: [UUID]]
+        var fileExtensionCounts: [String: Int] = [:]
+    }
+
+    private struct FileExtensionCatalogSummary {
+        let generation: UInt64
+        let extensions: Set<String>
     }
 
     private struct PendingSeededRoot {
@@ -2120,7 +2126,8 @@ actor WorkspaceFileContextStore {
                 folderIDsByRelativePath: state.folderIDsByRelativePath,
                 fileIDsByRelativePath: state.fileIDsByRelativePath,
                 childFolderIDsByFolderID: state.childFolderIDsByFolderID,
-                childFileIDsByFolderID: state.childFileIDsByFolderID
+                childFileIDsByFolderID: state.childFileIDsByFolderID,
+                fileExtensionCounts: state.fileExtensionCounts
             )
         }
 
@@ -2253,7 +2260,8 @@ actor WorkspaceFileContextStore {
                 folderIDsByRelativePath: state.folderIDsByRelativePath,
                 fileIDsByRelativePath: state.fileIDsByRelativePath,
                 childFolderIDsByFolderID: state.childFolderIDsByFolderID,
-                childFileIDsByFolderID: state.childFileIDsByFolderID
+                childFileIDsByFolderID: state.childFileIDsByFolderID,
+                fileExtensionCounts: state.fileExtensionCounts
             )
             return replacementLifetimeID
         }
@@ -3077,6 +3085,7 @@ actor WorkspaceFileContextStore {
         .allLoaded: 0
     ]
     private var catalogGenerationsByRootID: [UUID: UInt64] = [:]
+    private var fileExtensionSummariesByRootID: [UUID: FileExtensionCatalogSummary] = [:]
     private var sessionCatalogGenerationStatesByScope: [WorkspaceLookupRootScope: SessionCatalogGenerationState] = [:]
     private var nextSessionCatalogGeneration: UInt64 = 0
     private var searchCatalogSnapshotsByScope: [WorkspaceLookupRootScope: SearchCatalogSnapshotCacheEntry] = [:]
@@ -7548,6 +7557,25 @@ actor WorkspaceFileContextStore {
             .filter(isDiscoverableFileID)
             .compactMap { filesByID[$0] }
             .sorted { $0.standardizedRelativePath < $1.standardizedRelativePath }
+    }
+
+    /// Matches roots() + files(inRoot:) membership, including hidden and system
+    /// roots. Read only the catalog-owned summaries; never materialize a catalog
+    /// shard or enumerate files as a side effect of token accounting.
+    func allLoadedFileExtensions() -> Set<String> {
+        var extensions = Set<String>()
+        for rootID in rootLoadOrder {
+            if let summary = fileExtensionSummariesByRootID[rootID],
+               summary.generation == catalogGenerationsByRootID[rootID]
+            {
+                extensions.formUnion(summary.extensions)
+            } else if let state = rootStatesByID[rootID] {
+                // Seeded publication can expose a root before its first catalog
+                // generation advance. Its inventory is already built by indexing.
+                extensions.formUnion(state.fileExtensionCounts.keys)
+            }
+        }
+        return extensions
     }
 
     func file(id fileID: UUID) -> WorkspaceFileRecord? {
@@ -12374,6 +12402,7 @@ actor WorkspaceFileContextStore {
             ))
             appliedIndexGenerationsByRootID.removeValue(forKey: rootID)
             catalogGenerationsByRootID.removeValue(forKey: rootID)
+            fileExtensionSummariesByRootID.removeValue(forKey: rootID)
             #if DEBUG
                 publicationInvalidationHistoryByRootID.removeValue(forKey: rootID)
                 scopedIngressBarrierLaunchCountsByRootID.removeValue(forKey: rootID)
@@ -22524,7 +22553,14 @@ actor WorkspaceFileContextStore {
             ? Set(rootStatesByID.values.compactMap { affectedRootKinds.contains($0.root.kind) ? $0.root.id : nil })
             : affectedRootIDs
         for rootID in rootIDsToAdvance {
-            catalogGenerationsByRootID[rootID] = (catalogGenerationsByRootID[rootID] ?? 0) &+ 1
+            let generation = (catalogGenerationsByRootID[rootID] ?? 0) &+ 1
+            catalogGenerationsByRootID[rootID] = generation
+            if let state = rootStatesByID[rootID] {
+                fileExtensionSummariesByRootID[rootID] = FileExtensionCatalogSummary(
+                    generation: generation,
+                    extensions: Set(state.fileExtensionCounts.keys)
+                )
+            }
         }
         let rootIDsRequiringAuthorityFence = rootIDsToAdvance.filter {
             codemapPathLocalCatalogMutationDepthByRootID[$0] == nil
@@ -22971,7 +23007,9 @@ actor WorkspaceFileContextStore {
         rootStatesByID[root.id] = state
         if let file = file(rootID: root.id, relativePath: relativePath) {
             if managedOnly {
-                managedOnlyFileIDs.insert(file.id)
+                if managedOnlyFileIDs.insert(file.id).inserted {
+                    removeFileExtension(file, state: &rootStatesByID[root.id]!)
+                }
                 for folder in newlyIndexedParentFolders(for: relativePath, rootID: root.id, existingFolderPaths: existingFolderPaths) {
                     managedOnlyFolderIDs.insert(folder.id)
                 }
@@ -23104,7 +23142,9 @@ actor WorkspaceFileContextStore {
         invalidateSearchContent(file)
         searchContentInvalidationEpochsByFileID.removeValue(forKey: fileID)
         fileIDsByStandardizedFullPath.removeValue(forKey: file.standardizedFullPath)
-        managedOnlyFileIDs.remove(fileID)
+        if managedOnlyFileIDs.remove(fileID) == nil {
+            removeFileExtension(file, state: &state)
+        }
         if let parentID = file.parentFolderID {
             state.childFileIDsByFolderID[parentID]?.removeAll { $0 == fileID }
         }
@@ -23171,9 +23211,22 @@ actor WorkspaceFileContextStore {
     }
 
     private func promoteToDiscoverable(_ file: WorkspaceFileRecord) {
-        managedOnlyFileIDs.remove(file.id)
+        if managedOnlyFileIDs.remove(file.id) != nil {
+            let ext = (file.name as NSString).pathExtension.lowercased()
+            rootStatesByID[file.rootID]?.fileExtensionCounts[ext, default: 0] += 1
+        }
         if let folderID = file.parentFolderID, let folder = foldersByID[folderID] {
             promoteFolderToDiscoverable(folder)
+        }
+    }
+
+    private func removeFileExtension(_ file: WorkspaceFileRecord, state: inout RootState) {
+        let ext = (file.name as NSString).pathExtension.lowercased()
+        let remaining = (state.fileExtensionCounts[ext] ?? 0) - 1
+        if remaining > 0 {
+            state.fileExtensionCounts[ext] = remaining
+        } else {
+            state.fileExtensionCounts.removeValue(forKey: ext)
         }
     }
 
@@ -23309,6 +23362,8 @@ actor WorkspaceFileContextStore {
                 fullPath: (root.fullPath as NSString).appendingPathComponent(relativePath),
                 parentFolderID: parentID
             )
+            let ext = (file.name as NSString).pathExtension.lowercased()
+            state.fileExtensionCounts[ext, default: 0] += 1
             indexes.filesByID[file.id] = file
             indexes.fileIDsByStandardizedFullPath[file.standardizedFullPath] = file.id
             state.fileIDsByRelativePath[file.standardizedRelativePath] = file.id
