@@ -871,9 +871,10 @@ replies without that declaration remain ordinary. Completion notifications are u
 watchdog completion, and replay onto a new owner are ordinary.
 
 The single frozen `routineQuietCheckIn` claim/render Boolean records initial idle-follow-up routine
-qualification, including Codex. Actual rendered attention makes it false. Only qualified Claude Code
-gets `Nothing needed? Call self_noop.` in that dispatch's lane guidance, inside the existing 24 KiB
-budget and deterministic subset selection. Codex gets no sentence. Devin's classification and copy
+qualification, including Codex. Actual rendered attention makes it false. Qualified Claude Code and
+Codex get `Nothing needed? Call self_noop.` in that dispatch's lane guidance only with exact current
+returned-definition evidence, inside the existing 24 KiB budget and deterministic subset selection.
+Devin's classification and copy
 remain disabled together until its raw negative-evidence qualification closes. No standing guidance
 revision, autonomy rule, public field, provider protocol, or saved state changes.
 
