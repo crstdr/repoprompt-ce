@@ -145,7 +145,7 @@ struct AgentSessionLinkPassiveStatusNotices {
         var isRoutineWakeEligible: Bool {
             let freshIdle = toStatus == .idle && runFacts != nil
             let unpaid = ordinaryThrough.map { ordinary in
-                deliveredThroughAtSnapshot.map { ordinary > $0 } ?? false
+                deliveredThroughAtSnapshot.map { ordinary > $0 } ?? true
             } ?? false
             if freshIdle, let runFacts, let openingSettledThrough,
                runFacts.settledThrough > openingSettledThrough,

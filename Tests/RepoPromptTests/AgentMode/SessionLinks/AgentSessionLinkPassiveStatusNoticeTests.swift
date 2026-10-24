@@ -1275,6 +1275,54 @@ extension AgentSessionLinkPassiveStatusNoticeTests {
         XCTAssertFalse(reducer.snapshot.entries.contains(where: \.isRoutineWakeEligible), "A metadata-identical facts refresh before acceptance does not create another status occurrence")
     }
 
+    func testPacketFiveNewOrdinaryCloseAfterNilCutoffReceiptRemainsWakeEligible() throws {
+        var reducer = makeReducer()
+        reducer.enable(samples: [sample(0, status: .running)], linkSetRevision: 1)
+        observe(&reducer, .idle, nil)
+        observe(&reducer, .idle, facts(9, 9))
+        observe(&reducer, .running, facts(9, 9))
+        observe(&reducer, .idle, nil)
+        let receipt = Reducer.Receipt(snapshot: reducer.snapshot)
+        XCTAssertNil(receipt.deliveredStatuses.first?.settledThrough)
+        reducer.apply(receipt)
+        let parked = try XCTUnwrap(reducer.snapshot.entries.first)
+        XCTAssertEqual(parked.fromStatus, .idle)
+        XCTAssertEqual(parked.toStatus, .idle)
+        XCTAssertNil(reducer.deliveredRunThrough(for: parked.reference), "A nil-cutoff receipt cannot invent payment")
+        observe(&reducer, .idle, facts(9, 9))
+        observe(&reducer, .running, facts(9, 9))
+        observe(&reducer, .idle, facts(10, 10))
+        let successor = try XCTUnwrap(reducer.snapshot.entries.first)
+        XCTAssertEqual(successor.ordinaryThrough, 10)
+        XCTAssertNil(reducer.deliveredRunThrough(for: successor.reference))
+        XCTAssertTrue(successor.isRoutineWakeEligible, "An entirely new ordinary completion remains wake-eligible after the prior status was rendered without a cutoff")
+    }
+
+    func testPacketFiveParkedUnknownCoverageNeedsFreshProofAndKnownCutoffPayment() throws {
+        var reducer = makeReducer()
+        reducer.enable(samples: [sample(0, status: .running)], linkSetRevision: 1)
+        observe(&reducer, .idle, nil)
+        observe(&reducer, .idle, facts(9, 9))
+        observe(&reducer, .running, facts(9, 9))
+        observe(&reducer, .idle, nil)
+        reducer.apply(.init(snapshot: reducer.snapshot))
+        let parked = try XCTUnwrap(reducer.snapshot.entries.first)
+        XCTAssertFalse(parked.isRoutineWakeEligible, "Unknown facts alone cannot independently re-admit parked coverage")
+        XCTAssertNil(reducer.deliveredRunThrough(for: parked.reference))
+        observe(&reducer, .idle, facts(9, 9))
+        let owed = try XCTUnwrap(reducer.snapshot.entries.first)
+        XCTAssertTrue(owed.isRoutineWakeEligible, "Fresh idle proof admits coverage whose payment remains unknown")
+        XCTAssertEqual(owed.receiptSettledThrough, 9)
+        XCTAssertNil(reducer.deliveredRunThrough(for: owed.reference), "Fresh proof is not a receipt")
+        let receipt = Reducer.Receipt(snapshot: reducer.snapshot)
+        reducer.apply(receipt)
+        XCTAssertEqual(reducer.deliveredRunThrough(for: owed.reference), 9)
+        XCTAssertTrue(reducer.snapshot.entries.isEmpty)
+        reducer.apply(receipt)
+        observe(&reducer, .idle, facts(10, 9))
+        XCTAssertTrue(reducer.snapshot.entries.isEmpty, "A later certified quiet close cannot create new ordinary debt after actual payment")
+    }
+
     func testPacketFiveFreshLaneFirstProofStillBaselinesSilentlyWithoutPendingEdge() {
         var reducer = makeReducer()
         let reference = sample(0, status: .idle).reference
