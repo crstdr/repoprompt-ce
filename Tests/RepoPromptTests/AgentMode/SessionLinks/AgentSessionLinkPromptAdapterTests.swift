@@ -336,7 +336,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         }
     }
 
-    private func makeFixture(configureReplacement: ((MonitorFakeCodexController) -> Void)? = nil) throws -> Fixture {
+    private func makeFixture(shouldManageCodexTooling: Bool = false, configureReplacement: ((MonitorFakeCodexController) -> Void)? = nil) throws -> Fixture {
         let dispatches = MonitorCodexDispatchRecorder()
         let controller = MonitorFakeCodexController(dispatches: dispatches)
         var initialController: MonitorFakeCodexController? = controller
@@ -346,6 +346,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         let viewModel = AgentModeViewModel(
             testWindowID: 1,
             testWorkspacePath: FileManager.default.temporaryDirectory.path,
+            shouldManageCodexTooling: shouldManageCodexTooling,
             codexControllerFactory: { _, _, _, _, _, _ in
                 // Controllers are single-use: shutdown permanently finishes their event stream.
                 let next = initialController ?? MonitorFakeCodexController(dispatches: dispatches)
@@ -4394,6 +4395,63 @@ extension AgentSessionLinkCodexPromptAdapterTests {
         XCTAssertTrue(fixture.session.quietLedger.hostMarkerIDs.contains(wakeID))
         XCTAssertTrue(fixture.session.quietLedger.hiddenSourceIDs.contains(wakeID))
         XCTAssertEqual(fixture.session.items.count(where: { $0.id == wakeID }), 1)
+    }
+
+    func testFallbackSuccessorRefreshesTrackerBeforePhysicalToolActivity() async throws {
+        let fixture = try makeFixture(shouldManageCodexTooling: true)
+        let session = fixture.session
+        session.installRunID(UUID())
+        let owner = session.beginRunAttempt(source: "test.fallback.tracking.original")
+        let runID = try XCTUnwrap(session.runID)
+        let reference = try await fixture.controller.startOrResume(existing: nil, baseInstructions: "", model: nil, reasoningEffort: nil, serviceTier: nil)
+        session.codexController = fixture.controller
+        session.codexConversationID = reference.conversationID
+        await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
+        await fixture.coordinator.testStartCodexToolTracking(for: session, runID: runID)
+        addTeardownBlock { @MainActor in
+            await fixture.coordinator.testStopCodexToolTracking(for: session)
+        }
+        let queueID = UUID()
+        session.codexFallbackQueue.append(.init(
+            id: queueID, providerText: "queued ordinary successor", images: [], taggedFileAttachments: [],
+            model: nil, reasoningEffort: nil, serviceTier: nil, autoEffortApplied: false,
+            attachmentReservationID: nil, optimisticUserItemID: nil, draftText: "queued ordinary successor",
+            origin: .manual, fallbackReason: .activeWithoutAuthoritativeIdentity,
+            originThreadID: reference.conversationID, originControllerInstanceID: ObjectIdentifier(fixture.controller),
+            originControllerGeneration: session.codexControllerGeneration, originRunID: runID,
+            originRunAttemptID: owner.attemptID, blockingTurn: nil, state: .queued,
+            monitoringDispatchContext: nil, stopFence: nil
+        ))
+        XCTAssertTrue(session.endRunAttempt(ifCurrent: owner, source: "test.fallback.tracking.completed"))
+        session.runState = .completed
+        let gate = CatalogAuthorityGate()
+        fixture.controller.setStartGate(gate, fail: false)
+        addTeardownBlock { await gate.open() }
+        let pump = Task { @MainActor in
+            await fixture.coordinator.test_dispatchCodexFallbackHead(session: session, expectedQueueID: queueID, beginsSuccessorAttempt: true)
+        }
+        defer { pump.cancel() }
+        try await gate.waitUntilEntered(timeout: 3)
+        let successor = try XCTUnwrap(session.activeRunOwnership)
+        XCTAssertNotEqual(successor.attemptID, owner.attemptID)
+        let invocationID = UUID()
+        // Fire the real registered host observer while the physical start is still suspended.
+        // Native tool events do not render this RepoPrompt result for us.
+        let called = await ServerNetworkManager.shared.debugFireToolCalledObservers(runID: runID, invocationID: invocationID, toolName: "file_search", args: nil)
+        let completed = await ServerNetworkManager.shared.debugFireToolCompletedObservers(runID: runID, invocationID: invocationID, toolName: "file_search", args: nil, resultJSON: "{\"matches\":1}", isError: false)
+        XCTAssertEqual(called, 1)
+        XCTAssertEqual(completed, 1)
+        await fixture.coordinator.testFlushCodexToolTracking(for: session)
+        let result = session.items.last { $0.toolInvocationID == invocationID }
+        XCTAssertEqual(result?.kind, .toolResult, "A provider successor must not lose ordinary host results to the previous attempt's fence")
+        XCTAssertEqual(result?.toolName, "file_search")
+        XCTAssertEqual(result?.toolIsError, false)
+        let resultJSON = try XCTUnwrap(result?.toolResultJSON)
+        let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(resultJSON.utf8)) as? [String: Any])
+        XCTAssertEqual(payload["status"] as? String, "success", "The existing summary-only writer still owns the retained tool payload")
+        await gate.open()
+        let dispatched = await pump.value
+        XCTAssertTrue(dispatched)
     }
 
     func testPhysicalFallbackRetainsOldQuietWakeAfterOriginalAndSlotRetire() async throws {

@@ -3601,6 +3601,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         // ships the current membership revision rather than the one that was live at enqueue time.
         let promptDispatchID = AgentSessionLinkPromptDispatchID.codexFallback(queueID: head.id)
         let dispatchAttemptID = session.activeRunAttemptID
+        // A fallback successor bypasses normal session readiness, including its attempt-scoped observer registration.
+        await ensureCodexToolTrackingForReadySessionIfNeeded(for: session, runID: head.originRunID)
         let qualification = await viewModel?.qualifyProviderInputRoute(for: session) ?? .unavailable
         // Qualification suspends. A replaced run/head/controller may not spend this old entry or
         // terminalize its successor; the queue's exact owner handles its own cancellation.
