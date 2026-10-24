@@ -452,6 +452,28 @@ final class ClaudeSDKNDJSONTranslatorTests: XCTestCase {
         }
     }
 
+    func testRefusedOrTruncatedStopCannotBeErasedBySuccessMetadata() throws {
+        let wires = [
+            #"{"type":"assistant","message":{"id":"m","content":[{"type":"text","text":"closing"}],"stop_reason":"refusal"}}"#,
+            #"{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"max_tokens"}}}"#,
+            #"{"type":"result","subtype":"success","result":"closing","stop_reason":"refusal"}"#
+        ]
+        for wire in wires {
+            var translator = ClaudeSDKNDJSONTranslator()
+            let results = translator.parseNDJSONLine(Data(wire.utf8))
+            XCTAssertEqual(results.count(where: { $0.type == "event" }), 1, "Explicit negative evidence survives: \(wire)")
+            XCTAssertTrue(results.filter { $0.type == "event" }.allSatisfy { $0.text == nil })
+            if wire.contains("closing") {
+                XCTAssertEqual(results.compactMap(\.text), ["closing"], "Existing text remains unchanged")
+            }
+            guard let decoded = try ClaudeSDKProtocolCodec.decodeLine(Data(wire.utf8)),
+                  case let .streamPayload(payload) = decoded
+            else { return XCTFail("Expected a normalized payload") }
+            var normalized = ClaudeSDKNDJSONTranslator()
+            XCTAssertEqual(normalized.parseStreamPayload(payload), results)
+        }
+    }
+
     func testUnknownUnitDoesNotEraseKnownOutputAndKnownMetadataDoesNotInventOutput() {
         var translator = ClaudeSDKNDJSONTranslator()
         let mixed = translator.parseNDJSONLine(Data(#"{"type":"assistant","message":{"id":"m","content":[{"type":"text","text":"before"},{"type":"future_output"},{"type":"text","text":"after"}]}}"#.utf8))

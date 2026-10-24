@@ -3589,8 +3589,12 @@ final class CodexNativeSessionController {
         // Ordinary decoding owns positively recognized metadata. Unknown/malformed packets
         // still fall through to negative evidence; a method namespace is never sufficient.
         let livenessActivity = Self.parseLivenessActivity(method: notification.method, params: params)
-        if representedMCPToolEvent == nil, livenessActivity?.kind != .protocolMetadata,
-           hasUnrepresentedActivity(method: notification.method, params: params)
+        if let representedMCPToolEvent, case let .result(_, _, _, _, isError, _) = representedMCPToolEvent, isError != false {
+            // A failed or indeterminate mirror remains evidence even if its successful item
+            // was already rendered and the unchanged lifecycle deduplication drops this update.
+            await emitUnrepresentedActivity(method: notification.method, params: params)
+        } else if representedMCPToolEvent == nil, livenessActivity?.kind != .protocolMetadata,
+                  hasUnrepresentedActivity(method: notification.method, params: params)
         {
             await emitUnrepresentedActivity(method: notification.method, params: params)
         }
@@ -4118,7 +4122,9 @@ final class CodexNativeSessionController {
             let turn = params["turn"] as? [String: Any]
             return turn?["status"] as? String != "completed"
         case "codex/event/agent_message":
+            let message = (params["msg"] as? [String: Any])?["message"]
             return Self.notificationItemID(from: params, includeTopLevelIDFallback: false) == nil
+                || !(message is String || params["message"] is String)
         case "rawResponseItem/completed":
             return hasUnrepresentedRawResponseItem(params)
         case "rawResponse/completed":
@@ -4146,9 +4152,11 @@ final class CodexNativeSessionController {
         case "item/mcpToolCall/progress", "item/plan/delta", "turn/diff/updated":
             return Self.parseLivenessActivity(method: method, params: params) == nil
         case "codex/event/mcp_tool_call_begin", "codex/event/mcp_tool_call_end":
-            // A valid tool event already reaches typed activity before UI suppression. Only a
-            // malformed envelope needs the uncertainty fallback; preserve the existing first event.
-            return parseRawMCPToolLifecycleEvent(method: method, params: params) == nil
+            // Valid successful events reach typed activity. Preserve malformed or failed evidence
+            // here as well, before completed-scope and tool-result deduplication can discard it.
+            guard let event = parseRawMCPToolLifecycleEvent(method: method, params: params) else { return true }
+            if case let .result(_, _, _, _, isError, _) = event { return isError != false }
+            return false
         case "turn/started", "codex/event/turn_started",
              "codex/event/task_complete", "item/agentMessage/delta",
              "item/reasoning/summaryTextDelta", "item/reasoning/textDelta",

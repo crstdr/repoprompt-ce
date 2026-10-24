@@ -3121,6 +3121,71 @@ extension CodexResumeWedgeCommitTests {
         return (f, controller, owner)
     }
 
+    func testFailedMCPCompletionAfterSuccessfulMirrorPreservesOrdinaryEvidence() async throws {
+        let (f, controller, owner) = try await makeQuietToolProgressFixture()
+        defer { f.session.saveDebounceTask?.cancel() }
+        let itemID = "mcp-conflicting-completion"
+        let scope: [String: CodexJSONValue] = ["threadId": .string(Self.oldThreadID), "turnId": .string("progress-turn")]
+        let successful: [String: CodexJSONValue] = [
+            "id": .string(itemID), "type": .string("mcpToolCall"), "server": .string("RepoPromptCE"),
+            "tool": .string("self_noop"), "arguments": .object([:]), "status": .string("completed"),
+            "result": .object(["content": .array([])])
+        ]
+        await controller.test_handleNotification(method: "item/completed", params: scope.merging(["item": .object(successful)]) { _, value in value })
+        var failed = successful
+        failed["status"] = .string("failed")
+        failed["error"] = .object(["message": .string("conflicting failure")])
+        await controller.test_handleNotification(method: "item/completed", params: scope.merging(["item": .object(failed)]) { _, value in value })
+        await controller.test_handleNotification(method: "codex/event/mcp_tool_call_end", params: scope.merging([
+            "msg": .object([
+                "call_id": .string(itemID),
+                "invocation": .object(["server": .string("RepoPromptCE"), "tool": .string("self_noop"), "arguments": .object([:])]),
+                "result": .object(["Err": .string("conflicting failure")])
+            ])
+        ]) { _, value in value })
+        await controller.shutdown()
+        var resultCount = 0
+        var warnings: [String] = []
+        // Observe typed results independently; deliver the negative channel to isolate evidence
+        // lost by deduplication rather than an unrelated missing-host association veto.
+        XCTAssertNotNil(f.session.quietLedger.candidateStartKey(owner: owner))
+        for await event in controller.events {
+            if case .toolResult = event { resultCount += 1 }
+            if case let .livenessActivity(activity) = event, activity.kind == .warning {
+                warnings.append(activity.method)
+                await f.coordinator.test_handleCodexNativeEvent(event, session: f.session, sourceController: controller)
+            }
+        }
+        XCTAssertEqual(resultCount, 1, "Keep the existing canonical tool-result deduplication")
+        XCTAssertEqual(warnings, ["item/completed", "codex/event/mcp_tool_call_end"], "Conflicting failed mirrors must survive that deduplication")
+        XCTAssertNil(f.session.quietLedger.candidateStartKey(owner: owner))
+    }
+
+    func testMalformedLegacyAssistantWithKnownItemPreservesOrdinaryEvidenceBeforeDeduplication() async throws {
+        let (f, controller, owner) = try await makeQuietToolProgressFixture()
+        defer { f.session.saveDebounceTask?.cancel() }
+        let scope: [String: CodexJSONValue] = ["threadId": .string(Self.oldThreadID), "turnId": .string("progress-turn")]
+        await controller.test_handleNotification(method: "item/completed", params: scope.merging([
+            "item": .object(["id": .string("answer"), "type": .string("agentMessage"), "text": .string("")])
+        ]) { _, value in value })
+        await controller.test_handleNotification(method: "codex/event/agent_message", params: scope.merging([
+            "itemId": .string("answer"), "msg": .object(["message": .null])
+        ]) { _, value in value })
+        await controller.shutdown()
+        var warnings: [String] = []
+        var assistantCompletions = 0
+        for await event in controller.events {
+            if case .assistantCompleted = event { assistantCompletions += 1 }
+            if case let .livenessActivity(activity) = event, activity.kind == .warning {
+                warnings.append(activity.method)
+            }
+            await f.coordinator.test_handleCodexNativeEvent(event, session: f.session, sourceController: controller)
+        }
+        XCTAssertEqual(assistantCompletions, 1, "Canonical output remains unchanged")
+        XCTAssertEqual(warnings, ["codex/event/agent_message"])
+        XCTAssertNil(f.session.quietLedger.candidateStartKey(owner: owner))
+    }
+
     func testThousandNativeCommandOutputDeltasRecordExactlyOneAcceptedProgressEach() async throws {
         let (f, controller, owner) = try await makeQuietToolProgressFixture()
         defer { f.session.saveDebounceTask?.cancel() }

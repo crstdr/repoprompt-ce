@@ -202,6 +202,7 @@ public struct ClaudeSDKNDJSONTranslator {
 
     private mutating func parseAssistantMessage(_ json: [String: Any]) -> [ClaudeProviderStreamResult] {
         let payload = (json["message"] as? [String: Any]) ?? json
+        let unrepresentedStop = Self.hasUnrepresentedStopReason(payload)
         if !isSubagentMessage(json), let messageID = payload["id"] as? String { currentContentMessageID = messageID }
         if !isSubagentMessage(json) {
             if let model = Self.modelName(payload["model"]) { responseModel = model }
@@ -221,6 +222,7 @@ public struct ClaudeSDKNDJSONTranslator {
         }()
         guard let content = payload["content"] as? [Any] else {
             var fallbackResults = usageResult.map { [$0] } ?? []
+            if unrepresentedStop { fallbackResults.append(Self.unrepresentedActivity) }
             if let text = payload["content"] as? String {
                 if !text.isEmpty { fallbackResults.append(ClaudeProviderStreamResult(type: "content", text: text, contentMessageID: currentContentMessageID)) }
             } else {
@@ -230,6 +232,7 @@ public struct ClaudeSDKNDJSONTranslator {
         }
 
         var results: [ClaudeProviderStreamResult] = []
+        if unrepresentedStop { results.append(Self.unrepresentedActivity) }
         if let usageResult {
             results.append(usageResult)
         }
@@ -463,7 +466,7 @@ public struct ClaudeSDKNDJSONTranslator {
             guard let delta = event["delta"] as? [String: Any] else {
                 return [Self.unrepresentedActivity] + results
             }
-            if let stopReason = delta["stop_reason"], !(stopReason is NSNull), !(stopReason is String) {
+            if Self.hasUnrepresentedStopReason(delta) {
                 results.append(Self.unrepresentedActivity)
             }
             // A sub-agent's stop ends its own response, not one of this session's: forwarding it would
@@ -541,7 +544,7 @@ public struct ClaudeSDKNDJSONTranslator {
         )
         // Completion metadata cannot erase an unparseable result or a failed/refused close,
         // even when a known abort artifact intentionally has no user-facing error string.
-        if resultSubtype != "success" || isError
+        if resultSubtype != "success" || isError || Self.hasUnrepresentedStopReason(json)
             || (json["result"] != nil && !(json["result"] is String))
             || (shouldEmitResultError && shouldSuppressResultError)
         {
@@ -642,6 +645,16 @@ public struct ClaudeSDKNDJSONTranslator {
             .filter { !$0.isEmpty }
         guard !fragments.isEmpty else { return [Self.unrepresentedActivity] }
         return [ClaudeProviderStreamResult(type: "system", text: fragments.joined(separator: " — "))]
+    }
+
+    /// Only known normal/intermediate stops are framing. A refusal, truncation or unknown
+    /// provided reason must survive even when an outer result reports success.
+    private static func hasUnrepresentedStopReason(_ payload: [String: Any]) -> Bool {
+        ["stop_reason", "stopReason"].contains { key in
+            guard let value = payload[key], !(value is NSNull) else { return false }
+            guard let reason = value as? String else { return true }
+            return !["end_turn", "stop_sequence", "tool_use"].contains(reason)
+        }
     }
 
     private func firstString(in json: [String: Any], keys: [String]) -> String? {
