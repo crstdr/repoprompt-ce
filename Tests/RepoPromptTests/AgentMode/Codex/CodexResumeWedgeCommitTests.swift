@@ -2384,6 +2384,7 @@ extension CodexResumeWedgeCommitTests {
                 await f.coordinator.test_handleCodexNativeEvent(.toolCall(name: "get_file_tree", invocationID: UUID(), argsJSON: "{}"), session: f.session, sourceController: controller)
                 XCTAssertNil(f.session.quietLedger.candidateStartKey(owner: owner), "Accepted native tools latch before transcript hiding")
             }
+            XCTAssertEqual(f.session.quietLedger.candidateStartKey(owner: owner) == nil, [2, 3, 4].contains(variant), "Only accepted text/tool/plan ingress vetoes the open candidate before terminal recovery")
             if variant == 1 {
                 await f.coordinator.test_settleQuietIdleRecovery(session: f.session, snapshot: .init(
                     conversationID: Self.oldThreadID, rolloutPath: nil, model: nil, reasoningEffort: nil,
@@ -2393,7 +2394,8 @@ extension CodexResumeWedgeCommitTests {
             } else {
                 await f.coordinator.test_handleCodexNativeEvent(.turnCompleted(turnID: "quiet-normal", status: .completed), session: f.session, sourceController: controller)
             }
-            XCTAssertEqual(f.session.quietLedger.facts, AgentRunQuietFacts(settledThrough: 1, ordinaryThrough: variant == 0 || variant == 3 ? 0 : 1))
+            XCTAssertEqual(f.session.quietLedger.facts, AgentRunQuietFacts(settledThrough: 1, ordinaryThrough: 1), "Neither silence nor ack is a declaration")
+            XCTAssertTrue(f.session.quietLedger.hiddenSourceIDs.isEmpty)
             XCTAssertEqual(f.session.runState, .completed)
             let target = DomainAgentSessionLinkEndpointIdentity(
                 windowID: 2, workspaceID: UUID(), tabID: f.session.tabID, sessionID: UUID(),
@@ -2415,8 +2417,8 @@ extension CodexResumeWedgeCommitTests {
             notices.reconcile(samples: [sample(f.session.quietLedger.facts)], linkSetRevision: 1, deliverable: true)
             XCTAssertEqual(
                 notices.snapshot.entries.first?.isRoutineWakeEligible ?? false,
-                variant != 0 && variant != 3,
-                "F4: actual watchdog completion remains ordinary and downstream eligible even with every intermediate sample dropped"
+                true,
+                "Undeclared normal and watchdog completions remain ordinary and downstream eligible even with every intermediate sample dropped"
             )
             await f.coordinator.shutdownCodexSession(f.session)
             f.session.saveDebounceTask?.cancel()
@@ -2492,20 +2494,25 @@ extension CodexResumeWedgeCommitTests {
                     XCTAssertEqual(activity.turnID, variant >= 15 ? "foreign-turn" : "raw-turn")
                     if activity.turnID == "raw-turn" { ingressOrder.append("uncertainty") }
                 case let .assistantCompleted(completion) where completion.scope.itemID == "answer":
+                    XCTAssertEqual(
+                        f.session.quietLedger.candidateStartKey(owner: owner) == nil,
+                        [0, 1, 3, 4, 8, 9, 10, 11].contains(variant),
+                        "variant \(variant): current uncertainty/text vetoes before ack; foreign ingress cannot poison the owner"
+                    )
                     ingressOrder.append("ack")
                 default: break
                 }
                 await f.coordinator.test_handleCodexNativeEvent(event, session: f.session, sourceController: controller)
             }
-            let expectsQuiet = [0, 2, 6, 7].contains(variant) || variant >= 12
-            XCTAssertEqual(f.session.quietLedger.facts?.ordinaryThrough, expectsQuiet ? 0 : 1, "variant \(variant)")
+            XCTAssertEqual(f.session.quietLedger.facts?.ordinaryThrough, 1, "variant \(variant): an undeclared close is always ordinary")
+            XCTAssertTrue(f.session.quietLedger.hiddenSourceIDs.isEmpty, "variant \(variant)")
             XCTAssertEqual(f.session.quietLedger.facts?.settledThrough, 1)
             if (9 ... 11).contains(variant) {
                 XCTAssertEqual(ingressOrder, ["uncertainty", "ack"], "variant \(variant): uncertainty must precede the valid completion")
                 XCTAssertTrue(f.session.quietLedger.hiddenSourceIDs.isEmpty, "variant \(variant): missing identity cannot hide the ACK")
             } else if variant >= 12 || variant == 0 {
-                XCTAssertEqual(ingressOrder, ["ack"], "variant \(variant): foreign activity and valid same-item replacement remain quiet")
-                XCTAssertFalse(f.session.quietLedger.hiddenSourceIDs.isEmpty, "variant \(variant): valid ACK remains quiet-masked")
+                XCTAssertEqual(ingressOrder, ["ack"], "variant \(variant): foreign activity adds no current uncertainty; same-item replacement remains intact")
+                XCTAssertTrue(f.session.items.contains { $0.text == "[ack]" }, "variant \(variant): ordinary ACK remains in canonical history")
             }
             f.session.saveDebounceTask?.cancel()
         }
@@ -2604,8 +2611,12 @@ extension CodexResumeWedgeCommitTests {
                         "threadId": .string(Self.oldThreadID), "turn": .object(["id": .string("request-turn"), "status": .string("completed")])
                     ])
                     await current.shutdown()
+                    let acceptsRequest = ["current", "absent-turn", "null-turn"].contains(scope)
                     for await event in current.events {
                         verifyRequestEvent(event)
+                        if case .turnCompleted = event {
+                            XCTAssertEqual(f.session.quietLedger.candidateStartKey(owner: owner) == nil, ack || acceptsRequest, label)
+                        }
                         await f.coordinator.test_handleCodexNativeEvent(event, session: f.session, sourceController: current)
                     }
                     XCTAssertEqual(warningMethods, scope == "no-request" ? [] : [method], label)
@@ -2616,14 +2627,9 @@ extension CodexResumeWedgeCommitTests {
                         XCTAssertEqual(response["id"] as? Int, 42, label)
                         XCTAssertEqual((response["result"] as? [String: Any])?["action"] as? String, "accept", label)
                     }
-                    let ordinary = ["current", "absent-turn", "null-turn"].contains(scope)
-                    XCTAssertEqual(f.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: ordinary ? 1 : 0), label)
+                    XCTAssertEqual(f.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: 1), label)
                     XCTAssertEqual(f.session.runState, .completed, label)
-                    if ordinary {
-                        XCTAssertTrue(f.session.quietLedger.hiddenSourceIDs.isEmpty, label)
-                    } else if ack {
-                        XCTAssertFalse(f.session.quietLedger.hiddenSourceIDs.isEmpty, label)
-                    }
+                    XCTAssertTrue(f.session.quietLedger.hiddenSourceIDs.isEmpty, label)
                     let target = DomainAgentSessionLinkEndpointIdentity(
                         windowID: 2, workspaceID: UUID(), tabID: f.session.tabID, sessionID: UUID(),
                         persistentBindingGeneration: UUID(), bindingTransitionGeneration: 1
@@ -2642,7 +2648,7 @@ extension CodexResumeWedgeCommitTests {
                     }
                     notices.enable(samples: [sample(.zero)], linkSetRevision: 1)
                     notices.reconcile(samples: [sample(f.session.quietLedger.facts)], linkSetRevision: 1, deliverable: true)
-                    XCTAssertEqual(notices.snapshot.entries.first?.isRoutineWakeEligible ?? false, ordinary, label)
+                    XCTAssertTrue(notices.snapshot.entries.first?.isRoutineWakeEligible ?? false, "Undeclared completion retains ordinary downstream debt: \(label)")
                     f.session.saveDebounceTask?.cancel()
                 }
             }
@@ -2882,16 +2888,19 @@ extension CodexResumeWedgeCommitTests {
                         await current.test_handleNotification(method: method, params: params)
                     }
                     await current.shutdown()
+                    let neutralIngress = ["plain", "replacement", "image", "audio", "missing-usage-metadata", "foreign-thread", "foreign-turn", "stale-controller", "legacy-neutral"].contains(scenario)
                     var warnings: [String] = []
                     for await event in current.events {
                         if case let .livenessActivity(activity) = event, activity.kind == .warning { warnings.append(activity.method) }
+                        if case .turnCompleted = event {
+                            XCTAssertEqual(f.session.quietLedger.candidateStartKey(owner: owner) == nil, ack || !neutralIngress, label)
+                        }
                         await f.coordinator.test_handleCodexNativeEvent(event, session: f.session, sourceController: current)
                     }
-                    let quiet = ["plain", "replacement", "image", "audio", "missing-usage-metadata", "foreign-thread", "foreign-turn", "stale-controller", "legacy-neutral"].contains(scenario)
                     XCTAssertEqual(f.session.runState, .completed, label)
-                    XCTAssertEqual(f.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: quiet ? 0 : 1), label)
-                    XCTAssertEqual(f.session.quietLedger.hiddenSourceIDs.contains(wakeID), quiet, "\(label): silence must retain the exact wake mask too")
-                    if !quiet { XCTAssertTrue(f.session.quietLedger.hiddenSourceIDs.isEmpty, label) }
+                    XCTAssertEqual(f.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: 1), label)
+                    XCTAssertFalse(f.session.quietLedger.hiddenSourceIDs.contains(wakeID), "\(label): neither ack nor silence supplies a declaration")
+                    XCTAssertTrue(f.session.quietLedger.hiddenSourceIDs.isEmpty, label)
                     if scenario == "plain" || scenario == "replacement" { XCTAssertTrue(warnings.isEmpty, "\(label): \(warnings)") }
                     f.session.saveDebounceTask?.cancel()
                 }
@@ -2952,6 +2961,8 @@ extension CodexResumeWedgeCommitTests {
                         if case let .livenessActivity(activity) = event, activity.kind == .warning { warnings.append(activity.method) }
                         switch event {
                         case .canonicalAssistantDelta, .reasoningDelta: deltas += 1
+                        case .turnCompleted:
+                            XCTAssertEqual(f.session.quietLedger.candidateStartKey(owner: owner) == nil, ack || malformed, label)
                         default: break
                         }
                         await f.coordinator.test_handleCodexNativeEvent(event, session: f.session, sourceController: controller)
@@ -2960,9 +2971,9 @@ extension CodexResumeWedgeCommitTests {
                     let expectedProbeDeltas = malformed || name == "completed-valid" ? 0 : 1
                     XCTAssertEqual(deltas, 2 + (ack ? 1 : 0) + expectedProbeDeltas, "\(label): no duplicate typed delta on uncertainty or completed-item dedup")
                     XCTAssertEqual(f.session.runState, .completed, label)
-                    XCTAssertEqual(f.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: malformed ? 1 : 0), label)
-                    XCTAssertEqual(f.session.quietLedger.hiddenSourceIDs.contains(wakeID), !malformed, label)
-                    if malformed { XCTAssertTrue(f.session.quietLedger.hiddenSourceIDs.isEmpty, label) }
+                    XCTAssertEqual(f.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: 1), label)
+                    XCTAssertFalse(f.session.quietLedger.hiddenSourceIDs.contains(wakeID), label)
+                    XCTAssertTrue(f.session.quietLedger.hiddenSourceIDs.isEmpty, label)
                     f.session.saveDebounceTask?.cancel()
                 }
             }
@@ -3045,6 +3056,7 @@ extension CodexResumeWedgeCommitTests {
                 await f.coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "completion-turn"), session: f.session, sourceController: current)
                 var warnings = 0
                 var order: [String] = []
+                let acceptedMalformed = malformed && ["current", "completed-item"].contains(scope)
                 for await event in controller.events {
                     switch event {
                     case let .livenessActivity(activity) where activity.kind == .warning:
@@ -3054,6 +3066,12 @@ extension CodexResumeWedgeCommitTests {
                         XCTAssertEqual(activity.turnID, turn, label)
                         order.append("uncertainty")
                     case .assistantCompleted, .reasoningCompleted: order.append("completed")
+                    case .turnCompleted:
+                        if acceptedMalformed {
+                            XCTAssertNil(f.session.quietLedger.candidateStartKey(owner: owner), label)
+                        } else if !["current", "completed-item"].contains(scope) {
+                            XCTAssertNotNil(f.session.quietLedger.candidateStartKey(owner: owner), "Foreign/stale output cannot veto this owner: \(label)")
+                        }
                     default: break
                     }
                     await f.coordinator.test_handleCodexNativeEvent(event, session: f.session, sourceController: controller)
@@ -3062,10 +3080,12 @@ extension CodexResumeWedgeCommitTests {
                     await current.test_handleNotification(method: "turn/completed", params: terminal)
                     await current.shutdown()
                     for await event in current.events {
+                        if case .turnCompleted = event {
+                            XCTAssertNotNil(f.session.quietLedger.candidateStartKey(owner: owner), "Stale-controller output cannot veto this owner: \(label)")
+                        }
                         await f.coordinator.test_handleCodexNativeEvent(event, session: f.session, sourceController: current)
                     }
                 }
-                let acceptedMalformed = malformed && ["current", "completed-item"].contains(scope)
                 // Foreign envelopes may be dropped by routing; stale controllers still translate but cannot latch.
                 let translated = scope != "foreign-thread"
                 XCTAssertEqual(warnings, malformed && translated ? 1 : 0, label)
@@ -3078,11 +3098,9 @@ extension CodexResumeWedgeCommitTests {
                         label
                     )
                 }
-                XCTAssertEqual(f.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: acceptedMalformed ? 1 : 0), label)
-                XCTAssertEqual(f.session.quietLedger.hiddenSourceIDs.contains(wakeID), !acceptedMalformed, label)
-                if acceptedMalformed {
-                    XCTAssertTrue(f.session.quietLedger.hiddenSourceIDs.isEmpty, label)
-                }
+                XCTAssertEqual(f.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: 1), label)
+                XCTAssertFalse(f.session.quietLedger.hiddenSourceIDs.contains(wakeID), label)
+                XCTAssertTrue(f.session.quietLedger.hiddenSourceIDs.isEmpty, label)
                 f.session.saveDebounceTask?.cancel()
             }
         }
@@ -3148,7 +3166,7 @@ extension CodexResumeWedgeCommitTests {
         for (method, payload, uncertain) in cases {
             for scope in ["current", "foreign-thread", "foreign-turn", "stale-controller"] {
                 let label = "\(method) uncertain=\(uncertain) \(scope)"
-                let (f, controller, _) = try await makeQuietToolProgressFixture()
+                let (f, controller, owner) = try await makeQuietToolProgressFixture()
                 defer { f.session.saveDebounceTask?.cancel() }
                 let source: CodexNativeSessionController
                 if scope == "stale-controller" {
@@ -3179,9 +3197,10 @@ extension CodexResumeWedgeCommitTests {
                         && ["item/commandExecution/outputDelta", "item/fileChange/outputDelta"].contains(method)
                 )
                 XCTAssertEqual(f.session.runLifecycle.liveness?.lastAcceptedSequence, sequenceBefore + (accepted ? 1 : 0), label)
+                XCTAssertEqual(f.session.quietLedger.candidateStartKey(owner: owner) == nil, accepted, label)
                 await f.coordinator.test_handleCodexNativeEvent(.turnCompleted(turnID: "progress-turn", status: .completed), session: f.session, sourceController: controller)
-                XCTAssertEqual(f.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: accepted ? 1 : 0), label)
-                XCTAssertEqual(f.session.quietLedger.hiddenSourceIDs.isEmpty, accepted, label)
+                XCTAssertEqual(f.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: 1), label)
+                XCTAssertTrue(f.session.quietLedger.hiddenSourceIDs.isEmpty, label)
                 if scope == "stale-controller" { await controller.shutdown() }
             }
         }
@@ -3252,6 +3271,9 @@ extension CodexResumeWedgeCommitTests {
                             XCTFail("Refresh must succeed without substitute error or interaction evidence: \(label)")
                         default: break
                         }
+                        if case .turnCompleted = event {
+                            XCTAssertEqual(f.session.quietLedger.candidateStartKey(owner: owner) == nil, ack || scope == "current", label)
+                        }
                         await f.coordinator.test_handleCodexNativeEvent(event, session: f.session, sourceController: controller)
                     }
                 }
@@ -3280,11 +3302,10 @@ extension CodexResumeWedgeCommitTests {
                     XCTAssertEqual(payload, ["accessToken": "fixture-refreshed-token", "chatgptAccountId": "fixture-account", "chatgptPlanType": "fixture-plan"], label)
                 }
                 XCTAssertEqual(warningCount, scope == "no-request" ? 0 : 1, label)
-                let ordinary = scope == "current"
                 XCTAssertEqual(f.session.runState, .completed, label)
-                XCTAssertEqual(f.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: ordinary ? 1 : 0), label)
-                XCTAssertEqual(f.session.quietLedger.hiddenSourceIDs.contains(wakeID), !ordinary, label)
-                if ordinary { XCTAssertTrue(f.session.quietLedger.hiddenSourceIDs.isEmpty, label) }
+                XCTAssertEqual(f.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: 1), label)
+                XCTAssertFalse(f.session.quietLedger.hiddenSourceIDs.contains(wakeID), label)
+                XCTAssertTrue(f.session.quietLedger.hiddenSourceIDs.isEmpty, label)
                 f.session.saveDebounceTask?.cancel()
                 await client.stop()
             }
@@ -3334,6 +3355,9 @@ extension CodexResumeWedgeCommitTests {
                             XCTFail("No substitute error/tool activity: \(label)")
                         default: break
                         }
+                        if case .turnCompleted = event {
+                            XCTAssertEqual(f.session.quietLedger.candidateStartKey(owner: owner) == nil, ack || scope == "unscoped", label)
+                        }
                         await f.coordinator.test_handleCodexNativeEvent(event, session: f.session, sourceController: controller)
                     }
                 }
@@ -3354,11 +3378,10 @@ extension CodexResumeWedgeCommitTests {
                 await consume(current)
                 // Foreign thread is discarded by the controller; other scopes reach the coordinator.
                 XCTAssertEqual(warnings, scope == "foreign-thread-no-turn" ? 0 : 1, label)
-                let ordinary = scope == "unscoped"
                 XCTAssertEqual(f.session.runState, .completed, label)
-                XCTAssertEqual(f.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: ordinary ? 1 : 0), label)
-                XCTAssertEqual(f.session.quietLedger.hiddenSourceIDs.contains(wakeID), !ordinary, label)
-                if ordinary { XCTAssertTrue(f.session.quietLedger.hiddenSourceIDs.isEmpty, label) }
+                XCTAssertEqual(f.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: 1), label)
+                XCTAssertFalse(f.session.quietLedger.hiddenSourceIDs.contains(wakeID), label)
+                XCTAssertTrue(f.session.quietLedger.hiddenSourceIDs.isEmpty, label)
                 f.session.saveDebounceTask?.cancel()
             }
         }
@@ -3406,14 +3429,20 @@ extension CodexResumeWedgeCommitTests {
         var warnings: [String] = []
         for await event in controller.events {
             if case let .livenessActivity(activity) = event, activity.kind == .warning { warnings.append(activity.method) }
+            if case .canonicalAssistantDelta = event {
+                XCTAssertNotNil(f.session.quietLedger.candidateStartKey(owner: owner), "Metadata follows the ack in this incident schedule")
+            }
+            let ordinaryBefore = f.session.quietLedger.hasOrdinaryOccurrence(owner: owner)
             await f.coordinator.test_handleCodexNativeEvent(event, session: f.session, sourceController: controller)
+            if case let .livenessActivity(activity) = event, activity.kind == .protocolMetadata {
+                XCTAssertEqual(f.session.quietLedger.hasOrdinaryOccurrence(owner: owner), ordinaryBefore, "Protocol metadata cannot add or clear ordinary evidence")
+            }
         }
         XCTAssertEqual(warnings, malformed ? ["turn/moderationMetadata"] : [])
         XCTAssertEqual(f.session.runState, .completed)
-        XCTAssertEqual(f.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: malformed ? 1 : 0))
-        XCTAssertEqual(f.session.quietLedger.hiddenSourceIDs.contains(wakeID), !malformed)
-        if malformed { XCTAssertTrue(f.session.quietLedger.hiddenSourceIDs.isEmpty) }
-        else { XCTAssertGreaterThan(f.session.quietLedger.hiddenSourceIDs.count, 1, "The ack row is hidden with the wake") }
+        XCTAssertEqual(f.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: 1), "An undeclared ack remains ordinary, independently of metadata")
+        XCTAssertFalse(f.session.quietLedger.hiddenSourceIDs.contains(wakeID))
+        XCTAssertTrue(f.session.quietLedger.hiddenSourceIDs.isEmpty)
     }
 }
 
@@ -3466,9 +3495,8 @@ extension CodexResumeWedgeCommitTests {
             await controller.test_handleNotification(method: "turn/started", params: [
                 "threadId": thread, "turn": .object(["id": turn, "status": .string("inProgress"), "items": .array([])])
             ])
-            // Supplied incident ordering, using the unchanged legacy ack behavior only as a
-            // diagnostic control: wake -> final ack -> metadata/output -> normal completion.
-            // This is not a declaration, registration, or eventual self_noop certification.
+            // Preserve the incident ordering: wake -> final ack -> metadata/output -> completion.
+            // The undeclared ack is ordinary; warning and typed-metadata evidence discriminate ingress.
             await controller.test_handleNotification(method: "item/completed", params: [
                 "threadId": thread, "turnId": turn, "completedAtMs": .number(0),
                 "item": .object(["id": .string("w0e-answer"), "type": .string("agentMessage"), "text": .string("[ack]")])
@@ -3487,8 +3515,12 @@ extension CodexResumeWedgeCommitTests {
                 if case let .livenessActivity(activity) = event, activity.kind == .warning { warnings.append(activity.method) }
                 if case .turnCompleted = event {
                     reachedTerminal = true
-                    XCTAssertEqual(f.session.quietLedger.candidateStartKey(owner: owner) == nil, ordinary, "pre-presentation/terminal veto: \(label)")
+                    XCTAssertNil(f.session.quietLedger.candidateStartKey(owner: owner), "The preceding undeclared ack is ordinary: \(label)")
                 }
+                if case .canonicalAssistantDelta = event {
+                    XCTAssertNotNil(f.session.quietLedger.candidateStartKey(owner: owner), "Probe follows the ack; no uncertainty may arrive earlier: \(label)")
+                }
+                let ordinaryBefore = f.session.quietLedger.hasOrdinaryOccurrence(owner: owner)
                 let previousSequence = f.session.runLifecycle.liveness?.lastAcceptedSequence ?? 0
                 await f.coordinator.test_handleCodexNativeEvent(event, session: f.session, sourceController: controller)
                 if case let .livenessActivity(activity) = event, activity.kind == .protocolMetadata {
@@ -3497,14 +3529,15 @@ extension CodexResumeWedgeCommitTests {
                     XCTAssertNil(activity.message, label)
                     XCTAssertTrue(activity.activeFlags.isEmpty, label)
                     XCTAssertGreaterThan(f.session.runLifecycle.liveness?.lastAcceptedSequence ?? 0, previousSequence, "Ordinary metadata still records normal liveness: \(label)")
-                    XCTAssertNotNil(f.session.quietLedger.candidateStartKey(owner: owner), label)
+                    XCTAssertEqual(f.session.quietLedger.hasOrdinaryOccurrence(owner: owner), ordinaryBefore, "Protocol metadata cannot add or clear ordinary evidence: \(label)")
                 }
             }
             XCTAssertEqual(metadataMethods, ordinary ? [] : [method], "The ordinary adapter positively represents metadata: \(label)")
             XCTAssertTrue(reachedTerminal, label)
             XCTAssertEqual(warnings, ordinary ? [method] : [], label)
             XCTAssertEqual(f.session.runState, .completed, label)
-            XCTAssertEqual(f.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: ordinary ? 1 : 0), label)
+            XCTAssertEqual(f.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: 1), "Undeclared closes remain ordinary: \(label)")
+            XCTAssertTrue(f.session.quietLedger.hiddenSourceIDs.isEmpty, label)
             print("W0E_REPAIRED_CODEX \(label) warning=\(warnings) ordinary=\(ordinary)")
         }
     }
@@ -3569,7 +3602,8 @@ extension CodexResumeWedgeCommitTests {
             }
             XCTAssertEqual(f.session.runState, .completed)
             XCTAssertEqual(methods, ["turn/started", "item/completed", "turn/completed"], "Pre-existing transport drop: \(badLine)")
-            XCTAssertEqual(f.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: 0), "Dropped frame never reaches classification: \(badLine)")
+            XCTAssertEqual(f.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: 1), "The dropped frame adds no evidence, but the undeclared ack is ordinary: \(badLine)")
+            XCTAssertTrue(f.session.quietLedger.hiddenSourceIDs.isEmpty)
             await client.stop()
         }
     }
