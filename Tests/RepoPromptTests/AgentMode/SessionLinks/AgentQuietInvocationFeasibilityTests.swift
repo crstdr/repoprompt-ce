@@ -9,13 +9,13 @@
     /// Candidate eligibility isolates correlation vetoes; it does not certify these ordinary tools.
     @MainActor
     final class AgentQuietInvocationFeasibilityTests: XCTestCase {
-        private func fixture(_ agent: AgentProviderKind = .claudeCode) -> (AgentSessionLinkRunnerHarness, AgentTabSession, AgentRunOwnership) {
+        private func fixture(_ agent: AgentProviderKind = .claudeCode, routine: Bool = true) -> (AgentSessionLinkRunnerHarness, AgentTabSession, AgentRunOwnership) {
             let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
             let session = harness.makeSession(agent: agent)
             session.installRunID(UUID())
             session.runState = .running
             let owner = session.beginRunAttempt(source: "W0-invocation-feasibility")
-            session.quietLedger.markRoutineWake(owner: owner, wakeID: UUID())
+            if routine { session.quietLedger.markRoutineWake(owner: owner, wakeID: UUID()) }
             return (harness, session, owner)
         }
 
@@ -94,6 +94,29 @@
             XCTAssertNotNil(session.quietLedger.candidateStartKey(owner: owner), "Only this injected tracker-only correlation has positive host identity")
             let canonical = try XCTUnwrap(AgentTranscriptToolNormalizer.toolExecution(for: session.items[0]))
             XCTAssertEqual(canonical.invocationID, hostID)
+        }
+
+        func testClaudeNativeErrorWithoutHostCompletionKeepsOrdinaryResultVisible() async throws {
+            for routine in [false, true] {
+                let (harness, session, _) = fixture(routine: routine)
+                _ = harness
+                let handler = ClaudeAgentToolTrackingHandler()
+                try await handler.startTracking(runID: XCTUnwrap(session.runID), session: session, clientNameHint: nil)
+                let providerID = UUID()
+                let name = "mcp__\(MCPIntegrationHelper.repoPromptMCPServerName)__read_file"
+                XCTAssertTrue(handler.handleProviderToolEvent(.toolCall(.init(
+                    toolName: name, invocationID: providerID, argsJSON: "{}", claudeToolUseID: "toolu_denied"
+                )), session: session))
+                XCTAssertTrue(handler.handleProviderToolEvent(.toolResult(.init(
+                    toolName: name, invocationID: providerID, argsJSON: "{}", resultJSON: "Permission denied",
+                    isError: true, claudeToolUseID: "toolu_denied"
+                )), session: session))
+                XCTAssertEqual(session.items.count, 1)
+                XCTAssertEqual(session.items.first?.kind, .toolResult)
+                XCTAssertEqual(session.items.first?.toolResultJSON, "Permission denied")
+                XCTAssertEqual(session.items.first?.toolIsError, true)
+                await handler.stopTracking(for: session)
+            }
         }
 
         func testCodexHostIdentitySurvivesNativeEchoWhileOrdinaryToolLivenessStillVetoes() async {

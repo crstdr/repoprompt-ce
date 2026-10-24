@@ -163,7 +163,15 @@ final class ClaudeAgentToolTrackingHandler {
     func resetTurnState(
         for session: AgentTabSession
     ) {
+        let registeredOwner = exactObservationOwner
         resetCorrelationState(session)
+        // The send path resets after tracking is registered. Preserve only that same current
+        // registration; a successor must register its own callbacks before acquiring exact proof.
+        if let registeredOwner,
+           session.isCurrentRunAttemptForCurrentBinding(registeredOwner, expectedRunID: trackedRunID)
+        {
+            exactObservationOwner = registeredOwner
+        }
     }
 
     // MARK: - Provider Stream Event Handling
@@ -261,9 +269,14 @@ final class ClaudeAgentToolTrackingHandler {
             isResult: true,
             session: session
         ) {
-            if result.isError == true { session.noteUncertainToolCorrelation() }
-            hooks.addToolOutputTokens(outputJSON, session)
-            return true
+            if result.isError == true {
+                session.noteUncertainToolCorrelation()
+                // A client-side failure may have no host completion. Keep the existing provider
+                // result/error rendering instead of leaving its reserved slot pending.
+            } else {
+                hooks.addToolOutputTokens(outputJSON, session)
+                return true
+            }
         }
 
         // Claude Code emits `<tool_use_error>Error: No such tool available: …</tool_use_error>`
@@ -977,7 +990,8 @@ final class ClaudeAgentToolTrackingHandler {
     private func exactOwner(in session: AgentTabSession) -> AgentRunOwnership? {
         guard session.selectedAgent == .claudeCode, let owner = exactObservationOwner,
               trackedRunID == session.runID, session.activeRunOwnership == owner,
-              session.isCurrentRunAttemptForCurrentBinding(owner), session.quietLedger.isOpen(owner: owner)
+              session.isCurrentRunAttemptForCurrentBinding(owner), session.quietLedger.isOpen(owner: owner),
+              session.quietLedger.routineWakeID(owner: owner) != nil
         else { return nil }
         return owner
     }

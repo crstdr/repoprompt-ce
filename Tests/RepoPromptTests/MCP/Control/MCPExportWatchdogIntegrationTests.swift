@@ -485,6 +485,8 @@ import XCTest
                     try await Self.prepareCanonicalReadFixture(fixture, endpoint: endpoint, context: fixture.contextA)
                     await manager.debugSeedConnectionRunRouting(connectionID: endpoint.connectionID, runID: runID, windowID: fixture.contextA.window.windowID)
                     await handler.startTracking(runID: runID, session: session, clientNameHint: nil)
+                    // The production runner registers tracking before sendClaudeNativeMessage resets the turn.
+                    handler.resetTurnState(for: session)
                     server.setBeforeDomainReadContextResolutionForTesting { contexts.append($0) }
                     var hostIDs: [UUID] = []
                     for (index, raw) in ["toolu_before", "toolu_after"].enumerated() {
