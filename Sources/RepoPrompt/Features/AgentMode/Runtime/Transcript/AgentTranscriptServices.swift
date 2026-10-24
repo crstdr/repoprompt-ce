@@ -4682,20 +4682,31 @@ enum AgentTranscriptIO {
             turn.completedAt = nil
         }
         // The same conclusion-selection pass serves canonical and certified local views.
-        // A carrier must already exist: text, a bare call, or a legacy reply cannot create it.
+        // A carrier must already exist unless every certified member is an independently
+        // certified host marker. A late marker may land after a new user request; capture
+        // that recipient's ordinary state here, never borrow the older wake's baseline.
         var canonicalConclusion = ConclusionInputs()
         var localConclusion = ConclusionInputs()
+        var hasLocalInputs = turn.quietLocal != nil
         var hasCertifiedMember = false
+        var allCertifiedMembersAreHostMarkers = true
         for activity in activities {
-            hasCertifiedMember = hasCertifiedMember || activity.quietCheckInWakeID != nil
-            canonicalConclusion.append(activity)
-            if turn.quietLocal != nil, activity.quietCheckInWakeID == nil {
+            if let wakeID = activity.quietCheckInWakeID {
+                hasCertifiedMember = true
+                let isHostMarker = activity.itemKind == .system && wakeID == activity.id
+                allCertifiedMembersAreHostMarkers = allCertifiedMembersAreHostMarkers && isHostMarker
+                if !hasLocalInputs, isHostMarker {
+                    localConclusion = canonicalConclusion
+                    hasLocalInputs = true
+                }
+            } else if hasLocalInputs {
                 localConclusion.append(activity)
             }
+            canonicalConclusion.append(activity)
         }
         turn.conclusionActivityID = canonicalConclusion.conclusionID
         if !hasCertifiedMember { turn.quietLocal = nil }
-        if turn.quietLocal != nil {
+        if hasCertifiedMember, turn.quietLocal != nil || allCertifiedMembersAreHostMarkers {
             turn.quietLocal = AgentTranscriptQuietLocalTurn(
                 summary: nil, conclusionActivityID: localConclusion.conclusionID,
                 completedAt: localConclusion.lastActivityAt ?? turn.request?.timestamp ?? turn.startedAt

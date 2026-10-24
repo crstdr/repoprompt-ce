@@ -1703,6 +1703,87 @@ final class AgentQuietRetainedViewFeasibilityTests: XCTestCase {
         }
     }
 
+    func testLateCertifiedHostMarkerAfterNewUserTurnStaysHiddenAfterSaveReload() async throws {
+        let f = try await AgentSelfNoopTests.Fixture.assembled()
+        let vm = f.window.agentModeViewModel, session = f.session
+        _ = try await f.body()
+        f.appendDeclaration()
+        XCTAssertEqual(f.seal()?.ordinaryThrough, 0)
+        session.runState = .completed
+        XCTAssertTrue(session.endRunAttempt(ifCurrent: f.owner, source: "late-marker-restoration"))
+        vm.refreshDerivedTranscriptState(for: session, publishActivePresentation: false)
+        var ordinary = ordinaryRows(base: session.nextSequenceIndex, toolCount: 9)
+        ordinary[0].text = "Next ordinary request"
+        ordinary.forEach(session.appendItem)
+        vm.refreshDerivedTranscriptState(for: session, publishActivePresentation: false)
+        let ordinaryRecipient = try XCTUnwrap(session.transcript.turns.last)
+        let marker = AgentChatItem.laneUpdateAutoWake(wakeID: f.wakeID, acceptedAt: Date(), sequenceIndex: session.nextSequenceIndex)
+        // AcceptedAutoWake deliberately permits this physical acceptance after a local
+        // user submission; append uses the old wake's settled verdict, never the new run.
+        XCTAssertTrue(session.appendAcceptedHostMarker(marker))
+        XCTAssertEqual(session.items.last?.quietCheckInWakeID, f.wakeID)
+        vm.refreshDerivedTranscriptState(for: session, publishActivePresentation: false)
+        _ = vm.test_publishTranscriptPresentation(tabID: session.tabID)
+        vm.syncTranscriptUIState()
+        XCTAssertFalse(vm.ui.transcript.snapshot.presentation.visibleRows.contains { $0.id == marker.id })
+        let recipient = try XCTUnwrap(session.transcript.turns.last)
+        XCTAssertEqual(recipient.quietLocal?.conclusionActivityID, ordinaryRecipient.conclusionActivityID, "Capture this recipient's ordinary conclusion, not the older wake's baseline")
+        XCTAssertEqual(recipient.quietLocal?.summary, ordinaryRecipient.summary)
+        XCTAssertTrue(recipient.allActivities.contains { $0.id == marker.id && $0.quietCheckInWakeID == f.wakeID })
+        var workspace = try XCTUnwrap(f.workspace.activeWorkspace)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("quiet-late-marker-\(UUID())")
+        workspace.customStoragePath = directory
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let savedURL = try await AgentSessionDataService.shared.saveAgentSession(
+            AgentSession(id: XCTUnwrap(session.activeAgentSessionID), workspaceID: workspace.id, composeTabID: session.tabID, name: "Late marker", transcript: session.transcript, lastRunState: AgentSessionRunState.completed.rawValue),
+            for: workspace
+        )
+        let saved = try await AgentSessionDataService.shared.loadAgentSession(from: savedURL)
+        let restored = AgentTabSession(tabID: UUID())
+        restored.transcript = try XCTUnwrap(saved.transcript)
+        XCTAssertTrue(restored.quietLedger.hiddenSourceIDs.isEmpty)
+        let canonical = AgentTranscriptProjectionBuilder.build(from: restored.transcript)
+        let local = AgentTranscriptProjectionBuilder.build(from: restored.transcript, excludingQuiet: true)
+        XCTAssertTrue(canonical.workingRows.contains { $0.id == marker.id }, "Canonical audit retains accepted provenance")
+        XCTAssertFalse(local.workingRows.contains { $0.id == marker.id }, "Saved self-stamp, not old process ledger membership, hides the late marker")
+        XCTAssertTrue(local.workingRows.contains { $0.text == "Next ordinary request" })
+        // Age the recipient under unchanged canonical retention decisions. Its local
+        // counts and narration must exclude the marker as well as its visible row.
+        var aged = restored.transcript
+        let successorRows = ordinaryRows(base: session.nextSequenceIndex + 1000, toolCount: 9)
+        let successor = AgentTranscriptIO.buildTranscript(from: successorRows, terminalState: .completed)
+        aged.turns.append(contentsOf: successor.turns)
+        for tier in [AgentTranscriptRetentionTier.condensed, .summary, .archived] {
+            var retained = aged
+            let index = try XCTUnwrap(retained.turns.firstIndex { $0.id == recipient.id })
+            retained.turns[index].retentionTier = tier
+            retained = AgentTranscriptCompactor.compact(retained)
+            retained = try JSONDecoder().decode(AgentTranscript.self, from: JSONEncoder().encode(retained))
+            var reference = aged
+            reference.turns[index].retentionTier = tier
+            reference.turns[index].quietLocal = nil
+            reference.turns[index].summary = nil
+            reference.turns[index].conclusionActivityID = ordinaryRecipient.conclusionActivityID
+            reference.turns[index].completedAt = ordinaryRecipient.completedAt
+            for spanIndex in reference.turns[index].responseSpans.indices {
+                reference.turns[index].responseSpans[spanIndex].activities.removeAll { $0.id == marker.id }
+                reference.turns[index].responseSpans[spanIndex].quietLocal = nil
+                reference.turns[index].responseSpans[spanIndex].collapsedSummary = nil
+            }
+            reference = AgentTranscriptCompactor.compact(reference)
+            XCTAssertEqual(retained.turns[index].quietLocal?.summary, reference.turns[index].summary, "Retained narration and counts use exactly the ordinary recipient's canonical activities")
+            let actual = AgentTranscriptProjectionBuilder.build(from: .init(turns: [retained.turns[index]]), excludingQuiet: true)
+            let actualRows = actual.workingRows + actual.archivedRows
+            let conclusion = try XCTUnwrap((actual.workingBlocks + actual.archivedBlocks).first { $0.kind == .conclusion }?.rows.first)
+            let fullText = try XCTUnwrap(ordinaryRecipient.allActivities.first { $0.id == ordinaryRecipient.conclusionActivityID }?.text)
+            let expectedText = tier == .condensed ? fullText.trimmingCharacters(in: .whitespacesAndNewlines) : String(fullText.prefix(220)).trimmingCharacters(in: .whitespacesAndNewlines) + "…"
+            XCTAssertEqual(conclusion.text, expectedText)
+            XCTAssertEqual(conclusion.timestamp, ordinaryRecipient.completedAt)
+            XCTAssertFalse(actualRows.contains { $0.id == marker.id })
+        }
+        await vm.prepareForWindowClose()
+    }
+
     func testCanonicalRetainedSummaryDoesNotDependOnQuietLocalMetadata() throws {
         let ordinary = ordinaryRows(base: 0, toolCount: 12)
         let baseline = try XCTUnwrap(AgentTranscriptIO.buildTranscript(from: ordinary, terminalState: .completed).turns.first)
