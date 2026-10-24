@@ -1201,6 +1201,66 @@ extension AgentSessionLinkPassiveStatusNoticeTests {
 }
 
 extension AgentSessionLinkPassiveStatusNoticeTests {
+    func testPacketFivePaidQuietSuccessorUnknownRefreshDoesNotReadmitWithoutNewStatus() throws {
+        var reducer = makeReducer()
+        reducer.enable(samples: [sample(0, status: .idle, runFacts: facts(8, 8))], linkSetRevision: 1)
+        observe(&reducer, .running, facts(8, 8))
+        observe(&reducer, .idle, facts(9, 9))
+        let receipt = Reducer.Receipt(snapshot: reducer.snapshot)
+        let occurrence = try XCTUnwrap(reducer.snapshot.entries.first).edgeSequence
+        observe(&reducer, .running, facts(9, 9))
+        observe(&reducer, .idle, facts(10, 9))
+        reducer.apply(receipt)
+        let retained = try XCTUnwrap(reducer.snapshot.entries.first)
+        XCTAssertEqual(reducer.deliveredRunThrough(for: retained.reference), 9)
+        XCTAssertEqual(retained.edgeSequence, occurrence)
+        XCTAssertFalse(retained.isRoutineWakeEligible)
+        observe(&reducer, .idle, nil)
+        let unknown = try XCTUnwrap(reducer.snapshot.entries.first)
+        XCTAssertEqual(unknown.edgeSequence, occurrence)
+        XCTAssertEqual(unknown.ordinaryThrough, 9)
+        XCTAssertEqual(reducer.deliveredRunThrough(for: unknown.reference), 9)
+        XCTAssertFalse(unknown.isRoutineWakeEligible, "A facts-only refresh cannot re-admit the same paid idle occurrence")
+    }
+
+    func testPacketFiveFirstProofDoesNotPayPendingUnknownStatusEdgeWithoutReceipt() throws {
+        var reducer = makeReducer()
+        reducer.enable(samples: [sample(0, status: .running)], linkSetRevision: 1)
+        observe(&reducer, .idle, nil)
+        let pending = try XCTUnwrap(reducer.snapshot.entries.first)
+        XCTAssertTrue(pending.isRoutineWakeEligible)
+        XCTAssertNil(reducer.deliveredRunThrough(for: pending.reference))
+        observe(&reducer, .idle, facts(9, 9))
+        XCTAssertNil(reducer.deliveredRunThrough(for: pending.reference), "First proof is not acceptance of the already-pending status")
+        let receipt = Reducer.Receipt(snapshot: reducer.snapshot)
+        observe(&reducer, .running, facts(9, 9))
+        XCTAssertFalse(reducer.snapshot.entries.isEmpty, "The pending ordinary notice remains owed until a receipt names it")
+        observe(&reducer, .idle, facts(10, 10))
+        reducer.apply(receipt)
+        XCTAssertEqual(reducer.deliveredRunThrough(for: pending.reference), 9, "The receipt establishes only its rendered cutoff, never a synthetic zero or unseen successor 10")
+        XCTAssertEqual(reducer.snapshot.entries.first?.ordinaryThrough, 10)
+        XCTAssertTrue(try XCTUnwrap(reducer.snapshot.entries.first).isRoutineWakeEligible)
+        reducer.apply(receipt)
+        XCTAssertEqual(reducer.deliveredRunThrough(for: pending.reference), 9)
+        reducer.apply(.init(snapshot: reducer.snapshot))
+        XCTAssertEqual(reducer.deliveredRunThrough(for: pending.reference), 10)
+        XCTAssertTrue(reducer.snapshot.entries.isEmpty)
+    }
+
+    func testPacketFiveFreshLaneFirstProofStillBaselinesSilentlyWithoutPendingEdge() {
+        var reducer = makeReducer()
+        let reference = sample(0, status: .idle).reference
+        reducer.enable(samples: [sample(0, status: .idle)], linkSetRevision: 1)
+        XCTAssertNil(reducer.deliveredRunThrough(for: reference))
+        observe(&reducer, .idle, facts(9, 9))
+        XCTAssertEqual(reducer.deliveredRunThrough(for: reference), 9)
+        XCTAssertTrue(reducer.snapshot.entries.isEmpty, "First proof on a fresh lane does not wake for history")
+        observe(&reducer, .running, facts(9, 9))
+        observe(&reducer, .idle, facts(10, 10))
+        XCTAssertEqual(reducer.snapshot.entries.first?.ordinaryThrough, 10)
+        XCTAssertEqual(reducer.snapshot.entries.first?.isRoutineWakeEligible, true)
+    }
+
     func testUnavailableCacheRejectsRegressingFirstReturnBeforeFreshIdleRecovery() throws {
         var reducer = makeReducer()
         reducer.enable(samples: [sample(0, status: .idle, runFacts: facts(8, 8))], linkSetRevision: 1)
