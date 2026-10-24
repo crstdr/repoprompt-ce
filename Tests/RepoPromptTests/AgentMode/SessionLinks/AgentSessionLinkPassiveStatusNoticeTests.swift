@@ -1247,6 +1247,34 @@ extension AgentSessionLinkPassiveStatusNoticeTests {
         XCTAssertTrue(reducer.snapshot.entries.isEmpty)
     }
 
+    func testPacketFiveUnknownOpeningQuietSuccessorDoesNotReadmitPaidOccurrence() throws {
+        var reducer = makeReducer()
+        reducer.enable(samples: [sample(0, status: .running)], linkSetRevision: 1)
+        observe(&reducer, .idle, nil)
+        observe(&reducer, .idle, facts(9, 9))
+        let receipt = Reducer.Receipt(snapshot: reducer.snapshot)
+        observe(&reducer, .running, facts(9, 9))
+        observe(&reducer, .idle, facts(10, 9))
+        reducer.apply(receipt)
+        let retained = try XCTUnwrap(reducer.snapshot.entries.first)
+        XCTAssertEqual(reducer.deliveredRunThrough(for: retained.reference), 9)
+        XCTAssertFalse(retained.isRoutineWakeEligible, "A positively quiet successor cannot re-admit the paid pending occurrence even when its original opening was unknown")
+        observe(&reducer, .running, facts(10, 9))
+        observe(&reducer, .idle, facts(10, 9))
+        XCTAssertTrue(try XCTUnwrap(reducer.snapshot.entries.first).isRoutineWakeEligible, "A later unexplained close is still ordinary")
+    }
+
+    func testPacketFiveUnknownRefreshBeforeReceiptDoesNotDuplicateSameStatusDebt() {
+        var reducer = makeReducer()
+        reducer.enable(samples: [sample(0, status: .running, runFacts: facts(8, 8))], linkSetRevision: 1)
+        observe(&reducer, .idle, facts(9, 9))
+        let receipt = Reducer.Receipt(snapshot: reducer.snapshot)
+        observe(&reducer, .idle, nil)
+        reducer.apply(receipt)
+        XCTAssertEqual(reducer.deliveredRunThrough(for: sample(0, status: .idle).reference), 9)
+        XCTAssertFalse(reducer.snapshot.entries.contains(where: \.isRoutineWakeEligible), "A metadata-identical facts refresh before acceptance does not create another status occurrence")
+    }
+
     func testPacketFiveFreshLaneFirstProofStillBaselinesSilentlyWithoutPendingEdge() {
         var reducer = makeReducer()
         let reference = sample(0, status: .idle).reference

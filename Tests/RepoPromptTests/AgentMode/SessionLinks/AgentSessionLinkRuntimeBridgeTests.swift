@@ -9699,6 +9699,29 @@ extension AgentSessionLinkRuntimeBridgeTests {
         XCTAssertEqual(applied.count, 1, "A fresh pass may baseline under the now-current exact owner")
     }
 
+    func testW0dRejectedObserverDoesNotAbortAnotherObserverInTheSamePass() async {
+        let fixture = makeFixture()
+        let second = makeCandidate(windowID: 3, displayName: "Second observer")
+        fixture.host.candidates.append(second)
+        guard case .added = await addLink(fixture),
+              case .added = await fixture.bridge.addMonitorLink(observerEndpoint: second.domainEndpoint, targetEndpoint: fixture.target.domainEndpoint)
+        else { return XCTFail("add failed") }
+        await fixture.bridge.test_settleTargetPublications()
+        var replaced = false
+        var applied: [AgentSessionLinkPassiveStatusNotices.Sample] = []
+        fixture.bridge.test_onPassiveSample = { applied.append($0) }
+        fixture.bridge.test_afterPassiveObservationSnapshot = { _ in
+            guard !replaced else { return }
+            replaced = true
+            fixture.bridge.test_reinstallObservation(for: fixture.target)
+        }
+        await fixture.bridge.test_refreshStatus(sessionIDs: [fixture.observer.sessionID, second.sessionID])
+        fixture.bridge.test_afterPassiveObservationSnapshot = nil
+        fixture.bridge.test_onPassiveSample = nil
+        XCTAssertTrue(replaced)
+        XCTAssertEqual(applied.count, 1, "Reject only the first observer's obsolete pair; the other observer must still receive this same refresh pass")
+    }
+
     func testW0dObsoleteObservationOwnerRejectsTheWholeEnvelopeWithoutPayingDebt() async throws {
         let fixture = makeFixture()
         fixture.host.runFacts[fixture.target.sessionID] = .zero

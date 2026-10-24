@@ -4791,12 +4791,14 @@ final class AgentSessionLinkRuntimeBridge {
                 projectedEndpoints.remove(endpoint)
                 continue
             }
-            guard let projection = await makeProjection(
+            let projection = await makeProjection(
                 for: candidate,
                 inputs: inputs,
                 candidatesByEndpoint: scope.isFull ? fullMap : presentationCandidates(for: endpoint, inputs: inputs)
-            ) else { return }
+            )
             guard !isFrozenForTermination, self.host === host else { return }
+            // An obsolete observer pair cannot discard the other observers in this scoped pass.
+            guard let projection else { continue }
             guard host.agentSessionLinkCandidate(for: endpoint, includeLocation: false) != nil else { continue }
             host.agentSessionLinkPublishProjection(projection.props, to: endpoint)
             // Membership holds and inventory revisions remain the publication fence.

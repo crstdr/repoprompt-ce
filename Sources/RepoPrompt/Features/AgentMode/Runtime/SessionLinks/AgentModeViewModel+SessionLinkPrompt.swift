@@ -938,7 +938,7 @@ extension AgentModeViewModel {
         for session: TabSession, dispatchID: AgentSessionLinkPromptDispatchID,
         claim: AgentSessionLinkOutboundPromptClaim?, proof: AgentSessionLinkProviderInputRelease.Proof
     ) -> AgentSessionLinkProviderInputRelease.ReleasedDispatchContext {
-        AgentSessionLinkProviderInputRelease.handoff(
+        let released = AgentSessionLinkProviderInputRelease.handoff(
             original: claim, proof: proof,
             current: { self.agentSessionLinkPromptClaimOutcome(for: session, dispatchID: dispatchID) },
             isPending: { self.agentSessionLinkPromptClaimStore.isPending($0) },
@@ -947,6 +947,14 @@ extension AgentModeViewModel {
                 return AgentSessionLinkRuntimeBridge.shared.consumeLocalInputHandoff(decoration, observer: observer)
             }
         )
+        // Attention or other ordinary content can arrive after the physical routine mark while
+        // proof awaits. The actual synchronous release may only remove quiet qualification.
+        if claim?.routineQuietCheckIn == true, released.claim?.routineQuietCheckIn != true,
+           let owner = session.activeRunOwnership, session.isCurrentRunAttemptForCurrentBinding(owner)
+        {
+            session.quietLedger.noteOccurrence(owner: owner)
+        }
+        return released
     }
 
     /// Acknowledges one accepted dispatch. Idempotent and safe with `nil`.

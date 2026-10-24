@@ -876,7 +876,9 @@ struct AgentSessionLinkPassiveStatusNotices {
                 // origin. Quiet refresh/coalescing preserves the old occurrence's boundary.
                 preceding?.sample.runFacts?.settledThrough
             } else {
-                oldEntry?.openingSettledThrough
+                // Positive quiet evidence can supply an unknown occurrence opening, without
+                // replacing an earlier known boundary or acknowledging the pending ordinary work.
+                oldEntry?.openingSettledThrough ?? (quietClose ? preceding?.sample.runFacts?.settledThrough : nil)
             }
             if quietClose, let oldEntry { origin = oldEntry.fromStatus }
             // A facts-only refresh cannot turn the same positively paid idle occurrence into a
@@ -895,13 +897,17 @@ struct AgentSessionLinkPassiveStatusNotices {
                oldEntry.receiptSettledThrough == cutoff,
                oldEntry.ordinaryThrough == ordinary, oldEntry.openingSettledThrough == opening
             { continue }
+            // Losing only proof freshness does not change the status the frozen receipt rendered.
+            // Keep that receipt applicable; real edges and visible metadata changes still advance it.
+            let preservesStatusReceipt = !statusChanged && !advancesEdge && sample.runFacts == nil
+                && oldEntry?.hasSameFinalMetadata(as: sample) == true
             nextChangeSequence += 1
             pendingByReference[reference] = PendingEntry(
                 reference: reference, targetEndpoint: sample.targetEndpoint, targetSessionID: sample.targetSessionID,
                 displayName: sample.displayName, fromStatus: origin, toStatus: sample.status,
                 observedAt: observedAt, idleForSend: sample.idleForSend, idleSince: sample.idleSince,
                 waitingOn: sample.waitingOn, latestVisibleAssistantPreview: sample.latestVisibleAssistantPreview,
-                changeSequence: nextChangeSequence,
+                changeSequence: preservesStatusReceipt ? oldEntry?.changeSequence ?? nextChangeSequence : nextChangeSequence,
                 edgeSequence: advancesEdge ? nextChangeSequence : oldEntry?.edgeSequence ?? nextChangeSequence,
                 runFacts: sample.runFacts, receiptSettledThrough: cutoff,
                 ordinaryThrough: ordinary, openingSettledThrough: opening

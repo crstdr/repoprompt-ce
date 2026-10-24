@@ -736,6 +736,12 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             }
         }
 
+        func testW2AttentionArrivingAfterRoutineMarkDemotesTheReleasedAttempt() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { _ in
+                try await self.exerciseLiveDiscovery(w0fProvider: .codexExec, w2Probe: .lateAttention)
+            }
+        }
+
         func testW2ProductionCatalogProofHandoffCostWithActualAndTenfoldCatalog() async throws {
             try await MCPSharedServerTestLease.shared.withLease { _ in
                 try await self.exerciseLiveDiscovery(w0fProvider: .claudeCode, w2Probe: .catalogCost)
@@ -779,6 +785,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             case undeclared
             case terminal(delayed: Bool, nativeResult: Bool, closing: Bool = false, leading: Bool = false, cancel: Bool = false, corrupt: Bool = false)
             case hint(withdraw: Bool)
+            case lateAttention
             case catalogCost
         }
 
@@ -1213,6 +1220,8 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                         try await w2RegisteredTerminal(window: window, session: observer, connection: connection, runID: runID, delayed: delayed, nativeResult: nativeResult, closing: closing, leading: leading, cancel: cancel, corrupt: corrupt, w4Display: w4Display)
                     case let .hint(withdraw):
                         try await w2CatalogProof(window: window, session: observer, provider: provider, endpoint: endpoint, route: route, runID: runID, withdraw: withdraw)
+                    case .lateAttention:
+                        try await w2LateAttention(window: window, session: observer, target: target, endpoint: endpoint)
                     case .catalogCost:
                         try await w2CatalogCost(window: window, session: observer, provider: provider, endpoint: endpoint, runID: runID, inactiveTabID: targetTab)
                     }
@@ -3040,6 +3049,39 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             session.oversight.pendingAutoWake?.phase = .dispatching
             session.runState = .running
             return (owner, dispatch, claim)
+        }
+
+        func w2LateAttention(
+            window: WindowState, session: AgentTabSession, target: AgentTabSession,
+            endpoint: DomainAgentSessionLinkEndpointIdentity
+        ) async throws {
+            let vm = window.agentModeViewModel
+            let (owner, dispatch, original) = try w2RoutineClaim(window: window, session: session, endpoint: endpoint, localRead: false)
+            defer { session.oversight.pendingAutoWake = nil }
+            let proof = await vm.agentSessionLinkProveProviderInput(for: session, claim: original)
+            XCTAssertFalse(session.quietLedger.hasOrdinaryOccurrence(owner: owner))
+            let previous = try XCTUnwrap(vm.agentSessionLinkPassiveNoticesBySessionID[endpoint.sessionID])
+            let inventory = try XCTUnwrap(vm.agentSessionLinkPromptInventoryBySessionID[endpoint.sessionID])
+            let item = try XCTUnwrap(inventory.inventory.items.first)
+            let reference = try XCTUnwrap(item.reference)
+            let targetEndpoint = try XCTUnwrap(vm.agentSessionLinkObserverEndpoint(tabID: target.tabID))
+            let attention = AgentSessionLinkPassiveStatusNotices.PendingAttentionRequest(
+                occurrence: .init(queueEpoch: previous.queueEpoch, reference: reference, attentionSequence: 1),
+                targetEndpoint: targetEndpoint, targetSessionID: targetEndpoint.sessionID,
+                requestedAt: .distantPast, status: .idle
+            )
+            vm.agentSessionLinkPublishPassiveStatusNotices(.init(
+                observerEndpoint: endpoint, queueEpoch: previous.queueEpoch, queueRevision: previous.queueRevision + 1,
+                linkSetRevision: previous.linkSetRevision, isEnabled: true, isDeliverable: true,
+                entries: previous.entries, attentionRequests: [attention],
+                unacknowledgedOverflowCount: previous.unacknowledgedOverflowCount, overflowProduced: previous.overflowProduced
+            ), to: endpoint)
+            let released = vm.agentSessionLinkHandoffProviderInput(for: session, dispatchID: dispatch, claim: original, proof: proof)
+            XCTAssertFalse(released.mustAbortDispatch)
+            XCTAssertFalse(try XCTUnwrap(released.claim).routineQuietCheckIn)
+            XCTAssertEqual(released.claim?.passive?.receipt.deliveredAttentionOccurrences, [attention.occurrence])
+            XCTAssertFalse(released.text("").contains("Nothing needed? Call self_noop."))
+            XCTAssertTrue(session.quietLedger.hasOrdinaryOccurrence(owner: owner), "The actual attention-bearing release, not the earlier reservation, decides quiet qualification")
         }
 
         func w2CatalogProof(
