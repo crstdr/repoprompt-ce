@@ -1703,6 +1703,31 @@ final class AgentQuietRetainedViewFeasibilityTests: XCTestCase {
         }
     }
 
+    func testCanonicalRetainedSummaryDoesNotDependOnQuietLocalMetadata() throws {
+        let ordinary = ordinaryRows(base: 0, toolCount: 12)
+        let baseline = try XCTUnwrap(AgentTranscriptIO.buildTranscript(from: ordinary, terminalState: .completed).turns.first)
+        var transcript = AgentTranscriptIO.buildTranscript(from: ordinary + quietRows(base: 100, wakeID: id(900)) + ordinaryRows(base: 1000, toolCount: 9), terminalState: .completed)
+        AgentTranscriptIO.test_installQuietLocalBaseline(baseline, in: &transcript)
+        transcript.turns[0].retentionTier = .condensed
+        transcript = AgentTranscriptCompactor.compact(transcript)
+        XCTAssertEqual(transcript.turns[0].responseSpans[0].activities.count, 1, "Only the canonical conclusion remains in this retained span")
+        XCTAssertNotNil(transcript.turns[0].responseSpans[0].collapsedSummary)
+        XCTAssertNotNil(transcript.turns[0].responseSpans[0].quietLocal)
+        var withoutLocalMetadata = transcript
+        for index in withoutLocalMetadata.turns.indices {
+            withoutLocalMetadata.turns[index].quietLocal = nil
+            for spanIndex in withoutLocalMetadata.turns[index].responseSpans.indices {
+                withoutLocalMetadata.turns[index].responseSpans[spanIndex].quietLocal = nil
+            }
+        }
+        let expected = AgentTranscriptProjectionBuilder.build(from: withoutLocalMetadata)
+        let actual = AgentTranscriptProjectionBuilder.build(from: transcript)
+        XCTAssertEqual(actual.workingRows, expected.workingRows)
+        XCTAssertEqual(actual.workingBlocks, expected.workingBlocks, "Local proof alone cannot add canonical grouped-history output")
+        XCTAssertEqual(actual.archivedRows, expected.archivedRows)
+        XCTAssertEqual(actual.archivedBlocks, expected.archivedBlocks)
+    }
+
     func testW1MalformedOrMissingDisplayProofNeverReconstructsFromCallOrText() throws {
         let ordinary = ordinaryRows(base: 0, toolCount: 12)
         let baseline = try XCTUnwrap(AgentTranscriptIO.buildTranscript(from: ordinary, terminalState: .completed).turns.first)
@@ -1711,7 +1736,7 @@ final class AgentQuietRetainedViewFeasibilityTests: XCTestCase {
         transcript.turns[0].retentionTier = .condensed
         transcript = AgentTranscriptCompactor.compact(transcript)
         let encoded = try JSONEncoder().encode(transcript)
-        for damage in ["missing-turn", "malformed-turn", "missing-span", "malformed-stamp", "retained-stamp", "null-proof"] {
+        for damage in ["missing-turn", "malformed-turn", "missing-span", "malformed-stamp", "retained-stamp", "null-proof", "null-conclusion-text", "blank-conclusion-text"] {
             var payload = encoded
             if damage == "malformed-stamp" {
                 var full = AgentTranscriptIO.buildTranscript(from: ordinary + quietRows(base: 100, wakeID: id(900)), terminalState: .completed)
@@ -1720,6 +1745,15 @@ final class AgentQuietRetainedViewFeasibilityTests: XCTestCase {
             }
             var object = try XCTUnwrap(JSONSerialization.jsonObject(with: payload) as? [String: Any])
             var turns = try XCTUnwrap(object["turns"] as? [[String: Any]])
+            if damage == "null-conclusion-text" || damage == "blank-conclusion-text" {
+                var local = try XCTUnwrap(turns[0]["quietLocal"] as? [String: Any])
+                var summary = try XCTUnwrap(local["summary"] as? [String: Any])
+                let unusableText: Any = damage == "null-conclusion-text" ? NSNull() : " \n\t "
+                summary["conclusionText"] = unusableText
+                summary["compactConclusionText"] = unusableText
+                local["summary"] = summary
+                turns[0]["quietLocal"] = local
+            }
             if damage == "missing-turn" { turns[0].removeValue(forKey: "quietLocal") }
             if damage == "malformed-turn" { turns[0]["quietLocal"] = ["completedAt": "not-a-date"] }
             if damage == "missing-span" {

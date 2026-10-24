@@ -2419,10 +2419,27 @@ enum AgentTranscriptIO {
         // Retention keeps the canonical conclusion. If it differs from the local anchor,
         // its own certificate must still be present; damaged metadata cannot hide that row.
         // Full source is handled in the existing leaf passes, without another history scan.
-        let retainedConclusionIsCertified = turn.retentionTier == .full || turn.conclusionActivityID == nil
+        var retainedConclusionIsCertified = turn.retentionTier == .full || turn.conclusionActivityID == nil
             || turn.conclusionActivityID == baseline.conclusionActivityID
-            || turn.allActivities.contains { $0.id == turn.conclusionActivityID && $0.quietCheckInWakeID != nil }
-        let complete = retainedConclusionIsCertified && baseline.completedAt != nil && (
+        var localConclusionIsRenderable = turn.retentionTier == .full || baseline.conclusionActivityID == nil
+            || AgentDisplayableText.hasDisplayableBody(baseline.summary?.conclusionText ?? "")
+            || AgentDisplayableText.hasDisplayableBody(baseline.summary?.compactConclusionText ?? "")
+        // Use the same retained-activity inspection for both the canonical witness and
+        // an ordinary conclusion whose text is still retained. Full turns do not scan.
+        if !retainedConclusionIsCertified || !localConclusionIsRenderable {
+            activityInspection: for span in turn.responseSpans {
+                for activity in span.activities {
+                    if activity.id == turn.conclusionActivityID, activity.quietCheckInWakeID != nil {
+                        retainedConclusionIsCertified = true
+                    }
+                    if activity.id == baseline.conclusionActivityID, AgentDisplayableText.hasDisplayableBody(activity.text) {
+                        localConclusionIsRenderable = true
+                    }
+                    if retainedConclusionIsCertified, localConclusionIsRenderable { break activityInspection }
+                }
+            }
+        }
+        let complete = retainedConclusionIsCertified && localConclusionIsRenderable && baseline.completedAt != nil && (
             turn.retentionTier == .full ||
                 (baseline.summary != nil && (turn.retentionTier == .archived || turn.responseSpans.allSatisfy { $0.quietLocal != nil }))
         )
@@ -7886,7 +7903,7 @@ enum AgentTranscriptProjectionBuilder {
             )
             let contentBlocks = leafBlocks.filter { $0.kind != .conclusion }
             let conclusionBlocks = leafBlocks.filter { $0.kind == .conclusion }
-            if !contentBlocks.isEmpty || (span.quietLocal != nil && span.collapsedSummary != nil) {
+            if !contentBlocks.isEmpty || (context.excludingQuiet && turn.quietLocal != nil && span.quietLocal != nil && span.collapsedSummary != nil) {
                 blocks.append(groupedHistoryBlock(
                     for: contentBlocks,
                     frozenSummary: span.collapsedSummary,
