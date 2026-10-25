@@ -1311,6 +1311,7 @@ extension AgentModeViewModel {
         // very turn this continuation resumes; refusing here would deadlock the wake's own turn.
         let switchInFlightOnActiveRun = session.pendingHandoff.providerSwitchDelivery == .sending
             && session.runState.isActive && Self.providerSwitchHasOwnedCarryingAttempt(session)
+            && session.pendingHandoff.providerSwitchDispatch?.dispatchID != nil
         if !switchInFlightOnActiveRun, case .failure = await providerSwitchSendAdmission(
             session: session, input: claim.fragment, skipsAugmentation: true,
             inputAlreadyIncludesSupplement: true,
