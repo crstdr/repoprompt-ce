@@ -585,6 +585,7 @@ class WindowState: ObservableObject {
         detachTitlebarAccessoryControllers(from: nsWindow)
         clearTitlebarAccessoryRequestsForClose()
         if !isPreparedSessionOwner { apiSettingsViewModel.prepareForWindowClose() }
+        promptManager.cancelInitialModelRefreshForWindowClose()
         contextBuilderAgentViewModel.prepareForWindowClose()
         workspaceManager.prepareForWindowClose()
         promptManager.gitViewModel.prepareForWindowClose()
@@ -598,20 +599,22 @@ class WindowState: ObservableObject {
 
     // MARK: - Initialization
 
-    convenience init() {
+    convenience init(automaticProviderModelDiscoveryEnabled: Bool = true) {
         self.init(
             contextBuilderProviderFactory: nil,
             loadStoredAPISettingsDataOnInit: true,
             codexModelPollingService: .shared,
+            automaticProviderModelDiscoveryEnabled: automaticProviderModelDiscoveryEnabled,
             domainRuntimeOverride: nil
         )
     }
 
-    convenience init(domainRuntime: MCPDomainRuntime) {
+    convenience init(domainRuntime: MCPDomainRuntime, automaticProviderModelDiscoveryEnabled: Bool = true) {
         self.init(
             contextBuilderProviderFactory: nil,
             loadStoredAPISettingsDataOnInit: true,
             codexModelPollingService: .shared,
+            automaticProviderModelDiscoveryEnabled: automaticProviderModelDiscoveryEnabled,
             domainRuntimeOverride: domainRuntime
         )
     }
@@ -636,12 +639,14 @@ class WindowState: ObservableObject {
             domainRuntime: MCPDomainRuntime,
             keyManager: KeyManager,
             codexModelPollingService: CodexModelPollingService,
-            loadStoredAPISettingsDataOnInit: Bool
+            loadStoredAPISettingsDataOnInit: Bool,
+            automaticProviderModelDiscoveryEnabled: Bool = true
         ) {
             self.init(
                 contextBuilderProviderFactory: Optional(contextBuilderProviderFactory),
                 loadStoredAPISettingsDataOnInit: loadStoredAPISettingsDataOnInit,
                 codexModelPollingService: codexModelPollingService,
+                automaticProviderModelDiscoveryEnabled: automaticProviderModelDiscoveryEnabled,
                 domainRuntimeOverride: domainRuntime,
                 keyManager: keyManager
             )
@@ -759,6 +764,7 @@ class WindowState: ObservableObject {
         codexModelPollingService: CodexModelPollingService,
         workspaceFileContextStore injectedWorkspaceFileContextStore: WorkspaceFileContextStore? = nil,
         storedPromptPersistence: (any StoredPromptPersistenceServing)? = nil,
+        automaticProviderModelDiscoveryEnabled: Bool = true,
         domainRuntimeOverride: MCPDomainRuntime?,
         keyManager injectedKeyManager: KeyManager? = nil,
         agentModeViewModelFactory: WindowStateCompositionFactory.AgentModeViewModelFactory? = nil,
@@ -790,6 +796,7 @@ class WindowState: ObservableObject {
             workspaceFileContextStore: injectedWorkspaceFileContextStore,
             storedPromptPersistence: storedPromptPersistence,
             loadStoredAPISettingsDataOnInit: loadStoredAPISettingsDataOnInit,
+            automaticProviderModelDiscoveryEnabled: automaticProviderModelDiscoveryEnabled,
             codexModelPollingService: codexModelPollingService,
             agentModeViewModelFactory: agentModeViewModelFactory,
             sessionRuntimeWorkspace: sessionRuntimeWorkspace,
@@ -1256,14 +1263,19 @@ class WindowState: ObservableObject {
         )
     }
 
-    func closeActiveComposeTabFromShortcut() {
+    @discardableResult
+    func closeActiveComposeTabFromShortcut() -> Task<Void, Never>? {
         guard let activeTabID = promptManager.activeComposeTabID,
               promptManager.canCloseActiveComposeTab
         else {
-            return
+            return nil
         }
 
-        Task { await promptManager.stashTab(activeTabID) }
+        return Task {
+            await AgentSessionDeletionOrigin.currentTaskLocal.withValue(.userUI) {
+                _ = await promptManager.stashTab(activeTabID)
+            }
+        }
     }
 
     /// Starts a new Agent session tab (mirrors the titlebar "New Session" control).
@@ -1592,12 +1604,7 @@ class WindowState: ObservableObject {
                         reason: "titlebar_delete_confirmation"
                     )
                 #endif
-                await promptManager.closeComposeTab(
-                    target.tabID,
-                    isMutationContextCurrent: { [weak self] in
-                        self?.agentChatTitleClusterMenuTargetIsValid(target) == true
-                    }
-                )
+                await deleteAgentChatFromTitlebar(target: target)
             }
         }
 
@@ -1606,6 +1613,18 @@ class WindowState: ObservableObject {
         } else {
             applyDelete(alert.runModal())
         }
+    }
+
+    /// Executes the confirmed titlebar Delete action, retaining its stale-target guard.
+    func deleteAgentChatFromTitlebar(target: AgentChatOptionsMenuTarget) async {
+        guard agentChatTitleClusterMenuTargetIsValid(target) else { return }
+        await promptManager.closeComposeTab(
+            target.tabID,
+            deletionOrigin: .userUI,
+            isMutationContextCurrent: { [weak self] in
+                self?.agentChatTitleClusterMenuTargetIsValid(target) == true
+            }
+        )
     }
 
     /// Shows or hides the Agent mode New Session titlebar edge accessory.
@@ -2888,6 +2907,8 @@ class WindowState: ObservableObject {
         beginClose()
         // Join cancelled startup before saves/root drains so it cannot publish or hydrate late.
         await workspaceManager.awaitInitialWorkspaceActivationCompletion()
+        await workspaceManager.awaitPostSwitchGitDataLoadShutdown()
+        await promptManager.awaitInitialModelRefreshCompletion()
         // Finish this window's own saves (including the final `onDisappear` capture) before any
         // teardown step can stop the presentation that owns them (#1089).
         await workspaceManager.awaitOwnSavesForWindowClose()

@@ -176,6 +176,22 @@ struct DomainWorkspaceAuthorityClient {
         ))
     }
 
+    /// Same fail-closed submission for a caller that already holds the canonical document.
+    func replaceWorkingFailClosed(
+        _ document: DomainWorkspaceDocument,
+        expectedWorkspaceRevision: UInt64,
+        operationID: UUID = UUID()
+    ) async throws -> DomainCommandOutcome {
+        try Task.checkCancellation()
+        return await executeStable(.init(
+            operationID: operationID,
+            expectedWorkspaceRevision: expectedWorkspaceRevision,
+            conflictRecoveryPolicy: .failClosed,
+            origin: .appPresentation(windowID: windowID),
+            command: .replaceWorkingDocument(document)
+        ))
+    }
+
     func save(
         _ workspace: WorkspaceModel,
         fileURL: URL,

@@ -181,11 +181,12 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         "RepoPromptDomainRuntime",
         "RepoPromptShared",
         "RepoPromptTestSupport",
+        "RepoPromptVCS",
     }
     if set(_by_name_dependencies(core_tests)) != expected_core_test_dependencies:
         raise GeneratorError(
             "RepoPromptMCPCoreTests must depend on RepoPromptMCPCore, RepoPromptDomainRuntime, "
-            "RepoPromptShared, RepoPromptTestSupport, and RepoPromptTestSandboxPreflight"
+            "RepoPromptShared, RepoPromptTestSupport, RepoPromptTestSandboxPreflight, and RepoPromptVCS"
         )
 
     for target_name, expected_type, expected_path in (

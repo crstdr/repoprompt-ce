@@ -7789,6 +7789,13 @@ actor ServerNetworkManager {
         isSessionInTerminationCooldown(sessionToken)
     }
 
+    /// Liveness fence for queued approval UI; process identity may be unavailable
+    /// even for a live connection, so a missing peer PID is not a close signal.
+    func isConnectionLiveForApproval(_ connectionID: UUID) -> Bool {
+        guard let generation = connectionLifecycleGenerationByID[connectionID] else { return false }
+        return isCurrentConnection(connectionID, lifecycleGeneration: generation)
+    }
+
     /// Checks if a clientID is in user-initiated kill cooldown.
     /// Returns true if the client was killed by user action within the cooldown period.
     private func isClientInUserKillCooldown(_ clientID: String) -> Bool {
@@ -7858,6 +7865,20 @@ actor ServerNetworkManager {
             log.warning("terminateConnection: connection \(id) not found in connections dictionary")
             return
         }
+        // Registered connections always acquire their lifecycle generation before yielding.
+        // Revoke admission before transport closure becomes observable to a reentrant caller.
+        guard let generation = connectionLifecycleGenerationByID[id] else {
+            log.warning("terminateConnection: connection \(id) has no lifecycle generation")
+            return
+        }
+        guard let committedRemoval = commitConnectionRemoval(
+            connectionID: id,
+            expectedIdentity: ObjectIdentifier(connection as AnyObject),
+            expectedLifecycleGeneration: generation
+        ) else {
+            connectionLog("terminateConnection: \(id) cleanup already in progress; ignoring duplicate call")
+            return
+        }
 
         let sem = semanticsOverride ?? defaultSemantics(for: reason)
         let sessionToken = capabilityTokenByConnection[id] ?? connection.capabilityToken
@@ -7900,8 +7921,10 @@ actor ServerNetworkManager {
         // 3. Terminate the connection (writes "killed" to meta.json for filesystem)
         await connection.terminate(reason: reason, message: message)
 
-        // 4. Clean up connection state
-        await removeConnection(id, context: closeContext)
+        // 4. Finish the same removal owner committed before transport termination.
+        await removeConnection(
+            id, committedRemoval: committedRemoval, connectionAlreadyStopped: false, context: closeContext
+        )
 
         connectionLog("Successfully terminated and removed connection \(id)")
 
@@ -7918,6 +7941,18 @@ actor ServerNetworkManager {
             connectionLog("softDisconnectConnection: connection \(id) not found")
             return
         }
+        guard let generation = connectionLifecycleGenerationByID[id] else {
+            log.warning("softDisconnectConnection: connection \(id) has no lifecycle generation")
+            return
+        }
+        guard let committedRemoval = commitConnectionRemoval(
+            connectionID: id,
+            expectedIdentity: ObjectIdentifier(connection as AnyObject),
+            expectedLifecycleGeneration: generation
+        ) else {
+            connectionLog("softDisconnectConnection: \(id) cleanup already in progress; ignoring duplicate call")
+            return
+        }
         connectionLog("Soft-disconnecting connection \(id) reason=\(reason.rawValue)")
         #if DEBUG
             debugRecordConnectionEvent("soft_disconnected", connectionID: id, reason: reason.rawValue)
@@ -7929,7 +7964,9 @@ actor ServerNetworkManager {
         )
         persistAcceptedSocketTerminalRecord(connectionID: id, context: closeContext)
         await connection.stop()
-        await removeConnection(id, context: closeContext)
+        await removeConnection(
+            id, committedRemoval: committedRemoval, connectionAlreadyStopped: true, context: closeContext
+        )
     }
 
     private func currentBootstrapReplacementConnectionID(forSessionToken token: String) -> UUID? {
