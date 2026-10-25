@@ -238,7 +238,7 @@ extension AgentModeViewModel {
             // the definite reason rather than a busy hint a client would poll past forever.
             switch failure {
             case .providerSwitchUnconfirmed, .providerHandoverNeedsReview:
-                throw MCPError.invalidParams("Client task input was not submitted: a provider switch in this session needs the user's attention in RepoPrompt. \(failure.message)")
+                throw MCPError.invalidParams("Task input not submitted: provider switch pending. \(failure.message)")
             default:
                 throw MCPError.invalidParams(Self.mcpResidentBusyError)
             }
@@ -298,7 +298,7 @@ extension AgentModeViewModel {
                 || failure == .providerHandoverDoesNotFit || failure == .providerHandoverNeedsReview:
                 // Refused before the row was persisted; the "input was recorded" fallback would
                 // misreport the outcome and hide that only the user can resolve the handover.
-                throw MCPError.invalidParams("Client task input was not submitted: a provider switch in this session needs the user's attention in RepoPrompt. \(failure.message)")
+                throw MCPError.invalidParams("Task input not submitted: provider switch pending. \(failure.message)")
             default: throw MCPError.invalidParams(Self.mcpResidentUnconfirmedError)
             }
         }
