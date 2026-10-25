@@ -1505,10 +1505,12 @@ final class AgentTabSession: ObservableObject {
         didSet {
             if oldValue.executionLocationFailure != pendingHandoff.executionLocationFailure
                 || oldValue.providerSwitchDelivery != pendingHandoff.providerSwitchDelivery
+                || oldValue.providerSwitchDispatch != pendingHandoff.providerSwitchDispatch
                 || oldValue.sourceItemID != pendingHandoff.sourceItemID
                 || oldValue.isStagedForSend != pendingHandoff.isStagedForSend
             {
                 noteMonitorObservationInputsChanged()
+                objectWillChange.send()
             }
         }
     }
