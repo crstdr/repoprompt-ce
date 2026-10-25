@@ -138,9 +138,10 @@
             XCTAssertThrowsError(try Handover.Source(provider: "source", model: "\u{0}")) {
                 XCTAssertEqual($0 as? Handover.ValidationError, .invalidXMLText)
             }
-            XCTAssertThrowsError(try Handover.project(AgentTranscript(turns: [fixture(request: "bad\u{1}")]))) {
-                XCTAssertEqual($0 as? Handover.ValidationError, .invalidXMLText)
-            }
+            // Invalid scalars in content are stripped (like the link envelope's sanitizedBody)
+            // rather than disabling every handover mode for the session; identifiers still throw.
+            let projection = try Handover.project(AgentTranscript(turns: [fixture(request: "bad\u{1} text")]))
+            XCTAssertTrue(Handover.render(Handover.history(projection, source: source(), historyReference: nil)).contains("bad text"))
         }
 
         func testAttributionRequiresPositiveMetadataAndPreservesExistingEnvelope() throws {
@@ -280,6 +281,21 @@
             XCTAssertTrue(rendered.contains("source_provider=\"p\u{0338}&lt;\""))
             XCTAssertEqual(carrier.utf8Bytes, rendered.utf8.count)
             XCTAssertTrue(XMLParser(data: Data(rendered.utf8)).parse())
+        }
+
+        func testInvalidXMLScalarsInContentAreStrippedRatherThanDisablingHandover() throws {
+            // Linked-session rows and tool summaries are stored raw; one control scalar must not
+            // throw every handover mode away for the session. Identifiers still fail closed.
+            let ansi = "colored \u{1b}[31mtext\u{1b}[0m and a \u{7}b ens"
+            let turn = fixture(request: ansi, replies: [.assistant("done \u{c}")])
+            let projection = try Handover.project(AgentTranscript(turns: [turn]))
+            let carrier = Handover.history(projection, source: source(), historyReference: nil)
+            let rendered = Handover.render(carrier)
+            XCTAssertTrue(rendered.contains("colored [31mtext[0m and a b ens"))
+            XCTAssertTrue(rendered.contains("done "))
+            XCTAssertTrue(XMLParser(data: Data(rendered.utf8)).parse())
+            XCTAssertNotNil(Handover.newestCompleteTurns(projection, source: source(), historyReference: nil, budget: budget()))
+            XCTAssertThrowsError(try Handover.Source(provider: "bad \u{8}", model: "m"))
         }
 
         func testNewestTurnsStillEvaluatesAllTurnsCandidateAfterIntermediateSuffixMisses() throws {
