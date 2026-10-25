@@ -20315,7 +20315,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let switchInFlightOnActiveRun = session.pendingHandoff.providerSwitchDelivery == .sending
             && session.runState.isActive && Self.providerSwitchHasOwnedCarryingAttempt(session)
         if session.pendingHandoff.providerSwitchDelivery != nil, providerSwitchPreparation == nil,
-           !switchInFlightOnActiveRun {
+           !switchInFlightOnActiveRun
+        {
             let claim: AgentComposerSubmitClaim
             let ownsClaim = providerSwitchClaim == nil
             if let providerSwitchClaim {

@@ -2521,7 +2521,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 session.selectedAgent = .openCode
                 session.selectedModelRaw = "unknown-window"
                 fixture.window.promptManager.apiSettingsViewModel?.isOpenCodeConnected = true
-                // The saved payload omits turn 0, which the fresh (short) history would include.
+                /// The saved payload omits turn 0, which the fresh (short) history would include.
                 func tinyTurn(_ text: String, _ index: Int) -> AgentTranscriptTurn {
                     let request = AgentChatItem.user(text, sequenceIndex: index)
                     return AgentTranscriptTurn(
