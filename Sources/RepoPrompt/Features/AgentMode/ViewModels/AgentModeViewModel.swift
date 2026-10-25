@@ -20312,8 +20312,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // physical acceptance), ordinary input is steering or continuation on that same run, not a
         // new handover decision. Routing it through switch admission would refuse it — including the
         // turn's own waiting-continuation reply, which would deadlock the turn.
+        // Steers would cancel the ACP prompt carrying the handover (cancel + re-send), so only a
+        // waiting-continuation reply may pass through while the bound dispatch is in flight;
+        // everything else keeps the busy refusal until physical acceptance clears the marker.
         let switchInFlightOnActiveRun = session.pendingHandoff.providerSwitchDelivery == .sending
-            && session.runState.isActive && Self.providerSwitchHasOwnedCarryingAttempt(session)
+            && session.runState == .waitingForUser && session.instructionContinuation != nil
+            && Self.providerSwitchHasOwnedCarryingAttempt(session)
             && session.pendingHandoff.providerSwitchDispatch?.dispatchID != nil
         if session.pendingHandoff.providerSwitchDelivery != nil, providerSwitchPreparation == nil,
            !switchInFlightOnActiveRun
