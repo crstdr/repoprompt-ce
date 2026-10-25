@@ -960,12 +960,14 @@ extension AgentModeViewModel {
             {
                 var index = preview.choices.firstIndex(where: { $0.mode == mode && !$0.hidden })
                 if index == nil, mode == .newestTurns,
-                   let hiddenIndex = preview.choices.firstIndex(where: { $0.mode == .newestTurns }) {
+                   let hiddenIndex = preview.choices.firstIndex(where: { $0.mode == .newestTurns })
+                {
                     // The saved carrier may predate a budget that now fits full history; when it
                     // differs from the fresh suffix it is real approved content, so un-hide the
                     // row rather than retaining it under the Full history label.
                     if let carrier = preview.choices[hiddenIndex].carrier,
-                       payload != AgentProviderHandover.render(carrier) {
+                       payload != AgentProviderHandover.render(carrier)
+                    {
                         preview.choices[hiddenIndex].hidden = false
                         index = hiddenIndex
                     }
