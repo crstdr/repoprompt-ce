@@ -954,16 +954,31 @@ extension AgentModeViewModel {
             if !stale, let payload = originalSlot.payload, let descriptor = preview.originalDescriptor,
                providerSwitchReadReferenceIsCurrent(descriptor, session: session, destination: preview.destination),
                let mode = AgentProviderHandover.Mode(rawValue: descriptor.mode),
-               let index = preview.choices.firstIndex(where: { $0.mode == mode && !$0.hidden })
-               ?? (mode == .newestTurns ? preview.choices.firstIndex(where: { $0.mode == .history }) : nil),
                AgentProviderHandover.estimate(payload) <= budget.remainingCarrierTokens,
                payload.utf8.count <= AgentProviderHandover.maximumBytes,
                mode != .summary || payload.utf8.count <= AgentProviderHandover.maximumSummaryBytes
             {
-                preview.choices[index].retainedPayload = payload
-                preview.choices[index].retainedOmissions = descriptor.omissions.isEmpty ? nil : descriptor.omissions.joined(separator: ", ")
-                preview.choices[index].unavailable = nil
-                preview.selected = preview.choices[index].mode
+                var index = preview.choices.firstIndex(where: { $0.mode == mode && !$0.hidden })
+                if index == nil, mode == .newestTurns,
+                   let hiddenIndex = preview.choices.firstIndex(where: { $0.mode == .newestTurns }) {
+                    // The saved carrier may predate a budget that now fits full history; when it
+                    // differs from the fresh suffix it is real approved content, so un-hide the
+                    // row rather than retaining it under the Full history label.
+                    if let carrier = preview.choices[hiddenIndex].carrier,
+                       payload != AgentProviderHandover.render(carrier) {
+                        preview.choices[hiddenIndex].hidden = false
+                        index = hiddenIndex
+                    }
+                }
+                if index == nil, mode == .newestTurns {
+                    index = preview.choices.firstIndex(where: { $0.mode == .history })
+                }
+                if let index {
+                    preview.choices[index].retainedPayload = payload
+                    preview.choices[index].retainedOmissions = descriptor.omissions.isEmpty ? nil : descriptor.omissions.joined(separator: ", ")
+                    preview.choices[index].unavailable = nil
+                    preview.selected = preview.choices[index].mode
+                }
             } else if !preview.isReview, budget.fits(result.1) { preview.selected = .history }
             if let summary = preview.generatedSummary { fitProviderSwitchSummary(summary, into: &preview) }
             preview.building = false
