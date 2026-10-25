@@ -717,6 +717,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         /// Test-only exact route-token seam for synthetic catalog publications.
         var test_agentSessionLinkAuthoritativeRunCatalogRouteToken:
             ((UUID, Int, UUID) async -> AgentSessionLinkRunCatalogRouteToken?)?
+        /// Test-only bounded route-token wait seam (run, window, tab, timeout seconds); mirrors the
+        /// immediate seam above for `ProviderInputRouteWait`. Must honor the timeout. When only the
+        /// immediate seam is installed, waits re-check it until it yields a token or time runs out.
+        var test_agentSessionLinkAwaitAuthoritativeRunCatalogRouteToken:
+            ((UUID, Int, UUID, TimeInterval) async -> AgentSessionLinkRunCatalogRouteToken?)?
         /// Test-only synchronous route fence for synthetic Codex catalog projections.
         var test_agentSessionLinkCurrentRunCatalogRouteToken:
             ((AgentSessionLinkRunCatalogRouteToken, UUID) -> Bool)?
@@ -2522,9 +2527,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             prependPendingHandoff: { [weak self] text, session in
                 self?.prependPendingHandoffIfNeeded(text, session: session) ?? text
             },
-            qualifyAgentSessionLinkProviderInputRoute: { [weak self] session in
+            qualifyAgentSessionLinkProviderInputRoute: { [weak self] session, routeWait in
                 guard let self else { return .unavailable }
-                return await qualifyProviderInputRoute(for: session)
+                return await qualifyProviderInputRoute(for: session, routeWait: routeWait)
             },
             hasCurrentAgentSessionLinkProviderInputRoute: { [weak self] session, qualification in
                 guard let self else { return false }
@@ -3510,6 +3515,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 isCurrentSessionBinding: { [weak self] session, fence in
                     self?.sessions[session.tabID] === session
                         && session.persistentSessionBindingIdentity == fence.binding
+                },
+                restoreRouteRefusedUnsentTurn: { [weak self] session, userItemID, message in
+                    _ = self?.restoreRouteRefusedUnsentTurn(session: session, userItemID: userItemID, message: message)
                 }
             ),
             persistence: .init(
@@ -20589,7 +20597,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         attachments: attachmentsToSend,
                         taggedFileAttachments: taggedFilesToSend,
                         autoEffortSelection: autoEffortSelection,
-                        directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: repromptedText != nil, stopFence: resumedFence, localComposerCandidate: localComposerCandidate),
+                        directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: repromptedText != nil, stopFence: resumedFence, localComposerCandidate: localComposerCandidate, initialUserItemID: userItem.id),
                         providerSwitchPreparation: acceptedSwitchPreparation
                     )
                 }
@@ -20645,7 +20653,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     attachments: attachmentsToSend,
                     taggedFileAttachments: taggedFilesToSend,
                     autoEffortSelection: autoEffortSelection,
-                    directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: repromptedText != nil, stopFence: producerStopFence, localComposerCandidate: localComposerCandidate),
+                    directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: repromptedText != nil, stopFence: producerStopFence, localComposerCandidate: localComposerCandidate, initialUserItemID: userItem.id),
                     providerSwitchPreparation: acceptedSwitchPreparation
                 )
             }
@@ -22210,7 +22218,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             selfCompactDispatchID: directStartOptions.selfCompactDispatchID,
             startOutcome: startOutcome,
             stopFence: stopFence,
-            localComposerCandidate: directStartOptions.localComposerCandidate
+            localComposerCandidate: directStartOptions.localComposerCandidate,
+            initialUserItemID: directStartOptions.initialUserItemID
         )
     }
 

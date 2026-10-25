@@ -7,8 +7,24 @@ import RepoPromptFileSystem
 import RepoPromptInstrumentation
 import RepoPromptPersistence
 import RepoPromptProcess
+import RepoPromptShared
 import RepoPromptVCS
 import RepoPromptWorkspaceCore
+
+extension GitDiffCompareSpec {
+    /// Validate even programmatically constructed or decoded specs before Git runs.
+    func validateRevisionArgument() throws {
+        switch self {
+        case let .uncommitted(base), let .uncommittedMergeBase(base),
+             let .staged(base), let .stagedMergeBase(base):
+            try GitRevisionArgument.validate(base)
+        case let .revspec(spec):
+            try GitRevisionArgument.validate(spec)
+        case .unstaged:
+            break
+        }
+    }
+}
 
 enum GitPrefixControlEvidenceCacheMode {
     case automatic
@@ -2259,6 +2275,8 @@ actor GitService {
     // MARK: - Worktree Merge Primitives
 
     func getMergeBase(sourceHead: String, targetHead: String, at repoURL: URL) async throws -> String {
+        try GitRevisionArgument.validate(sourceHead)
+        try GitRevisionArgument.validate(targetHead)
         let (stdout, stderr, exitCode) = try await runGit(
             ["merge-base", targetHead, sourceHead],
             at: repoURL
@@ -2270,6 +2288,8 @@ actor GitService {
     }
 
     func isAncestor(_ ancestor: String, of descendant: String, at repoURL: URL) async throws -> Bool {
+        try GitRevisionArgument.validate(ancestor)
+        try GitRevisionArgument.validate(descendant)
         let (_, stderr, exitCode) = try await runGit(
             ["merge-base", "--is-ancestor", ancestor, descendant],
             at: repoURL
@@ -2733,6 +2753,7 @@ actor GitService {
 
     /// Get uncommitted modified files in the repository
     func getUncommittedFiles(at repoURL: URL) async throws -> [UncommittedFile] {
+        try await requireCompleteWorkingTreeInspection(at: repoURL)
         let (stdout, stderr, exitCode) = try await runGit(
             ["status", "--porcelain", "--untracked-files=all"],
             at: repoURL
@@ -2759,8 +2780,9 @@ actor GitService {
 
     /// Resolve any ref (branch, tag, commit-ish) to a SHA.
     func getRefSHA(at repoURL: URL, ref: String) async throws -> String {
+        try GitRevisionArgument.validate(ref)
         let (stdout, stderr, exitCode) = try await runGit(
-            ["rev-parse", ref],
+            ["rev-parse", "--verify", "--end-of-options", ref],
             at: repoURL
         )
         guard exitCode == 0 else {
@@ -2771,6 +2793,7 @@ actor GitService {
 
     /// Get git status output in porcelain format with NUL delimiters.
     func getStatusPorcelainZ(at repoURL: URL) async throws -> Data {
+        try await requireCompleteWorkingTreeInspection(at: repoURL)
         let (stdout, stderr, exitCode) = try await runGit(
             ["status", "--porcelain", "-z", "--untracked-files=all"],
             at: repoURL
@@ -2868,6 +2891,7 @@ actor GitService {
 
     /// Get diff between specified branch and working tree
     func getDiff(from branch: String, at repoURL: URL) async throws -> String {
+        try GitRevisionArgument.validate(branch)
         // Compare branch to working tree to include all uncommitted changes
         let (stdout, stderr, exitCode) = try await runGit(
             ["diff", branch],
@@ -2883,6 +2907,7 @@ actor GitService {
 
     /// Get diff between specified branch and working tree for specific files
     func getDiff(from branch: String, for files: [String], at repoURL: URL) async throws -> String {
+        try GitRevisionArgument.validate(branch)
         // Prefer normal argv for smaller file sets (compatibility),
         // use pathspec-from-file when args are large, and chunk as a fallback.
         let maxChunk = 3000
@@ -3281,6 +3306,7 @@ actor GitService {
         paths: [String]?,
         at repoURL: URL
     ) async throws -> String {
+        if let refArg { try GitRevisionArgument.validate(refArg) }
         let maxChunk = 3000
         let pathspecByteLimit = 128 * 1024
         let cleanedPaths = (paths ?? []).filter { !$0.isEmpty }
@@ -3304,7 +3330,7 @@ actor GitService {
             do {
                 var args = baseArgs()
                 args.append(contentsOf: ["--pathspec-from-file=-", "--pathspec-file-nul"])
-                if let refArg, !refArg.isEmpty {
+                if let refArg {
                     args.append(refArg)
                 }
                 let stdin = makePathspecStdinData(cleanedPaths)
@@ -3322,9 +3348,10 @@ actor GitService {
 
         guard !cleanedPaths.isEmpty else {
             var args = baseArgs()
-            if let refArg, !refArg.isEmpty {
+            if let refArg {
                 args.append(refArg)
             }
+            args.append("--")
             let (stdout, stderr, exitCode) = try await runGit(args, at: repoURL)
             guard exitCode == 0 || exitCode == 1 else {
                 throw GitError(message: "git diff failed: \(stderr)")
@@ -3334,7 +3361,7 @@ actor GitService {
 
         if cleanedPaths.count <= maxChunk {
             var args = baseArgs()
-            if let refArg, !refArg.isEmpty {
+            if let refArg {
                 args.append(refArg)
             }
             args.append("--")
@@ -3349,7 +3376,7 @@ actor GitService {
         var combined = ""
         for chunk in cleanedPaths.chunked(into: maxChunk) {
             var args = baseArgs()
-            if let refArg, !refArg.isEmpty {
+            if let refArg {
                 args.append(refArg)
             }
             args.append("--")
@@ -3846,6 +3873,10 @@ actor GitService {
         case let .branch(ref): [ref]
         }
 
+        for ref in reference {
+            try GitRevisionArgument.validate(ref)
+        }
+        try await requireCompleteWorkingTreeInspection(at: repoURL)
         let numstatArgs = ["diff"] + reference + ["--numstat"]
         let nameStatusArgs = ["diff"] + reference + ["--name-status"]
 
@@ -4013,8 +4044,13 @@ actor GitService {
         paths: [String]? = nil,
         at repoURL: URL
     ) async throws -> [UncommittedFile] {
-        if let paths, paths.isEmpty {
-            return []
+        try compare.validateRevisionArgument()
+        if let paths, paths.isEmpty { return [] }
+        switch compare {
+        case .uncommitted, .uncommittedMergeBase, .unstaged:
+            try await requireCompleteWorkingTreeInspection(at: repoURL)
+        case .staged, .stagedMergeBase, .revspec:
+            break
         }
         let includeUntracked = includeUntrackedWhenApplicable && {
             switch compare {
@@ -4163,8 +4199,21 @@ actor GitService {
         let workingStatus: WorkingStatus
     }
 
+    private func requireCompleteWorkingTreeInspection(at repoURL: URL) async throws {
+        // The passive status fence suppresses Git's recursive submodule status:
+        // children have independent executable configuration that has not been
+        // validated. Never interpret that deliberately partial view as clean.
+        // Index metadata is safe to read without entering those repositories.
+        let (index, indexError, indexExit) = try await runGitData(["ls-files", "--stage", "-z", "--", ":/"], at: repoURL)
+        guard indexExit == 0 else { throw GitError(message: "Could not determine status completeness: \(String(decoding: indexError, as: UTF8.self))") }
+        if index.split(separator: 0).contains(where: { $0.starts(with: "160000 ".utf8) }) {
+            throw GitError(message: "Working-tree status is incomplete: tracked submodules cannot be safely inspected by passive Git reads. Cleanliness is unknown; inspect submodules with Git outside RepoPrompt before merging. RepoPrompt cannot approve a worktree merge from this partial status.")
+        }
+    }
+
     /// Read branch metadata and working-tree state from one porcelain-v2 snapshot.
     func getRepositoryStatus(at repoURL: URL) async throws -> RepositoryStatus {
+        try await requireCompleteWorkingTreeInspection(at: repoURL)
         let args = ["status", "--porcelain=v2", "-z", "--branch", "--untracked-files=all"]
         let (stdout, stderr, exitCode) = try await runGit(args, at: repoURL)
         guard exitCode == 0 else {
@@ -4969,15 +5018,9 @@ actor GitService {
     private nonisolated static func targetEvidenceGitArguments(
         _ arguments: [String]
     ) -> [String] {
-        let safetyArguments = [
-            "-c", "core.fsmonitor=false",
-            "-c", "core.hooksPath=/dev/null",
-            "-c", "core.untrackedCache=false"
-        ]
-        if Array(arguments.prefix(safetyArguments.count)) == safetyArguments {
-            return arguments
-        }
-        return safetyArguments + arguments
+        let fenced = GitReadSafety.arguments(arguments)
+        return fenced.starts(with: GitReadSafety.configurationArguments)
+            ? fenced : GitReadSafety.configurationArguments + fenced
     }
 
     private nonisolated static func targetEvidenceEnvironmentIdentity(
@@ -7373,6 +7416,7 @@ actor GitService {
 
     /// Get commit info (metadata only, no diff).
     func commitInfo(ref: String, at repoURL: URL) async throws -> CommitInfo {
+        try GitRevisionArgument.validate(ref)
         let args = [
             "show",
             "-s",
@@ -7381,7 +7425,9 @@ actor GitService {
             "--no-ext-diff",
             "--no-textconv",
             "--color=never",
-            ref
+            // Peel annotated tags so their headers cannot enter the commit metadata.
+            "\(ref)^{commit}",
+            "--"
         ]
         let (stdout, stderr, exitCode) = try await runGit(args, at: repoURL)
         guard exitCode == 0 else {
@@ -7551,25 +7597,7 @@ actor GitService {
     }
 
     nonisolated static func isVerifiedReadOnlyGitOperation(_ args: [String]) -> Bool {
-        guard let command = args.first else { return false }
-        switch command {
-        case "rev-parse", "status", "ls-files", "ls-tree", "diff", "diff-tree", "check-attr", "merge-base", "merge-tree",
-             "show-ref", "for-each-ref", "log", "rev-list", "show", "blame", "cat-file":
-            return true
-        case "worktree":
-            return args.dropFirst().first == "list"
-        case "symbolic-ref":
-            return args.contains("--short") && args.last == "HEAD"
-        case "branch":
-            return args == ["branch", "--show-current"]
-        case "config":
-            return args.contains("--get") || args.contains("--get-regexp")
-        default:
-            if command == "--git-dir", let configIndex = args.firstIndex(of: "config") {
-                return args[configIndex...].contains("--get")
-            }
-            return false
-        }
+        GitReadSafety.isRead(args)
     }
 
     private func withWorkspaceAuthorityMutation<T>(
@@ -7785,6 +7813,11 @@ actor GitService {
         admissionPriority: GitProcessAdmissionPriority,
         commandFamily: GitProcessCommandFamily
     ) async throws -> (GitRawOutputSpoolLease, Data, Int32, Process.TerminationReason) {
+        let (args, environment) = try await preparePassiveGitRead(
+            args, at: repoURL, environment: environment,
+            diagnosticRepositoryPath: diagnosticRepositoryPath,
+            admissionPriority: admissionPriority, commandTimeout: resourcePolicy.activityTimeout
+        )
         #if DEBUG
             let benchmarkMetricTag = WorktreeStartupInstrumentation.currentBenchmarkMetricTag
         #endif
@@ -8132,7 +8165,7 @@ actor GitService {
         environment["GIT_ALLOW_PROTOCOL"] = ""
         environment["LC_ALL"] = "C"
         environment["LANG"] = "C"
-        return environment
+        return GitReadSafety.environment(environment)
     }
 
     private nonisolated static func exactWorktreeEnvironment(
@@ -8169,6 +8202,39 @@ actor GitService {
         }
     }
 
+    /// Called inside the existing admission lease; the config query uses that
+    /// lease too, rather than recursively acquiring a per-repository slot.
+    /// Do not cache this result: includes and worktree configuration can change
+    /// without changing the main config's modification time.
+    private func preparePassiveGitRead(
+        _ args: [String],
+        at repoURL: URL,
+        environment: [String: String],
+        diagnosticRepositoryPath: String,
+        admissionPriority: GitProcessAdmissionPriority,
+        commandTimeout: Duration
+    ) async throws -> ([String], [String: String]) {
+        guard GitReadSafety.isRead(args) else { return (args, environment) }
+        try GitReadSafety.validateSupportedRead(args)
+        let safeEnvironment = GitReadSafety.environment(environment)
+        if GitReadSafety.needsDriverCheck(args), let commandIndex = GitReadSafety.commandIndex(in: args) {
+            let query = Array(args.prefix(commandIndex)) + GitReadSafety.driverQuery
+            let (configuration, diagnostic, exitCode) = try await runAdmittedGitData(
+                query, at: repoURL, environment: safeEnvironment, stdin: nil,
+                diagnosticRepositoryPath: diagnosticRepositoryPath,
+                processQueueWaitMicroseconds: 0,
+                stdoutByteLimit: 1024 * 1024, stderrByteLimit: 64 * 1024,
+                admissionPriority: admissionPriority, commandFamily: .repositoryRead,
+                commandTimeout: commandTimeout
+            )
+            guard exitCode == 0 || (exitCode == 1 && configuration.isEmpty && diagnostic.isEmpty) else {
+                throw GitError(message: GitReadSafety.driverQueryFailure(exitCode: exitCode, stderr: diagnostic))
+            }
+            try GitReadSafety.validateDriverConfiguration(configuration, for: args)
+        }
+        return (GitReadSafety.arguments(args), safeEnvironment)
+    }
+
     private func runAdmittedGitData(
         _ args: [String],
         at repoURL: URL,
@@ -8182,6 +8248,11 @@ actor GitService {
         commandFamily: GitProcessCommandFamily,
         commandTimeout: Duration
     ) async throws -> (Data, Data, Int32) {
+        let (args, environment) = try await preparePassiveGitRead(
+            args, at: repoURL, environment: environment,
+            diagnosticRepositoryPath: diagnosticRepositoryPath,
+            admissionPriority: admissionPriority, commandTimeout: commandTimeout
+        )
         #if DEBUG
             let benchmarkMetricTag = WorktreeStartupInstrumentation.currentBenchmarkMetricTag
         #endif
