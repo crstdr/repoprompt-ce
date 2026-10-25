@@ -215,7 +215,11 @@ extension AgentModeViewModel {
         { return true }
         if let claimID = proof.composerAttemptID, session.activeComposerSubmitAttempt?.id == claimID { return true }
         if let inputID = proof.acceptedInputID {
-            return session.hasLocalComposerCandidate(itemID: inputID, fence: proof.stopFence)
+            if session.hasLocalComposerCandidate(itemID: inputID, fence: proof.stopFence) { return true }
+            // Non-local producers (session-link send, MCP resident, auto/periodic wakes) leave no
+            // composer candidate, and their claim can be released before the spawned run registers
+            // ownership. The durably accepted row itself is the carrying attempt until then.
+            return session.items.contains { $0.id == inputID }
         }
         return false
     }

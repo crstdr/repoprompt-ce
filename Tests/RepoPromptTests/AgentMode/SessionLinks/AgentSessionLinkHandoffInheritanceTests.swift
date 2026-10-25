@@ -2480,6 +2480,38 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             }
         }
 
+        func testNonLocalAcceptedRowKeepsSwitchOwnershipUntilRunAssociation() async throws {
+            // Session-link and MCP sends release their composer claim before the spawned run
+            // registers ownership; the durably accepted row must carry the attempt across that
+            // window or readiness transiently reports unconfirmed/needs-review.
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                session.selectedAgent = .openCode
+                session.selectedModelRaw = "unknown-window"
+                try installSwitch(fixture)
+                let preparation = try await switchPreparation(fixture)
+                let item = AgentChatItem.user("non-local input", sequenceIndex: session.nextSequenceIndex)
+                session.appendItem(item)
+                _ = preparation.accepting(item.id, session: session)
+                XCTAssertNil(session.activeComposerSubmitAttempt)
+                XCTAssertTrue(AgentModeViewModel.providerSwitchHasOwnedCarryingAttempt(session))
+                session.pendingHandoff.providerSwitchDelivery = .sending
+                session.pendingHandoff.isStagedForSend = true
+                XCTAssertFalse(AgentModeViewModel.providerSwitchUnconfirmed(session))
+                let candidate = try XCTUnwrap(vm.agentSessionLinkCandidate(
+                    tabID: session.tabID, sessionID: XCTUnwrap(session.activeAgentSessionID),
+                    tabName: "Target", isWindowClosing: false
+                ))
+                let inputs = AgentModeViewModel.sendReadinessInputs(session: session, candidate: candidate, status: .idle)
+                XCTAssertTrue(inputs.runStateIsActive, "idle_for_send must agree with send admission during the dispatch window")
+                _ = try session.removeItem(at: XCTUnwrap(session.items.firstIndex { $0.id == item.id }))
+                session.pendingHandoff.providerSwitchDispatch = nil
+                XCTAssertFalse(AgentModeViewModel.providerSwitchHasOwnedCarryingAttempt(session))
+                XCTAssertTrue(AgentModeViewModel.providerSwitchUnconfirmed(session))
+            }
+        }
+
         func testOrdinarySendArmingChangeReachesExistingPersistenceBoundary() async throws {
             for initiallyArmed in [false, true] {
                 try await withFixture { fixture in
