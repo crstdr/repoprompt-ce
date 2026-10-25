@@ -2209,6 +2209,7 @@ final class ACPIntegratedAgentModeRunner {
             )
             inspectedItemCount += candidates.inspectedItemCount
             if let index = candidates.indices.first {
+                session.noteUncertainToolCorrelation()
                 MCPToolObserverAttributionContext.record(
                     correlationPath: candidates.usedFallbackScan ? "signature_active_turn_scan" : "signature",
                     scannedItemCount: inspectedItemCount
@@ -2231,6 +2232,7 @@ final class ACPIntegratedAgentModeRunner {
             })
             inspectedItemCount += candidates.scannedItemCount
             if let index = candidates.indices.first {
+                session.noteUncertainToolCorrelation()
                 MCPToolObserverAttributionContext.record(correlationPath: "late_placeholder_active_turn_scan", scannedItemCount: inspectedItemCount)
                 return index
             }
@@ -2247,6 +2249,7 @@ final class ACPIntegratedAgentModeRunner {
                 correlationPath: fallback.indices.first == nil ? "none" : "name_active_turn_scan",
                 scannedItemCount: inspectedItemCount
             )
+            if !fallback.indices.isEmpty { session.noteUncertainToolCorrelation() }
             return fallback.indices.first
         }
         MCPToolObserverAttributionContext.record(

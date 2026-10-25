@@ -63,6 +63,17 @@ final class MCPDomainStandaloneCompositionTests: XCTestCase {
             XCTAssertTrue(String(describing: error).contains("session_admin is not available"), "\(error)")
         }
 
+        let noopCandidate = await runtime.toolRegistry.resolve(
+            toolName: MCPWindowToolName.selfNoop, scope: .standalone(id: scopeID)
+        )
+        let noop = try XCTUnwrap(noopCandidate).binding
+        do {
+            _ = try await noop([:])
+            XCTFail("Standalone cannot manufacture an app-owned declaration acknowledgement")
+        } catch let denial as MCPDomainCallPolicyDenial {
+            XCTAssertEqual(denial, .missingAdditionalGrant(toolName: MCPWindowToolName.selfNoop))
+        }
+
         let protectedCandidate = await runtime.toolRegistry.resolve(
             toolName: MCPWindowToolName.manageSelection,
             scope: .standalone(id: scopeID)

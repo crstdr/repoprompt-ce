@@ -4735,7 +4735,8 @@ extension AgentSessionLinkPromptClaimStoreTests {
                         }
                         let before = try makeClaim(offersQuiet: false)
                         let after = try makeClaim(offersQuiet: basis == "routine" || basis == "overflow" || basis == "attention")
-                        let qualifies = (provider == .claudeCode || provider == .codexExec) && (basis == "routine" || basis == "overflow")
+                        let qualifies = AgentSessionLinkPrompts.supportsQuietCheckIn(provider) && (basis == "routine" || basis == "overflow")
+
                         XCTAssertEqual(
                             after.fragment.components(separatedBy: literal).count - 1,
                             qualifies ? 1 : 0,
@@ -4767,6 +4768,12 @@ extension AgentSessionLinkPromptClaimStoreTests {
                         ]
                         let data = try JSONSerialization.data(withJSONObject: measurement, options: [.sortedKeys])
                         print("QUIET_C4_ENVELOPE " + data.base64EncodedString())
+                        if qualifies, !reminder, !nearCap, basis == "routine" {
+                            let range = try XCTUnwrap(after.fragment.range(of: literal))
+                            let hint = String(after.fragment[range])
+                            print("W2_TRIAL_HINT " + Data(literal.utf8).base64EncodedString())
+                            print("W2_ACTUAL_HINT " + Data(hint.utf8).base64EncodedString())
+                        }
                     }
                 }
             }

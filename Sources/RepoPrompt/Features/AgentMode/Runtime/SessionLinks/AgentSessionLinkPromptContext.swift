@@ -1130,8 +1130,9 @@ final class AgentSessionLinkOutboundPromptClaimStore {
         passiveNotices: AgentSessionLinkPassiveStatusNotices.Snapshot? = nil,
         locationLabelsByReference: [DomainAgentSessionLinkReference: String] = [:],
         allowsClaimlessAutoWake: Bool = false,
-        decorateLocalInputs: (AgentSessionLinkPromptRenderResult) -> AgentSessionLinkLocalInputDecoration? = { _ in nil },
         routineQuietCheckIn: Bool = false,
+        decorateLocalInputs: (AgentSessionLinkPromptRenderResult) -> AgentSessionLinkLocalInputDecoration? = { _ in nil },
+
         inventoryGuidanceRevision: UInt64 = AgentSessionLinkPrompts.currentInventoryGuidanceRevision,
         render: (AgentSessionLinkPromptRenderRequest) -> AgentSessionLinkPromptRenderResult
     ) -> AgentSessionLinkPromptClaimOutcome {

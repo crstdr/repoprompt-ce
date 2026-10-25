@@ -1,6 +1,7 @@
 import MCP
 
-/// Fork-only feasibility trial: a stateless response, not a host-side turn seal.
+// Call acknowledgement only. The app's exact live attempt owns declaration qualification.
+
 package enum AgentSelfNoopTool {
     package static let definition = MCPDomainToolDefinition(
         name: MCPWindowToolName.selfNoop,
@@ -12,9 +13,5 @@ package enum AgentSelfNoopTool {
         ])
     )
 
-    package static func execute() -> Value {
-        .object(["result": .string("done")])
-    }
-
-    package static let binding = MCPDomainToolBinding(definition: definition) { _ in execute() }
+    package static let acknowledgement: Value = .object(["result": .string("done")])
 }
