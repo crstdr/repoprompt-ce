@@ -40,6 +40,7 @@ def swift_literal(value):
     for key, replacement in {
         "toolReference": TOOL,
         "server": "RepoPromptCE",
+        "grokServer": "RepoPromptCEGrokRuntime",
         "envelopeTag": "repoprompt_session_oversight",
         "capabilityChangeEnvelopeTag": "repoprompt_session_oversight_capability_change",
     }.items():

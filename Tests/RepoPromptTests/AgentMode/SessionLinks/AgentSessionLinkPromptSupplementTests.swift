@@ -4778,6 +4778,10 @@ extension AgentSessionLinkPromptClaimStoreTests {
                     }
                 }
             }
+        }
+    }
+}
+
 @MainActor
 final class AgentOrchestrationGuidanceTests: XCTestCase {
     func testInventoryTeachesManagedDirectionWithoutUpgradingRestrictedGrant() {
