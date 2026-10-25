@@ -30,6 +30,30 @@ struct AgentSelfMCPToolService {
         "self_compact is available only to the calling Agent Mode session with a resolved live binding; no target selector grants access."
     )
 
+    /// Ordinary host policy has already admitted this Agent Mode caller. This result acknowledges
+    /// every body call, including stale/ineligible/duplicate declarations; only the ledger decides
+    /// quietness. Schema, disabled-tool and transport failures remain in the normal host envelope.
+    func executeNoop(args: [String: Value]) async throws -> Value {
+        let origin = captureCallOrigin()
+        let context = MCPInvocationContextBridge.current
+        let window = try requireTargetWindow()
+        if let origin, let context {
+            window.agentModeViewModel.enterSelfNoopBody(
+                origin: origin, invocationID: context.invocationID, argumentsAreEmpty: args.isEmpty
+            )
+        }
+        let metadata = await captureRequestMetadata()
+        let endpoint = await AgentSessionTargetOperationGuard.resolveObserverEndpoint(
+            metadata: metadata, targetWindow: window, resolveObserverEndpoint: resolveObserverEndpoint
+        )
+        if let origin, let context {
+            window.agentModeViewModel.acceptSelfNoopBody(
+                origin: origin, endpoint: window.isClosing ? nil : endpoint, invocationID: context.invocationID
+            )
+        }
+        return AgentSelfNoopTool.acknowledgement
+    }
+
     func execute(args: [String: Value]) async throws -> Value {
         guard isToolEnabled() else { throw MCPError.invalidParams("self_compact is disabled.") }
         guard let op = AgentMCPToolHelpers.normalizedString(args["op"])?.lowercased() else {

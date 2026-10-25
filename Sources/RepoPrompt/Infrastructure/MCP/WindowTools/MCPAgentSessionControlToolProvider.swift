@@ -33,8 +33,9 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
             freshnessPolicy: .none,
             description: AgentSelfNoopTool.definition.description,
             inputSchema: .object(properties: [:])
-        ) { _, _ in
-            AgentSelfNoopTool.execute()
+        ) { [dependencies] invocation, args in
+            _ = try await dependencies.requireAgentModeConnection(invocation.context, MCPWindowToolName.selfNoop)
+            return try await dependencies.executeAgentSelf(args)
         }
     }
 

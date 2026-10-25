@@ -311,7 +311,7 @@ extension AgentSessionLinkRuntimeBridgeTests {
             addTeardownBlock { @MainActor in await fixture.vm.test_claudeCoordinator.shutdownClaudeSession(session) }
             let initialFacts = try XCTUnwrap(session.quietLedger.facts)
             let claim = try XCTUnwrap(fixture.vm.agentSessionLinkPromptClaim(for: session, dispatchID: .autoWake(wakeID: fixture.wake.wakeID)))
-            XCTAssertTrue(claim.routineQuietCheckIn, "Freeze idle-route qualification before beginning the attempt")
+            XCTAssertFalse(claim.routineQuietCheckIn, "A route without the returned self_noop definition starts ordinary")
             defer {
                 session.agentTask?.cancel()
                 fixture.bridge.freezeForTermination()
@@ -331,18 +331,18 @@ extension AgentSessionLinkRuntimeBridgeTests {
             await runner.startRun(tabID: fixture.tabID, session: session, initialUserMessage: "", initialMessageForRun: "", attachments: [], makeLease: { harness.makeLease(runID: $0, tabID: fixture.tabID) })
             try await AsyncTestWait.waitUntil("routine Claude attempt accepted") { !session.claudeExpectedTurnIDs.isEmpty && session.claudeSteeringAbandonment != nil }
             let owner = try XCTUnwrap(session.activeRunOwnership)
-            XCTAssertNotNil(session.quietLedger.candidateStartKey(owner: owner), "This starts as a real routine wake, not an ordinary user turn")
+            XCTAssertNil(session.quietLedger.candidateStartKey(owner: owner), "Missing exact catalog evidence keeps this routine wake ordinary")
             let wakeRows = session.quietLedger.hostMarkerIDs
             XCTAssertFalse(wakeRows.isEmpty)
             await fixture.claude.emit(.stream(.init(type: "final_content", text: reply)))
             try await AsyncTestWait.waitUntil("empty or ACK reply consumed") { replyConsumed }
-            XCTAssertNotNil(session.quietLedger.candidateStartKey(owner: owner), "The consumed reply must not pre-emptively make the turn ordinary")
-            // Model the stale-active state at the probe boundary: no outstanding completion,
-            // a live idle provider, and no user/tool ingress to make the run ordinary first.
+            XCTAssertNil(session.quietLedger.candidateStartKey(owner: owner), "Neither silence nor an undeclared reply creates quiet eligibility")
+            // Model the stale-active state at the probe boundary: no outstanding completion
+            // and a live idle provider. Recovery must keep this ordinary wake visible.
             session.claudeExpectedTurnIDs.removeAll()
             await fixture.claude.setTurnInFlight(false)
             XCTAssertTrue(try ClaudeIntegratedAgentModeRunner.staleActiveRecoveryFencesAreClear(session: session, coordinator: fixture.vm.test_claudeCoordinator, ownership: owner, runID: XCTUnwrap(session.runID)))
-            XCTAssertNotNil(session.quietLedger.candidateStartKey(owner: owner), "The stale boundary must still be quiet-eligible before recovery")
+            XCTAssertNil(session.quietLedger.candidateStartKey(owner: owner), "The stale boundary cannot invent a declaration")
             publishClaudeSuccessorWake(fixture)
             try await AsyncTestWait.waitUntil("refused wake recovers stale-active attempt") { session.runState == .failed }
             XCTAssertTrue(session.items.contains { $0.kind == .error && $0.text == "Claude Code stopped reporting this run's outcome, so RepoPrompt closed it as failed. The conversation is intact; send a message to continue." }, "The specific stale-active recovery branch must have committed")

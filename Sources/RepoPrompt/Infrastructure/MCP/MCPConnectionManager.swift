@@ -1868,6 +1868,7 @@ actor ServerNetworkManager {
         let hasActiveOutboundLink: Bool?
         let expectedSurface: Data?
         let returnedSurface: Data?
+        let returnedCatalog: [String: [MCP.Tool]]?
         let projectionRevision: UInt64
 
         var routeToken: AgentSessionLinkRunCatalogRouteToken? {
@@ -1894,7 +1895,8 @@ actor ServerNetworkManager {
                 hasAnyActiveLink: hasAnyActiveLink,
                 hasActiveOutboundLink: hasActiveOutboundLink,
                 expectedSurface: expectedSurface,
-                returnedSurface: returnedSurface
+                returnedSurface: returnedSurface,
+                returnedCatalog: returnedCatalog
             )
         }
     }
@@ -1937,6 +1939,11 @@ actor ServerNetworkManager {
 
     private nonisolated let codeStructureSettlementRegistry = MCPCodeStructureSettlementRegistry()
     private nonisolated let toolCardOwnershipLedger = MCPToolCardOwnershipLedger()
+
+    /// The outer observer path owns this indexed key until its callbacks have been enqueued.
+    nonisolated func hasPendingToolCardObservations(windowID: Int, runID: UUID) -> Bool {
+        toolCardOwnershipLedger.hasOwners(windowID: windowID, runID: runID)
+    }
 
     /// The registry remains the lease owner. This actor keeps only the identity
     /// of a warning projected into each window, so healthy calls do not hop to
@@ -3527,7 +3534,9 @@ actor ServerNetworkManager {
         connectionID: UUID,
         initialRouteToken: AgentSessionLinkRunCatalogRouteToken?,
         returnedSessionLinkPresence: Bool,
-        returnedSurface: Data? = nil
+        returnedSurface: Data? = nil,
+        returnedCatalog: [String: [MCP.Tool]]? = nil,
+        catalogStartRevision: UInt64? = nil
     ) async {
         let runID = initialRouteToken?.runID ?? runIDByConnectionID[connectionID]
         guard let runID else { return }
@@ -3553,6 +3562,12 @@ actor ServerNetworkManager {
         let liveCatalogPresence = liveAnyLinkPresence == true || finalSnapshot?.hasActivatedOverseer == true
         let membershipAgrees = returnedSurface.map { $0 == expectedSurface }
             ?? (liveCatalogPresence == returnedSessionLinkPresence)
+        // A list that began before a newer publication cannot supply positive tool evidence.
+        // Use the existing revision clock, not another list counter or capability record. The
+        // ordinary family merge/repair semantics above deliberately remain unchanged.
+        let catalogIsCurrent = catalogStartRevision.map {
+            (currentObservation?.projectionRevision ?? runCatalogProjectionRevision) <= $0
+        } ?? false
         let currentRouteToken = currentObservation?.routeToken
         // The currently authoritative successor may replace a preserved unready predecessor.
         // A late predecessor completion still fails `routeIsCurrent` and cannot overwrite a
@@ -3567,6 +3582,7 @@ actor ServerNetworkManager {
                 hasActiveOutboundLink: routeIsCurrent ? liveOutboundPresence : nil,
                 expectedSurface: routeIsCurrent ? expectedSurface : nil,
                 returnedSurface: routeIsCurrent ? returnedSurface : nil,
+                returnedCatalog: routeIsCurrent && catalogIsCurrent ? returnedCatalog : nil,
                 supersedesWaiters: false
             )
         }
@@ -3577,6 +3593,23 @@ actor ServerNetworkManager {
         } else if let authoritativeRouteToken = await authoritativeRunCatalogRouteToken(for: runID) {
             await notifyToolListChanged(connectionID: authoritativeRouteToken.connectionID)
         }
+    }
+
+    /// Reads only the existing run observation; never waits for catalog convergence or requests a
+    /// relist. Callers still own routine-role, exact attempt and final binding qualification.
+    func hasCurrentReturnedTool(
+        _ definition: MCP.Tool,
+        routeToken: AgentSessionLinkRunCatalogRouteToken,
+        projectionRevision: UInt64
+    ) async -> Bool {
+        let currentRoute = await authoritativeRunCatalogRouteToken(for: routeToken.runID)
+        let enabled = await MainActor.run { ToolAvailabilityStore.shared.isEnabled(definition.name) }
+        guard enabled, isEnabledState, currentRoute == routeToken, isCurrentCatalogRouteToken(routeToken),
+              let projection = runCatalogObservationByRunID[routeToken.runID]?.projection,
+              projection.projectionRevision == projectionRevision,
+              projection.routeToken == routeToken
+        else { return false }
+        return projection.containsReturnedTool(definition)
     }
 
     /// Final actor-local generation fence after expected-definition actor hops.
@@ -3616,6 +3649,7 @@ actor ServerNetworkManager {
         hasActiveOutboundLink: Bool?,
         expectedSurface: Data? = nil,
         returnedSurface: Data? = nil,
+        returnedCatalog: [String: [MCP.Tool]]? = nil,
         supersedesWaiters: Bool
     ) async -> AgentSessionLinkRunCatalogProjection {
         runCatalogProjectionRevision &+= 1
@@ -3630,6 +3664,7 @@ actor ServerNetworkManager {
             hasActiveOutboundLink: hasActiveOutboundLink,
             expectedSurface: expectedSurface,
             returnedSurface: returnedSurface,
+            returnedCatalog: returnedCatalog,
             projectionRevision: runCatalogProjectionRevision
         )
         runCatalogObservationByRunID[runID] = observation
@@ -11650,6 +11685,11 @@ actor ServerNetworkManager {
                 debugBeforeToolResultFormattingForTesting = handler
             }
 
+            /// Existing outer-handler ownership outlives wrapper cleanup and observer suspension.
+            nonisolated func debugHasPendingToolCardObservations(windowID: Int, runID: UUID) -> Bool {
+                toolCardOwnershipLedger.snapshots().contains { $0.key.windowID == windowID && $0.key.runID == runID && !$0.invocationIDs.isEmpty }
+            }
+
             func debugSetBeforeToolCompletionObserversForTesting(
                 _ handler: (@Sendable (UUID, String) async -> Void)?
             ) {
@@ -12147,6 +12187,12 @@ actor ServerNetworkManager {
 
     #if DEBUG
         private(set) var debugCatalogHydrationWorkCount = 0
+        /// Controlled returned-catalog fixture only; no product advertisement or registration.
+        private var debugReturnedCatalogToolsForTesting: (@Sendable ([MCP.Tool], Bool) -> [MCP.Tool])?
+        func debugSetReturnedCatalogToolsForTesting(_ shape: (@Sendable ([MCP.Tool], Bool) -> [MCP.Tool])?) {
+            debugReturnedCatalogToolsForTesting = shape
+        }
+
         private var debugAfterExpectedCatalogSurfaceForTesting: (@Sendable () async -> Void)?
         private var debugAfterBecomeOverseerProofRegistrationForTesting: (
             @Sendable (UUID, DomainAgentSessionLinkEndpointIdentity) async -> Void
@@ -13367,6 +13413,7 @@ actor ServerNetworkManager {
         // ------------------------------------------------------------------
         await server.withMethodHandler(ListTools.self) { [weak self] _ in
             guard let self else { return ListTools.Result(tools: []) }
+            let catalogStartRevision = await runCatalogProjectionRevision
 
             connectionLog("Handling ListTools request for \(connectionID)")
             let clientIdentifier = await clientIdentifier(forConnection: connectionID)
@@ -13467,12 +13514,19 @@ actor ServerNetworkManager {
                     "hiddenSamples": hiddenToolSamples.joined(separator: ",")
                 ])
             #endif
+            #if DEBUG
+                if let shape = await debugReturnedCatalogToolsForTesting {
+                    tools = shape(tools, sessionLinkGrantSnapshot?.hasActiveOutboundLink == true)
+                }
+            #endif
             let returnedSessionLinkPresence = tools.contains { $0.name == MCPWindowToolName.agentSessionLink }
             try await completeRunCatalogObservation(
                 connectionID: connectionID,
                 initialRouteToken: sessionLinkGrantSnapshot?.routeToken,
                 returnedSessionLinkPresence: returnedSessionLinkPresence,
-                returnedSurface: AgentSessionLinkCatalogSurface.fingerprint(tools)
+                returnedSurface: AgentSessionLinkCatalogSurface.fingerprint(tools),
+                returnedCatalog: Dictionary(grouping: tools, by: \.name),
+                catalogStartRevision: catalogStartRevision
             )
             connectionLog("Returning \(tools.count) available tools for \(connectionID)")
             return ListTools.Result(tools: tools)
@@ -13904,7 +13958,13 @@ actor ServerNetworkManager {
                 let effectivePolicy = initialPolicy
                 // Recomputed live rather than read from the installed policy: a `list_changed`
                 // notification can lag a grant change in either direction, so stale advertisement
-                let liveSessionLinkGrant = AgentSessionLinkCatalogSurface.toolNames.contains(toolName)
+                let liveSessionLinkGrant = (
+                    toolName == MCPWindowToolName.agentSessionLink
+                        || toolName == MCPWindowToolName.becomeOverseer
+                        || toolName == MCPWindowToolName.sessionAdmin
+                        || toolName == MCPWindowToolName.selfNoop
+                )
+
                     ? await liveSessionLinkGrantSnapshot(connectionID: connectionID, modelOnly: isMemoryOnlyModelCall)
                     : nil
                 guard await isCurrentToolPolicyAdmission(policyAdmissionToken) else {
@@ -14007,7 +14067,13 @@ actor ServerNetworkManager {
                 // Rebuild with a fresh exact link fact. The early grant check and this role/profile
                 // gate are separated by routing work, so carrying the earlier answer would let a
                 // revocation stale-authorize this exception.
-                let liveSessionLinkGrant = AgentSessionLinkCatalogSurface.toolNames.contains(toolName)
+                let liveSessionLinkGrant = (
+                    toolName == MCPWindowToolName.agentSessionLink
+                        || toolName == MCPWindowToolName.becomeOverseer
+                        || toolName == MCPWindowToolName.sessionAdmin
+                        || toolName == MCPWindowToolName.selfNoop
+                )
+
                     ? await liveSessionLinkGrantSnapshot(connectionID: connectionID, modelOnly: isMemoryOnlyModelCall)
                     : nil
                 guard await isCurrentToolPolicyAdmission(policyAdmissionToken) else {
@@ -14076,6 +14142,9 @@ actor ServerNetworkManager {
                 nil
             }
             let capturedConnectionGeneration = await requestTimelineConnectionGeneration(for: connectionID)
+            let candidateClaudeToolUseID = ToolInvocationContext.candidateClaudeToolUseID(params._meta?["claudecode/toolUseId"])
+            let candidateCodexCallID = ToolInvocationContext.correlationString(params._meta?["callId"])
+            let candidateCodexThreadID = ToolInvocationContext.correlationString(params._meta?["threadId"])
             let capturedProgressState: MCPDomainRequestProgressHandle? = if let progressToken = params._meta?.progressToken,
                                                                             let connectionGeneration = capturedConnectionGeneration
             {
@@ -14736,12 +14805,35 @@ actor ServerNetworkManager {
                                 }
                                 defer { toolCardOwnershipLease?.release() }
 
+                                let networkInvocationContext = await ToolInvocationContext(
+                                    origin: .network,
+                                    invocationID: invocationID,
+                                    requestID: validatedTransportDispatchIdentity?.requestID ?? resolvedRequestIdentity?.jsonRPCRequestID,
+                                    toolName: toolName,
+                                    metadata: MCPRequestMetadata(
+                                        connectionID: connectionID,
+                                        clientName: self.clientIdentifier(forConnection: connectionID),
+                                        windowID: chosenID,
+                                        runPurpose: self.runPurpose(for: connectionID),
+                                        tabContextHint: capturedTabContextHint.map {
+                                            MCPTabContextHint(tabID: $0.tabID, workspaceID: $0.workspaceID, windowID: $0.windowID)
+                                        },
+                                        invocationID: invocationID,
+                                        requestID: validatedTransportDispatchIdentity?.requestID ?? resolvedRequestIdentity?.jsonRPCRequestID
+                                    ),
+                                    dispatchAuthorization: nil,
+                                    claudeToolUseID: candidateClaudeToolUseID,
+                                    codexCallID: candidateCodexCallID,
+                                    codexThreadID: candidateCodexThreadID
+                                )
                                 if let runID = observerRunIDForCallbacksFinal {
                                     let observerState = EditFlowPerf.begin(
                                         EditFlowPerf.Stage.MCPToolCall.observerCallbacks,
                                         EditFlowPerf.Dimensions(toolName: toolName)
                                     )
-                                    let eventObserverCount = await self.fireToolCalledObservers(runID: runID, invocationID: invocationID, toolName: toolName, args: capturedArguments)
+                                    let eventObserverCount = await MCPInvocationContextBridge.withInvocation(networkInvocationContext) {
+                                        await self.fireToolCalledObservers(runID: runID, invocationID: invocationID, toolName: toolName, args: capturedArguments)
+                                    }
                                     EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.observerCallbacks, observerState)
                                     #if DEBUG
                                         if toolName == "agent_run" {
@@ -15776,24 +15868,6 @@ actor ServerNetworkManager {
                                     } else {
                                         nil
                                     }
-                                    let networkInvocationContext = await ToolInvocationContext(
-                                        origin: .network,
-                                        invocationID: invocationID,
-                                        requestID: validatedTransportDispatchIdentity?.requestID ?? resolvedRequestIdentity?.jsonRPCRequestID,
-                                        toolName: toolName,
-                                        metadata: MCPRequestMetadata(
-                                            connectionID: connectionID,
-                                            clientName: self.clientIdentifier(forConnection: connectionID),
-                                            windowID: chosenID,
-                                            runPurpose: self.runPurpose(for: connectionID),
-                                            tabContextHint: capturedTabContextHint.map {
-                                                MCPTabContextHint(tabID: $0.tabID, workspaceID: $0.workspaceID, windowID: $0.windowID)
-                                            },
-                                            invocationID: invocationID,
-                                            requestID: validatedTransportDispatchIdentity?.requestID ?? resolvedRequestIdentity?.jsonRPCRequestID
-                                        ),
-                                        dispatchAuthorization: nil
-                                    )
                                     let resolvedOperation: @Sendable (PromptExportProviderEntryBridge?, ToolInvocationContext) async throws -> Value = { providerEntryBridge, invocationContext in
                                         let diagnosticAdapter = MCPInvocationDiagnosticAdapter()
                                         return try await MCPInvocationContextBridge.$diagnosticSink.withValue({ failure in
@@ -15932,15 +16006,17 @@ actor ServerNetworkManager {
                                                                 EditFlowPerf.Stage.MCPToolCall.completionObserverCallbacks,
                                                                 EditFlowPerf.Dimensions(toolName: toolName)
                                                             ) {
-                                                                await self.fireToolCompletedObservers(
-                                                                    runID: runID,
-                                                                    invocationID: invocationID,
-                                                                    toolName: toolName,
-                                                                    args: capturedArguments,
-                                                                    resultJSON: resultJSON,
-                                                                    isError: false,
-                                                                    shouldDeliver: isPromptExportPublicationAuthorityCurrent
-                                                                )
+                                                                await MCPInvocationContextBridge.withInvocation(networkInvocationContext) {
+                                                                    await self.fireToolCompletedObservers(
+                                                                        runID: runID,
+                                                                        invocationID: invocationID,
+                                                                        toolName: toolName,
+                                                                        args: capturedArguments,
+                                                                        resultJSON: resultJSON,
+                                                                        isError: false,
+                                                                        shouldDeliver: isPromptExportPublicationAuthorityCurrent
+                                                                    )
+                                                                }
                                                             }
                                                             #if DEBUG
                                                                 if toolName == "agent_run" {
