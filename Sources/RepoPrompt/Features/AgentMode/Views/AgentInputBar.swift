@@ -161,6 +161,7 @@ struct AgentInputBar: View {
             selectAgentModel: { agent, rawModel in
                 if agentModeVM.requestProviderSwitchSelection(agent: agent, model: rawModel, tabID: currentTabID) { return }
                 guard !composerUI.props.areModelControlsDisabled else { return }
+                AgentModelCatalog.updateLastUsedEffortIfEncoded(agentKind: agent, rawModel: rawModel)
                 agentModeVM.selectedAgent = agent
                 agentModeVM.selectModel(rawModel: rawModel)
             },
@@ -1201,10 +1202,6 @@ struct AgentComposerView: View, Equatable {
             imageSystemName: AgentModelSelectionWarningVisuals.stableMenuImageSystemName(agent: agent, rawModel: model.rawValue),
             style: AgentModelSelectionWarningVisuals.stableMenuStyle(agent: agent, rawModel: model.rawValue)
         ) {
-            AgentModelCatalog.updateLastUsedEffortIfEncoded(
-                agentKind: agent,
-                rawModel: model.rawValue
-            )
             actions.selectAgentModel(agent, model.rawValue)
         }
     }
