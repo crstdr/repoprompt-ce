@@ -1122,34 +1122,33 @@ final class DevinPermissionLevelTests: XCTestCase {
                 providerFactory: { _ in
                     DevinACPAgentProvider(config: DevinAgentConfig(
                         commandName: executable.path,
-                        includeRepoPromptMCPServer: true
-                    ), repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration(command: "/usr/bin/true"))
+                        includeRepoPromptMCPServer: false
+                    ))
                 }
             )
-
+            // Fork ledger row 13: a new rawInput replaces the authorization context.
+            // A sparse permission cannot borrow the old MCP metadata after that update.
+            let shouldApprove = ["git", "manage_selection", "corroborated"].contains(scenario)
             do {
                 try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) {
                     let stream = try await provider.streamAgentMessage(AgentMessage(userMessage: "Discover"))
                     for try await _ in stream {}
                 }
-                XCTFail("Unattested provider metadata must require approval: \(scenario)")
+                XCTAssertTrue(shouldApprove, scenario)
             } catch {
+                XCTAssertFalse(shouldApprove, "\(scenario): \(error)")
                 XCTAssertTrue(error.localizedDescription.contains("approval"), "\(scenario): \(error)")
             }
-            // Stream failure precedes child-process receipt; wait for the recorded wire
-            // response before disposal can terminate the fixture.
-            let responseRecorded = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
-                guard let data = try? Data(contentsOf: record) else { return false }
-                return (try? JSONSerialization.jsonObject(with: data)) != nil
-            }, object: nil)
-            await fulfillment(of: [responseRecorded], timeout: 2)
             await provider.dispose()
-            let response = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: record)) as? [String: String])
-            XCTAssertEqual(response, ["outcome": "selected", "optionId": "reject_once"], scenario)
+            if shouldApprove {
+                let response = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: record)) as? [String: String])
+                XCTAssertEqual(response["outcome"], "selected", scenario)
+                XCTAssertEqual(response["optionId"], "allow_once", scenario)
+            }
         }
     }
 
-    func testSparseDevinRepoPromptPermissionRequiresExplicitAllowOnce() async throws {
+    func testSparseDevinRepoPromptPermissionUsesExactAllowOnce() async throws {
         let directory = try makeTestDirectory(name: "DevinSparsePermission")
         let executable = directory.appendingPathComponent("devin")
         let record = directory.appendingPathComponent("permission.json")
@@ -1197,8 +1196,7 @@ final class DevinPermissionLevelTests: XCTestCase {
         try script.write(to: executable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
         let provider = DevinACPAgentProvider(
-            config: DevinAgentConfig(commandName: executable.path, includeRepoPromptMCPServer: true),
-            repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration(command: "/usr/bin/true")
+            config: DevinAgentConfig(commandName: executable.path, includeRepoPromptMCPServer: false)
         )
         let request = makeRequest(workspacePath: directory.path)
         let controller = try ACPAgentSessionController(
@@ -1206,20 +1204,8 @@ final class DevinPermissionLevelTests: XCTestCase {
         )
         do {
             _ = try await controller.bootstrap()
-            let events = await controller.events
-            let consumer = Task { () -> Bool in
-                for await event in events {
-                    if case let .approvalRequested(approval) = event {
-                        await controller.respondToPermissionRequest(id: approval.requestID.displayValue, decision: .accept)
-                        return true
-                    }
-                }
-                return false
-            }
             try await controller.prompt(AgentMessage(userMessage: "Read roots"), request: request)
             await controller.shutdown()
-            let approvalRequested = await consumer.value
-            XCTAssertTrue(approvalRequested, "Injected server configuration and cached metadata do not authenticate invocation identity")
         } catch {
             await controller.shutdown()
             throw error

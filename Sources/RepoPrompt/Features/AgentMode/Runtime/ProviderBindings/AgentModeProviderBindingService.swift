@@ -268,7 +268,7 @@ final class AgentModeProviderBindingService {
                 Task { @MainActor in
                     await controller.setAutoApproveAllToolPermissions(runtime.autoApproveAllACPToolPermissions)
                     if runtime.autoApproveAllACPToolPermissions, let pendingApproval = session.pendingApproval {
-                        await controller.respondToPendingPermissionRequestForFullAccess(id: pendingApproval.requestID.displayValue)
+                        await controller.respondToPermissionRequest(id: pendingApproval.requestID.displayValue, decision: .acceptForSession)
                     }
                     if session.tabID == currentTabID {
                         updateActiveBindings(session)
