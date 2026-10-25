@@ -282,6 +282,25 @@
             XCTAssertTrue(XMLParser(data: Data(rendered.utf8)).parse())
         }
 
+        func testNewestTurnsStillEvaluatesAllTurnsCandidateAfterIntermediateSuffixMisses() throws {
+            // Candidate size is not monotone across positions: reaching index 0 drops the whole
+            // older-turns marker, so the full suffix can fit where an intermediate one cannot.
+            let projection = try Handover.project(AgentTranscript(turns: [
+                fixture(request: "a"),
+                fixture(request: String(repeating: "b", count: 70)),
+                fixture(request: String(repeating: "c", count: 320))
+            ]))
+            let tight = Handover.Budget(
+                catalogWindow: 18500, instructions: [],
+                composedInput: String(repeating: "x", count: 50), isPreview: false
+            )
+            let carrier = try XCTUnwrap(Handover.newestCompleteTurns(projection, source: source(), historyReference: nil, budget: tight))
+            XCTAssertEqual(carrier.turnIndices, [0, 1, 2])
+            XCTAssertNil(carrier.omittedOlderTurns)
+            XCTAssertTrue(tight.fits(carrier))
+            XCTAssertEqual(Handover.render(carrier).utf8.count, carrier.utf8Bytes)
+        }
+
         func testHistoryReferenceUsesConfiguredServerNearestTwentyAndRequiresPolicyAndMatchingIndices() throws {
             let projection = try Handover.project(AgentTranscript(turns: (0 ..< 42).map { fixture(request: "turn \($0)") }))
             let reference = try XCTUnwrap(Handover.HistoryReference(server: "CE & custom", sessionID: sessionID, historyAllowed: true, indicesMatch: true))
