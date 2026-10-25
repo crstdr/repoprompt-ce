@@ -166,7 +166,10 @@ enum AgentProviderHandover {
             let omissionBytes = omitted.map { olderMarker($0, reference: historyReference).utf8.count } ?? 0
             let bodyCount = projection.turns.count - position + (omitted == nil ? 0 : 1) + (hasTools ? 1 : 0)
             let bytes = framing + turnBytes + omissionBytes + (hasTools ? toolMarker.utf8.count : 0) + bodyCount - 1
-            guard budget.fits(bytes: bytes, mode: .newestTurns) else { break }
+            // Keep scanning older positions on a miss: size is not monotone, because reaching
+            // position 0 drops the whole omission marker, so the all-turns candidate can fit where
+            // an intermediate suffix could not. Unsettled turns still stop the scan outright.
+            guard budget.fits(bytes: bytes, mode: .newestTurns) else { continue }
             selectedStart = position
         }
         guard let selectedStart else { return nil }
