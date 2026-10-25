@@ -2431,6 +2431,8 @@ class PromptViewModel: ObservableObject {
         var clipboardCommitCompletionForTesting: ((Bool) -> Void)?
     #endif
 
+    private var initialModelRefreshTask: Task<Void, Never>?
+
     init(
         fileManager: WorkspaceFilesViewModel,
         aiQueriesService: AIQueriesService? = nil,
@@ -2464,8 +2466,9 @@ class PromptViewModel: ObservableObject {
         updateFileTree()
 
         if refreshAvailableModelsOnInit {
-            Task {
-                await self.refreshAvailableModels()
+            initialModelRefreshTask = Task { [weak self] in
+                guard let self else { return }
+                await refreshAvailableModels()
             }
         }
 
@@ -4213,12 +4216,15 @@ class PromptViewModel: ObservableObject {
     @MainActor
     func closeComposeTab(
         _ id: UUID,
+        deletionOrigin: AgentSessionDeletionOrigin = .current,
         isMutationContextCurrent: (@MainActor () -> Bool)? = nil
     ) async -> ComposeTabMutationReport {
-        await removeComposeTabs(
-            withIDs: [id],
-            isMutationContextCurrent: isMutationContextCurrent
-        )
+        await AgentSessionDeletionOrigin.currentTaskLocal.withValue(deletionOrigin) {
+            await removeComposeTabs(
+                withIDs: [id],
+                isMutationContextCurrent: isMutationContextCurrent
+            )
+        }
     }
 
     @MainActor
@@ -6885,6 +6891,16 @@ class PromptViewModel: ObservableObject {
 
     // MARK: - Model and Settings Management
 
+    /// Stop this prompt's constructor-owned refresh; the owner joins it before teardown completes.
+    func cancelInitialModelRefreshForWindowClose() {
+        initialModelRefreshTask?.cancel()
+    }
+
+    func awaitInitialModelRefreshCompletion() async {
+        await initialModelRefreshTask?.value
+        initialModelRefreshTask = nil
+    }
+
     @MainActor
     func refreshAvailableModels() async {
         await apiSettingsViewModel?.loadStoredData {
@@ -7128,6 +7144,7 @@ class PromptViewModel: ObservableObject {
     }
 
     deinit {
+        initialModelRefreshTask?.cancel()
         activeTabApplyTask?.cancel()
         cancellables.removeAll()
         /*

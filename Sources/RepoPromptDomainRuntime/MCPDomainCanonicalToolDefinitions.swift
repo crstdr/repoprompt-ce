@@ -2554,17 +2554,66 @@ package enum MCPDomainCanonicalToolDefinitions {
         }
     }
 
+    /// Wording-only projection. Keep prior migration anchors and every schema/authority unchanged.
+    private enum AgentSessionLinkDirectionGuidanceMigration {
+        static let description: String = {
+            let previous = AgentSessionLinkWaitCursorMigration.description
+            let replacements = [
+                (
+                    "- `send`: deliver an attributed message when `idle_for_send: true`, or queue one with `delivery: \"when_sendable\"`.",
+                    "- `send`: `idle_for_send: true` or queue one with `delivery: \"when_sendable\"`; exact Manage grants use task framing."
+                ),
+                (
+                    "- `steer`: [manage] direct that target now with a new `idempotency_key`; pending prompts block steering. ACP live steering is supported.",
+                    "- `steer`: [manage] assign/resume, even idle; new `idempotency_key`. Pending prompts block steering. ACP live steering is supported."
+                )
+            ]
+            return replacements.reduce(previous) { text, replacement in
+                guard let revised = replacingOneExactLine(
+                    in: text, replacements: [(from: replacement.0, to: replacement.1)]
+                ) else { preconditionFailure("Expected one exact direction-guidance anchor") }
+                return revised
+            }
+        }()
+
+        static func isCurrent(_ definition: MCPDomainToolDefinition) -> Bool {
+            definition.description == description
+                && definition.inputSchema == AgentSessionLinkWaitCursorMigration.inputSchema
+        }
+
+        static func apply(_ definition: MCPDomainToolDefinition) -> MCPDomainToolDefinition {
+            precondition(AgentSessionLinkWaitCursorMigration.isCurrent(definition))
+            return MCPDomainToolDefinition(
+                name: definition.name, description: description, inputSchema: definition.inputSchema,
+                annotations: definition.annotations, isEnabledByDefault: definition.isEnabledByDefault
+            )
+        }
+    }
+
     private static func canonicalizeAgentSessionLink(
         _ definition: MCPDomainToolDefinition
     ) -> MCPDomainToolDefinition {
-        if AgentSessionLinkWaitCursorMigration.isCurrent(definition) { return definition }
+        if AgentSessionLinkDirectionGuidanceMigration.isCurrent(definition) {
+            return definition
+        }
+        return AgentSessionLinkDirectionGuidanceMigration.apply(canonicalizeAgentSessionLinkBeforeDirectionGuidance(definition))
+    }
+
+    private static func canonicalizeAgentSessionLinkBeforeDirectionGuidance(
+        _ definition: MCPDomainToolDefinition
+    ) -> MCPDomainToolDefinition {
+        if AgentSessionLinkWaitCursorMigration.isCurrent(definition) {
+            return definition
+        }
         return AgentSessionLinkWaitCursorMigration.applying(to: canonicalizeAgentSessionLinkBeforeWaitCursors(definition))
     }
 
     private static func canonicalizeAgentSessionLinkBeforeWaitCursors(
         _ definition: MCPDomainToolDefinition
     ) -> MCPDomainToolDefinition {
-        if AgentSessionLinkOverseerActivationGuidance.isCurrent(definition) { return definition }
+        if AgentSessionLinkOverseerActivationGuidance.isCurrent(definition) {
+            return definition
+        }
         if AgentSessionLinkModelSelectionMigration.isCurrent(definition) || AgentSessionLinkOverseerActivationGuidance.isPrevious(definition) {
             return AgentSessionLinkOverseerActivationGuidance.applying(to: definition)
         }
@@ -2575,7 +2624,8 @@ package enum MCPDomainCanonicalToolDefinitions {
     }
 
     private static func agentSessionLinkModelSelectionIsPartial(_ definition: MCPDomainToolDefinition) -> Bool {
-        !AgentSessionLinkWaitCursorMigration.isCurrent(definition)
+        !AgentSessionLinkDirectionGuidanceMigration.isCurrent(definition)
+            && !AgentSessionLinkWaitCursorMigration.isCurrent(definition)
             && !AgentSessionLinkOverseerActivationGuidance.isCurrent(definition)
             && !AgentSessionLinkOverseerActivationGuidance.isPrevious(definition)
             && !AgentSessionLinkModelSelectionMigration.isCurrent(definition)
@@ -2600,7 +2650,9 @@ package enum MCPDomainCanonicalToolDefinitions {
     private static func canonicalizeAgentSessionLinkBeforeRefusalSubreason(
         _ definition: MCPDomainToolDefinition
     ) -> MCPDomainToolDefinition {
-        if AgentSessionLinkLaneOperationsMigration.isCurrent(definition) { return definition }
+        if AgentSessionLinkLaneOperationsMigration.isCurrent(definition) {
+            return definition
+        }
         if AgentSessionLinkStopMigration.isCurrent(definition) {
             return AgentSessionLinkLaneOperationsMigration.apply(definition)
         }
@@ -2705,7 +2757,9 @@ package enum MCPDomainCanonicalToolDefinitions {
                     "agent_session_link canonical definition only partially carries request_attention"
                 )
             }
-            if descriptionWithCurrentList == definition.description { return definition }
+            if descriptionWithCurrentList == definition.description {
+                return definition
+            }
             return MCPDomainToolDefinition(
                 name: definition.name,
                 description: descriptionWithCurrentList,
@@ -2921,8 +2975,12 @@ package enum MCPDomainCanonicalToolDefinitions {
            queueClauseCount == 1,
            retiredTokenCount == 1
         {
-            if incomingOnlyCount == 1, automaticCount == 0 { return .historicalIncomingOnly }
-            if incomingOnlyCount == 0, automaticCount == 1 { return .historicalAutomatic }
+            if incomingOnlyCount == 1, automaticCount == 0 {
+                return .historicalIncomingOnly
+            }
+            if incomingOnlyCount == 0, automaticCount == 1 {
+                return .historicalAutomatic
+            }
             return .partial
         }
 
@@ -2978,6 +3036,10 @@ package enum MCPDomainCanonicalToolDefinitions {
     package static func test_agentSessionLinkPreviousStopDefinition() -> MCPDomainToolDefinition {
         canonicalizeAgentSessionLinkBeforeModelSelection(test_agentSessionLinkLegacyCurrentDefinition())
     }
+
+        package static func test_agentSessionLinkBeforeDirectionGuidanceDefinition() -> MCPDomainToolDefinition {
+            canonicalizeAgentSessionLinkBeforeDirectionGuidance(test_agentSessionLinkLegacyCurrentDefinition())
+        }
 
         package static func test_agentSessionLinkPreviousCursorDefinition() -> MCPDomainToolDefinition {
             canonicalizeAgentSessionLinkBeforeWaitCursors(test_agentSessionLinkLegacyCurrentDefinition())

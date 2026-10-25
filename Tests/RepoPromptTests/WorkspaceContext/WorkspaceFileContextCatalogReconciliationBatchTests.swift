@@ -183,6 +183,15 @@ final class CatalogBulkAddPerformanceTests: XCTestCase {
     }
 
     func testBulkAddPublicationPreservesIndexesAndEventsWithinBudget() async throws {
+        let smaller = try await measureBulkAddPublication(fileCount: 10000)
+        let larger = try await measureBulkAddPublication(fileCount: 20000)
+        // Double files and folders together: linear work grows 2x and event sorting
+        // about 2.2x. Allow 2.5x, but reject near-quadratic 4x growth without
+        // depending on the shared runner's absolute speed.
+        XCTAssertLessThanOrEqual(larger, smaller * 2.5)
+    }
+
+    private func measureBulkAddPublication(fileCount: Int) async throws -> Duration {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let store = WorkspaceFileContextStore(codemapGraphIndexBuildLaunchPolicyForTesting: .disabled)
@@ -191,30 +200,27 @@ final class CatalogBulkAddPerformanceTests: XCTestCase {
             await store.unloadRoot(id: root.id)
             try? FileManager.default.removeItem(at: directory)
         }
-        let folderPaths = (0 ..< 1000).map { "folder-\($0)" }
+        let folderCount = fileCount / 20
+        let folderPaths = (0 ..< folderCount).map { "folder-\($0)" }
         try await store.applyIndexDeltasWithFakeDiskForTesting(rootID: root.id, deltas: folderPaths.map(FileSystemDelta.folderAdded))
         let beforeValue = await store.appliedIndexRootSnapshot(rootID: root.id)
         let before = try XCTUnwrap(beforeValue)
         let lifetime = try await store.rootLifetimeIDForTesting(rootID: root.id)
         let events = await store.appliedIndexEvents()
         var iterator = events.makeAsyncIterator()
-        let filePaths = (0 ..< 20000).map { "folder-\($0 % 1000)/child/file-\($0).swift" }
+        let filePaths = (0 ..< fileCount).map { "folder-\($0 % folderCount)/child/file-\($0).swift" }
         let deltas = filePaths.map(FileSystemDelta.fileAdded)
         let start = ContinuousClock.now
         try await store.applyIndexDeltasWithFakeDiskForTesting(rootID: root.id, deltas: deltas)
         let elapsed = start.duration(to: .now)
-        print("CATALOG_BULK_ADD files=20000 existingFolders=1000 newFolders=1000 duration=\(elapsed)")
-        // Guard the pre-fix near-quadratic behavior (14.15s on this fixture).
-        // A 5s budget remains ~2.8x below that baseline and gives the measured
-        // fixed ~2.14s run >2x headroom on a loaded CI machine.
-        XCTAssertLessThanOrEqual(elapsed, .seconds(5))
+        print("CATALOG_BULK_ADD files=\(fileCount) existingFolders=\(folderCount) newFolders=\(folderCount) duration=\(elapsed)")
 
         let eventValue = await iterator.next()
         let event = try XCTUnwrap(eventValue)
         let afterValue = await store.appliedIndexRootSnapshot(rootID: root.id)
         let after = try XCTUnwrap(afterValue)
         XCTAssertEqual(after.files.map(\.standardizedRelativePath), filePaths.sorted())
-        XCTAssertEqual(after.folders.count, before.folders.count + 1000)
+        XCTAssertEqual(after.folders.count, before.folders.count + folderCount)
         let foldersByPath = Dictionary(uniqueKeysWithValues: after.folders.map { ($0.standardizedRelativePath, $0) })
         for folder in before.folders {
             XCTAssertEqual(foldersByPath[folder.standardizedRelativePath], folder)
@@ -246,5 +252,6 @@ final class CatalogBulkAddPerformanceTests: XCTestCase {
         let parent = (first.standardizedRelativePath as NSString).deletingLastPathComponent
         let ancestorPaths = [parent, (parent as NSString).deletingLastPathComponent].sorted()
         XCTAssertEqual(upsert.upsertedFolders, try ancestorPaths.map { try XCTUnwrap(foldersByPath[$0]) })
+        return elapsed
     }
 }
