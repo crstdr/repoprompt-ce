@@ -2512,6 +2512,47 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             }
         }
 
+        func testRestoredDifferingNewestTurnsPayloadUnhidesRowInsteadOfMislabelingHistory() async throws {
+            // A saved newest-turns carrier that omits older history predates a budget that now fits
+            // full history; retaining it on the Full history row would mislabel real omissions.
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                session.selectedAgent = .openCode
+                session.selectedModelRaw = "unknown-window"
+                fixture.window.promptManager.apiSettingsViewModel?.isOpenCodeConnected = true
+                // The saved payload omits turn 0, which the fresh (short) history would include.
+                func tinyTurn(_ text: String, _ index: Int) -> AgentTranscriptTurn {
+                    let request = AgentChatItem.user(text, sequenceIndex: index)
+                    return AgentTranscriptTurn(
+                        request: .init(from: request), responseSpans: [], conclusionActivityID: nil,
+                        terminalState: .completed, startedAt: request.timestamp, completedAt: request.timestamp
+                    )
+                }
+                let projection = try AgentProviderHandover.project(AgentTranscript(turns: [
+                    tinyTurn(String(repeating: "x", count: 40000), 0), tinyTurn("recent", 1)
+                ]))
+                let source = try AgentProviderHandover.Source(provider: "source", model: "source-model")
+                let budget = AgentProviderHandover.Budget(catalogWindow: 24000, instructions: [], composedInput: "", isPreview: false)
+                let carrier = try XCTUnwrap(AgentProviderHandover.newestCompleteTurns(
+                    projection, source: source, historyReference: nil, budget: budget
+                ))
+                let payload = AgentProviderHandover.render(carrier)
+                session.pendingHandoff = try .init(
+                    payload: payload, createdAt: Date(),
+                    sourceItemID: session.items.last?.id, providerSwitchDelivery: .ready
+                )
+                await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
+                try await AsyncTestWait.waitUntil("review settled") { vm.providerSwitchPreview?.building == false }
+                let preview = try XCTUnwrap(vm.providerSwitchPreview)
+                let recent = try XCTUnwrap(preview.choices.first { $0.mode == .newestTurns })
+                XCTAssertFalse(recent.hidden, "A differing restored payload must surface on its own row")
+                XCTAssertEqual(recent.retainedPayload, payload)
+                XCTAssertNil(preview.choices.first { $0.mode == .history }?.retainedPayload)
+                XCTAssertEqual(preview.selected, .newestTurns)
+            }
+        }
+
         func testOrdinarySendArmingChangeReachesExistingPersistenceBoundary() async throws {
             for initiallyArmed in [false, true] {
                 try await withFixture { fixture in
