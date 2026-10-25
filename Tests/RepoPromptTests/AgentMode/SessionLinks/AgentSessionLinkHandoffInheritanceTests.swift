@@ -2545,11 +2545,42 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
                 try await AsyncTestWait.waitUntil("review settled") { vm.providerSwitchPreview?.building == false }
                 let preview = try XCTUnwrap(vm.providerSwitchPreview)
+                XCTAssertNil(preview.choices.first { $0.mode == .history }?.unavailable, "Precondition: fresh full history fits")
                 let recent = try XCTUnwrap(preview.choices.first { $0.mode == .newestTurns })
                 XCTAssertFalse(recent.hidden, "A differing restored payload must surface on its own row")
                 XCTAssertEqual(recent.retainedPayload, payload)
                 XCTAssertNil(preview.choices.first { $0.mode == .history }?.retainedPayload)
                 XCTAssertEqual(preview.selected, .newestTurns)
+            }
+        }
+
+        func testRestoredIdenticalNewestTurnsFallsBackToFullHistory() async throws {
+            // The saved newest-turns carrier equals what the fresh budget renders as full history;
+            // the hidden row must resolve to .history rather than a missing selection.
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                session.selectedAgent = .openCode
+                session.selectedModelRaw = "unknown-window"
+                fixture.window.promptManager.apiSettingsViewModel?.isOpenCodeConnected = true
+                let projection = try AgentProviderHandover.project(session.transcript)
+                let source = try AgentProviderHandover.Source(provider: "source", model: "source-model")
+                let budget = AgentProviderHandover.Budget(catalogWindow: nil, instructions: [], composedInput: "", isPreview: false)
+                let carrier = try XCTUnwrap(AgentProviderHandover.newestCompleteTurns(
+                    projection, source: source, historyReference: nil, budget: budget
+                ))
+                let payload = AgentProviderHandover.render(carrier)
+                session.pendingHandoff = try .init(
+                    payload: payload, createdAt: Date(),
+                    sourceItemID: session.items.last?.id, providerSwitchDelivery: .ready
+                )
+                await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
+                try await AsyncTestWait.waitUntil("identical restore settled") { vm.providerSwitchPreview?.building == false }
+                let preview = try XCTUnwrap(vm.providerSwitchPreview)
+                XCTAssertEqual(preview.choices.first { $0.mode == .newestTurns }?.hidden, true)
+                XCTAssertNil(preview.choices.first { $0.mode == .history }?.unavailable)
+                XCTAssertEqual(preview.selected, .history)
+                XCTAssertEqual(preview.choices.first { $0.mode == .history }?.retainedPayload, payload)
             }
         }
 
