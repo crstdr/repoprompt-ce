@@ -3015,6 +3015,22 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             }
         }
 
+        func testIdenticalNewestTurnsRowIsHiddenButPayloadAndSelectionStayValid() async throws {
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                try installSwitch(fixture)
+                await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
+                try await AsyncTestWait.waitUntil("short preview settled") { vm.providerSwitchPreview?.building == false }
+                let preview = try XCTUnwrap(vm.providerSwitchPreview)
+                XCTAssertEqual(preview.choices.count, 3)
+                XCTAssertEqual(preview.choices.first(where: { $0.mode == .newestTurns })?.hidden, true)
+                XCTAssertEqual(preview.selected, .history)
+                let payload = await vm.providerSwitchPayload(preview.id, mode: .newestTurns)
+                XCTAssertNotNil(payload)
+            }
+        }
+
         func testProviderSwitchScaleThreeHundredSavedChatsThreeWindowsTenLinks() async throws {
             let clock = ContinuousClock()
             let started = clock.now
