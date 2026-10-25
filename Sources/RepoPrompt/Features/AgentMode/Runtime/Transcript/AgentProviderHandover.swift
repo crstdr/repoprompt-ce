@@ -421,11 +421,36 @@ enum AgentProviderHandover {
         return escapeValidated(value, attribute: attribute)
     }
 
+    /// Iterates Unicode scalars, not `Character`s, for the same reason the link envelope's `escaped`
+    /// does: grapheme-cluster matching lets a metacharacter followed by a combining mark slip through
+    /// unescaped. `>` and `'` stay literal to keep escaped output byte-minimal; `]]>` is handled
+    /// scalar-wise by tracking a two-`]` run.
     private static func escapeValidated(_ value: String, attribute: Bool = false) -> String {
-        var result = value.replacingOccurrences(of: "&", with: "&amp;")
-            .replacingOccurrences(of: "<", with: "&lt;")
-            .replacingOccurrences(of: "]]>", with: "]]&gt;")
-        if attribute { result = result.replacingOccurrences(of: "\"", with: "&quot;") }
+        var result = ""
+        result.reserveCapacity(value.utf8.count)
+        var bracketRun = 0
+        for scalar in value.unicodeScalars {
+            switch scalar {
+            case "&":
+                result += "&amp;"
+                bracketRun = 0
+            case "<":
+                result += "&lt;"
+                bracketRun = 0
+            case "\"" where attribute:
+                result += "&quot;"
+                bracketRun = 0
+            case "]":
+                result.unicodeScalars.append(scalar)
+                bracketRun += 1
+            case ">":
+                result += bracketRun >= 2 ? "&gt;" : ">"
+                bracketRun = 0
+            default:
+                result.unicodeScalars.append(scalar)
+                bracketRun = 0
+            }
+        }
         return result
     }
 }
