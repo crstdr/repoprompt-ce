@@ -1681,7 +1681,7 @@ extension AgentModeViewModel {
     ) -> SendReadinessInputs {
         SendReadinessInputs(
             status: status,
-            runStateIsActive: session.runState.isActive,
+            runStateIsActive: session.runState.isActive || Self.providerSwitchHasOwnedCarryingAttempt(session),
             hasLoadedPersistedState: session.hasLoadedPersistedState,
             bindingTransitionInProgress: session.bindingTransitionInProgress,
             terminalCommitInProgress: session.terminalCommitInProgress,
