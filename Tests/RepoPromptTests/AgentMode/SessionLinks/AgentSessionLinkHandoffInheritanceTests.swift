@@ -2457,6 +2457,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 (AgentProviderSwitchDelivery.sending, 0, AgentSessionLinkSendFailure.providerSwitchUnconfirmed.message),
                 (.ready, Int(AgentProviderHandover.maximumBytes) + 100, AgentSessionLinkSendFailure.providerHandoverDoesNotFit.message)
             ] {
+                let expected = "Client task input was not submitted: a provider switch in this session needs the user's attention in RepoPrompt. \(expected)"
                 try await withFixture { fixture in
                     let vm = fixture.viewModel
                     let session = fixture.sourceSession
@@ -2473,6 +2474,8 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                         XCTAssertEqual(message, expected)
                     }
                     XCTAssertEqual(session.items.count, rows, "Refused input must not leave a transcript row")
+                    XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, delivery, "A refused send must not consume or mutate the handover")
+                    XCTAssertNil(session.activeComposerSubmitAttempt, "The submit claim must be released for the next input")
                 }
             }
         }
