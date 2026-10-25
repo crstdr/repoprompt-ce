@@ -20314,6 +20314,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // turn's own waiting-continuation reply, which would deadlock the turn.
         let switchInFlightOnActiveRun = session.pendingHandoff.providerSwitchDelivery == .sending
             && session.runState.isActive && Self.providerSwitchHasOwnedCarryingAttempt(session)
+            && session.pendingHandoff.providerSwitchDispatch?.dispatchID != nil
         if session.pendingHandoff.providerSwitchDelivery != nil, providerSwitchPreparation == nil,
            !switchInFlightOnActiveRun
         {
