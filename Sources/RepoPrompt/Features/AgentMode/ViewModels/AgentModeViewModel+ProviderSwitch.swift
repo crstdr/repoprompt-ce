@@ -512,6 +512,7 @@ extension AgentModeViewModel {
         var retainedPayload: String?
         var retainedOmissions: String?
         var unavailable: String?
+        var hidden = false
         var bytes: Int {
             retainedPayload?.utf8.count ?? carrier?.utf8Bytes ?? 0
         }
@@ -933,15 +934,24 @@ extension AgentModeViewModel {
             preview.historyReference = reference
             preview.cutoff = result.4
             preview.wordLimit = preview.isReview ? nil : result.3
+            // A newest-turns suffix that covers every projected turn carries the same body as full
+            // history; two identical rows are noise, so drop it whenever full history also fits.
+            let recentDuplicatesFull = result.2.map {
+                $0.turnIndices == result.1.turnIndices
+                    && $0.omittedOlderTurns == nil
+                    && $0.hasToolOutputOmission == result.1.hasToolOutputOmission
+                    && $0.hasImageOmission == result.1.hasImageOmission
+            } ?? false
             preview.choices = [
                 .init(mode: .history, carrier: result.1, unavailable: budget.fits(result.1) ? nil : "Full history doesn't fit."),
-                .init(mode: .newestTurns, carrier: result.2, unavailable: result.2 == nil ? "the last turn alone doesn't fit" : nil),
+                .init(mode: .newestTurns, carrier: result.2, unavailable: result.2 == nil ? "the last turn alone doesn't fit" : nil, hidden: recentDuplicatesFull && budget.fits(result.1)),
                 .init(mode: .summary, unavailable: preview.isReview ? AgentSessionLinkSendFailure.providerHandoverNeedsReview.message : (result.3 == nil ? "no room for a summary" : nil))
             ]
             if !stale, let payload = originalSlot.payload, let descriptor = preview.originalDescriptor,
                providerSwitchReadReferenceIsCurrent(descriptor, session: session, destination: preview.destination),
                let mode = AgentProviderHandover.Mode(rawValue: descriptor.mode),
-               let index = preview.choices.firstIndex(where: { $0.mode == mode }),
+               let index = preview.choices.firstIndex(where: { $0.mode == mode && !$0.hidden })
+               ?? (mode == .newestTurns ? preview.choices.firstIndex(where: { $0.mode == .history }) : nil),
                AgentProviderHandover.estimate(payload) <= budget.remainingCarrierTokens,
                payload.utf8.count <= AgentProviderHandover.maximumBytes,
                mode != .summary || payload.utf8.count <= AgentProviderHandover.maximumSummaryBytes
@@ -949,7 +959,7 @@ extension AgentModeViewModel {
                 preview.choices[index].retainedPayload = payload
                 preview.choices[index].retainedOmissions = descriptor.omissions.isEmpty ? nil : descriptor.omissions.joined(separator: ", ")
                 preview.choices[index].unavailable = nil
-                preview.selected = mode
+                preview.selected = preview.choices[index].mode
             } else if !preview.isReview, budget.fits(result.1) { preview.selected = .history }
             if let summary = preview.generatedSummary { fitProviderSwitchSummary(summary, into: &preview) }
             preview.building = false

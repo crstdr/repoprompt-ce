@@ -75,7 +75,7 @@ struct AgentProviderSwitchPreview: View {
                 if preview.updated { Text("Preview updated.").foregroundStyle(.secondary) }
                 if preview.building { ProgressView() }
                 if preview.choices.first?.unavailable != nil { Text("Full history doesn't fit.") }
-                ForEach(preview.choices, id: \.mode.rawValue) { choice in
+                ForEach(preview.choices.filter { !$0.hidden }, id: \.mode.rawValue) { choice in
                     VStack(alignment: .leading, spacing: 5) {
                         HStack {
                             Button {
