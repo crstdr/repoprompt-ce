@@ -687,6 +687,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         /// Test-only exact route-token seam for synthetic catalog publications.
         var test_agentSessionLinkAuthoritativeRunCatalogRouteToken:
             ((UUID, Int, UUID) async -> AgentSessionLinkRunCatalogRouteToken?)?
+        /// Test-only bounded route-token wait seam (run, window, tab, timeout seconds); mirrors the
+        /// immediate seam above for `ProviderInputRouteWait`. Must honor the timeout. When only the
+        /// immediate seam is installed, waits re-check it until it yields a token or time runs out.
+        var test_agentSessionLinkAwaitAuthoritativeRunCatalogRouteToken:
+            ((UUID, Int, UUID, TimeInterval) async -> AgentSessionLinkRunCatalogRouteToken?)?
         /// Test-only synchronous route fence for synthetic Codex catalog projections.
         var test_agentSessionLinkCurrentRunCatalogRouteToken:
             ((AgentSessionLinkRunCatalogRouteToken, UUID) -> Bool)?
@@ -2478,9 +2483,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             prependPendingHandoff: { [weak self] text, session in
                 self?.prependPendingHandoffIfNeeded(text, session: session) ?? text
             },
-            qualifyAgentSessionLinkProviderInputRoute: { [weak self] session in
+            qualifyAgentSessionLinkProviderInputRoute: { [weak self] session, routeWait in
                 guard let self else { return .unavailable }
-                return await qualifyProviderInputRoute(for: session)
+                return await qualifyProviderInputRoute(for: session, routeWait: routeWait)
             },
             hasCurrentAgentSessionLinkProviderInputRoute: { [weak self] session, qualification in
                 guard let self else { return false }
@@ -3466,6 +3471,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 isCurrentSessionBinding: { [weak self] session, fence in
                     self?.sessions[session.tabID] === session
                         && session.persistentSessionBindingIdentity == fence.binding
+                },
+                restoreRouteRefusedUnsentTurn: { [weak self] session, userItemID, message in
+                    _ = self?.restoreRouteRefusedUnsentTurn(session: session, userItemID: userItemID, message: message)
                 }
             ),
             persistence: .init(
@@ -18229,13 +18237,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let target = claim.attempt.target
         let claimedSourceSession = claim.sourceSession
         let repromptRecoveryID = repromptUIStore.recoveries[target.tabID]?.id
+        // A presented handoff owns restoration even if it is cancelled while this executor awaits.
+        let presentedHandoffOwnsRecovery = ui.composer.pendingSubmissions[claim.attempt.id] != nil
         var approvedBriefForRecovery: String?
         var submittedApprovedBrief = false
         guard composerSubmitClaimIsCurrent(claim) else {
+            clearRepromptSubmissionState(claimID: claim.attempt.id)
             return .blocked(message: Self.staleComposerSubmitTargetMessage)
         }
         defer {
-            if let approvedBriefForRecovery, !submittedApprovedBrief {
+            if !presentedHandoffOwnsRecovery, let approvedBriefForRecovery, !submittedApprovedBrief {
                 repromptUIStore.recoveries[target.tabID] = .init(
                     text: approvedBriefForRecovery, originalDraft: repromptDispatchOriginals[claim.attempt.id] ?? claim.attempt.rawDraftSnapshot,
                     reason: "The approved turn could not be submitted.",
@@ -18246,10 +18257,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 repromptUIStore.recoveries[target.tabID]?.requiresDecision = false
                 repromptUIStore.recoveries[target.tabID]?.bypassesPreparation = false
             }
-            cancelRepromptSpeculation(claimID: claim.attempt.id)
-            repromptAudits[claim.attempt.id] = nil
-            repromptDispatchTexts[claim.attempt.id] = nil
-            repromptDispatchOriginals[claim.attempt.id] = nil
+            clearRepromptSubmissionState(claimID: claim.attempt.id)
             releaseComposerSubmitClaim(claim)
         }
 
@@ -18433,6 +18441,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 return .blocked(message: "Failed to create a new agent session.")
             }
             let destinationSession = session(for: destinationTabID)
+            movePendingComposerSubmission(claim, to: destinationTabID)
             guard isFreshFirstSendDestination(destinationSession) else {
                 logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "invalid_first_send_destination")
                 resyncAfterRejectedSubmitTarget(target)
@@ -18530,6 +18539,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         destinationTabID: UUID,
         repromptedText: String? = nil
     ) async -> UserTurnSubmissionResult {
+        movePendingComposerSubmission(claim, to: destinationTabID)
         guard composerSubmitClaimIsCurrent(claim), sessions[destinationTabID] === session else {
             return .blocked(message: Self.staleComposerSubmitTargetMessage)
         }
@@ -20221,7 +20231,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         attachments: attachmentsToSend,
                         taggedFileAttachments: taggedFilesToSend,
                         autoEffortSelection: autoEffortSelection,
-                        directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: repromptedText != nil, stopFence: resumedFence, localComposerCandidate: localComposerCandidate)
+                        directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: repromptedText != nil, stopFence: resumedFence, localComposerCandidate: localComposerCandidate, initialUserItemID: userItem.id)
                     )
                 }
                 return UserTurnSubmissionResult.submitted
@@ -20276,7 +20286,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     attachments: attachmentsToSend,
                     taggedFileAttachments: taggedFilesToSend,
                     autoEffortSelection: autoEffortSelection,
-                    directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: repromptedText != nil, stopFence: producerStopFence, localComposerCandidate: localComposerCandidate)
+                    directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: repromptedText != nil, stopFence: producerStopFence, localComposerCandidate: localComposerCandidate, initialUserItemID: userItem.id)
                 )
             }
         } else if let route = activeProviderSteeringRoute(for: session, attachments: attachmentsToSend) {
@@ -21796,7 +21806,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             selfCompactDispatchID: directStartOptions.selfCompactDispatchID,
             startOutcome: startOutcome,
             stopFence: stopFence,
-            localComposerCandidate: directStartOptions.localComposerCandidate
+            localComposerCandidate: directStartOptions.localComposerCandidate,
+            initialUserItemID: directStartOptions.initialUserItemID
         )
     }
 

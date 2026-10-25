@@ -1324,6 +1324,7 @@ actor WorkspaceFileContextStore {
 
     #if DEBUG
         private var rootLoadWillStartHandler: (@Sendable (String) async -> Void)?
+        private var rootLoadWillReturnHandlerForTesting: (@Sendable (String, UUID) async -> Void)?
         private var sessionWorktreeDrainDidEnterLoadFlightWaitHandler: (@Sendable () -> Void)?
         private var sessionWorktreeDrainLoadFlightWaiterCount = 0
         private var rootLoadDidJoinInFlightHandler: (@Sendable (String) async -> Void)?
@@ -2061,6 +2062,10 @@ actor WorkspaceFileContextStore {
 
         func setRootLoadWillStartHandler(_ handler: (@Sendable (String) async -> Void)?) {
             rootLoadWillStartHandler = handler
+        }
+
+        func setRootLoadWillReturnHandlerForTesting(_ handler: (@Sendable (String, UUID) async -> Void)?) {
+            rootLoadWillReturnHandlerForTesting = handler
         }
 
         func setSessionWorktreeDrainDidEnterLoadFlightWaitHandler(
@@ -11538,6 +11543,9 @@ actor WorkspaceFileContextStore {
         }
     }
 
+    /// An owning caller cancels and joins its underlying load. If publication already won,
+    /// return the root even on cancellation so the caller can clean up that exact receipt.
+    /// Shared callers retain prompt cancellation without cancelling the shared load.
     @discardableResult
     func loadRoot(
         path: String,
@@ -11622,7 +11630,6 @@ actor WorkspaceFileContextStore {
             #endif
             return try await awaitRootLoadTask(
                 inFlight.task,
-                flightID: inFlight.id,
                 standardizedPath: standardizedPath,
                 cancelUnderlyingLoadOnCallerCancellation: cancelUnderlyingLoadOnCallerCancellation
             )
@@ -11677,7 +11684,6 @@ actor WorkspaceFileContextStore {
         }
         return try await awaitRootLoadTask(
             task,
-            flightID: flightID,
             standardizedPath: standardizedPath,
             cancelUnderlyingLoadOnCallerCancellation: cancelUnderlyingLoadOnCallerCancellation
         )
@@ -11685,10 +11691,24 @@ actor WorkspaceFileContextStore {
 
     private func awaitRootLoadTask(
         _ task: Task<WorkspaceRootRecord, Error>,
-        flightID: UUID,
         standardizedPath: String,
         cancelUnderlyingLoadOnCallerCancellation: Bool
     ) async throws -> WorkspaceRootRecord {
+        if cancelUnderlyingLoadOnCallerCancellation {
+            let root = try await withTaskCancellationHandler {
+                try await task.value
+            } onCancel: {
+                task.cancel()
+            }
+            #if DEBUG
+                if let rootLoadWillReturnHandlerForTesting {
+                    await rootLoadWillReturnHandlerForTesting(standardizedPath, root.id)
+                }
+            #endif
+            // The caller must receive a committed root before checking cancellation. Throwing
+            // here would abandon a store-only root that its UI cleanup has never learned about.
+            return root
+        }
         let race = RootLoadTaskWaitRace()
         Task {
             await race.resolve(task.result)
@@ -11697,14 +11717,6 @@ actor WorkspaceFileContextStore {
             try await race.value()
         } onCancel: {
             race.cancel()
-            guard cancelUnderlyingLoadOnCallerCancellation else { return }
-            task.cancel()
-            Task {
-                await self.cancelRootLoad(
-                    standardizedPath: standardizedPath,
-                    expectedFlightID: flightID
-                )
-            }
         }
         try Task.checkCancellation()
         return root
@@ -11717,20 +11729,6 @@ actor WorkspaceFileContextStore {
         removeRootLoadFlight(
             standardizedPath: standardizedPath,
             expectedFlightID: flight.id
-        )
-    }
-
-    private func cancelRootLoad(
-        standardizedPath: String,
-        expectedFlightID: UUID
-    ) {
-        guard let flight = rootLoadFlightsByPath[standardizedPath],
-              flight.id == expectedFlightID
-        else { return }
-        flight.task.cancel()
-        removeRootLoadFlight(
-            standardizedPath: standardizedPath,
-            expectedFlightID: expectedFlightID
         )
     }
 
