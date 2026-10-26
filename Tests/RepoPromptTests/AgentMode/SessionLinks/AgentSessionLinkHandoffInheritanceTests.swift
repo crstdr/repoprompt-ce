@@ -2554,6 +2554,100 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             }
         }
 
+        func testInstructionWaitReplyFlowsDuringOwnedBoundSwitchSend() async throws {
+            // While the carrying dispatch is bound and its turn waits for user instruction, only the
+            // continuation reply may pass; every other input keeps the retryable busy refusal so no
+            // cancel can reach the prompt carrying the handover.
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                session.selectedAgent = .openCode
+                session.selectedModelRaw = "unknown-window"
+                try installSwitch(fixture)
+                let preparation = try await switchPreparation(fixture)
+                vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("wait-switch.json") }
+                _ = await vm.prepareProviderSwitchHandoverForSend(preparation, session: session, stopFence: .init(session: session))
+                session.installRunID(UUID())
+                session.beginRunAttempt(source: "test.switch.waitReply")
+                session.runState = .running
+                XCTAssertTrue(vm.agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: .codexNativeSend(UUID())))
+                let rows = session.items.map(\.id)
+                var steerTask: Task<AgentModeViewModel.UserTurnSubmissionResult, Never>?
+                XCTAssertEqual(
+                    vm.submitUserTurn(
+                        text: "steer during flight",
+                        tabID: session.tabID,
+                        scheduledProviderSwitchSubmission: { steerTask = $0 }
+                    ),
+                    .submitted
+                )
+                guard case .blocked = try await (XCTUnwrap(steerTask)).value else {
+                    return XCTFail("A steer during the bound in-flight window must stay a busy refusal")
+                }
+                XCTAssertEqual(session.items.map(\.id), rows, "A refused steer must not append a row that could stale the carrier")
+                let waiting = Task { try await vm.waitForNextUserInstruction(tabID: session.tabID, timeoutSeconds: 10) }
+                try await AsyncTestWait.waitUntil("continuation installed") { session.instructionContinuation != nil }
+                XCTAssertEqual(session.runState, .waitingForUser, "The real wait must own the waiting state the gate keys on")
+                defer {
+                    session.instructionTimeoutTask?.cancel()
+                    session.instructionTimeoutTask = nil
+                    session.instructionContinuation?.resume(throwing: CancellationError())
+                    session.instructionContinuation = nil
+                    session.instructionWaitID = nil
+                    session.waitingPrompt = nil
+                    waiting.cancel()
+                }
+                _ = vm.submitUserTurn(text: "the answer", tabID: session.tabID)
+                let response = try await waiting.value
+                XCTAssertEqual(response.text, "the answer", "The turn's own continuation reply must reach the held input")
+                XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .sending)
+                XCTAssertFalse(AgentModeViewModel.providerSwitchNeedsReview(session), "A bound handover is en route, never stale")
+                XCTAssertFalse(AgentModeViewModel.providerSwitchUnconfirmed(session))
+            }
+        }
+
+        func testSessionLinkSendThroughReadySwitchDeliversHandover() async throws {
+            // The send's own accepted row owns the attempt and must not make the send reject itself
+            // as stale or busy: the handover-carrying input delivers and the marker reaches .sending.
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                session.selectedAgent = .openCode
+                session.selectedModelRaw = "unknown-window"
+                try installSwitch(fixture)
+                let candidate = try XCTUnwrap(vm.agentSessionLinkCandidate(
+                    tabID: session.tabID, sessionID: XCTUnwrap(session.activeAgentSessionID),
+                    tabName: "Target", isWindowClosing: false
+                ))
+                let observer = DomainAgentSessionLinkEndpointIdentity(
+                    windowID: 2, workspaceID: UUID(), tabID: UUID(), sessionID: UUID(),
+                    persistentBindingGeneration: UUID(), bindingTransitionGeneration: 1
+                )
+                let request = AgentSessionLinkSendRequest(
+                    linkID: UUID(), linkGeneration: 1, observerEndpoint: observer,
+                    observerDisplayName: "Planning", message: "carry me", workflow: nil
+                )
+                var starts = 0
+                var firstInput: String?
+                vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("link-send.json") }
+                vm.test_providerSwitchStart = { _, user, _ in
+                    starts += 1
+                    firstInput = user
+                }
+                let outcome = await vm.agentSessionLinkPerformSend(
+                    to: candidate, request: request,
+                    liveness: { .init(observerEndpointIsLive: true, targetEndpointIsLive: true, targetWindowIsClosing: false) },
+                    commitAuthorization: { .committed }
+                )
+                guard case .delivered = outcome else {
+                    return XCTFail("A send through a ready switch must deliver, got \(outcome)")
+                }
+                XCTAssertEqual(starts, 1, "The provider switch must drive exactly one start")
+                XCTAssertTrue(firstInput?.contains("repoprompt_provider_handover") ?? false, "The carrying input must be prefixed with the handover")
+                XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .sending)
+            }
+        }
+
         func testRestoredIdenticalNewestTurnsFallsBackToFullHistory() async throws {
             // The saved newest-turns carrier equals what the fresh budget renders as full history;
             // the hidden row must resolve to .history rather than a missing selection.
