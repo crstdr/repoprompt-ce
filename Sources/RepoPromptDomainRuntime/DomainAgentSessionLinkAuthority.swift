@@ -185,6 +185,7 @@ package actor DomainAgentSessionLinkAuthority {
     // MARK: - Internal records
 
     private struct LinkRecord {
+        let revocationFence = DomainAgentSessionLinkRevocationFence()
         var grant: DomainAgentSessionLinkGrant
         /// Authority revision at activation. Used so a stale lifecycle observation cannot revoke a
         /// link that was activated after that observation was taken.
@@ -1106,6 +1107,15 @@ package actor DomainAgentSessionLinkAuthority {
         guard record.grant.sourceScopeID == lease.sourceScopeID, hasSourceConsent(record.grant) else { return .linkRevoked }
         guard effectiveCapabilities(of: record.grant).contains(lease.capability) else { return .capabilityDenied }
         return nil
+    }
+
+    /// Issues an exact-grant publication fence while this actor still owns lease validation.
+    package func commitAuthorization(for lease: DomainAgentSessionLinkLease) -> DomainAgentSessionLinkCommitAuthorization? {
+        guard validate(lease: lease) == nil, let record = links[lease.linkID] else { return nil }
+        return DomainAgentSessionLinkCommitAuthorization(
+            lease: lease, fence: record.revocationFence, grant: record.grant,
+            consent: scopeConsent, elevation: capabilityElevation, now: now
+        )
     }
 
     /// One all-or-none actor transition at optional provider disclosure. Reuses the exact operation
@@ -2085,7 +2095,9 @@ package actor DomainAgentSessionLinkAuthority {
         let revokedAt = now()
 
         for linkID in linkIDs.sorted(by: { $0.uuidString < $1.uuidString }) {
-            guard let record = links.removeValue(forKey: linkID) else { continue }
+            guard let record = links[linkID] else { continue }
+            record.revocationFence.revoke()
+            links.removeValue(forKey: linkID)
             let key = AuthorizationKey(observer: record.grant.observer, targetSessionID: record.grant.target.sessionID)
             authorizationLinks[key]?.remove(linkID)
             if authorizationLinks[key]?.isEmpty == true { authorizationLinks.removeValue(forKey: key) }
@@ -2230,6 +2242,9 @@ package actor DomainAgentSessionLinkAuthority {
         isDraining = true
         for waiterID in waiters.keys.sorted(by: { $0.uuidString < $1.uuidString }) {
             resumeWaiter(waiterID, outcome: .shuttingDown, includeTargets: false)
+        }
+        for record in links.values {
+            record.revocationFence.revoke()
         }
         isShutDown = true
         localInputGenerations.removeAll()
