@@ -1053,6 +1053,53 @@ extension AgentSessionLinkPassiveStatusNoticeTests {
         XCTAssertTrue(try XCTUnwrap(reducer.snapshot.entries.first).isRoutineWakeEligible)
     }
 
+    func testQuietCyclesDoNotReproduceOverflowOrRearmFailedWake() throws {
+        var reducer = makeReducer()
+        reducer.enable(
+            samples: (0 ..< 18).map { sample($0, status: .idle, runFacts: facts(8, 8)) },
+            linkSetRevision: 1
+        )
+        reducer.reconcile(
+            samples: (0 ..< 18).map { sample($0, status: .idle, runFacts: facts(9, 9)) },
+            linkSetRevision: 1, deliverable: true
+        )
+        let failed = reducer.snapshot
+        XCTAssertEqual(failed.entries.count, 16)
+        XCTAssertEqual(failed.overflowProduced, 2)
+        let deliveredEntry = try XCTUnwrap(failed.entries.first)
+        let lateReceipt = Reducer.Receipt(
+            snapshot: failed, deliveredEntries: [deliveredEntry], overflowProducedThrough: 0
+        )
+
+        // Withhold all receipts while only quiet settlements advance the same ordinary coverage.
+        for cycle in 0 ..< 3 {
+            let opening = UInt64(9 + cycle)
+            reducer.reconcile(
+                samples: (0 ..< 18).map { sample($0, status: .running, runFacts: facts(opening, 9)) },
+                linkSetRevision: 1, deliverable: true
+            )
+            XCTAssertEqual(reducer.snapshot.wakeEligibilityFingerprint, failed.wakeEligibilityFingerprint, "running cycle \(cycle)")
+            reducer.reconcile(
+                samples: (0 ..< 18).map { sample($0, status: .idle, runFacts: facts(opening + 1, 9)) },
+                linkSetRevision: 1, deliverable: true
+            )
+            XCTAssertEqual(reducer.snapshot.entries.count, 16, "quiet cycle \(cycle)")
+            XCTAssertEqual(reducer.snapshot.overflowProduced, 2, "quiet cycle \(cycle)")
+            XCTAssertEqual(reducer.snapshot.unacknowledgedOverflowCount, 2, "quiet cycle \(cycle)")
+            XCTAssertEqual(reducer.snapshot.wakeEligibilityFingerprint, failed.wakeEligibilityFingerprint, "quiet churn cannot re-arm the failed occurrence")
+            for index in 0 ..< 18 {
+                XCTAssertEqual(reducer.deliveredRunThrough(for: sample(index, status: .idle).reference), 8)
+            }
+        }
+
+        reducer.apply(lateReceipt)
+        XCTAssertEqual(reducer.deliveredRunThrough(for: deliveredEntry.reference), 9, "late exact receipt pays only its frozen cutoff, not the later quiet settlements")
+        XCTAssertFalse(reducer.snapshot.entries.contains { $0.reference == deliveredEntry.reference })
+        XCTAssertEqual(reducer.deliveredRunThrough(for: sample(0, status: .idle).reference), 8, "overflow representation never pays an evicted target")
+        XCTAssertEqual(reducer.snapshot.overflowProduced, 2)
+        XCTAssertEqual(reducer.snapshot.unacknowledgedOverflowCount, 2, "the receipt did not render overflow")
+    }
+
     func testEvictionDoesNotPayAndAnonymousOverflowCannotPayTargets() {
         var reducer = makeReducer()
         let baseline = (0 ..< 18).map { sample($0, status: .idle, runFacts: facts(8, 8)) }
