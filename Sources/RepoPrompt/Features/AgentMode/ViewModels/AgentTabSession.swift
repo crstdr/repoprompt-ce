@@ -610,7 +610,7 @@ final class AgentTabSession: ObservableObject {
         let targetRunAttemptID: UUID?
         /// The text we actually send to the provider (may include workflow wrapping, etc.)
         let providerText: String
-        let attachments: [AgentImageAttachment]
+        let attachments: [AgentFileAttachment]
         let taggedFileAttachments: [AgentTaggedFileAttachment]
         /// The original user-typed text to restore into the composer on failure/cancel.
         let draftText: String
@@ -679,7 +679,7 @@ final class AgentTabSession: ObservableObject {
         /// providers drop the cancelled prompt from provider history, so the flush
         /// re-bundles this with `providerText` after session/cancel.
         let interruptedPromptProviderText: String?
-        let attachments: [AgentImageAttachment]
+        let attachments: [AgentFileAttachment]
         let taggedFileAttachments: [AgentTaggedFileAttachment]
         /// The original user-typed text to restore into the composer on failure/cancel.
         let draftText: String
@@ -740,7 +740,7 @@ final class AgentTabSession: ObservableObject {
     struct CodexPendingAuthRetryTurn: Equatable {
         /// Undecorated provider text, exactly as every other Codex buffer stores it.
         var text: String
-        var images: [AgentImageAttachment]
+        var attachments: [AgentFileAttachment]
         var model: String?
         var reasoningEffort: String?
         var serviceTier: String?
@@ -870,7 +870,7 @@ final class AgentTabSession: ObservableObject {
     struct CodexFallbackSubmissionContext: Equatable {
         let queueID: UUID
         let providerText: String
-        let images: [AgentImageAttachment]
+        let attachments: [AgentFileAttachment]
         let taggedFileAttachments: [AgentTaggedFileAttachment]
         let draftText: String
         let optimisticUserItemID: UUID?
@@ -906,7 +906,7 @@ final class AgentTabSession: ObservableObject {
     struct CodexFallbackQueueEntry: Equatable, Identifiable {
         let id: UUID
         let providerText: String
-        let images: [AgentImageAttachment]
+        let attachments: [AgentFileAttachment]
         let taggedFileAttachments: [AgentTaggedFileAttachment]
         let model: String?
         let reasoningEffort: String?
@@ -1135,9 +1135,9 @@ final class AgentTabSession: ObservableObject {
     var userWorkflowSelectionMutationGeneration: UInt64 = 0
 
     // Pending image attachments for the next user turn
-    @Published var pendingImageAttachments: [AgentImageAttachment] = []
+    @Published var pendingFileAttachments: [AgentFileAttachment] = []
     @Published var pendingTaggedFileAttachments: [AgentTaggedFileAttachment] = []
-    var attachmentsPendingProviderConsumptionCleanup: [AgentImageAttachment] = []
+    var attachmentsPendingProviderConsumptionCleanup: [AgentFileAttachment] = []
     var attachmentTurnState: AgentModeViewModel.AttachmentTurnState = .idle
 
     /// Provider session ID for resumption (e.g., Claude CLI session_id)

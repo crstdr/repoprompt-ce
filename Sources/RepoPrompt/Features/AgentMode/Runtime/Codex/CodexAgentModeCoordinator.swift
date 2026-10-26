@@ -268,6 +268,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     private let runtimeWorkspacePathsProvider: (AgentTabSession) throws -> CodexRuntimeWorkspacePaths
     private let codexControllerFactory: CodexControllerFactory
     private let codexCapabilitiesForLaunch: (_ isMCPRelated: Bool) -> CodexCapabilitySettings
+    private let computerUseRuntimeUnavailableMessage: () -> String?
+    private let computerUseRuntimePreflight: () async -> String?
     private let computerUseCompanionReady: () -> Bool
     private let computerUseReservedEntryExists: () -> Bool
     private let connectionPolicyInstaller: ConnectionPolicyInstaller
@@ -412,6 +414,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         },
         shouldManageCodexTooling: Bool,
         codexCapabilitiesForLaunch: @escaping (_ isMCPRelated: Bool) -> CodexCapabilitySettings = { _ in .disabled },
+        computerUseRuntimeUnavailableMessage: (() -> String?)? = nil,
+        computerUseRuntimePreflight: (() async -> String?)? = nil,
         computerUseCompanionReady: @escaping () -> Bool = { CodexNativeSessionController.computerUseClientPath() != nil },
         computerUseReservedEntryExists: @escaping () -> Bool = { CodexNativeSessionController.hasReservedComputerUseEntry(MCPIntegrationHelper.codexMCPServerEntries()) },
         authRecovery: any CodexManagedAuthRecovering = CodexManagedAuthRecoveryService.shared,
@@ -436,6 +440,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         self.runtimeWorkspacePathsProvider = runtimeWorkspacePathsProvider
         self.codexControllerFactory = codexControllerFactory
         self.codexCapabilitiesForLaunch = codexCapabilitiesForLaunch
+        if let computerUseRuntimeUnavailableMessage {
+            self.computerUseRuntimeUnavailableMessage = computerUseRuntimeUnavailableMessage
+            self.computerUseRuntimePreflight = computerUseRuntimePreflight ?? { computerUseRuntimeUnavailableMessage() }
+        } else {
+            self.computerUseRuntimeUnavailableMessage = { CodexComputerUseWorkflow.configuredRuntimeUnavailableMessage }
+            self.computerUseRuntimePreflight = computerUseRuntimePreflight ?? { await CodexComputerUseWorkflow.checkConfiguredRuntimeRequirement() }
+        }
         self.computerUseCompanionReady = computerUseCompanionReady
         self.computerUseReservedEntryExists = computerUseReservedEntryExists
         self.connectionPolicyInstaller = connectionPolicyInstaller
@@ -2359,12 +2370,17 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         nativeSlashCommandAvailabilityMessage(command, argumentsText: "", session: session)
     }
 
-    private func computerUseAdmissionMessage(session: AgentTabSession) -> String? {
+    func computerUseRuntimeRequirementMessage() async -> String? {
+        await computerUseRuntimePreflight()
+    }
+
+    private func computerUseAdmissionMessage(session: AgentTabSession, checkRuntime: Bool = true) -> String? {
         guard CodexComputerUseWorkflow.isEnabled else { return CodexComputerUseWorkflow.disabledMessage }
         guard session.selectedAgent == .codexExec, session.parentSessionID == nil,
               viewModel?.sessions[session.tabID] === session,
               session.codexComputerUseOwnershipTransitionHolds.isEmpty,
               codexControllerRetirementTaskByTabID[session.tabID]?.includesComputerUse != true else { return CodexComputerUseWorkflow.ineligibleMessage }
+        if checkRuntime, let message = computerUseRuntimeUnavailableMessage() { return message }
         guard !computerUseReservedEntryExists() else { return CodexComputerUseWorkflow.collisionMessage }
         guard computerUseCompanionReady() else { return CodexComputerUseWorkflow.unavailableMessage }
         return nil
@@ -2374,16 +2390,18 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     func armCodexComputerUse(session: AgentTabSession, requestID: UUID) async throws {
         let binding = session.persistentSessionBindingIdentity
         let generation = session.bindingTransitionGeneration
+        let runtimeMessage = await computerUseRuntimePreflight()
         guard !Task.isCancelled,
               viewModel?.currentTabID == session.tabID,
               viewModel?.sessions[session.tabID] === session,
               session.codexComputerUseArmingRequestID == requestID,
               session.persistentSessionBindingIdentity == binding,
               session.bindingTransitionGeneration == generation,
+              runtimeMessage == nil,
               computerUseAdmissionMessage(session: session) == nil,
               !session.runState.isActive || session.isCodexComputerUseArmed
         else {
-            throw CodexAppServerClient.ClientError.executableUnavailable(computerUseAdmissionMessage(session: session) ?? CodexComputerUseWorkflow.ineligibleMessage)
+            throw CodexAppServerClient.ClientError.executableUnavailable(runtimeMessage ?? computerUseAdmissionMessage(session: session) ?? CodexComputerUseWorkflow.ineligibleMessage)
         }
         _ = stageCodexComputerUseActivationIfNeeded(session: session)
         cancelCodexIdleShutdown(for: session.tabID)
@@ -2520,7 +2538,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         _ command: NativeSlashCommand,
         argumentsText: String,
         session: AgentTabSession,
-        effectiveRunState: AgentSessionRunState? = nil
+        effectiveRunState: AgentSessionRunState? = nil,
+        deferComputerUseRuntimeCheckUntilArming: Bool = false
     ) -> String? {
         let runState = effectiveRunState ?? session.runState
         guard session.selectedAgent == .codexExec else {
@@ -2542,7 +2561,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
             return nil
         case .computerUse:
-            if let message = computerUseAdmissionMessage(session: session) { return message }
+            if let message = computerUseAdmissionMessage(session: session, checkRuntime: !deferComputerUseRuntimeCheckUntilArming) { return message }
             guard !runState.isActive || runState == .waitingForUser else {
                 return "Wait for the current Codex turn to finish before starting a /computer-use workflow."
             }
@@ -3276,13 +3295,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     private func fallbackSubmissionContext(
         _ context: AgentTabSession.CodexFallbackSubmissionContext?,
         text: String,
-        images: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         stopFence: AgentRunStartStopFence
     ) -> AgentTabSession.CodexFallbackSubmissionContext {
         context ?? .init(
             queueID: UUID(),
             providerText: text,
-            images: images,
+            attachments: attachments,
             taggedFileAttachments: [],
             draftText: text,
             optimisticUserItemID: nil,
@@ -3310,7 +3329,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session: AgentTabSession,
         context: AgentTabSession.CodexFallbackSubmissionContext?,
         text: String,
-        images: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         selection: (model: String?, reasoningEffort: String?, serviceTier: String?),
         autoEffortApplied: Bool,
         attachmentReservationID: UUID?,
@@ -3325,7 +3344,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         else {
             return .stale(reason: "Codex could not queue fallback delivery because its run lineage changed.")
         }
-        let submission = fallbackSubmissionContext(context, text: text, images: images, stopFence: stopFence)
+        let submission = fallbackSubmissionContext(context, text: text, attachments: attachments, stopFence: stopFence)
         if session.codexFallbackQueue.contains(where: { $0.id == submission.queueID })
             || session.codexFallbackDispatchInFlight?.id == submission.queueID
         {
@@ -3342,7 +3361,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         let entry = AgentTabSession.CodexFallbackQueueEntry(
             id: submission.queueID,
             providerText: submission.providerText,
-            images: submission.images,
+            attachments: submission.attachments,
             taggedFileAttachments: submission.taggedFileAttachments,
             model: selection.model,
             reasoningEffort: selection.reasoningEffort,
@@ -3473,12 +3492,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         _ entry: AgentTabSession.CodexFallbackQueueEntry,
         session: AgentTabSession
     ) -> Bool {
-        guard !entry.images.isEmpty else { return true }
+        guard !entry.attachments.isEmpty else { return true }
         guard let reservationID = entry.attachmentReservationID else { return false }
         guard case .idle = session.attachmentTurnState else { return false }
         session.attachmentTurnState = .reserved(
             reservationID: reservationID,
-            attachments: entry.images
+            attachments: entry.attachments
         )
         return true
     }
@@ -3691,7 +3710,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             guard released?.mustAbortDispatch != true else { throw CancellationError() }
             _ = try await controller.startUserTurn(
                 text: released?.text(head.providerText) ?? monitoring?.text ?? head.providerText,
-                images: head.images,
+                attachments: head.attachments,
                 model: head.model,
                 reasoningEffort: head.reasoningEffort,
                 serviceTier: head.serviceTier
@@ -3721,7 +3740,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             await applySuccessfulCodexNativeSend(
                 for: session,
                 runID: session.runID ?? head.originRunID,
-                attachments: head.images,
+                attachments: head.attachments,
                 attachmentReservationID: head.attachmentReservationID
             )
             if let ownership = session.activeRunOwnership {
@@ -3824,9 +3843,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 _ = session.removeItem(at: index)
             }
             if mode == .restoreInput {
-                let pendingImageIDs = Set(session.pendingImageAttachments.map(\.id))
-                session.pendingImageAttachments.append(contentsOf: entry.images.filter {
-                    !pendingImageIDs.contains($0.id)
+                let pendingAttachmentIDs = Set(session.pendingFileAttachments.map(\.id))
+                session.pendingFileAttachments.append(contentsOf: entry.attachments.filter {
+                    !pendingAttachmentIDs.contains($0.id)
                 })
                 let pendingTaggedIDs = Set(session.pendingTaggedFileAttachments.map(\.id))
                 session.pendingTaggedFileAttachments.append(contentsOf: entry.taggedFileAttachments.filter {
@@ -5862,7 +5881,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     private func applySuccessfulCodexNativeSend(
         for session: AgentTabSession,
         runID: UUID,
-        attachments: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         attachmentReservationID: UUID?
     ) async {
         setRunningStatus("Waiting for response…", source: .transport, session: session, urgent: true)
@@ -6135,7 +6154,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 }
                 let receipt = try await controller.startUserTurn(
                     text: replayText,
-                    images: replayTurn.images,
+                    attachments: replayTurn.attachments,
                     model: replayTurn.model,
                     reasoningEffort: replayTurn.reasoningEffort,
                     serviceTier: replayTurn.serviceTier
@@ -6156,7 +6175,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             await applySuccessfulCodexNativeSend(
                 for: session,
                 runID: runID,
-                attachments: replayTurn.images,
+                attachments: replayTurn.attachments,
                 attachmentReservationID: replayTurn.attachmentReservationID
             )
             viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
@@ -7663,7 +7682,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     func sendCodexNativeMessage(
         session: AgentTabSession,
         text: String,
-        attachments: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         fallbackContext: AgentTabSession.CodexFallbackSubmissionContext? = nil,
         stopFence: AgentRunStartStopFence? = nil,
         attachmentReservationID: UUID? = nil,
@@ -7821,7 +7840,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         )
         if !isSelfNote { session.codexPendingAuthRetryTurn = .init(
             text: text,
-            images: attachments,
+            attachments: attachments,
             model: selection.model,
             reasoningEffort: selection.reasoningEffort,
             serviceTier: selection.serviceTier,
@@ -7964,7 +7983,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 session: session,
                 context: fallbackContext,
                 text: text,
-                images: attachments,
+                attachments: attachments,
                 selection: selection,
                 autoEffortApplied: initialSelection.isAuto,
                 attachmentReservationID: attachmentReservationID,
@@ -8308,7 +8327,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                             let dispatchText = parkedNote.map { $0.frame + "\n\n" + baseText } ?? baseText
                             receipt = try await controller.startUserTurn(
                                 text: dispatchText,
-                                images: attachments,
+                                attachments: attachments,
                                 model: physicalSelection.model,
                                 reasoningEffort: physicalSelection.reasoningEffort,
                                 serviceTier: physicalSelection.serviceTier
@@ -8398,7 +8417,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     let dispatchText = parkedNote.map { $0.frame + "\n\n" + baseText } ?? baseText
                     let receipt = try await controller.steerUserTurn(
                         text: dispatchText,
-                        images: attachments,
+                        attachments: attachments,
                         expectedTurnID: identity.turnID
                     )
                     if let parkedNote {
@@ -8460,7 +8479,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         let retryText = releasedMonitoringClaim.map { AgentSessionLinkPromptComposer.decorated(text, with: $0) } ?? text
                         let receipt = try await controller.steerUserTurn(
                             text: retryText,
-                            images: attachments,
+                            attachments: attachments,
                             expectedTurnID: actualTurnID
                         )
                         recordAcceptedSteer()
@@ -8605,7 +8624,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 session: session,
                 context: fallbackContext,
                 text: text,
-                images: attachments,
+                attachments: attachments,
                 selection: selection,
                 autoEffortApplied: initialSelection.isAuto,
                 attachmentReservationID: attachmentReservationID,

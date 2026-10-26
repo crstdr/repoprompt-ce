@@ -922,7 +922,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 if w0fProvider == .codexExec {
                     observer.codexController = codex
                     _ = try await codex.startOrResume(existing: nil, baseInstructions: "")
-                    _ = try await codex.startUserTurn(text: "", images: [], model: nil, reasoningEffort: nil, serviceTier: nil)
+                    _ = try await codex.startUserTurn(text: "", attachments: [], model: nil, reasoningEffort: nil, serviceTier: nil)
                 } else {
                     observer.claudeController = provider
                 }
