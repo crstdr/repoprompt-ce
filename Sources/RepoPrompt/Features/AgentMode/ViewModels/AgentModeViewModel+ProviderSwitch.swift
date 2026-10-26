@@ -215,7 +215,11 @@ extension AgentModeViewModel {
         { return true }
         if let claimID = proof.composerAttemptID, session.activeComposerSubmitAttempt?.id == claimID { return true }
         if let inputID = proof.acceptedInputID {
-            return session.hasLocalComposerCandidate(itemID: inputID, fence: proof.stopFence)
+            if session.hasLocalComposerCandidate(itemID: inputID, fence: proof.stopFence) { return true }
+            // Non-local producers (session-link send, MCP resident, auto/periodic wakes) leave no
+            // composer candidate, and their claim can be released before the spawned run registers
+            // ownership. The durably accepted row itself is the carrying attempt until then.
+            return session.items.contains { $0.id == inputID }
         }
         return false
     }
@@ -228,6 +232,9 @@ extension AgentModeViewModel {
     /// being started is excluded, never arbitrary equal text. Missing retained cutoff fails closed.
     static func providerSwitchNeedsReview(_ session: TabSession, excluding inputID: UUID? = nil) -> Bool {
         guard session.pendingHandoff.providerSwitchDelivery != nil else { return false }
+        // Once the carrying dispatch is physically bound, the handover is already en route to the
+        // destination; input accepted after it is ordinary traffic on that run, never staleness.
+        if session.pendingHandoff.providerSwitchDispatch?.dispatchID != nil { return false }
         let ownedInputID = inputID ?? (providerSwitchHasOwnedCarryingAttempt(session) ? session.pendingHandoff.providerSwitchDispatch?.acceptedInputID : nil)
         var positions: [UUID: Int] = [:]
         var inputs: [UUID: Int] = [:]
@@ -512,6 +519,7 @@ extension AgentModeViewModel {
         var retainedPayload: String?
         var retainedOmissions: String?
         var unavailable: String?
+        var hidden = false
         var bytes: Int {
             retainedPayload?.utf8.count ?? carrier?.utf8Bytes ?? 0
         }
@@ -933,23 +941,49 @@ extension AgentModeViewModel {
             preview.historyReference = reference
             preview.cutoff = result.4
             preview.wordLimit = preview.isReview ? nil : result.3
+            // A newest-turns suffix that covers every projected turn carries the same body as full
+            // history; two identical rows are noise, so drop it whenever full history also fits.
+            let recentDuplicatesFull = result.2.map {
+                $0.turnIndices == result.1.turnIndices
+                    && $0.omittedOlderTurns == nil
+                    && $0.hasToolOutputOmission == result.1.hasToolOutputOmission
+                    && $0.hasImageOmission == result.1.hasImageOmission
+            } ?? false
             preview.choices = [
                 .init(mode: .history, carrier: result.1, unavailable: budget.fits(result.1) ? nil : "Full history doesn't fit."),
-                .init(mode: .newestTurns, carrier: result.2, unavailable: result.2 == nil ? "the last turn alone doesn't fit" : nil),
+                .init(mode: .newestTurns, carrier: result.2, unavailable: result.2 == nil ? "the last turn alone doesn't fit" : nil, hidden: recentDuplicatesFull && budget.fits(result.1)),
                 .init(mode: .summary, unavailable: preview.isReview ? AgentSessionLinkSendFailure.providerHandoverNeedsReview.message : (result.3 == nil ? "no room for a summary" : nil))
             ]
             if !stale, let payload = originalSlot.payload, let descriptor = preview.originalDescriptor,
                providerSwitchReadReferenceIsCurrent(descriptor, session: session, destination: preview.destination),
                let mode = AgentProviderHandover.Mode(rawValue: descriptor.mode),
-               let index = preview.choices.firstIndex(where: { $0.mode == mode }),
                AgentProviderHandover.estimate(payload) <= budget.remainingCarrierTokens,
                payload.utf8.count <= AgentProviderHandover.maximumBytes,
                mode != .summary || payload.utf8.count <= AgentProviderHandover.maximumSummaryBytes
             {
-                preview.choices[index].retainedPayload = payload
-                preview.choices[index].retainedOmissions = descriptor.omissions.isEmpty ? nil : descriptor.omissions.joined(separator: ", ")
-                preview.choices[index].unavailable = nil
-                preview.selected = mode
+                var index = preview.choices.firstIndex(where: { $0.mode == mode && !$0.hidden })
+                if index == nil, mode == .newestTurns,
+                   let hiddenIndex = preview.choices.firstIndex(where: { $0.mode == .newestTurns })
+                {
+                    // The saved carrier may predate a budget that now fits full history; when it
+                    // differs from the fresh suffix it is real approved content, so un-hide the
+                    // row rather than retaining it under the Full history label.
+                    if let carrier = preview.choices[hiddenIndex].carrier,
+                       payload != AgentProviderHandover.render(carrier)
+                    {
+                        preview.choices[hiddenIndex].hidden = false
+                        index = hiddenIndex
+                    }
+                }
+                if index == nil, mode == .newestTurns {
+                    index = preview.choices.firstIndex(where: { $0.mode == .history })
+                }
+                if let index {
+                    preview.choices[index].retainedPayload = payload
+                    preview.choices[index].retainedOmissions = descriptor.omissions.isEmpty ? nil : descriptor.omissions.joined(separator: ", ")
+                    preview.choices[index].unavailable = nil
+                    preview.selected = preview.choices[index].mode
+                }
             } else if !preview.isReview, budget.fits(result.1) { preview.selected = .history }
             if let summary = preview.generatedSummary { fitProviderSwitchSummary(summary, into: &preview) }
             preview.building = false

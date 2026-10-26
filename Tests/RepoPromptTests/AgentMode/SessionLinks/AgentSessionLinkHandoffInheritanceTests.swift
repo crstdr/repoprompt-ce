@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import Foundation
+import MCP
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 import SwiftUI
@@ -2448,6 +2449,235 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             }
         }
 
+        func testResidentSubmissionSurfacesProviderSwitchRefusalsInsteadOfBusyOrRecorded() async throws {
+            // .sending blocks at admission (unconfirmed); an oversized ready carrier refuses inside
+            // persistAndStartNoncomposerTurn (does not fit). Neither may fall back to the generic
+            // busy or "input was recorded" errors: nothing was recorded and only the user can fix it.
+            for (delivery, padding, expected) in [
+                (AgentProviderSwitchDelivery.sending, 0, AgentSessionLinkSendFailure.providerSwitchUnconfirmed.message),
+                (.ready, Int(AgentProviderHandover.maximumBytes) + 100, AgentSessionLinkSendFailure.providerHandoverDoesNotFit.message)
+            ] {
+                let expected = "Task input not submitted: provider switch pending. \(expected)"
+                try await withFixture { fixture in
+                    let vm = fixture.viewModel
+                    let session = fixture.sourceSession
+                    session.selectedAgent = .openCode
+                    session.selectedModelRaw = "unknown-window"
+                    try installSwitch(fixture, padding: padding)
+                    session.pendingHandoff.providerSwitchDelivery = delivery
+                    let rows = session.items.count
+                    let target = try XCTUnwrap(try vm.mcpResidentTarget(sessionID: XCTUnwrap(session.activeAgentSessionID), requiringLoadedState: true))
+                    do {
+                        _ = try await vm.mcpSubmitResidentTask(target, text: "resident task", workflow: nil, windowIsAvailable: { true })
+                        XCTFail("A pending provider switch must refuse resident input")
+                    } catch let MCPError.invalidParams(message) {
+                        XCTAssertEqual(message, expected)
+                    }
+                    XCTAssertEqual(session.items.count, rows, "Refused input must not leave a transcript row")
+                    XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, delivery, "A refused send must not consume or mutate the handover")
+                    XCTAssertNil(session.activeComposerSubmitAttempt, "The submit claim must be released for the next input")
+                }
+            }
+        }
+
+        func testNonLocalAcceptedRowKeepsSwitchOwnershipUntilRunAssociation() async throws {
+            // Session-link and MCP sends release their composer claim before the spawned run
+            // registers ownership; the durably accepted row must carry the attempt across that
+            // window or readiness transiently reports unconfirmed/needs-review.
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                session.selectedAgent = .openCode
+                session.selectedModelRaw = "unknown-window"
+                try installSwitch(fixture)
+                let preparation = try await switchPreparation(fixture)
+                let item = AgentChatItem.user("non-local input", sequenceIndex: session.nextSequenceIndex)
+                session.appendItem(item)
+                _ = preparation.accepting(item.id, session: session)
+                XCTAssertNil(session.activeComposerSubmitAttempt)
+                XCTAssertTrue(AgentModeViewModel.providerSwitchHasOwnedCarryingAttempt(session))
+                session.pendingHandoff.providerSwitchDelivery = .sending
+                session.pendingHandoff.isStagedForSend = true
+                XCTAssertFalse(AgentModeViewModel.providerSwitchUnconfirmed(session))
+                let candidate = try XCTUnwrap(vm.agentSessionLinkCandidate(
+                    tabID: session.tabID, sessionID: XCTUnwrap(session.activeAgentSessionID),
+                    tabName: "Target", isWindowClosing: false
+                ))
+                let inputs = AgentModeViewModel.sendReadinessInputs(session: session, candidate: candidate, status: .idle)
+                XCTAssertTrue(inputs.runStateIsActive, "idle_for_send must agree with send admission during the dispatch window")
+                _ = try session.removeItem(at: XCTUnwrap(session.items.firstIndex { $0.id == item.id }))
+                session.pendingHandoff.providerSwitchDispatch = nil
+                XCTAssertFalse(AgentModeViewModel.providerSwitchHasOwnedCarryingAttempt(session))
+                XCTAssertTrue(AgentModeViewModel.providerSwitchUnconfirmed(session))
+            }
+        }
+
+        func testRestoredDifferingNewestTurnsPayloadUnhidesRowInsteadOfMislabelingHistory() async throws {
+            // A saved newest-turns carrier that omits older history predates a budget that now fits
+            // full history; retaining it on the Full history row would mislabel real omissions.
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                session.selectedAgent = .openCode
+                session.selectedModelRaw = "unknown-window"
+                fixture.window.promptManager.apiSettingsViewModel?.isOpenCodeConnected = true
+                /// The saved payload omits turn 0, which the fresh (short) history would include.
+                func tinyTurn(_ text: String, _ index: Int) -> AgentTranscriptTurn {
+                    let request = AgentChatItem.user(text, sequenceIndex: index)
+                    return AgentTranscriptTurn(
+                        request: .init(from: request), responseSpans: [], conclusionActivityID: nil,
+                        terminalState: .completed, startedAt: request.timestamp, completedAt: request.timestamp
+                    )
+                }
+                let projection = try AgentProviderHandover.project(AgentTranscript(turns: [
+                    tinyTurn(String(repeating: "x", count: 40000), 0), tinyTurn("recent", 1)
+                ]))
+                let source = try AgentProviderHandover.Source(provider: "source", model: "source-model")
+                let budget = AgentProviderHandover.Budget(catalogWindow: 24000, instructions: [], composedInput: "", isPreview: false)
+                let carrier = try XCTUnwrap(AgentProviderHandover.newestCompleteTurns(
+                    projection, source: source, historyReference: nil, budget: budget
+                ))
+                let payload = AgentProviderHandover.render(carrier)
+                session.pendingHandoff = try .init(
+                    payload: payload, createdAt: Date(),
+                    sourceItemID: session.items.last?.id, providerSwitchDelivery: .ready
+                )
+                await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
+                try await AsyncTestWait.waitUntil("review settled") { vm.providerSwitchPreview?.building == false }
+                let preview = try XCTUnwrap(vm.providerSwitchPreview)
+                XCTAssertNil(preview.choices.first { $0.mode == .history }?.unavailable, "Precondition: fresh full history fits")
+                let recent = try XCTUnwrap(preview.choices.first { $0.mode == .newestTurns })
+                XCTAssertFalse(recent.hidden, "A differing restored payload must surface on its own row")
+                XCTAssertEqual(recent.retainedPayload, payload)
+                XCTAssertNil(preview.choices.first { $0.mode == .history }?.retainedPayload)
+                XCTAssertEqual(preview.selected, .newestTurns)
+            }
+        }
+
+        func testInstructionWaitReplyFlowsDuringOwnedBoundSwitchSend() async throws {
+            // While the carrying dispatch is bound and its turn waits for user instruction, only the
+            // continuation reply may pass; every other input keeps the retryable busy refusal so no
+            // cancel can reach the prompt carrying the handover.
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                session.selectedAgent = .openCode
+                session.selectedModelRaw = "unknown-window"
+                try installSwitch(fixture)
+                let preparation = try await switchPreparation(fixture)
+                vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("wait-switch.json") }
+                _ = await vm.prepareProviderSwitchHandoverForSend(preparation, session: session, stopFence: .init(session: session))
+                session.installRunID(UUID())
+                session.beginRunAttempt(source: "test.switch.waitReply")
+                session.runState = .running
+                XCTAssertTrue(vm.agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: .codexNativeSend(UUID())))
+                let rows = session.items.map(\.id)
+                var steerTask: Task<AgentModeViewModel.UserTurnSubmissionResult, Never>?
+                XCTAssertEqual(
+                    vm.submitUserTurn(
+                        text: "steer during flight",
+                        tabID: session.tabID,
+                        scheduledProviderSwitchSubmission: { steerTask = $0 }
+                    ),
+                    .submitted
+                )
+                guard case .blocked = try await (XCTUnwrap(steerTask)).value else {
+                    return XCTFail("A steer during the bound in-flight window must stay a busy refusal")
+                }
+                XCTAssertEqual(session.items.map(\.id), rows, "A refused steer must not append a row that could stale the carrier")
+                let waiting = Task { try await vm.waitForNextUserInstruction(tabID: session.tabID, timeoutSeconds: 10) }
+                try await AsyncTestWait.waitUntil("continuation installed") { session.instructionContinuation != nil }
+                XCTAssertEqual(session.runState, .waitingForUser, "The real wait must own the waiting state the gate keys on")
+                defer {
+                    session.instructionTimeoutTask?.cancel()
+                    session.instructionTimeoutTask = nil
+                    session.instructionContinuation?.resume(throwing: CancellationError())
+                    session.instructionContinuation = nil
+                    session.instructionWaitID = nil
+                    session.waitingPrompt = nil
+                    waiting.cancel()
+                }
+                _ = vm.submitUserTurn(text: "the answer", tabID: session.tabID)
+                let response = try await waiting.value
+                XCTAssertEqual(response.text, "the answer", "The turn's own continuation reply must reach the held input")
+                XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .sending)
+                XCTAssertFalse(AgentModeViewModel.providerSwitchNeedsReview(session), "A bound handover is en route, never stale")
+                XCTAssertFalse(AgentModeViewModel.providerSwitchUnconfirmed(session))
+            }
+        }
+
+        func testSessionLinkSendThroughReadySwitchDeliversHandover() async throws {
+            // The send's own accepted row owns the attempt and must not make the send reject itself
+            // as stale or busy: the handover-carrying input delivers and the marker reaches .sending.
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                session.selectedAgent = .openCode
+                session.selectedModelRaw = "unknown-window"
+                try installSwitch(fixture)
+                let candidate = try XCTUnwrap(vm.agentSessionLinkCandidate(
+                    tabID: session.tabID, sessionID: XCTUnwrap(session.activeAgentSessionID),
+                    tabName: "Target", isWindowClosing: false
+                ))
+                let observer = DomainAgentSessionLinkEndpointIdentity(
+                    windowID: 2, workspaceID: UUID(), tabID: UUID(), sessionID: UUID(),
+                    persistentBindingGeneration: UUID(), bindingTransitionGeneration: 1
+                )
+                let request = AgentSessionLinkSendRequest(
+                    linkID: UUID(), linkGeneration: 1, observerEndpoint: observer,
+                    observerDisplayName: "Planning", message: "carry me", workflow: nil
+                )
+                var starts = 0
+                var firstInput: String?
+                vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("link-send.json") }
+                vm.test_providerSwitchStart = { _, user, _ in
+                    starts += 1
+                    firstInput = user
+                }
+                let outcome = await vm.agentSessionLinkPerformSend(
+                    to: candidate, request: request,
+                    liveness: { .init(observerEndpointIsLive: true, targetEndpointIsLive: true, targetWindowIsClosing: false) },
+                    commitAuthorization: { .committed }
+                )
+                guard case .delivered = outcome else {
+                    return XCTFail("A send through a ready switch must deliver, got \(outcome)")
+                }
+                XCTAssertEqual(starts, 1, "The provider switch must drive exactly one start")
+                XCTAssertTrue(firstInput?.contains("repoprompt_provider_handover") ?? false, "The carrying input must be prefixed with the handover")
+                XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .sending)
+            }
+        }
+
+        func testRestoredIdenticalNewestTurnsFallsBackToFullHistory() async throws {
+            // The saved newest-turns carrier equals what the fresh budget renders as full history;
+            // the hidden row must resolve to .history rather than a missing selection.
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                session.selectedAgent = .openCode
+                session.selectedModelRaw = "unknown-window"
+                fixture.window.promptManager.apiSettingsViewModel?.isOpenCodeConnected = true
+                let projection = try AgentProviderHandover.project(session.transcript)
+                let source = try AgentProviderHandover.Source(provider: "source", model: "source-model")
+                let budget = AgentProviderHandover.Budget(catalogWindow: nil, instructions: [], composedInput: "", isPreview: false)
+                let carrier = try XCTUnwrap(AgentProviderHandover.newestCompleteTurns(
+                    projection, source: source, historyReference: nil, budget: budget
+                ))
+                let payload = AgentProviderHandover.render(carrier)
+                session.pendingHandoff = try .init(
+                    payload: payload, createdAt: Date(),
+                    sourceItemID: session.items.last?.id, providerSwitchDelivery: .ready
+                )
+                await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
+                try await AsyncTestWait.waitUntil("identical restore settled") { vm.providerSwitchPreview?.building == false }
+                let preview = try XCTUnwrap(vm.providerSwitchPreview)
+                XCTAssertEqual(preview.choices.first { $0.mode == .newestTurns }?.hidden, true)
+                XCTAssertNil(preview.choices.first { $0.mode == .history }?.unavailable)
+                XCTAssertEqual(preview.selected, .history)
+                XCTAssertEqual(preview.choices.first { $0.mode == .history }?.retainedPayload, payload)
+            }
+        }
+
         func testOrdinarySendArmingChangeReachesExistingPersistenceBoundary() async throws {
             for initiallyArmed in [false, true] {
                 try await withFixture { fixture in
@@ -3012,6 +3242,22 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                         XCTAssertEqual(successor.selectedModelRaw, "successor-selection")
                     }
                 }
+            }
+        }
+
+        func testIdenticalNewestTurnsRowIsHiddenButPayloadAndSelectionStayValid() async throws {
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                try installSwitch(fixture)
+                await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
+                try await AsyncTestWait.waitUntil("short preview settled") { vm.providerSwitchPreview?.building == false }
+                let preview = try XCTUnwrap(vm.providerSwitchPreview)
+                XCTAssertEqual(preview.choices.count, 3)
+                XCTAssertEqual(preview.choices.first(where: { $0.mode == .newestTurns })?.hidden, true)
+                XCTAssertEqual(preview.selected, .history)
+                let payload = await vm.providerSwitchPayload(preview.id, mode: .newestTurns)
+                XCTAssertNotNil(payload)
             }
         }
 

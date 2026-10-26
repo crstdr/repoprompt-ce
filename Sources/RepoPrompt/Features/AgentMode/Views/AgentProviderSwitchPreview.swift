@@ -75,7 +75,7 @@ struct AgentProviderSwitchPreview: View {
                 if preview.updated { Text("Preview updated.").foregroundStyle(.secondary) }
                 if preview.building { ProgressView() }
                 if preview.choices.first?.unavailable != nil { Text("Full history doesn't fit.") }
-                ForEach(preview.choices, id: \.mode.rawValue) { choice in
+                ForEach(preview.choices.filter { !$0.hidden }, id: \.mode.rawValue) { choice in
                     VStack(alignment: .leading, spacing: 5) {
                         HStack {
                             Button {
@@ -128,13 +128,14 @@ struct AgentProviderSwitchPreview: View {
                 HStack {
                     if preview.isReview {
                         Button("Discard handover") { Task { await viewModel.applyProviderSwitch(preview.id, discard: true) } }
-                            .disabled(viewModel.providerSwitchDiscardBlocker(preview) != nil)
+                            .disabled(viewModel.providerSwitchDiscardBlocker(preview) != nil || viewModel.providerSwitchMutation != nil)
                     }
                     Spacer()
                     Button("Cancel") { viewModel.cancelProviderSwitchPreview() }.keyboardShortcut(.cancelAction)
+                        .disabled(viewModel.providerSwitchMutation != nil)
                     Button("Switch") { Task { await viewModel.applyProviderSwitch(preview.id) } }
                         .keyboardShortcut(.defaultAction)
-                        .disabled(preview.building || preview.selected == nil || preview.chosen?.unavailable != nil || preview.chosen?.bytes ?? 0 == 0 || preview.generationItemID != nil || viewModel.providerSwitchPreviewBlocker(preview) != nil)
+                        .disabled(preview.building || preview.selected == nil || preview.chosen?.unavailable != nil || preview.chosen?.bytes ?? 0 == 0 || preview.generationItemID != nil || viewModel.providerSwitchPreviewBlocker(preview) != nil || viewModel.providerSwitchMutation != nil)
                 }
             }
             .padding(20)

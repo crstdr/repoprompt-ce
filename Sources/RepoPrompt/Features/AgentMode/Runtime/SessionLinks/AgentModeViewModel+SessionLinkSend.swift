@@ -482,6 +482,11 @@ extension AgentModeViewModel {
         if let index = session.items.firstIndex(where: { $0.id == itemID }) {
             _ = session.removeItem(at: index)
         }
+        // The accepting() proof pointed at the removed row; a .ready handover must not keep it,
+        // because the proof also participates in pendingHandoff equality and ownership checks.
+        if session.pendingHandoff.providerSwitchDelivery == .ready {
+            session.pendingHandoff.providerSwitchDispatch = nil
+        }
         rollbackAgentTurnUserAnchor(anchorRollback, session: session)
         updateBindingsFromSession(session)
         requestUIRefresh(tabID: tabID, urgent: true)

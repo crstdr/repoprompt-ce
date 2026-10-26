@@ -166,7 +166,10 @@ enum AgentProviderHandover {
             let omissionBytes = omitted.map { olderMarker($0, reference: historyReference).utf8.count } ?? 0
             let bodyCount = projection.turns.count - position + (omitted == nil ? 0 : 1) + (hasTools ? 1 : 0)
             let bytes = framing + turnBytes + omissionBytes + (hasTools ? toolMarker.utf8.count : 0) + bodyCount - 1
-            guard budget.fits(bytes: bytes, mode: .newestTurns) else { break }
+            // Keep scanning older positions on a miss: size is not monotone, because reaching
+            // position 0 drops the whole omission marker, so the all-turns candidate can fit where
+            // an intermediate suffix could not. Unsettled turns still stop the scan outright.
+            guard budget.fits(bytes: bytes, mode: .newestTurns) else { continue }
             selectedStart = position
         }
         guard let selectedStart else { return nil }
@@ -182,7 +185,7 @@ enum AgentProviderHandover {
         }
         var body: [String] = []
         if let omitted { body.append(olderMarker(omitted, reference: historyReference)) }
-        try body.append("<model_summary>\(escaped(text))</model_summary>")
+        body.append("<model_summary>\(escaped(text))</model_summary>")
         let images = projection.turns.contains(where: \.hasImages)
         if images { body.append(imageMarker) }
         return carrier(source: source, mode: .summary, turns: [], omitted: omitted, tools: false, images: images, reference: historyReference, body: body)
@@ -257,7 +260,7 @@ enum AgentProviderHandover {
             // do not move a conclusion ahead of an intervening diagnostic by concatenating them.
             for (sequence, text) in [(middleSequence, summary?.middleSummaryText), (conclusionSequence, conclusion)] {
                 guard let text, !text.isEmpty, representedTexts.insert(text).inserted else { continue }
-                try ordered.append((sequence, "<turn_summary>\(escaped(text))</turn_summary>"))
+                ordered.append((sequence, "<turn_summary>\(escaped(text))</turn_summary>"))
             }
         }
         var hasTools = false
@@ -270,14 +273,14 @@ enum AgentProviderHandover {
                 try ordered.append((activity.sequenceIndex, userMessage(activity.text, origin: activity.userInputOrigin, attribution: activity.crossSessionAttribution)))
             case .assistant, .assistantInline:
                 if compacted, activity.id == turn.conclusionActivityID || representedTexts.contains(activity.text) { continue }
-                try ordered.append((activity.sequenceIndex, "<message role=\"assistant\">\(escaped(activity.text))</message>"))
+                ordered.append((activity.sequenceIndex, "<message role=\"assistant\">\(escaped(activity.text))</message>"))
             case .system, .error:
                 if compacted, activity.recoveryDiagnostic != nil, representedTexts.contains(activity.text) { continue }
-                try ordered.append((activity.sequenceIndex, "<event>\(escaped(activity.text))</event>"))
+                ordered.append((activity.sequenceIndex, "<event>\(escaped(activity.text))</event>"))
             case .toolCall, .toolResult:
                 hasTools = true
                 let tool = activity.toolExecution
-                try ordered.append((
+                ordered.append((
                     activity.sequenceIndex,
                     "<tool name=\"\(escaped(tool?.toolName ?? "", attribute: true))\" status=\"\(tool?.status.rawValue ?? "unknown")\">\(escaped(tool?.summaryText ?? ""))</tool>"
                 ))
@@ -285,7 +288,7 @@ enum AgentProviderHandover {
         }
         for diagnostic in summary?.normalizedRecoveryDiagnostics ?? [] where seenIDs.insert(diagnostic.id).inserted {
             guard !representedTexts.contains(diagnostic.text) else { continue }
-            try ordered.append((diagnostic.sequenceIndex, "<event>\(escaped(diagnostic.text))</event>"))
+            ordered.append((diagnostic.sequenceIndex, "<event>\(escaped(diagnostic.text))</event>"))
         }
         // Stable tie handling preserves the original stored order for equal sequence indices.
         elements += ordered.enumerated().sorted {
@@ -305,7 +308,7 @@ enum AgentProviderHandover {
             // No durable automatic-user metadata exists today; absence never means local authorship.
             ""
         }
-        return try "<message role=\"user\"\(from)>\(escaped(text))</message>"
+        return "<message role=\"user\"\(from)>\(escaped(text))</message>"
     }
 
     // MARK: - Single serializer / measurement
@@ -408,24 +411,62 @@ enum AgentProviderHandover {
 
     private static func validateIdentifier(_ value: String) throws {
         guard !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw ValidationError.emptyIdentifier }
-        _ = try escaped(value)
+        guard value.unicodeScalars.allSatisfy(isValidXMLScalar) else { throw ValidationError.invalidXMLText }
     }
 
-    private static func escaped(_ value: String, attribute: Bool = false) throws -> String {
-        guard value.unicodeScalars.allSatisfy({ scalar in
-            scalar.value == 9 || scalar.value == 10 || scalar.value == 13
-                || (0x20 ... 0xD7FF).contains(scalar.value)
-                || (0xE000 ... 0xFFFD).contains(scalar.value)
-                || (0x10000 ... 0x10FFFF).contains(scalar.value)
-        }) else { throw ValidationError.invalidXMLText }
-        return escapeValidated(value, attribute: attribute)
+    /// Content paths sanitize like the link envelope's `sanitizedBody`: a stray control scalar in a
+    /// stored row (ANSI escapes, pastes, linked-session text kept raw by design) must not disable
+    /// every handover mode for the session forever. Identifiers instead fail closed via the
+    /// `isValidXMLScalar` check in `validateIdentifier` above.
+    private static func escaped(_ value: String, attribute: Bool = false) -> String {
+        guard value.unicodeScalars.contains(where: { !isValidXMLScalar($0) }) else {
+            return escapeValidated(value, attribute: attribute)
+        }
+        var scalars = String.UnicodeScalarView()
+        scalars.reserveCapacity(value.unicodeScalars.count)
+        for scalar in value.unicodeScalars where isValidXMLScalar(scalar) {
+            scalars.append(scalar)
+        }
+        return escapeValidated(String(scalars), attribute: attribute)
     }
 
+    private static func isValidXMLScalar(_ scalar: Unicode.Scalar) -> Bool {
+        switch scalar.value {
+        case 0x9, 0xA, 0xD, 0x20 ... 0xD7FF, 0xE000 ... 0xFFFD, 0x10000 ... 0x10FFFF: true
+        default: false
+        }
+    }
+
+    /// Iterates Unicode scalars, not `Character`s, for the same reason the link envelope's `escaped`
+    /// does: grapheme-cluster matching lets a metacharacter followed by a combining mark slip through
+    /// unescaped. `>` and `'` stay literal to keep escaped output byte-minimal; `]]>` is handled
+    /// scalar-wise by tracking a two-`]` run.
     private static func escapeValidated(_ value: String, attribute: Bool = false) -> String {
-        var result = value.replacingOccurrences(of: "&", with: "&amp;")
-            .replacingOccurrences(of: "<", with: "&lt;")
-            .replacingOccurrences(of: "]]>", with: "]]&gt;")
-        if attribute { result = result.replacingOccurrences(of: "\"", with: "&quot;") }
+        var result = ""
+        result.reserveCapacity(value.utf8.count)
+        var bracketRun = 0
+        for scalar in value.unicodeScalars {
+            switch scalar {
+            case "&":
+                result += "&amp;"
+                bracketRun = 0
+            case "<":
+                result += "&lt;"
+                bracketRun = 0
+            case "\"" where attribute:
+                result += "&quot;"
+                bracketRun = 0
+            case "]":
+                result.unicodeScalars.append(scalar)
+                bracketRun += 1
+            case ">":
+                result += bracketRun >= 2 ? "&gt;" : ">"
+                bracketRun = 0
+            default:
+                result.unicodeScalars.append(scalar)
+                bracketRun = 0
+            }
+        }
         return result
     }
 }

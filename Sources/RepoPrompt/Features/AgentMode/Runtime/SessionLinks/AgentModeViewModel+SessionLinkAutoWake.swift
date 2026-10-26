@@ -1331,7 +1331,12 @@ extension AgentModeViewModel {
                 return
             }
         }
-        if case .failure = await providerSwitchSendAdmission(
+        // A .sending marker already owned by this live run means the handover is in flight on the
+        // very turn this continuation resumes; refusing here would deadlock the wake's own turn.
+        let switchInFlightOnActiveRun = session.pendingHandoff.providerSwitchDelivery == .sending
+            && session.runState.isActive && Self.providerSwitchHasOwnedCarryingAttempt(session)
+            && session.pendingHandoff.providerSwitchDispatch?.dispatchID != nil
+        if !switchInFlightOnActiveRun, case .failure = await providerSwitchSendAdmission(
             session: session, input: claim.fragment, skipsAugmentation: true,
             inputAlreadyIncludesSupplement: true,
             isCurrent: { self.agentSessionLinkAutoWakeSession(for: endpoint) === session

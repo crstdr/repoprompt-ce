@@ -20308,7 +20308,20 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             workflow: activeWorkflow,
             includeBuiltInCleanupGuidance: GlobalSettingsStore.shared.showBuiltInWorkflowCleanupGuidance()
         )
-        if session.pendingHandoff.providerSwitchDelivery != nil, providerSwitchPreparation == nil {
+        // Once the .sending dispatch is owned by a live run (ACP keeps the marker until the turn's
+        // physical acceptance), ordinary input is steering or continuation on that same run, not a
+        // new handover decision. Routing it through switch admission would refuse it — including the
+        // turn's own waiting-continuation reply, which would deadlock the turn.
+        // Steers would cancel the ACP prompt carrying the handover (cancel + re-send), so only a
+        // waiting-continuation reply may pass through while the bound dispatch is in flight;
+        // everything else keeps the busy refusal until physical acceptance clears the marker.
+        let switchInFlightOnActiveRun = session.pendingHandoff.providerSwitchDelivery == .sending
+            && session.runState == .waitingForUser && session.instructionContinuation != nil
+            && Self.providerSwitchHasOwnedCarryingAttempt(session)
+            && session.pendingHandoff.providerSwitchDispatch?.dispatchID != nil
+        if session.pendingHandoff.providerSwitchDelivery != nil, providerSwitchPreparation == nil,
+           !switchInFlightOnActiveRun
+        {
             let claim: AgentComposerSubmitClaim
             let ownsClaim = providerSwitchClaim == nil
             if let providerSwitchClaim {
@@ -20342,6 +20355,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 case let .failure(failure):
                     let message = failure == .providerHandoverDoesNotFit && isLocalComposerInput
                         ? "Too long to send with the handover." : failure.message
+                    // A managed steer has no caller awaiting this task; resolve its sink now or
+                    // the overseer would wait out the outcome timeout for a turn never sent.
+                    managedTurn?.sink.resolve(.notAccepted(message: message))
                     return .blocked(message: message)
                 case let .success(preparation):
                     guard let preparation, composerSubmitClaimIsCurrent(claim), capturedStop.permitsStart(of: session),
@@ -20382,7 +20398,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
         }
         if managedTurn == nil, interviewFirst, nativePreparedTurn == nil,
-           isLocalComposerInput || providerSwitchPreparation == nil,
+           isLocalComposerInput || providerSwitchPreparation != nil,
            session.items.isEmpty || !session.items.contains(where: { $0.kind == .assistant }) { interviewFirst = false }
         let codexCompactionInFlight = session.selectedAgent == .codexExec
             && codexCoordinator.isCodexCompactionInFlight(session: session)
