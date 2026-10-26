@@ -83,7 +83,7 @@ extension AgentModeViewModel {
     func providerSwitchSendAdmission(
         session: TabSession,
         input: String,
-        attachments: [AgentImageAttachment] = [],
+        attachments: [AgentFileAttachment] = [],
         taggedFiles: [AgentTaggedFileAttachment] = [],
         skipsAugmentation: Bool = false,
         skipsSlashExpansion: Bool = false,
@@ -572,7 +572,7 @@ extension AgentModeViewModel {
         let includesInterview: Bool
         let interviewPreference: Bool
         let includeCleanupGuidance: Bool
-        let images: [AgentImageAttachment]
+        let images: [AgentFileAttachment]
         let taggedFiles: [AgentTaggedFileAttachment]
     }
 
