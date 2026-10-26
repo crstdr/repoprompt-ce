@@ -305,6 +305,7 @@ extension AgentModeViewModel {
             releaseComposerSubmitClaim(claim)
             return .blocked(.providerHandoverNeedsReview)
         }
+        liveSession.noteAcceptedTaskInput()
         // 6. Durable acceptance. The bubble keeps raw words; the exact provider payload is metadata.
         let userItem = AgentChatItem.user(
             displayText,

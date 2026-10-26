@@ -584,7 +584,7 @@ extension AgentModeViewModel {
             includesInterview: interviewFirst && (session.items.isEmpty || !session.items.contains(where: { $0.kind == .assistant })),
             interviewPreference: interviewFirst,
             includeCleanupGuidance: GlobalSettingsStore.shared.showBuiltInWorkflowCleanupGuidance(),
-            images: session.pendingImageAttachments, taggedFiles: session.pendingTaggedFileAttachments
+            images: session.pendingFileAttachments, taggedFiles: session.pendingTaggedFileAttachments
         )
     }
 

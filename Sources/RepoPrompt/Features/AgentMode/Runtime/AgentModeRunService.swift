@@ -196,7 +196,7 @@ final class AgentModeRunService {
         session: AgentTabSession,
         initialUserMessage: String,
         initialMessageForRun: String,
-        attachments: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         codexFallbackContext: AgentTabSession.CodexFallbackSubmissionContext? = nil,
         autoEffortSelection: AutoEffortTurnSelection? = nil,
         providerControlCommand: AgentProviderControlCommand? = nil,
@@ -384,7 +384,7 @@ final class AgentModeRunService {
     func submitActiveACPPromptIfSupported(
         session: AgentTabSession,
         messageForRun: String,
-        attachments: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         targetRunID: UUID?,
         targetRunAttemptID: UUID?,
         targetController: ACPAgentSessionController,
@@ -436,7 +436,7 @@ final class AgentModeRunService {
     static func makeACPRunRequest(
         session: AgentTabSession,
         workspacePath: String?,
-        attachments: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         runtimePermission: AgentProviderRuntimePermissionBinding
     ) -> ACPRunRequest? {
         let selectedAgent = session.selectedAgent
