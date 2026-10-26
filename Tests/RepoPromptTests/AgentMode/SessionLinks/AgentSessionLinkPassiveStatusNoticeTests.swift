@@ -1138,6 +1138,12 @@ extension AgentSessionLinkPassiveStatusNoticeTests {
         }
         XCTAssertEqual(reducer.snapshot.unacknowledgedOverflowCount, 2)
 
+        reducer.reconcile(samples: [sample(0, status: .unavailable)] + Array(all(.idle, facts(settled, 9)).dropFirst()), linkSetRevision: 1, deliverable: true)
+        reducer.reconcile(samples: all(.idle, facts(settled, 9)), linkSetRevision: 1, deliverable: true)
+        XCTAssertEqual(reducer.snapshot.overflowProduced, 2, "A proof-gap return is not new ordinary coverage")
+        XCTAssertFalse(reducer.snapshot.entries.contains { $0.reference == evicted })
+        XCTAssertEqual(reducer.snapshot.wakeEligibilityFingerprint, failedIdentity)
+
         // The late exact receipt still pays its frozen cutoff for the evicted lane.
         reducer.apply(lateReceipt)
         XCTAssertEqual(reducer.deliveredRunThrough(for: evicted), 9)
@@ -1151,6 +1157,7 @@ extension AgentSessionLinkPassiveStatusNoticeTests {
 
         // A partial receipt for a retained row pays only its frozen cutoff, not the quiet closes.
         reducer.apply(retainedReceipt)
+        XCTAssertFalse(reducer.snapshot.entries.contains { $0.reference == retained.reference })
         XCTAssertEqual(reducer.deliveredRunThrough(for: retained.reference), 9)
         XCTAssertEqual(reducer.snapshot.unacknowledgedOverflowCount, 3, "the partial receipt did not render overflow")
     }
