@@ -743,6 +743,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
         }
 
         func testW2ProductionCatalogProofHandoffCostWithActualAndTenfoldCatalog() async throws {
+            try XCTSkipUnless(ProcessInfo.processInfo.environment["RPCE_RUN_SCALE_TESTS"] == "quiet-w2-catalog", "Opt-in catalog proof/handoff cost gate")
             try await MCPSharedServerTestLease.shared.withLease { _ in
                 try await self.exerciseLiveDiscovery(w0fProvider: .claudeCode, w2Probe: .catalogCost)
             }
