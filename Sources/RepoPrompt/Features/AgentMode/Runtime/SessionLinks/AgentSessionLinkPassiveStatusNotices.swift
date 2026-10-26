@@ -586,6 +586,8 @@ struct AgentSessionLinkPassiveStatusNotices {
     private struct DeliveredRunPosition {
         let target: DomainAgentSessionLinkEndpointIdentity
         var through: UInt64?
+        /// Evicted ordinary coverage is already represented by overflow, but is not paid.
+        var overflowRepresentedOrdinaryThrough: UInt64?
     }
 
     /// One position per live lane, not per pending row. Target unreadability does not retire it.
@@ -827,6 +829,10 @@ struct AgentSessionLinkPassiveStatusNotices {
                 delivered.map { facts.ordinaryThrough > $0 } ?? (oldEntry != nil || immediateEdge)
             } ?? false
             let freshIdleDebt = sample.status == .idle && sample.runFacts != nil && owesCoverage
+            let overflowRepresented = deliveredRunThrough[reference]?.overflowRepresentedOrdinaryThrough
+            let unrepresentedCoverage = owesCoverage && (known.map { facts in
+                overflowRepresented.map { facts.ordinaryThrough > $0 } ?? true
+            } ?? false)
             let newOrdinary = sample.runFacts.map { $0.ordinaryThrough > (preceding?.lastKnownRunFacts?.ordinaryThrough ?? 0) } ?? false
             let reacquired = sample.runFacts != nil && preceding?.sample.runFacts == nil
             changed = changed || statusChanged
@@ -845,7 +851,7 @@ struct AgentSessionLinkPassiveStatusNotices {
             }
             // A first observation is a silent baseline, but a surviving position returning from an
             // unavailable/proof gap must recover owed work BEFORE same-status early return.
-            let recoverDebt = freshIdleDebt && !isBaseline && (newOrdinary || reacquired)
+            let recoverDebt = freshIdleDebt && unrepresentedCoverage && !isBaseline && (newOrdinary || reacquired)
             if preceding == nil && !recoverDebt { continue }
             let quietClose = sample.status == .idle && quietInterval
             var origin = oldEntry?.fromStatus ?? priorStatus
@@ -856,9 +862,9 @@ struct AgentSessionLinkPassiveStatusNotices {
             let coalescedEdge = PendingEntry.isStatusEdge(from: origin, to: sample.status)
             let retainsCoverage = oldEntry != nil && owesCoverage
             // A quiet successor may be the first observed close after ordinary coverage was
-            // sampled only while running. Quiet proof cannot suppress that still-unpaid coverage.
+            // sampled only while running. Quiet proof cannot suppress that unrepresented coverage.
             let shouldRepresent = retainsCoverage || recoverDebt || (oldEntry != nil && !statusChanged)
-                || (statusChanged && coalescedEdge && (!quietClose || owesCoverage))
+                || (statusChanged && coalescedEdge && (!quietClose || unrepresentedCoverage))
             if !shouldRepresent {
                 if statusChanged, oldEntry != nil {
                     pendingByReference.removeValue(forKey: reference)
@@ -1115,6 +1121,12 @@ struct AgentSessionLinkPassiveStatusNotices {
         let overflowCount = max(0, pendingByReference.count - Self.maximumPendingTargetCount)
         guard overflowCount > 0 else { return 0 }
         for entry in orderedPendingEntries.prefix(overflowCount) {
+            if let ordinary = entry.ordinaryThrough,
+               var position = deliveredRunThrough[entry.reference], position.target == entry.targetEndpoint
+            {
+                position.overflowRepresentedOrdinaryThrough = max(position.overflowRepresentedOrdinaryThrough ?? 0, ordinary)
+                deliveredRunThrough[entry.reference] = position
+            }
             pendingByReference.removeValue(forKey: entry.reference)
         }
         return overflowCount
