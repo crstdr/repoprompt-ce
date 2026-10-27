@@ -781,7 +781,8 @@ extension AgentModeViewModel {
     /// Codex, Claude native, ACP, and headless alike.
     func agentSessionLinkPromptClaimOutcome(
         for session: TabSession,
-        dispatchID: AgentSessionLinkPromptDispatchID
+        dispatchID: AgentSessionLinkPromptDispatchID,
+        allowsQuietCheckIn: Bool = true
     ) -> AgentSessionLinkPromptClaimOutcome {
         let effectiveID = agentSessionLinkEffectiveDispatchID(for: session, dispatchID: dispatchID)
         let periodicAttempt = session.oversight.pendingAutoWake.flatMap { attempt in
@@ -820,13 +821,13 @@ extension AgentModeViewModel {
                 locationLabelsByReference[reference] = locationLabel
             }
         }
-        // The first reservation knows the route before begin makes the run active. Later adapters
-        // retain that frozen qualification, not a route re-derived from the now-running session.
+        // Preparation preserves only the original idle-route candidacy. Catalog eligibility is
+        // finalized from the actual current-route response before physical acquisition.
         let routineQuietCheckIn: Bool = if let attempt = session.oversight.pendingAutoWake, attempt.wakeID == effectiveID.autoWakeID {
             if attempt.phase.ownsTransportBoundary,
                let reserved = agentSessionLinkPromptClaimStore.pendingClaim(dispatchID: effectiveID, observerSessionID: context.epoch.endpoint.sessionID)
             {
-                reserved.routineQuietCheckIn
+                (reserved.routineQuietCheckIn || (attempt.phase == .preparingDispatch && attempt.routineQuietCandidate))
                     && selfNoopHintIsCurrent(for: session)
             } else {
                 attempt.admissionBasis == .routineStatusOrOverflow
@@ -844,8 +845,7 @@ extension AgentModeViewModel {
             passiveNotices: context.passiveNotices,
             locationLabelsByReference: locationLabelsByReference,
             allowsClaimlessAutoWake: periodicAttempt != nil,
-            routineQuietCheckIn: routineQuietCheckIn,
-
+            routineQuietCheckIn: routineQuietCheckIn && allowsQuietCheckIn,
             decorateLocalInputs: { baseline in
                 #if DEBUG
                     if let decorate = self.test_agentSessionLinkLocalInputDecoration { return decorate(baseline) }
@@ -982,7 +982,9 @@ extension AgentModeViewModel {
         for session: TabSession, claim: AgentSessionLinkOutboundPromptClaim?
     ) async -> AgentSessionLinkProviderInputRelease.Proof {
         let owner = session.activeRunOwnership
-        let projection = claim?.observerEndpoint.flatMap { agentSessionLinkRunCatalogProjectionByEndpoint[$0] }
+        let attempt = session.oversight.pendingAutoWake
+        let canUpgrade = claim?.dispatchID.autoWakeID == attempt?.wakeID
+            && attempt?.phase == .preparingDispatch && attempt?.routineQuietCandidate == true
         let proof = await AgentSessionLinkProviderInputRelease.prove(claim) { decoration in
             guard let observer = claim?.observerEndpoint,
                   self.sessions[session.tabID] === session else { return false }
@@ -995,30 +997,80 @@ extension AgentModeViewModel {
         // point. Keep this the last await: a withdrawal during optional local-read proof must not
         // survive through a lagging MainActor mirror. Later server mutations linearize after this
         // proof; this is not a cross-actor atomic send/observation transaction.
-        var supportsDeclaration = claim?.routineQuietCheckIn != true
-        if claim?.routineQuietCheckIn == true, let projection, let route = projection.routeToken {
+        let projection = claim?.observerEndpoint.flatMap { agentSessionLinkRunCatalogProjectionByEndpoint[$0] }
+        let needsDeclarationProof = canUpgrade || claim?.routineQuietCheckIn == true
+        var supportsDeclaration = !needsDeclarationProof
+        if needsDeclarationProof, let projection, let route = projection.routeToken {
             supportsDeclaration = await ServerNetworkManager.shared.hasCurrentReturnedTool(
                 Self.selfNoopCatalogDefinition, routeToken: route, projectionRevision: projection.projectionRevision
             )
         }
         let currentProjection = claim?.observerEndpoint.flatMap { agentSessionLinkRunCatalogProjectionByEndpoint[$0] }
-        if claim?.routineQuietCheckIn == true, let owner,
-           session.isCurrentRunAttemptForCurrentBinding(owner),
-           !supportsDeclaration || !selfNoopHintIsCurrent(for: session)
-           || currentProjection?.projectionRevision != projection?.projectionRevision
-           || currentProjection?.routeToken != projection?.routeToken
+        guard needsDeclarationProof, let claim, let owner,
+              session.isCurrentRunAttemptForCurrentBinding(owner)
+        else { return proof }
+        let supportHolds = supportsDeclaration && selfNoopHintIsCurrent(for: session)
+            && currentProjection?.projectionRevision == projection?.projectionRevision
+            && currentProjection?.routeToken == projection?.routeToken
+        let qualifies = supportHolds && agentSessionLinkPromptClaimStore.isPending(claim)
+        var finalized: AgentSessionLinkOutboundPromptClaim? = claim
+        let mayUpgrade = session.oversight.pendingAutoWake.map {
+            $0.wakeID == claim.dispatchID.autoWakeID && $0.phase == .preparingDispatch
+        } == true
+        if agentSessionLinkPromptClaimStore.isPending(claim),
+           !qualifies && claim.routineQuietCheckIn || qualifies && !claim.routineQuietCheckIn && mayUpgrade
         {
+            finalized = agentSessionLinkPromptClaimOutcome(
+                for: session, dispatchID: claim.dispatchID, allowsQuietCheckIn: qualifies
+            ).claim
+        }
+        // Adding the hint cannot select different debt or membership from the reserved batch.
+        // If its budget would change that receipt, keep the ordinary rendering instead.
+        if finalized?.routineQuietCheckIn == true,
+           finalized?.passive != claim.passive || finalized?.membership != claim.membership
+        {
+            finalized = agentSessionLinkPromptClaimOutcome(
+                for: session, dispatchID: claim.dispatchID, allowsQuietCheckIn: false
+            ).claim
+        }
+        if var current = session.oversight.pendingAutoWake,
+           current.wakeID == claim.dispatchID.autoWakeID, current.phase == .preparingDispatch,
+           current.routineQuietCandidate
+        {
+            let definition: AgentSessionLinkCatalogDiagnostics.ReturnedDefinition
+            if let catalog = projection?.returnedCatalog {
+                let matches = catalog[MCPWindowToolName.selfNoop] ?? []
+                definition = matches.isEmpty ? .absent : matches.count != 1 ? .ambiguous
+                    : matches[0] == Self.selfNoopCatalogDefinition ? .exact : .different
+            } else {
+                definition = .unknown
+            }
+            AgentSessionLinkCatalogDiagnostics.quietQualification(
+                tabID: session.tabID, reserved: claim.routineQuietCheckIn, candidate: true,
+                routingGeneration: projection?.routeToken?.routingAuthorityGeneration,
+                definition: definition, serverProof: supportsDeclaration,
+                ordinary: session.quietLedger.hasOrdinaryOccurrence(owner: owner),
+                qualified: supportHolds && finalized?.routineQuietCheckIn == true
+            )
+            current.routineQuietCandidate = false
+            session.oversight.pendingAutoWake = current
+        }
+        if !supportHolds || claim.routineQuietCheckIn && finalized?.routineQuietCheckIn != true {
             session.quietLedger.noteOccurrence(owner: owner)
         }
-        return proof
+        return proof.replacingClaim(finalized)
     }
 
     func agentSessionLinkHandoffProviderInput(
         for session: TabSession, dispatchID: AgentSessionLinkPromptDispatchID,
         claim: AgentSessionLinkOutboundPromptClaim?, proof: AgentSessionLinkProviderInputRelease.Proof
     ) -> AgentSessionLinkProviderInputRelease.ReleasedDispatchContext {
+        let finalized = proof.claim.flatMap { prepared in
+            prepared.dispatchID == claim?.dispatchID && prepared.epochToken == claim?.epochToken
+                && prepared.observerEndpoint == claim?.observerEndpoint ? prepared : nil
+        } ?? claim
         let released = AgentSessionLinkProviderInputRelease.handoff(
-            original: claim, proof: proof,
+            original: finalized, proof: proof,
             current: { self.agentSessionLinkPromptClaimOutcome(for: session, dispatchID: dispatchID) },
             isPending: { self.agentSessionLinkPromptClaimStore.isPending($0) },
             consume: { decoration in
@@ -1026,9 +1078,9 @@ extension AgentModeViewModel {
                 return AgentSessionLinkRuntimeBridge.shared.consumeLocalInputHandoff(decoration, observer: observer)
             }
         )
-        // Attention or other ordinary content can arrive after the physical routine mark while
-        // proof awaits. The actual synchronous release may only remove quiet qualification.
-        if claim?.routineQuietCheckIn == true, released.claim?.routineQuietCheckIn != true,
+        // Callers retain their transport fences around proof. Synchronous handoff may only
+        // remove qualification, including qualification first gained by this proof.
+        if finalized?.routineQuietCheckIn == true, released.claim?.routineQuietCheckIn != true,
            let owner = session.activeRunOwnership, session.isCurrentRunAttemptForCurrentBinding(owner)
         {
             session.quietLedger.noteOccurrence(owner: owner)

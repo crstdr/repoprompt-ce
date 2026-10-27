@@ -796,6 +796,18 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             }
         }
 
+        func testW2FailedAuthoritativeProofVetoesAReplacedRoutineClaim() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { _ in
+                try await self.exerciseLiveDiscovery(w0fProvider: .claudeCode, w2Probe: .hint(withdraw: true, replaced: true))
+            }
+        }
+
+        func testW2FailedProofVetoesAReplacedOrdinaryCandidate() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { _ in
+                try await self.exerciseLiveDiscovery(w0fProvider: .claudeCode, w2Probe: .hint(withdraw: true, replaced: true, ordinaryCandidate: true))
+            }
+        }
+
         func testW2SameRouteCatalogWithdrawalDuringLocalProofRemovesActualSentHint() async throws {
             for withdraw in [false, true] {
                 try await MCPSharedServerTestLease.shared.withLease { _ in
@@ -853,7 +865,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             case undeclared
             case forkMetadata(malformed: Bool)
             case terminal(delayed: Bool, nativeResult: Bool, closing: Bool = false, leading: Bool = false, cancel: Bool = false, corrupt: Bool = false)
-            case hint(withdraw: Bool)
+            case hint(withdraw: Bool, replaced: Bool = false, ordinaryCandidate: Bool = false)
             case lateAttention
             case catalogCost
         }
@@ -1309,8 +1321,8 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                         try await w2RegisteredTerminal(window: window, session: observer, connection: connection, runID: runID, delayed: false, nativeResult: false, closing: false, leading: false, cancel: false, w3Undeclared: true)
                     case let .terminal(delayed, nativeResult, closing, leading, cancel, corrupt):
                         try await w2RegisteredTerminal(window: window, session: observer, connection: connection, runID: runID, delayed: delayed, nativeResult: nativeResult, closing: closing, leading: leading, cancel: cancel, corrupt: corrupt, w4Display: w4Display)
-                    case let .hint(withdraw):
-                        try await w2CatalogProof(window: window, session: observer, provider: provider, endpoint: endpoint, route: route, runID: runID, withdraw: withdraw)
+                    case let .hint(withdraw, replaced, ordinaryCandidate):
+                        try await w2CatalogProof(window: window, session: observer, provider: provider, endpoint: endpoint, route: route, runID: runID, withdraw: withdraw, replaced: replaced, ordinaryCandidate: ordinaryCandidate)
                     case .lateAttention:
                         try await w2LateAttention(window: window, session: observer, target: target, endpoint: endpoint)
                     case .catalogCost:
@@ -1538,7 +1550,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
         }
 
         private var configuration = SessionLinkNativeConfigurationFixture()
-        private let eventPair = AsyncStream<NativeAgentRuntimeEvent>.makeStream()
+        private var eventPair = AsyncStream<NativeAgentRuntimeEvent>.makeStream()
         var hasActiveSession: Bool {
             connection != nil
         }
@@ -1571,6 +1583,8 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
 
         func ensureEventsStreamReady() {}
         func resetEventsStreamForNewRun() {
+            eventPair.continuation.finish()
+            eventPair = AsyncStream<NativeAgentRuntimeEvent>.makeStream()
             lifecycleRevision += 1
         }
 
@@ -3136,7 +3150,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
 
         func w2RoutineClaim(
             window: WindowState, session: AgentTabSession, endpoint: DomainAgentSessionLinkEndpointIdentity,
-            localRead: Bool
+            localRead: Bool, ordinaryCandidate: Bool = false
         ) throws -> (AgentRunOwnership, AgentSessionLinkPromptDispatchID, AgentSessionLinkOutboundPromptClaim) {
             let vm = window.agentModeViewModel
             session.runState = .idle
@@ -3151,12 +3165,18 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 }
             }
             let dispatch = AgentSessionLinkPromptDispatchID.autoWake(wakeID: wake)
+            let projection = vm.agentSessionLinkRunCatalogProjectionByEndpoint[endpoint]
+            if ordinaryCandidate {
+                session.oversight.pendingAutoWake?.routineQuietCandidate = true
+                vm.agentSessionLinkRunCatalogProjectionByEndpoint[endpoint] = nil
+            }
             let claim = try XCTUnwrap(vm.agentSessionLinkPromptClaimOutcome(for: session, dispatchID: dispatch).claim)
-            XCTAssertTrue(claim.routineQuietCheckIn)
-            XCTAssertTrue(claim.fragment.contains("Nothing needed? Call self_noop."))
+            vm.agentSessionLinkRunCatalogProjectionByEndpoint[endpoint] = projection
+            XCTAssertEqual(claim.routineQuietCheckIn, !ordinaryCandidate)
+            XCTAssertEqual(claim.fragment.contains("Nothing needed? Call self_noop."), !ordinaryCandidate)
             let owner = session.beginRunAttempt(source: "W2.production-proof-fixture")
             session.quietLedger.markRoutineWake(owner: owner, wakeID: wake)
-            session.oversight.pendingAutoWake?.phase = .dispatching
+            if !ordinaryCandidate { session.oversight.pendingAutoWake?.phase = .dispatching }
             session.runState = .running
             return (owner, dispatch, claim)
         }
@@ -3197,7 +3217,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
         func w2CatalogProof(
             window: WindowState, session: AgentTabSession, provider: HeldDiscoveryProvider,
             endpoint: DomainAgentSessionLinkEndpointIdentity, route: AgentSessionLinkRunCatalogRouteToken,
-            runID: UUID, withdraw: Bool
+            runID: UUID, withdraw: Bool, replaced: Bool, ordinaryCandidate: Bool
         ) async throws {
             let vm = window.agentModeViewModel
             let manager = ServerNetworkManager.shared
@@ -3205,7 +3225,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             let nativeBefore = await provider.heldTurnSnapshot
             let generation = session.codexControllerGeneration
             let repair = session.codexSessionLinkCatalogRepairCycle
-            let (_, dispatch, original) = try w2RoutineClaim(window: window, session: session, endpoint: endpoint, localRead: true)
+            let (_, dispatch, original) = try w2RoutineClaim(window: window, session: session, endpoint: endpoint, localRead: true, ordinaryCandidate: ordinaryCandidate)
             let frozenProjection = try XCTUnwrap(vm.agentSessionLinkRunCatalogProjectionByEndpoint[endpoint])
             vm.test_agentSessionLinkLocalInputReadProof = { _ in await gate.enterAndWait()
                 return false
@@ -3233,6 +3253,26 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                     XCTAssertEqual(latest.routeToken, route)
                     XCTAssertFalse(latest.containsReturnedTool(Self.w0fTool()))
                     XCTAssertEqual(vm.agentSessionLinkRunCatalogProjectionByEndpoint[endpoint], frozenProjection, "Mirror intentionally lags the authoritative observation")
+                }
+                if ordinaryCandidate {
+                    XCTAssertTrue(session.oversight.pendingAutoWake?.routineQuietCandidate == true)
+                    XCTAssertEqual(session.oversight.pendingAutoWake?.phase, .preparingDispatch)
+                    XCTAssertTrue(vm.selfNoopHintIsCurrent(for: session))
+                }
+                if replaced {
+                    if !ordinaryCandidate {
+                        let previous = try XCTUnwrap(vm.agentSessionLinkPassiveNoticesBySessionID[endpoint.sessionID])
+                        vm.agentSessionLinkPublishPassiveStatusNotices(.init(
+                            observerEndpoint: endpoint, queueEpoch: previous.queueEpoch, queueRevision: previous.queueRevision + 1,
+                            linkSetRevision: previous.linkSetRevision, isEnabled: true, isDeliverable: true,
+                            entries: previous.entries, attentionRequests: previous.attentionRequests,
+                            unacknowledgedOverflowCount: previous.unacknowledgedOverflowCount, overflowProduced: previous.overflowProduced
+                        ), to: endpoint)
+                    }
+                    let successor = try XCTUnwrap(vm.agentSessionLinkPromptClaimOutcome(for: session, dispatchID: dispatch).claim)
+                    XCTAssertTrue(successor.routineQuietCheckIn, "The mirror still advertises the withdrawn declaration")
+                    XCTAssertNotEqual(successor, original)
+                    XCTAssertFalse(vm.agentSessionLinkPromptClaimStore.isPending(original))
                 }
                 gate.release()
                 let proof = await proofTask.value

@@ -82,6 +82,8 @@ struct AgentSessionLinkAutoWakeAttempt {
     /// Stored rather than re-derived because every later gate evaluates the *same* basis the
     /// reservation was made under, and a manual basis has no queue state that could recover it.
     var admissionBasis: AgentSessionLinkWakeAdmissionDecision.Basis
+    /// Original idle-route candidacy, not catalog proof. Can upgrade only before acquisition.
+    var routineQuietCandidate = false
     /// Frozen only at the physical boundary, so a later edge can never be suppressed as though it
     /// had been included in already-immutable provider text.
     var attemptedFingerprint: AgentSessionLinkPassiveStatusNotices.WakeEligibilityFingerprint?
@@ -1122,6 +1124,8 @@ extension AgentModeViewModel {
               attempt.phase == .scheduled || attempt.phase == .awaitingSettlement
         else { return nil }
         let stopFence = AgentRunStartStopFence(session: session)
+        attempt.routineQuietCandidate = attempt.admissionBasis == .routineStatusOrOverflow
+            && agentSessionLinkAutoWakeRoute(session, refusalPhase: attempt.phase) == .idleFollowUp
         attempt.phase = .preparingDispatch
         attempt.attemptedFingerprint = nil
         attempt.physicalOutcome = .notAttempted

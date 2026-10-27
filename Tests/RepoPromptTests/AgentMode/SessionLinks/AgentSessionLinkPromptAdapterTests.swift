@@ -1078,7 +1078,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             let entered = await gate.waitUntilEntered()
             XCTAssertTrue(entered)
             let proof = try XCTUnwrap(session.pendingHandoff.providerSwitchDispatch)
-            XCTAssertNotNil(proof.dispatchID, "The actual native coordinator must have acquired before Read proof waits")
+            XCTAssertNil(proof.dispatchID, "Physical acquisition must wait for Read and catalog proof; the admitted composition is already frozen")
             XCTAssertNotNil(proof.runOwnership)
             XCTAssertTrue(fixture.startedTurns.isEmpty)
             let route = try XCTUnwrap(vm.agentSessionLinkRunCatalogProjectionByEndpoint[input.observer]?.routeToken)
@@ -1097,7 +1097,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             let outcome = await send.value
             if drift {
                 XCTAssertFalse(outcome.didSend)
-                XCTAssertTrue(fixture.startedTurns.isEmpty, "No controller transport may follow postacquisition composition drift")
+                XCTAssertTrue(fixture.startedTurns.isEmpty, "No controller transport may follow frozen composition drift during proof")
                 XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .sending)
                 XCTAssertEqual(session.pendingHandoff.payload, payload)
                 XCTAssertFalse(session.items.contains { $0.recoveryDiagnostic?.outcome == "sent" })
@@ -4278,6 +4278,7 @@ final class MonitorFakeCodexController: CodexSessionControllerPassiveStubDefault
 
     private let dispatches: MonitorCodexDispatchRecorder
     private let rejectFirstStartForAuth: Bool
+    private let processID: pid_t?
     private let lock = NSLock()
     private var started: [String] = []
     private var steered: [String] = []
@@ -4322,12 +4323,17 @@ final class MonitorFakeCodexController: CodexSessionControllerPassiveStubDefault
     private let continuation: AsyncStream<CodexNativeSessionController.Event>.Continuation
     private let stream: AsyncStream<CodexNativeSessionController.Event>
 
-    init(dispatches: MonitorCodexDispatchRecorder, rejectFirstStartForAuth: Bool = false) {
+    init(dispatches: MonitorCodexDispatchRecorder, rejectFirstStartForAuth: Bool = false, processID: pid_t? = nil) {
         self.dispatches = dispatches
         self.rejectFirstStartForAuth = rejectFirstStartForAuth
+        self.processID = processID
         var storedContinuation: AsyncStream<CodexNativeSessionController.Event>.Continuation!
         stream = AsyncStream { storedContinuation = $0 }
         continuation = storedContinuation
+    }
+
+    func routingProcessID() async -> pid_t? {
+        processID
     }
 
     var startedTurns: [String] {
