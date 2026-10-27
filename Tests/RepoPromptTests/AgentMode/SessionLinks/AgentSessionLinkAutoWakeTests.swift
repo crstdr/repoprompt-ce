@@ -1903,6 +1903,27 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         ))
     }
 
+    func testPreparationFinalizerReleasesStoppedUnacquiredWakeWhileRunRemainsActive() async throws {
+        let fixture = try makeFixture()
+        try publishInventory(fixture, revision: 1)
+        fixture.session.oversight.autoWakeOnUpdates = true
+        fixture.session.runState = .running
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+        var attempt = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+        attempt.task?.cancel()
+        attempt.phase = .preparingDispatch
+        attempt.physicalOutcome = .notAttempted
+        fixture.session.oversight.pendingAutoWake = attempt
+        fixture.viewModel.agentSessionLinkRetractAutoWakeForUserStop(fixture.session)
+        XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.phase, .cancelledBeforeDispatch)
+        // The idle-follow-up caller runs this owner after startAgentRun returns, including
+        // cancellation. It must not require a provider acquisition or an inactive successor.
+        await fixture.viewModel.agentSessionLinkAwaitPhysicalDispatchSettlement(wakeID: attempt.wakeID, endpoint: attempt.observerEndpoint)
+        XCTAssertTrue(fixture.session.runState.isActive)
+        XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+        XCTAssertEqual(fixture.session.oversight.suppressedWakeFingerprint, attempt.wakeFingerprint)
+    }
+
     func testUserStopRetractsOnlyPreDispatchAutoWakePhases() throws {
         for phase: AgentSessionLinkAutoWakeAttempt.Phase in [
             .scheduled, .awaitingSettlement, .preparingDispatch,

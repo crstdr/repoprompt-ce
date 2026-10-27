@@ -1009,10 +1009,10 @@ extension AgentModeViewModel {
         guard needsDeclarationProof, let claim, let owner,
               session.isCurrentRunAttemptForCurrentBinding(owner)
         else { return proof }
-        let qualifies = supportsDeclaration && selfNoopHintIsCurrent(for: session)
+        let supportHolds = supportsDeclaration && selfNoopHintIsCurrent(for: session)
             && currentProjection?.projectionRevision == projection?.projectionRevision
             && currentProjection?.routeToken == projection?.routeToken
-            && agentSessionLinkPromptClaimStore.isPending(claim)
+        let qualifies = supportHolds && agentSessionLinkPromptClaimStore.isPending(claim)
         var finalized: AgentSessionLinkOutboundPromptClaim? = claim
         let mayUpgrade = session.oversight.pendingAutoWake.map {
             $0.wakeID == claim.dispatchID.autoWakeID && $0.phase == .preparingDispatch
@@ -1050,12 +1050,12 @@ extension AgentModeViewModel {
                 routingGeneration: projection?.routeToken?.routingAuthorityGeneration,
                 definition: definition, serverProof: supportsDeclaration,
                 ordinary: session.quietLedger.hasOrdinaryOccurrence(owner: owner),
-                qualified: finalized?.routineQuietCheckIn == true
+                qualified: supportHolds && finalized?.routineQuietCheckIn == true
             )
             current.routineQuietCandidate = false
             session.oversight.pendingAutoWake = current
         }
-        if claim.routineQuietCheckIn, finalized?.routineQuietCheckIn != true {
+        if claim.routineQuietCheckIn, !supportHolds || finalized?.routineQuietCheckIn != true {
             session.quietLedger.noteOccurrence(owner: owner)
         }
         return proof.replacingClaim(finalized)
