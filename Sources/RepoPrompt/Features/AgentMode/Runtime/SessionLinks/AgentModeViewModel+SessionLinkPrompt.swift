@@ -1055,7 +1055,7 @@ extension AgentModeViewModel {
             current.routineQuietCandidate = false
             session.oversight.pendingAutoWake = current
         }
-        if claim.routineQuietCheckIn, !supportHolds || finalized?.routineQuietCheckIn != true {
+        if !supportHolds || claim.routineQuietCheckIn && finalized?.routineQuietCheckIn != true {
             session.quietLedger.noteOccurrence(owner: owner)
         }
         return proof.replacingClaim(finalized)
