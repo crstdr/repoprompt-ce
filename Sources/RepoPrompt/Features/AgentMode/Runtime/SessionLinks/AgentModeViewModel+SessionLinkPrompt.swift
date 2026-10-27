@@ -1013,9 +1013,17 @@ extension AgentModeViewModel {
             && currentProjection?.projectionRevision == projection?.projectionRevision
             && currentProjection?.routeToken == projection?.routeToken
             && agentSessionLinkPromptClaimStore.isPending(claim)
-        var finalized = agentSessionLinkPromptClaimOutcome(
-            for: session, dispatchID: claim.dispatchID, allowsQuietCheckIn: qualifies
-        ).claim
+        var finalized: AgentSessionLinkOutboundPromptClaim? = claim
+        let mayUpgrade = session.oversight.pendingAutoWake.map {
+            $0.wakeID == claim.dispatchID.autoWakeID && $0.phase == .preparingDispatch
+        } == true
+        if agentSessionLinkPromptClaimStore.isPending(claim),
+           !qualifies && claim.routineQuietCheckIn || qualifies && !claim.routineQuietCheckIn && mayUpgrade
+        {
+            finalized = agentSessionLinkPromptClaimOutcome(
+                for: session, dispatchID: claim.dispatchID, allowsQuietCheckIn: qualifies
+            ).claim
+        }
         // Adding the hint cannot select different debt or membership from the reserved batch.
         // If its budget would change that receipt, keep the ordinary rendering instead.
         if finalized?.routineQuietCheckIn == true,
@@ -1026,25 +1034,24 @@ extension AgentModeViewModel {
             ).claim
         }
         if var current = session.oversight.pendingAutoWake,
-           current.wakeID == claim.dispatchID.autoWakeID, current.phase == .preparingDispatch
+           current.wakeID == claim.dispatchID.autoWakeID, current.phase == .preparingDispatch,
+           current.routineQuietCandidate
         {
-            if current.routineQuietCandidate {
-                let definition: AgentSessionLinkCatalogDiagnostics.ReturnedDefinition
-                if let catalog = projection?.returnedCatalog {
-                    let matches = catalog[MCPWindowToolName.selfNoop] ?? []
-                    definition = matches.isEmpty ? .absent : matches.count != 1 ? .ambiguous
-                        : matches[0] == Self.selfNoopCatalogDefinition ? .exact : .different
-                } else {
-                    definition = .unknown
-                }
-                AgentSessionLinkCatalogDiagnostics.quietQualification(
-                    tabID: session.tabID, reserved: claim.routineQuietCheckIn, candidate: true,
-                    routingGeneration: projection?.routeToken?.routingAuthorityGeneration,
-                    definition: definition, serverProof: supportsDeclaration,
-                    ordinary: session.quietLedger.hasOrdinaryOccurrence(owner: owner),
-                    qualified: finalized?.routineQuietCheckIn == true
-                )
+            let definition: AgentSessionLinkCatalogDiagnostics.ReturnedDefinition
+            if let catalog = projection?.returnedCatalog {
+                let matches = catalog[MCPWindowToolName.selfNoop] ?? []
+                definition = matches.isEmpty ? .absent : matches.count != 1 ? .ambiguous
+                    : matches[0] == Self.selfNoopCatalogDefinition ? .exact : .different
+            } else {
+                definition = .unknown
             }
+            AgentSessionLinkCatalogDiagnostics.quietQualification(
+                tabID: session.tabID, reserved: claim.routineQuietCheckIn, candidate: true,
+                routingGeneration: projection?.routeToken?.routingAuthorityGeneration,
+                definition: definition, serverProof: supportsDeclaration,
+                ordinary: session.quietLedger.hasOrdinaryOccurrence(owner: owner),
+                qualified: finalized?.routineQuietCheckIn == true
+            )
             current.routineQuietCandidate = false
             session.oversight.pendingAutoWake = current
         }
@@ -1071,9 +1078,9 @@ extension AgentModeViewModel {
                 return AgentSessionLinkRuntimeBridge.shared.consumeLocalInputHandoff(decoration, observer: observer)
             }
         )
-        // Attention or other ordinary content can arrive after the physical routine mark while
-        // proof awaits. The actual synchronous release may only remove quiet qualification.
-        if claim?.routineQuietCheckIn == true, released.claim?.routineQuietCheckIn != true,
+        // Callers retain their transport fences around proof. Synchronous handoff may only
+        // remove qualification, including qualification first gained by this proof.
+        if finalized?.routineQuietCheckIn == true, released.claim?.routineQuietCheckIn != true,
            let owner = session.activeRunOwnership, session.isCurrentRunAttemptForCurrentBinding(owner)
         {
             session.quietLedger.noteOccurrence(owner: owner)

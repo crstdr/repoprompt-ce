@@ -62,7 +62,7 @@ import XCTest
             let runID = UUID()
             let observerTab = UUID()
             let targetTab = UUID()
-            var transport: PersistentMCPTestEndpoint?
+            var transports: [PersistentMCPTestEndpoint] = []
             var grant: DomainAgentSessionLinkReference?
             var session: AgentTabSession?
             var native: ClaudeNativeProcessSessionController?
@@ -78,7 +78,7 @@ import XCTest
                 await provider.shutdown()
                 await manager.debugSetReturnedCatalogToolsForTesting(nil)
                 if let grant { await bridge.revokeLink(linkID: grant.linkID, generation: grant.generation) }
-                if let transport {
+                for transport in transports {
                     transport.client.close()
                     await transport.connectionManager.stop()
                     await manager.debugRemoveConnection(transport.connectionID)
@@ -129,7 +129,7 @@ import XCTest
                 await manager.installClientConnectionPolicy(for: clientName, windowID: windowID, restrictedTools: AgentModeMCPToolPolicy.restrictedTools, oneShot: true, reason: "late-catalog fixture", ttl: 60, tabID: observerTab, runID: runID, additionalTools: nil, purpose: .agentModeRun, taskLabelKind: nil, allowsAgentExternalControlTools: false)
                 await manager.setEnabled(true)
                 let initial = try await PersistentMCPTestEndpoint.make(label: "late-catalog-initial", networkManager: manager, clientName: clientName, requiredToolNames: [MCPWindowToolName.agentSessionLink])
-                transport = initial
+                transports.append(initial)
                 await provider.attach(initial)
                 _ = try await provider.listTools()
                 XCTAssertFalse(vm.selfNoopHintIsCurrent(for: observer))
@@ -160,6 +160,7 @@ import XCTest
                     if catalogBeforeSend { await manager.debugSetReturnedCatalogToolsForTesting(nil) }
                     do {
                         let next = try await PersistentMCPTestEndpoint.make(label: "late-catalog-current-policy", networkManager: manager, clientName: name, useProductionAgentAdmission: true, requiredToolNames: [MCPWindowToolName.agentSessionLink])
+                        transports.append(next)
                         await provider.attach(next)
                         _ = try await provider.listTools()
                         try await Self.assertReturnedDeclaration(runID: spec.runID, expected: catalogBeforeSend)
@@ -197,6 +198,7 @@ import XCTest
                         do {
                             XCTAssertTrue(armed)
                             let next = try await PersistentMCPTestEndpoint.make(label: "late-catalog-codex-startup", networkManager: manager, clientName: clientName, useProductionAgentAdmission: true, requiredToolNames: [MCPWindowToolName.agentSessionLink])
+                            await MainActor.run { transports.append(next) }
                             await provider.attach(next)
                             _ = try await provider.listTools()
                             try await Self.assertReturnedDeclaration(runID: runID, expected: catalogBeforeSend)
@@ -223,12 +225,13 @@ import XCTest
                     XCTAssertNil(observer.quietLedger.routineWakeID(owner: owner), "Post-send evidence never upgrades the attempt")
                     XCTAssertTrue(observer.quietLedger.hasOrdinaryOccurrence(owner: owner))
                 }
-                // Both providers acknowledge the original debt, not a newly selected batch.
+                // Both providers acknowledge the owed batch; no routine debt remains.
                 await bridge.test_settleTargetPublications()
                 await bridge.test_refreshStatus(sessionIDs: [endpoint.sessionID])
                 let remaining = vm.agentSessionLinkPassiveNoticesBySessionID[endpoint.sessionID]
                 XCTAssertFalse(remaining?.entries.contains { $0.isRoutineWakeEligible } ?? false)
                 XCTAssertTrue(observer.liveItemIDs.contains(attempt.wakeID))
+                XCTAssertEqual(kind == .claudeCode ? frames.userMessages.count : codex.startedTurns.count, 1)
                 await cleanup()
             } catch {
                 await cleanup()

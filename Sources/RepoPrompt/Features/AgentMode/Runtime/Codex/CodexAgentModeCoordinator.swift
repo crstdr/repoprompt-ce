@@ -8424,7 +8424,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         }
                         guard await computerUsePhysicalDispatchIsCurrent() else { throw CancellationError() }
                         let proof = await viewModel?.agentSessionLinkProveProviderInput(for: session, claim: monitoring?.claim)
-                        if monitoring?.claim?.localInput != nil {
+                        if monitoring?.claim?.localInput != nil || monitoring?.claim?.dispatchID.isAutoWakeFamily == true {
                             guard !Task.isCancelled, effectiveStopFence.permitsStart(of: session),
                                   session.runID == sendRunID, session.activeRunAttemptID == sendRunAttemptIDAtEntry,
                                   session.codexController.map(ObjectIdentifier.init) == expectedControllerID,
@@ -8526,7 +8526,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 }
                 do {
                     let proof = await viewModel?.agentSessionLinkProveProviderInput(for: session, claim: monitoring?.claim)
-                    if monitoring?.claim?.localInput != nil {
+                    if monitoring?.claim?.localInput != nil || monitoring?.claim?.dispatchID.isAutoWakeFamily == true {
                         guard !Task.isCancelled, effectiveStopFence.permitsStart(of: session),
                               session.runID == sendRunID, session.activeRunAttemptID == sendRunAttemptIDAtEntry,
                               session.codexController.map(ObjectIdentifier.init) == expectedControllerID,

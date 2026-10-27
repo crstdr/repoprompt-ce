@@ -4584,6 +4584,43 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
 }
 
 extension AgentSessionLinkPromptClaimStoreTests {
+    func testAcquiredOrdinaryWakeReleasesThePendingReservationWithoutRerendering() async throws {
+        let store = AgentSessionLinkOutboundPromptClaimStore()
+        let live = inventory(revision: 1, targetCount: 1)
+        let batch = passiveSnapshot(linkSetRevision: 1, targetIDs: [grantedTargetID(0)])
+        let epoch = AgentSessionLinkPromptEpoch(endpoint: endpoint, allowsSupplement: true, providerContext: .codexExec)
+        let claim = try XCTUnwrap(store.claim(dispatchID: .autoWake(wakeID: UUID()), epoch: epoch, inventory: live, passiveNotices: batch, render: render))
+        let proof = await AgentSessionLinkProviderInputRelease.prove(claim) { _ in false }
+        var renders = 0
+        let released = AgentSessionLinkProviderInputRelease.handoff(
+            original: claim, proof: proof,
+            current: { renders += 1
+                return .requiredLaneBatchUnavailable
+            },
+            isPending: { store.isPending($0) }, consume: { _ in false }
+        )
+        XCTAssertEqual(renders, 0, "Acquisition already validated this immutable ordinary batch")
+        XCTAssertEqual(released.claim, claim)
+        XCTAssertFalse(released.mustAbortDispatch)
+    }
+
+    func testLateQuietUpgradeKeepsReservationWhenOptionalRenderOmitsPassiveBatch() throws {
+        let store = AgentSessionLinkOutboundPromptClaimStore()
+        let live = inventory(revision: 1, targetCount: 1)
+        let batch = passiveSnapshot(linkSetRevision: 1, targetIDs: [grantedTargetID(0)])
+        let epoch = AgentSessionLinkPromptEpoch(endpoint: endpoint, allowsSupplement: true, providerContext: .codexExec)
+        let dispatch = AgentSessionLinkPromptDispatchID.autoWake(wakeID: UUID())
+        let ordinary = try XCTUnwrap(store.claim(dispatchID: dispatch, epoch: epoch, inventory: live, passiveNotices: batch, render: render))
+        let outcome = store.claimOutcome(dispatchID: dispatch, epoch: epoch, inventory: live, passiveNotices: batch, routineQuietCheckIn: true) { request in
+            // The optional rendering may exhaust its passive budget. It cannot destroy the
+            // valid ordinary reservation for this same fingerprint.
+            AgentSessionLinkPromptRenderResult(fragment: self.render(request).fragment)
+        }
+        XCTAssertEqual(outcome.claim, ordinary)
+        XCTAssertFalse(outcome.mustAbortDispatch)
+        XCTAssertTrue(store.isPending(ordinary))
+    }
+
     func testRoutineBooleanIsDefaultFalseAndPartOfRenderClaimCopyAndReuseIdentity() throws {
         let live = inventory(revision: 1, targetCount: 1)
         let batch = passiveSnapshot(linkSetRevision: 1, targetIDs: [grantedTargetID(0)])
