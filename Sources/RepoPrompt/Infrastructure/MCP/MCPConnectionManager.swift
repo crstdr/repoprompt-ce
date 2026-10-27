@@ -12324,6 +12324,12 @@ actor ServerNetworkManager {
             debugReturnedCatalogToolsForTesting = shape
         }
 
+        private var debugCatalogOfferRouteForTesting: (@Sendable (AgentSessionLinkRunCatalogRouteToken?) -> AgentSessionLinkRunCatalogRouteToken?)?
+
+        func debugSetCatalogOfferRouteForTesting(_ transform: (@Sendable (AgentSessionLinkRunCatalogRouteToken?) -> AgentSessionLinkRunCatalogRouteToken?)?) {
+            debugCatalogOfferRouteForTesting = transform
+        }
+
         private var debugAfterExpectedCatalogSurfaceForTesting: (@Sendable () async -> Void)?
         private var debugAfterBecomeOverseerProofRegistrationForTesting: (
             @Sendable (UUID, DomainAgentSessionLinkEndpointIdentity) async -> Void
@@ -13575,11 +13581,14 @@ actor ServerNetworkManager {
             )
 
             let offerRunID = await runIDByConnectionID[connectionID]
-            let offerRoute: AgentSessionLinkRunCatalogRouteToken? = if let offerRunID {
+            var offerRoute: AgentSessionLinkRunCatalogRouteToken? = if let offerRunID {
                 await authoritativeRunCatalogRouteToken(for: offerRunID)
             } else {
                 nil
             }
+            #if DEBUG
+                if let transform = await debugCatalogOfferRouteForTesting { offerRoute = transform(offerRoute) }
+            #endif
             let offerInputs: MCPRunCatalogOfferInputs? = if let offerRoute {
                 await runCatalogOfferInputs(route: offerRoute)
             } else {
@@ -13680,8 +13689,9 @@ actor ServerNetworkManager {
                 returnedSessionLinkPresence: returnedSessionLinkPresence,
                 returnedSurface: AgentSessionLinkCatalogSurface.fingerprint(tools),
                 returnedCatalog: Dictionary(grouping: tools, by: \.name),
-                offerInputs: offerInputs,
-                offerExpiresAt: offerExpiresAt,
+                // Capture barriers and deadlines must belong to the exact route used for shaping.
+                offerInputs: offerRoute == sessionLinkGrantSnapshot?.routeToken ? offerInputs : nil,
+                offerExpiresAt: offerRoute == sessionLinkGrantSnapshot?.routeToken ? offerExpiresAt : nil,
                 catalogStartRevision: catalogStartRevision
             )
             connectionLog("Returning \(tools.count) available tools for \(connectionID)")
