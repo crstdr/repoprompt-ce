@@ -13705,13 +13705,19 @@ actor ServerNetworkManager {
             )
 
             let offerRunID = await runIDByConnectionID[connectionID]
-            var offerRoute: AgentSessionLinkRunCatalogRouteToken? = if let offerRunID {
+            let resolvedOfferRoute: AgentSessionLinkRunCatalogRouteToken? = if let offerRunID {
                 await authoritativeRunCatalogRouteToken(for: offerRunID)
             } else {
                 nil
             }
             #if DEBUG
-                if let transform = await debugCatalogOfferRouteForTesting { offerRoute = transform(offerRoute) }
+                let offerRoute: AgentSessionLinkRunCatalogRouteToken? = if let transform = await debugCatalogOfferRouteForTesting {
+                    transform(resolvedOfferRoute)
+                } else {
+                    resolvedOfferRoute
+                }
+            #else
+                let offerRoute = resolvedOfferRoute
             #endif
             let offerInputs: MCPRunCatalogOfferInputs? = if let offerRoute {
                 await runCatalogOfferInputs(route: offerRoute)
