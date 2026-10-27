@@ -82,7 +82,7 @@ struct AgentSessionLinkAutoWakeAttempt {
     /// Stored rather than re-derived because every later gate evaluates the *same* basis the
     /// reservation was made under, and a manual basis has no queue state that could recover it.
     var admissionBasis: AgentSessionLinkWakeAdmissionDecision.Basis
-    /// Original idle-route candidacy, not catalog proof. Consumed before physical acquisition.
+    /// Original idle-route candidacy, not catalog proof. Can upgrade only before acquisition.
     var routineQuietCandidate = false
     /// Frozen only at the physical boundary, so a later edge can never be suppressed as though it
     /// had been included in already-immutable provider text.

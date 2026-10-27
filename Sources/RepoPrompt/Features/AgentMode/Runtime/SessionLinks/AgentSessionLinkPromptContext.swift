@@ -716,7 +716,7 @@ struct AgentSessionLinkOutboundPromptClaim: Hashable {
     /// The exact observer incarnation this claim was rendered for. Acceptance never transfers its
     /// inventory or passive receipt to a successor incarnation.
     var observerEndpoint: DomainAgentSessionLinkEndpointIdentity?
-    /// Finalized before physical acquisition from current-route proof and the actually rendered batch.
+    /// Upgraded only before acquisition from current-route proof; removable until release.
     let routineQuietCheckIn: Bool
 
     init(
