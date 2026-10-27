@@ -176,6 +176,21 @@ enum AgentSessionLinkCatalogDiagnostics {
         ))
     }
 
+    enum ReturnedDefinition: String {
+        case unknown, absent, exact, ambiguous, different
+    }
+
+    /// One bounded record at an attempt's final qualification; never input to the decision.
+    @discardableResult
+    static func quietQualification(
+        tabID: UUID, reserved: Bool, candidate: Bool, routingGeneration: UInt64?,
+        definition: ReturnedDefinition, serverProof: Bool, ordinary: Bool, qualified: Bool
+    ) -> Bool {
+        guard logger.isEnabled(type: .default) else { return false }
+        logger.notice("event=quiet-qualification tab=\(hashedID(tabID), privacy: .public) reserved=\(reserved, privacy: .public) candidate=\(candidate, privacy: .public) routingGeneration=\(routingGeneration.map(String.init) ?? "nil", privacy: .public) definition=\(definition.rawValue, privacy: .public) serverProof=\(serverProof, privacy: .public) ordinaryOccurrence=\(ordinary, privacy: .public) qualified=\(qualified, privacy: .public)")
+        return true
+    }
+
     static func toolCallReceived(runID: UUID?, tabID: UUID?, connectionID: UUID) {
         emit(Record(
             event: .toolCallReceived,

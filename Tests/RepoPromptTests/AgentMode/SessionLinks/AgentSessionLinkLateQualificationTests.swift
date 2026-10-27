@@ -16,6 +16,26 @@ import XCTest
             try await exerciseRunner(.codexExec)
         }
 
+        func testQualificationLogCost() throws {
+            try XCTSkipUnless(ProcessInfo.processInfo.environment["RPCE_RUN_SCALE_TESTS"] == "quiet-qualification", "Opt-in qualification diagnostic cost")
+            let tabID = UUID()
+            var samples: [Double] = []
+            for ordinal in 0 ..< 1100 {
+                let start = ContinuousClock.now
+                let logged = AgentSessionLinkCatalogDiagnostics.quietQualification(
+                    tabID: tabID, reserved: false, candidate: true, routingGeneration: 42,
+                    definition: .exact, serverProof: true, ordinary: false, qualified: true
+                )
+                let duration = start.duration(to: .now)
+                try XCTSkipUnless(logged, "Notice logging disabled: no enabled-path cost sample")
+                if ordinal >= 100 {
+                    samples.append(Double(duration.components.seconds) * 1000 + Double(duration.components.attoseconds) / 1e15)
+                }
+            }
+            samples.sort()
+            print("QUIET_QUALIFICATION_LOG_COST count=\(samples.count) median_ms=\(samples[500]) p95_ms=\(samples[949]) max_ms=\(samples[999])")
+        }
+
         private func exerciseRunner(_ kind: AgentProviderKind) async throws {
             // These are the two sides of the physical-input boundary, not provider permutations.
             for beforeSend in [true, false] {

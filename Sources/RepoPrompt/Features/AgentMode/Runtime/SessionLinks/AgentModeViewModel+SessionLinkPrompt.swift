@@ -1027,6 +1027,23 @@ extension AgentModeViewModel {
         if var current = session.oversight.pendingAutoWake,
            current.wakeID == claim.dispatchID.autoWakeID, current.phase == .preparingDispatch
         {
+            if current.routineQuietCandidate {
+                let definition: AgentSessionLinkCatalogDiagnostics.ReturnedDefinition
+                if let catalog = projection?.returnedCatalog {
+                    let matches = catalog[MCPWindowToolName.selfNoop] ?? []
+                    definition = matches.isEmpty ? .absent : matches.count != 1 ? .ambiguous
+                        : matches[0] == Self.selfNoopCatalogDefinition ? .exact : .different
+                } else {
+                    definition = .unknown
+                }
+                AgentSessionLinkCatalogDiagnostics.quietQualification(
+                    tabID: session.tabID, reserved: claim.routineQuietCheckIn, candidate: true,
+                    routingGeneration: projection?.routeToken?.routingAuthorityGeneration,
+                    definition: definition, serverProof: supportsDeclaration,
+                    ordinary: session.quietLedger.hasOrdinaryOccurrence(owner: owner),
+                    qualified: finalized?.routineQuietCheckIn == true
+                )
+            }
             current.routineQuietCandidate = false
             session.oversight.pendingAutoWake = current
         }
