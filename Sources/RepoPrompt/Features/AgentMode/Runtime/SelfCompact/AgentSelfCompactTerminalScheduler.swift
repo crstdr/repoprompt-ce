@@ -8,7 +8,7 @@ final class AgentSelfCompactTerminalScheduler {
         _ requestID: UUID,
         _ support: AgentSessionLinkCompactSupport,
         _ stillAdmissible: @escaping @MainActor () -> Bool
-    ) async -> Bool
+    ) async -> AgentSelfCompactDiagnostics.CompactDispatchOutcome
 
     private let load: @MainActor () -> AgentSelfCompactState
     private let store: @MainActor (AgentSelfCompactState) -> Void
@@ -59,30 +59,53 @@ final class AgentSelfCompactTerminalScheduler {
         else { return }
 
         switch publication {
-        case .rejected:
+        case let .rejected(reason):
             // A duplicate commit may retry this exact revision, but an unretired rejection must
             // not block readiness forever if no retry comes.
             Task { @MainActor [self] in
-                await settleRejectedIfUnresolved(requestID: attempt.id, owner: owner)
+                await settleRejectedIfUnresolved(
+                    requestID: attempt.id, owner: owner, rejectionReason: reason
+                )
             }
             return
         case .stale:
-            state.settle(.cancelled, noteDelivery: .notSent, completionVerified: false)
-            store(state)
+            settleCancelled(attempt.id, cause: .publicationStale, details: .init(publication: .stale))
             return
         case .accepted(successorEpoch: nil):
             break
         case .accepted:
-            state.settle(.cancelled, noteDelivery: .notSent, completionVerified: false)
-            store(state)
+            settleCancelled(
+                attempt.id,
+                cause: .successorEpochCommitted,
+                details: .init(publication: .acceptedSuccessorEpoch)
+            )
             return
         }
         // Item 2 deliberately narrowed the plan's failed-origin allowance. A generic .failed
         // terminal does not prove context exhaustion or even a live provider conversation, so native
         // self-compaction remains fail-closed until a typed context-limit failure is available.
-        guard !successorClaimed, terminalState == .completed, isCurrentOwner(owner) else {
-            state.settle(.cancelled, noteDelivery: .notSent, completionVerified: false)
-            store(state)
+        guard !successorClaimed else {
+            settleCancelled(
+                attempt.id,
+                cause: .successorClaimed,
+                details: .init(publication: publicationKind(publication))
+            )
+            return
+        }
+        guard terminalState == .completed else {
+            settleCancelled(
+                attempt.id,
+                cause: .originNotCompleted,
+                details: .init(publication: publicationKind(publication))
+            )
+            return
+        }
+        guard isCurrentOwner(owner) else {
+            settleCancelled(
+                attempt.id,
+                cause: .ownerLost,
+                details: .init(publication: publicationKind(publication))
+            )
             return
         }
         state.active?.phase = .compactDispatchPending
@@ -96,12 +119,10 @@ final class AgentSelfCompactTerminalScheduler {
 
     /// Local input wins only once accepted, not when a draft changes or admission is refused.
     func cancelForAcceptedLocalInput() {
-        var state = load()
-        guard let phase = state.active?.phase,
-              phase == .scheduled || phase == .compactDispatchPending
+        guard let active = load().active,
+              active.phase == .scheduled || active.phase == .compactDispatchPending
         else { return }
-        state.settle(.cancelled, noteDelivery: .notSent, completionVerified: false)
-        store(state)
+        settleCancelled(active.id, cause: .acceptedLocalInput)
     }
 
     private func run(
@@ -112,12 +133,15 @@ final class AgentSelfCompactTerminalScheduler {
         for poll in 0 ... maximumDrainPolls {
             guard isPending(requestID, owner: owner) else { return }
             guard isCurrentOwner(owner) else {
-                settleCancellation(requestID)
+                settleCancelled(requestID, cause: .ownerLost)
                 return
             }
             if teardownSettled(), !hasActiveTools(owner.runID) { break }
             guard poll < maximumDrainPolls else {
-                settleFailure(requestID)
+                var details = AgentSelfCompactDiagnostics.SettleDetails()
+                details.toolsActive = hasActiveTools(owner.runID)
+                details.teardownPending = !teardownSettled()
+                settleFailed(requestID, cause: .drainTimeout, details: details)
                 return
             }
             await sleep(.milliseconds(100))
@@ -125,50 +149,64 @@ final class AgentSelfCompactTerminalScheduler {
         }
         guard isPending(requestID, owner: owner) else { return }
         guard isCurrentOwner(owner) else {
-            settleCancellation(requestID)
+            settleCancelled(requestID, cause: .ownerLost)
             return
         }
         let admittedSupport = await support()
         guard isPending(requestID, owner: owner) else { return }
         guard isCurrentOwner(owner) else {
-            settleCancellation(requestID)
+            settleCancelled(requestID, cause: .ownerLost)
             return
         }
         guard load().active?.admittedSupport == admittedSupport,
               admittedSupport == .codex || admittedSupport == .claudeCode
               || admittedSupport == .acpAdvertisedCommand
         else {
-            settleFailure(requestID)
+            settleFailed(
+                requestID,
+                cause: .supportChanged,
+                details: .init(supportNow: admittedSupport)
+            )
             return
         }
         var state = load()
         state.active?.phase = .dispatchingCompact
         state.active?.compactDispatchStarted = true
         store(state)
-        let didStart = await dispatch(requestID, admittedSupport) { [self] in
+        let dispatchOutcome = await dispatch(requestID, admittedSupport) { [self] in
             isDispatching(requestID, owner: owner)
                 && isCurrentOwner(owner)
                 && load().active?.admittedSupport == admittedSupport
         }
+        let didStart = dispatchOutcome.didStart
         guard isDispatching(requestID, owner: owner) else { return }
         guard isCurrentOwner(owner) else {
             if didStart {
-                settleCompletionUnverified(requestID)
+                settleCompletionUnverified(requestID, cause: .ownerLost, didStart: true)
             } else {
-                settleCancellation(requestID)
+                settleCancelled(requestID, cause: .ownerLost, details: .init(didStart: false))
             }
             return
         }
         state = load()
         if didStart {
+            recordSettle(state: state, requestID: requestID, outcome: .compactDispatched, cause: .compactDispatchStarted)
             state.active?.phase = .awaitingCompactTurn
             store(state)
         } else {
-            settleFailure(requestID)
+            settleFailed(
+                requestID,
+                cause: .dispatchNotStarted,
+                details: .init(blocker: dispatchOutcome.blocker ?? .unknown)
+            )
         }
     }
 
-    private func settleRejectedIfUnresolved(requestID: UUID, owner: AgentSelfCompactOwner) async {
+    private func settleRejectedIfUnresolved(
+        requestID: UUID,
+        owner: AgentSelfCompactOwner,
+        rejectionReason: String
+    ) async {
         // A rejected publication gets only a short duplicate-commit retry window, not the full
         // teardown/tool-drain budget.
         for _ in 0 ..< min(maximumDrainPolls, 50) {
@@ -181,7 +219,14 @@ final class AgentSelfCompactTerminalScheduler {
         guard let attempt = load().active,
               attempt.id == requestID, attempt.owner == owner, attempt.phase == .scheduled
         else { return }
-        settleFailure(requestID)
+        settleFailed(
+            requestID,
+            cause: .rejectedPublicationTimeout,
+            details: .init(
+                publication: .rejected,
+                publicationRejection: .init(rawReason: rejectionReason)
+            )
+        )
     }
 
     private func isPending(_ requestID: UUID, owner: AgentSelfCompactOwner) -> Bool {
@@ -196,23 +241,73 @@ final class AgentSelfCompactTerminalScheduler {
             && attempt.owner == owner
     }
 
-    private func settleCancellation(_ requestID: UUID) {
+    private func publicationKind(
+        _ publication: AgentRunTerminalPublicationResult
+    ) -> AgentSelfCompactDiagnostics.PublicationKind {
+        switch publication {
+        case let .accepted(successorEpoch):
+            successorEpoch == nil ? .accepted : .acceptedSuccessorEpoch
+        case .stale:
+            .stale
+        case .rejected:
+            .rejected
+        }
+    }
+
+    private func recordSettle(
+        state: AgentSelfCompactState,
+        requestID: UUID,
+        outcome: AgentSelfCompactDiagnostics.SettleOutcome,
+        cause: AgentSelfCompactDiagnostics.SettleCause,
+        details: AgentSelfCompactDiagnostics.SettleDetails = .init()
+    ) {
+        guard let attempt = state.active, attempt.id == requestID else { return }
+        AgentSelfCompactDiagnostics.settle(
+            attempt: attempt,
+            outcome: outcome,
+            cause: cause,
+            details: details
+        )
+    }
+
+    private func settleCancelled(
+        _ requestID: UUID,
+        cause: AgentSelfCompactDiagnostics.SettleCause,
+        details: AgentSelfCompactDiagnostics.SettleDetails = .init()
+    ) {
         var state = load()
         guard state.active?.id == requestID else { return }
+        recordSettle(state: state, requestID: requestID, outcome: .cancelled, cause: cause, details: details)
         state.settle(.cancelled, noteDelivery: .notSent, completionVerified: false)
         store(state)
     }
 
-    private func settleCompletionUnverified(_ requestID: UUID) {
+    private func settleCompletionUnverified(
+        _ requestID: UUID,
+        cause: AgentSelfCompactDiagnostics.SettleCause,
+        didStart: Bool
+    ) {
         var state = load()
         guard state.active?.id == requestID else { return }
+        recordSettle(
+            state: state,
+            requestID: requestID,
+            outcome: .completionUnverified,
+            cause: cause,
+            details: .init(didStart: didStart)
+        )
         state.settle(.completionUnverified, noteDelivery: .notSent, completionVerified: false)
         store(state)
     }
 
-    private func settleFailure(_ requestID: UUID) {
+    private func settleFailed(
+        _ requestID: UUID,
+        cause: AgentSelfCompactDiagnostics.SettleCause,
+        details: AgentSelfCompactDiagnostics.SettleDetails = .init()
+    ) {
         var state = load()
         guard state.active?.id == requestID else { return }
+        recordSettle(state: state, requestID: requestID, outcome: .failed, cause: cause, details: details)
         state.settle(.failed, noteDelivery: .notSent, completionVerified: false)
         store(state)
     }

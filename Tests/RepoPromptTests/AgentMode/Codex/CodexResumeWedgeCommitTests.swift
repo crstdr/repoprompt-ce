@@ -1815,7 +1815,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
                     selfCompactDispatchID: .init(requestID: id, stage: .compact),
                     isStillAdmissible: admissible
                 )
-                return result == .started
+                return result == .started ? .started : .refused(.nativeNotStarted)
             }
         )
         scheduler.terminalSettled(

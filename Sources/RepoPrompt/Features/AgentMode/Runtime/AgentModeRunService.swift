@@ -1456,11 +1456,36 @@ final class AgentModeRunService {
         completion: CancellationCompletion = .terminalPublished,
         origin: CancellationOrigin = .internalLifecycle,
         admission: AgentRunCancellationAdmission? = nil,
-        outcomeRecorder: AgentRunCancellationOutcomeRecorder? = nil
+        outcomeRecorder: AgentRunCancellationOutcomeRecorder? = nil,
+        caller: AgentSelfCompactDiagnostics.RunCancelCaller = .unspecified
     ) async {
+        let selfCompactAttempt = session.selfCompactState.active
+        let capturedAttemptID = session.activeRunOwnership?.attemptID
+        let cancelOrigin: AgentSelfCompactDiagnostics.RunCancelOrigin =
+            origin == .explicitStop ? .explicitStop : .internalLifecycle
+        let recordRunCancel = { (
+            action: AgentSelfCompactDiagnostics.RunCancelAction,
+            currentAttempt: UUID?
+        ) in
+            guard let attempt = session.selfCompactState.active ?? selfCompactAttempt else { return }
+            AgentSelfCompactDiagnostics.runCancel(
+                attempt: attempt,
+                caller: caller,
+                intent: intent.cancellationReason,
+                origin: cancelOrigin,
+                action: action,
+                capturedAttempt: capturedAttemptID,
+                currentAttempt: currentAttempt,
+                taskPresent: session.agentTask != nil,
+                taskIsCancelled: session.agentTask?.isCancelled ?? false
+            )
+        }
         if let admission {
             // Pending starts are withdrawn synchronously by their producer owner, not terminalized.
-            guard admission.scope == .activeRun, admission.claim(for: session) else { return }
+            guard admission.scope == .activeRun, admission.claim(for: session) else {
+                recordRunCancel(.admissionRefused, session.activeRunOwnership?.attemptID)
+                return
+            }
             outcomeRecorder?.recordCancellationInitiated()
         }
         hooks.prepareForCancellation(session, intent, origin)
@@ -1482,6 +1507,7 @@ final class AgentModeRunService {
                     lifecycle: session.runLifecycle
                 )
             }
+            recordRunCancel(.terminalReturn, session.activeRunOwnership?.attemptID)
             return
         }
         hooks.interactions.cancelPendingQuestion(session)
@@ -1545,6 +1571,7 @@ final class AgentModeRunService {
                 expectedRunID: expectedRunID
             )
             : nil
+        recordRunCancel(.cancelActiveTask, ownership.attemptID)
         session.agentTask?.cancel()
 
         if session.selectedAgent == .codexExec {
