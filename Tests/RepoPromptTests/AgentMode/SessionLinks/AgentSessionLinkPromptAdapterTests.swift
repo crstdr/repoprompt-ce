@@ -4103,6 +4103,7 @@ final class MonitorFakeCodexController: CodexSessionControllerPassiveStubDefault
     }
 
     private let dispatches: MonitorCodexDispatchRecorder
+    private let processID: pid_t?
     private let lock = NSLock()
     private var started: [String] = []
     private var steered: [String] = []
@@ -4141,11 +4142,16 @@ final class MonitorFakeCodexController: CodexSessionControllerPassiveStubDefault
     private let continuation: AsyncStream<CodexNativeSessionController.Event>.Continuation
     private let stream: AsyncStream<CodexNativeSessionController.Event>
 
-    init(dispatches: MonitorCodexDispatchRecorder) {
+    init(dispatches: MonitorCodexDispatchRecorder, processID: pid_t? = nil) {
         self.dispatches = dispatches
+        self.processID = processID
         var storedContinuation: AsyncStream<CodexNativeSessionController.Event>.Continuation!
         stream = AsyncStream { storedContinuation = $0 }
         continuation = storedContinuation
+    }
+
+    func routingProcessID() async -> pid_t? {
+        processID
     }
 
     var startedTurns: [String] {
