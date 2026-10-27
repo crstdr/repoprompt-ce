@@ -57,7 +57,9 @@ enum AgentSessionLinkProviderInputRelease {
         guard let original else {
             return ReleasedDispatchContext(claim: nil, fragment: nil, mustAbortDispatch: false, disclosedLocalInputs: false)
         }
-        if original.localInput == nil, !original.routineQuietCheckIn, !original.dispatchID.isAutoWakeFamily {
+        if original.localInput == nil, !original.routineQuietCheckIn,
+           !original.dispatchID.isAutoWakeFamily || isPending(original)
+        {
             return ReleasedDispatchContext(claim: original, fragment: original.fragment, mustAbortDispatch: false, disclosedLocalInputs: false)
         }
         let outcome = current()
