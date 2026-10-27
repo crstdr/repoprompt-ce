@@ -9904,7 +9904,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                             tabID: session.tabID,
                             session: session,
                             intent: .executionLocationChange,
-                            completion: .terminalPublished
+                            completion: .terminalPublished,
+                            caller: .executionLocationChange
                         )
                     case .userExecutionLocationChange, .externalManagement, .initialSend:
                         throw ExecutionLocationTransitionError.stale
@@ -12574,7 +12575,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     tabID: target.tabID,
                     session: session,
                     intent: .runtimeShutdown,
-                    completion: .terminalTeardownCompleted
+                    completion: .terminalTeardownCompleted,
+                    caller: .provisionalTargetDetach
                 )
             }
             cancelPersistedLoad(for: session)
@@ -12852,7 +12854,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             tabID: tabID,
             session: session,
             intent: .runtimeShutdown,
-            completion: .terminalTeardownCompleted
+            completion: .terminalTeardownCompleted,
+            caller: .controlContextShutdown
         )
     }
 
@@ -17654,7 +17657,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
                 // Cancel agent run
                 if session.runState.isActive {
-                    await runService.cancelRun(tabID: tabID, session: session)
+                    await runService.cancelRun(tabID: tabID, session: session, caller: .composeTabTeardown)
                 }
 
                 // All compose-tab removal reasons detach the live TabSession owner from `sessions`.
@@ -23262,7 +23265,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
         }
         retireTimedOutManagedStopIfEligible(session)
-        await runService.cancelRun(tabID: tabID, session: session, completion: completion, origin: origin)
+        await runService.cancelRun(
+            tabID: tabID, session: session, completion: completion, origin: origin, caller: .localStop
+        )
     }
 
     /// Releases a managed-Stop gate whose cleanup never started, or whose started teardown
@@ -23298,7 +23303,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             completion: completion,
             origin: .explicitStop,
             admission: admission,
-            outcomeRecorder: outcomeRecorder
+            outcomeRecorder: outcomeRecorder,
+            caller: .managedSessionLinkStop
         )
         return outcomeRecorder.initiatedCancellation
     }
@@ -23342,7 +23348,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return false
         }
         await runService.cancelRun(
-            tabID: target.tabID, session: session, completion: completion, origin: .explicitStop
+            tabID: target.tabID, session: session, completion: completion, origin: .explicitStop,
+            caller: .renderTargetStop
         )
         return true
     }
@@ -23883,7 +23890,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         tabID: session.tabID,
                         session: session,
                         intent: .userStop,
-                        completion: .terminalPublished
+                        completion: .terminalPublished,
+                        caller: .instructionWaitTimeout
                     )
                     continuation.resume(returning: UserInstructionResponse(
                         text: nil,

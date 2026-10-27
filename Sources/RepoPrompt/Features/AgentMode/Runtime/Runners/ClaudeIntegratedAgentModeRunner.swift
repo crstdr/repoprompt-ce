@@ -184,6 +184,16 @@ final class ClaudeIntegratedAgentModeRunner {
                 )
                 return
             }
+            AgentSelfCompactDiagnostics.compactAttempt(
+                attempt: session.selfCompactState.active,
+                requestID: dispatchID.requestID,
+                runID: runID,
+                compactAttemptID: runAttemptID,
+                phase: .bound,
+                bailout: nil,
+                taskIsCancelled: Task.isCancelled,
+                attemptCurrent: session.activeRunOwnership?.attemptID == runAttemptID
+            )
         }
         session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .preparingRuntime)
         session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
@@ -704,6 +714,22 @@ final class ClaudeIntegratedAgentModeRunner {
         ownership: AgentRunOwnership,
         attachmentReservationID: UUID?
     ) async {
+        if let compactAttempt = session.selfCompactState.active,
+           compactAttempt.compactRunAttemptID == ownership.attemptID
+        {
+            // The lease's exact bailout is not readable synchronously; the task flag is
+            // the only discriminator available at this point.
+            AgentSelfCompactDiagnostics.compactAttempt(
+                attempt: compactAttempt,
+                requestID: compactAttempt.id,
+                runID: runID,
+                compactAttemptID: ownership.attemptID,
+                phase: .bootstrapFailed,
+                bailout: Task.isCancelled ? .taskCancelled : .unknown,
+                taskIsCancelled: Task.isCancelled,
+                attemptCurrent: session.activeRunOwnership?.attemptID == ownership.attemptID
+            )
+        }
         hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
         await terminalCommitBarrier.commit(.init(
             binding: hooks.bindTerminalSession(session),
