@@ -32,6 +32,10 @@ import XCTest
             try await exerciseRetainedOffer(.ambiguous)
         }
 
+        func testCatalogCaptureCannotBorrowAnotherBindingIncarnation() async throws {
+            try await exerciseRetainedOffer(.mismatchedIngress)
+        }
+
         func testAvailabilityProducerABAVetoesRetainedOffer() async throws {
             try await exerciseRetainedOffer(.availabilityABA)
         }
@@ -41,7 +45,7 @@ import XCTest
         }
 
         private enum RetainedOfferCase {
-            case benign, absentThenFresh, reconnect, ambiguous, availabilityABA, expiry
+            case benign, absentThenFresh, reconnect, ambiguous, mismatchedIngress, availabilityABA, expiry
 
             var qualifies: Bool {
                 self == .benign || self == .absentThenFresh || self == .expiry
@@ -118,6 +122,7 @@ import XCTest
                 await session?.agentTask?.value
                 await provider.shutdown()
                 await manager.debugSetReturnedCatalogToolsForTesting(nil)
+                await manager.debugSetCatalogOfferRouteForTesting(nil)
                 if let expiringScope {
                     bridge.delegationScopes.revoke(scopeID: expiringScope.id)
                 }
@@ -223,6 +228,26 @@ import XCTest
                             XCTAssertEqual(initialOffer?.offerInputs, currentInputs, "Only a semantically benign renewal may retain an offer")
                         }
                         let prior = try? XCTUnwrap(initialOffer)
+                        if retainedOffer == .mismatchedIngress {
+                            // Model a captured token just before rebinding, with colliding per-session
+                            // revision values. Actual definitions still come from the real socket list.
+                            await manager.debugSetCatalogOfferRouteForTesting { route in
+                                guard let route else { return nil }
+                                let endpoint = route.observerEndpoint
+                                return .init(
+                                    runID: route.runID,
+                                    observerEndpoint: .init(
+                                        windowID: endpoint.windowID, workspaceID: endpoint.workspaceID,
+                                        tabID: endpoint.tabID, sessionID: endpoint.sessionID,
+                                        persistentBindingGeneration: UUID(),
+                                        bindingTransitionGeneration: endpoint.bindingTransitionGeneration
+                                    ),
+                                    connectionID: route.connectionID,
+                                    routingAuthorityGeneration: route.routingAuthorityGeneration,
+                                    connectionLifecycleGeneration: route.connectionLifecycleGeneration
+                                )
+                            }
+                        }
                         if retainedOffer == .availabilityABA {
                             ToolAvailabilityStore.shared.debugDisableAndReenableWithoutPersistenceForTesting(MCPWindowToolName.selfNoop)
                         }
@@ -239,8 +264,13 @@ import XCTest
                                 transports.append(next)
                                 await provider.attach(next)
                             }
-                            if retainedOffer == .absentThenFresh || retainedOffer == .reconnect || retainedOffer == .ambiguous {
+                            if retainedOffer == .absentThenFresh || retainedOffer == .reconnect || retainedOffer == .ambiguous || retainedOffer == .mismatchedIngress {
                                 _ = try await provider.listTools()
+                            }
+                            await manager.debugSetCatalogOfferRouteForTesting(nil)
+                            if retainedOffer == .mismatchedIngress {
+                                let captured = await manager.debugRunCatalogProjection(for: runID)
+                                XCTAssertNil(captured?.returnedCatalog, "A list must not associate another binding's barriers or expiry with its shaped response")
                             }
                             if let prior, let token = prior.routeToken, retainedOffer != .benign, retainedOffer != .expiry {
                                 let oldSupport = await manager.hasCurrentReturnedTool(AgentModeViewModel.selfNoopCatalogDefinition, routeToken: token, projectionRevision: prior.projectionRevision)
