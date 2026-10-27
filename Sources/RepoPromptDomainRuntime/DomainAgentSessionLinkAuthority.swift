@@ -861,6 +861,15 @@ package actor DomainAgentSessionLinkAuthority {
         }
     }
 
+    /// Captured at actual catalog ingress only. Consent expiry can change advertisement without
+    /// changing membership revisions; visit only this exact endpoint's existing link indexes.
+    package func catalogConsentExpiresAt(endpoint: DomainAgentSessionLinkEndpointIdentity) -> Date? {
+        let outbound = outboundLinksByEndpoint[endpoint] ?? []
+        let inbound = targets[endpoint.sessionID].flatMap { $0.endpoint == endpoint ? $0.inboundLinkIDs : nil } ?? []
+        let scopes = Set(outbound.union(inbound).compactMap { links[$0]?.grant.sourceScopeID })
+        return scopeConsent?.earliestExpiry(scopeIDs: scopes, at: now())
+    }
+
     /// Exact indexed relationship sample for a caller that must exclude its own unsettled
     /// activation-backed creations. Ordinary inbound grants cannot be those creations: the private
     /// bootstrap proof is restricted to a freshly allocated lane target, never the ordinary caller.

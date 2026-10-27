@@ -1599,6 +1599,7 @@ final class AgentTabSession: ObservableObject {
     }
 
     var createdByOverseerSessionID: UUID? {
+        willSet { if createdByOverseerSessionID != newValue { ServerNetworkManager.catalogAdvertisementDidChange() } }
         didSet {
             if createdByOverseerSessionID != nil { oversight.overseerActivation = nil }
         }

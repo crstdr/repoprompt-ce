@@ -837,6 +837,7 @@ enum AgentSessionLinkCandidateReadinessSignal {
     static var onChange: (() -> Void)?
 
     static func didChange() {
+        ServerNetworkManager.catalogAdvertisementDidChange()
         onChange?()
     }
 }
@@ -2098,6 +2099,7 @@ final class AgentSessionLinkRuntimeBridge {
     /// oversight, not tear it down one window-close notification at a time.
     func freezeForTermination() {
         guard !isFrozenForTermination else { return }
+        ServerNetworkManager.catalogAdvertisementDidChange()
         isFrozenForTermination = true
         // The deletion registry owns reported per-session removals. Closing its admission and
         // checking both disk attempts and commit callbacks in this same MainActor turn proves that
