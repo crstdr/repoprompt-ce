@@ -1550,7 +1550,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
         }
 
         private var configuration = SessionLinkNativeConfigurationFixture()
-        private let eventPair = AsyncStream<NativeAgentRuntimeEvent>.makeStream()
+        private var eventPair = AsyncStream<NativeAgentRuntimeEvent>.makeStream()
         var hasActiveSession: Bool {
             connection != nil
         }
@@ -1583,6 +1583,8 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
 
         func ensureEventsStreamReady() {}
         func resetEventsStreamForNewRun() {
+            eventPair.continuation.finish()
+            eventPair = AsyncStream<NativeAgentRuntimeEvent>.makeStream()
             lifecycleRevision += 1
         }
 
