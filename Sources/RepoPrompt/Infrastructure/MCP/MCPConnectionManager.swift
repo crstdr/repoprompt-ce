@@ -436,6 +436,33 @@ typealias MCPConnectionCallLimiterWatchdogDiagnostics = MCPDomainConnectionCallL
 #endif
 typealias AsyncLimiter = MCPDomainAsyncLimiter
 
+/// Inputs that can change a returned advertisement, independently of route renewal.
+/// Stored only with the existing observation; never a reconstructed or expected catalog.
+struct MCPRunCatalogOfferInputs: Equatable {
+    let advertisementRevision: UInt64
+    let registryID: UUID
+    let registryRevision: UInt64
+    let outboundRevision: UInt64
+    let inboundRevision: UInt64
+    let policyRevision: UUID?
+    let connectionPolicyRevision: UInt64
+    let connectionIdentity: ObjectIdentifier?
+    let clientIdentifier: String?
+}
+
+private final class MCPCatalogAdvertisementClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var revision: UInt64 = 0
+
+    func read() -> UInt64 {
+        lock.withLock { revision }
+    }
+
+    func advance() {
+        lock.withLock { revision &+= 1 }
+    }
+}
+
 enum MCPRunRouteAuthorityDecision: Equatable {
     case committed
     case revocationFenced
@@ -1869,6 +1896,8 @@ actor ServerNetworkManager {
         let expectedSurface: Data?
         let returnedSurface: Data?
         let returnedCatalog: [String: [MCP.Tool]]?
+        let offerInputs: MCPRunCatalogOfferInputs?
+        let offerExpiresAt: Date?
         let projectionRevision: UInt64
 
         var routeToken: AgentSessionLinkRunCatalogRouteToken? {
@@ -1896,9 +1925,23 @@ actor ServerNetworkManager {
                 hasActiveOutboundLink: hasActiveOutboundLink,
                 expectedSurface: expectedSurface,
                 returnedSurface: returnedSurface,
-                returnedCatalog: returnedCatalog
+                returnedCatalog: returnedCatalog,
+                offerInputs: offerInputs,
+                offerExpiresAt: offerExpiresAt
             )
         }
+    }
+
+    private nonisolated static let catalogAdvertisementClock = MCPCatalogAdvertisementClock()
+
+    /// Synchronous producer hook: invalidate before a changed input can cross an actor boundary.
+    /// One increment, no scans, notifications, registry, or settings mutation.
+    nonisolated static func catalogAdvertisementDidChange() {
+        catalogAdvertisementClock.advance()
+    }
+
+    nonisolated static var catalogAdvertisementRevision: UInt64 {
+        catalogAdvertisementClock.read()
     }
 
     private struct RunCatalogWaiter {
@@ -3536,6 +3579,8 @@ actor ServerNetworkManager {
         returnedSessionLinkPresence: Bool,
         returnedSurface: Data? = nil,
         returnedCatalog: [String: [MCP.Tool]]? = nil,
+        offerInputs: MCPRunCatalogOfferInputs? = nil,
+        offerExpiresAt: Date? = nil,
         catalogStartRevision: UInt64? = nil
     ) async {
         let runID = initialRouteToken?.runID ?? runIDByConnectionID[connectionID]
@@ -3543,6 +3588,11 @@ actor ServerNetworkManager {
 
         let initialRevision = runCatalogObservationByRunID[runID]?.projectionRevision ?? 0
         let finalSnapshot = await liveSessionLinkGrantSnapshot(connectionID: connectionID)
+        let currentOfferInputs: MCPRunCatalogOfferInputs? = if let route = finalSnapshot?.routeToken {
+            await runCatalogOfferInputs(route: route)
+        } else {
+            nil
+        }
         let computedSurface = await expectedSessionLinkCatalogSurface(connectionID: connectionID, snapshot: finalSnapshot)
         #if DEBUG
             await debugAfterExpectedCatalogSurfaceForTesting?()
@@ -3582,7 +3632,10 @@ actor ServerNetworkManager {
                 hasActiveOutboundLink: routeIsCurrent ? liveOutboundPresence : nil,
                 expectedSurface: routeIsCurrent ? expectedSurface : nil,
                 returnedSurface: routeIsCurrent ? returnedSurface : nil,
-                returnedCatalog: routeIsCurrent && catalogIsCurrent ? returnedCatalog : nil,
+                returnedCatalog: routeIsCurrent && catalogIsCurrent && offerInputs != nil && offerInputs == currentOfferInputs
+                    && offerInputs?.advertisementRevision == Self.catalogAdvertisementRevision ? returnedCatalog : nil,
+                offerInputs: offerInputs,
+                offerExpiresAt: offerExpiresAt,
                 supersedesWaiters: false
             )
         }
@@ -3602,14 +3655,46 @@ actor ServerNetworkManager {
         routeToken: AgentSessionLinkRunCatalogRouteToken,
         projectionRevision: UInt64
     ) async -> Bool {
-        let currentRoute = await authoritativeRunCatalogRouteToken(for: routeToken.runID)
+        guard let currentRoute = await authoritativeRunCatalogRouteToken(for: routeToken.runID),
+              currentRoute.hasSameClientIncarnation(as: routeToken) else { return false }
         let enabled = await MainActor.run { ToolAvailabilityStore.shared.isEnabled(definition.name) }
-        guard enabled, isEnabledState, currentRoute == routeToken, isCurrentCatalogRouteToken(routeToken),
+        let inputs = await runCatalogOfferInputs(route: currentRoute)
+        guard enabled, isEnabledState, isCurrentCatalogRouteToken(currentRoute),
               let projection = runCatalogObservationByRunID[routeToken.runID]?.projection,
               projection.projectionRevision == projectionRevision,
-              projection.routeToken == routeToken
+              projection.routeToken == routeToken,
+              let inputs, projection.offerInputs == inputs,
+              inputs.advertisementRevision == Self.catalogAdvertisementRevision,
+              projection.hasUnchangedOffer
         else { return false }
         return projection.containsReturnedTool(definition)
+    }
+
+    /// Two bounded revision collections establish a coherent sample across the input owners.
+    /// No retry, convergence wait, catalog scan, or inventory scan on send. A mutation after the
+    /// shared sample point linearizes after this proof, not as an atomic cross-actor send.
+    private func runCatalogOfferInputs(route: AgentSessionLinkRunCatalogRouteToken) async -> MCPRunCatalogOfferInputs? {
+        guard let first = await collectRunCatalogOfferInputs(route: route),
+              let second = await collectRunCatalogOfferInputs(route: route), first == second else { return nil }
+        return second
+    }
+
+    private func collectRunCatalogOfferInputs(route: AgentSessionLinkRunCatalogRouteToken) async -> MCPRunCatalogOfferInputs? {
+        let revision = Self.catalogAdvertisementRevision
+        let registry = domainHost.registry
+        let registryRevision = await registry.scopePresence(requiredToolNames: [], scope: .window(id: route.observerEndpoint.windowID)).revision
+        let authority = AppDomainRuntimeComposition.shared.runtime.agentSessionLinkAuthority
+        let outbound = await authority.observerLinkSetRevision(route.observerEndpoint.sessionID)
+        let inbound = await authority.targetLinkSetRevision(route.observerEndpoint.sessionID)
+        guard revision == Self.catalogAdvertisementRevision, isCurrentCatalogRouteToken(route) else { return nil }
+        return MCPRunCatalogOfferInputs(
+            advertisementRevision: revision, registryID: registry.registryID, registryRevision: registryRevision,
+            outboundRevision: outbound, inboundRevision: inbound,
+            policyRevision: runPolicyStateByRunID[route.runID]?.admissionRevision,
+            connectionPolicyRevision: policyGenerationByConnectionID[route.connectionID] ?? 0,
+            connectionIdentity: connections[route.connectionID].map { ObjectIdentifier($0) },
+            clientIdentifier: clientIdentifier(forConnection: route.connectionID)
+        )
     }
 
     /// Final actor-local generation fence after expected-definition actor hops.
@@ -3650,6 +3735,8 @@ actor ServerNetworkManager {
         expectedSurface: Data? = nil,
         returnedSurface: Data? = nil,
         returnedCatalog: [String: [MCP.Tool]]? = nil,
+        offerInputs: MCPRunCatalogOfferInputs? = nil,
+        offerExpiresAt: Date? = nil,
         supersedesWaiters: Bool
     ) async -> AgentSessionLinkRunCatalogProjection {
         runCatalogProjectionRevision &+= 1
@@ -3665,6 +3752,8 @@ actor ServerNetworkManager {
             expectedSurface: expectedSurface,
             returnedSurface: returnedSurface,
             returnedCatalog: returnedCatalog,
+            offerInputs: offerInputs,
+            offerExpiresAt: offerExpiresAt,
             projectionRevision: runCatalogProjectionRevision
         )
         runCatalogObservationByRunID[runID] = observation
@@ -11933,6 +12022,11 @@ actor ServerNetworkManager {
             runCatalogObservationByRunID[runID]?.projection
         }
 
+        func debugCurrentRunCatalogOfferInputs(for runID: UUID) async -> MCPRunCatalogOfferInputs? {
+            guard let route = await authoritativeRunCatalogRouteToken(for: runID) else { return nil }
+            return await runCatalogOfferInputs(route: route)
+        }
+
         func debugHasRunCatalogState(for runID: UUID) -> Bool {
             runCatalogObservationByRunID[runID] != nil || runCatalogWaitersByRunID[runID] != nil
         }
@@ -13480,11 +13574,34 @@ actor ServerNetworkManager {
                 reason: "tools/list"
             )
 
-            let disabled = await MainActor.run {
-                ToolAvailabilityStore.shared.effectiveDisabledTools
+            let offerRunID = await runIDByConnectionID[connectionID]
+            let offerRoute: AgentSessionLinkRunCatalogRouteToken? = if let offerRunID {
+                await authoritativeRunCatalogRouteToken(for: offerRunID)
+            } else {
+                nil
             }
-            let policy = await effectivePolicyState(for: connectionID)
+            let offerInputs: MCPRunCatalogOfferInputs? = if let offerRoute {
+                await runCatalogOfferInputs(route: offerRoute)
+            } else {
+                nil
+            }
+            let (disabled, scopeExpiry) = await MainActor.run {
+                (
+                    ToolAvailabilityStore.shared.effectiveDisabledTools,
+                    offerRoute.flatMap {
+                        AgentSessionLinkRuntimeBridge.shared.delegationScopes.catalogOfferExpiresAt(grantedTo: $0.observerEndpoint.sessionID)
+                    }
+                )
+            }
+            let linkExpiry: Date? = if let endpoint = offerRoute?.observerEndpoint {
+                await AppDomainRuntimeComposition.shared.runtime.agentSessionLinkAuthority.catalogConsentExpiresAt(endpoint: endpoint)
+            } else {
+                nil
+            }
+            let offerExpiresAt = [scopeExpiry, linkExpiry].compactMap(\.self).min()
+            // Sample expiry and revision barriers before any grant/role facts used for shaping.
             let sessionLinkGrantSnapshot = await liveSessionLinkGrantSnapshot(connectionID: connectionID)
+            let policy = await effectivePolicyState(for: connectionID)
             let domainPolicy = MCPToolAdmissionPolicy.clientPolicySnapshot(
                 restricted: policy.restricted,
                 additional: policy.additional.union(
@@ -13563,6 +13680,8 @@ actor ServerNetworkManager {
                 returnedSessionLinkPresence: returnedSessionLinkPresence,
                 returnedSurface: AgentSessionLinkCatalogSurface.fingerprint(tools),
                 returnedCatalog: Dictionary(grouping: tools, by: \.name),
+                offerInputs: offerInputs,
+                offerExpiresAt: offerExpiresAt,
                 catalogStartRevision: catalogStartRevision
             )
             connectionLog("Returning \(tools.count) available tools for \(connectionID)")
@@ -16401,6 +16520,7 @@ actor ServerNetworkManager {
         // Only do something if the state actually changes
         guard isEnabledState != enabled else { return }
 
+        Self.catalogAdvertisementDidChange()
         isEnabledState = enabled
         log.notice("RepoPrompt MCP enabled state changed to: \(enabled)")
 
@@ -16963,6 +17083,7 @@ actor ServerNetworkManager {
         var set = activeConnectionsByClient[clientID, default: []]
         set.insert(connectionID)
         activeConnectionsByClient[clientID] = set
+        if clientIDByConnection[connectionID] != clientID { Self.catalogAdvertisementDidChange() }
         clientIDByConnection[connectionID] = clientID
         connectionLog("Admitted connection \(connectionID) with clientID='\(clientID)'")
         // Once admitted, the authoritative map is set — drop only the pending label this admission owns.

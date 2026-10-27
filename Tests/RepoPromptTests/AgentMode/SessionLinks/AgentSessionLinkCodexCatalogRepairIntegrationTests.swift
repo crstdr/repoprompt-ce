@@ -2521,6 +2521,16 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                     XCTFail("Restored setup still has rebuild/save/summary work: \(label) before=\(settled) after=\(workCounts())")
                     throw CancellationError()
                 }
+                if label == "initial-restoration" {
+                    let observed = try await ServerNetworkManager.shared.debugRunCatalogProjection(for: XCTUnwrap(session.runID))
+                    let prior = try XCTUnwrap(observed)
+                    let oldSupport = try await ServerNetworkManager.shared.hasCurrentReturnedTool(AgentModeViewModel.selfNoopCatalogDefinition, routeToken: XCTUnwrap(prior.routeToken), projectionRevision: prior.projectionRevision)
+                    XCTAssertFalse(oldSupport, "An offer predating restored chats and new links must be invalidated")
+                }
+                // Material setup changes invalidate the earlier offer. Obtain one real list after
+                // setup, outside measurement, without retrying until positive.
+                let names = try await provider.listTools()
+                XCTAssertTrue(names.contains(MCPWindowToolName.selfNoop))
                 try await w3RequireCurrentCatalog(vm: vm, session: session, label: label)
                 guard workCounts() == settled, allSessions.map(\.saveRequestGeneration) == generations,
                       allSessions.allSatisfy({ $0.derivedTranscriptRefreshTask == nil })

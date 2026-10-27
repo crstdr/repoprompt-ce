@@ -967,6 +967,7 @@ extension AgentModeViewModel {
               let route = projection.routeToken, route.runID == session.runID,
               route.observerEndpoint == endpoint,
               hasCurrentRunCatalogRouteTokenInCurrentMCPServer(route, tabID: session.tabID),
+              projection.hasUnchangedOffer,
               projection.containsReturnedTool(Self.selfNoopCatalogDefinition) else { return false }
         if let owner = session.activeRunOwnership,
            session.quietLedger.hasOrdinaryOccurrence(owner: owner) { return false }
@@ -993,10 +994,10 @@ extension AgentModeViewModel {
             #endif
             return await AgentSessionLinkRuntimeBridge.shared.proveLocalInputRead(decoration, observer: observer)
         }
-        // The server's final actor-local observation read is the catalog proof's linearization
-        // point. Keep this the last await: a withdrawal during optional local-read proof must not
-        // survive through a lagging MainActor mirror. Later server mutations linearize after this
-        // proof; this is not a cross-actor atomic send/observation transaction.
+        // Keep the server's stable-input observation proof the last await: a withdrawal during
+        // optional local-read proof must not survive through a lagging MainActor mirror. Its two
+        // bounded input collections establish a coherent sample, not a cross-actor atomic send.
+        // Mutations after that shared sample point linearize after the proof.
         let projection = claim?.observerEndpoint.flatMap { agentSessionLinkRunCatalogProjectionByEndpoint[$0] }
         let needsDeclarationProof = canUpgrade || claim?.routineQuietCheckIn == true
         var supportsDeclaration = !needsDeclarationProof

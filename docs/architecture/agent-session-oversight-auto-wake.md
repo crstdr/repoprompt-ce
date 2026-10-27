@@ -979,10 +979,21 @@ closing output after the declaration need not use a keyword. Silence, `[ack]` an
 replies without that declaration remain ordinary. Completion notifications are unchanged. Unsupported providers, natural/manual/periodic/waiting/control work,
 watchdog completion, and replay onto a new owner are ordinary.
 
-The single frozen `routineQuietCheckIn` claim/render Boolean records initial idle-follow-up routine
-qualification, including Codex. Actual rendered attention makes it false. Qualified Claude Code and
-Codex get `Nothing needed? Call self_noop.` in that dispatch's lane guidance only with exact current
-returned-definition evidence, inside the existing 24 KiB budget and deterministic subset selection.
+The owed batch is reserved early; the existing attempt retains its original idle-follow-up candidacy,
+not frozen quiet qualification. After provider preparation, the prompt owner finalizes the claim/render
+`routineQuietCheckIn` Boolean from an actual returned definition for the same run, observer incarnation,
+connection and lifecycle, plus the ordinary-occurrence veto, before physical input. Current route
+authorization remains required. The returned offer keeps its original routing-generation token. It may
+survive a generation renewal only while the advertisement inputs are unchanged: the manager checks
+producer revisions, registry and membership revisions, semantic policy identities, and captured consent
+expiry. An absent or invalidated observation cannot be restored from expected definitions. A material
+change followed by reversal still needs a fresh actual list.
+Qualification may upgrade only before acquisition and may still be removed until release. Missing,
+withdrawn, ambiguous, stale or after-send evidence cannot qualify; there is no added wait or relist.
+Actual rendered attention makes it false. Qualified Claude Code and Codex get
+`Nothing needed? Call self_noop.` in that dispatch's lane guidance only with that proof,
+inside the existing 24 KiB budget and deterministic subset selection; adding the hint cannot replace
+the reserved receipt.
 Devin's classification and copy
 remain disabled together until its raw negative-evidence qualification closes. No standing guidance
 revision, autonomy rule, public field, provider protocol, or saved state changes.
