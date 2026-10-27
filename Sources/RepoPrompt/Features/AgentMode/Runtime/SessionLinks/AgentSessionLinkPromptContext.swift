@@ -1296,6 +1296,14 @@ final class AgentSessionLinkOutboundPromptClaimStore {
             routineQuietCheckIn: effectiveRoutineQuietCheckIn
         )
         claim.localInput = decorateLocalInputs(rendered)
+        if let reserved = state.pending[dispatchID], !reserved.routineQuietCheckIn,
+           claim.routineQuietCheckIn, reserved.passiveQueue == claim.passiveQueue,
+           reserved.membership == claim.membership, reserved.passive != claim.passive
+        {
+            // The hint may spend spare budget, never replace an already reserved receipt.
+            state.recordPossibleDelivery(of: reserved)
+            return .claimed(reserved)
+        }
         state.setPending(claim)
         // Recorded at hand-off, not at dispatch: the store never learns whether the caller's transport
         // succeeded, so this is the only point where the possibility is knowable at all.

@@ -8343,34 +8343,21 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 pendingAuthTurn.monitoringDispatchContext = candidate?.dispatchContext
                 session.codexPendingAuthRetryTurn = pendingAuthTurn
             }
-            let acquired = self.viewModel?.agentSessionLinkAcquirePhysicalDispatch(
-                for: session,
-                dispatchID: promptDispatchID
-            ) ?? !AgentModeViewModel.dispatchRequiresLaneBatch(session, promptDispatchID)
-            guard acquired else {
-                self.viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
-                    for: session,
-                    dispatchID: promptDispatchID
-                )
-                self.clearCodexPendingAuthRetryTurn(session)
-                self.viewModel?.finalizeAttachmentsForTurn(
-                    for: session,
-                    reservationID: attachmentReservationID,
-                    disposition: .restoreToPending
-                )
-                if terminalizeRejectedSend {
-                    await self.finalizeCodexRun(
-                        session,
-                        turnStatus: .interrupted,
-                        reason: "send-physical-dispatch-not-acquired",
-                        notifyOnCompleted: false
-                    )
-                }
-                return .cancelled
-            }
             monitoring = candidate
-            acquiredAgentSessionLinkPhysicalDispatch = true
             return nil
+        }
+
+        func acquireFinalizedAgentSessionLinkDispatch() -> Bool {
+            guard !isSelfNote else { return true }
+            let acquired = viewModel?.agentSessionLinkAcquirePhysicalDispatch(
+                for: session, dispatchID: promptDispatchID
+            ) ?? !AgentModeViewModel.dispatchRequiresLaneBatch(session, promptDispatchID)
+            if acquired {
+                acquiredAgentSessionLinkPhysicalDispatch = true
+            } else {
+                viewModel?.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: promptDispatchID)
+            }
+            return acquired
         }
 
         func computerUsePhysicalDispatchIsCurrent() async -> Bool {
@@ -8447,11 +8434,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                                   isSelfNote || viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) == true
                             else { throw CancellationError() }
                         }
-                        // Read proof can suspend after acquisition. Assert the same frozen switch
-                        // evidence again at this final synchronous release fence, never re-fit it.
+                        // Read proof may suspend. Assert the same frozen switch evidence at this
+                        // final synchronous release fence, never re-fit it.
                         guard viewModel?.providerSwitchAcquirePhysicalDispatch(session: session, dispatchID: promptDispatchID)
                             ?? (session.pendingHandoff.providerSwitchDelivery == nil)
                         else { throw CancellationError() }
+                        guard acquireFinalizedAgentSessionLinkDispatch() else { throw CancellationError() }
                         // A parked note remains unattempted throughout optional Read proof.
                         // Claim it before synchronous frontier consumption, with no intervening await.
                         if let noteDispatchID {
@@ -8548,6 +8536,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                               viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) == true
                         else { throw CancellationError() }
                     }
+                    guard acquireFinalizedAgentSessionLinkDispatch() else { throw CancellationError() }
                     if let parkedNote {
                         guard session.selfCompactNoteDispatchIsCurrent(parkedNote.dispatchID) else {
                             return .cancelled
