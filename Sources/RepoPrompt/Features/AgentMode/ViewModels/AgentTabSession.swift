@@ -1868,9 +1868,6 @@ final class AgentTabSession: ObservableObject {
         resetQuietLedgerForBinding()
         oversight.clearWakeSuppression()
         invalidateLocalInputStructure()
-        // The existing full endpoint is retired by this generation change. No saved verdicts.
-        resetQuietLedgerForBinding()
-        oversight.clearWakeSuppression()
 
         oversight.overseerActivation = nil
         // Clear the outgoing proof before the generation moves so it cannot be observed under the

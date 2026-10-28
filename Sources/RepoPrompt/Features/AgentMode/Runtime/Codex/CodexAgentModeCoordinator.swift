@@ -7458,8 +7458,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         )
         let existingRef = resumeCandidate
         guard let startController = session.codexController else { return }
-        guard await computerUseStartupIsCurrent(startController) else { return }
         let controllerGenerationAtStart = session.codexControllerGeneration
+        guard await computerUseStartupIsCurrent(startController) else { return }
         do {
             let startResult = try await startCodexNativeSession(
                 controller: startController,
