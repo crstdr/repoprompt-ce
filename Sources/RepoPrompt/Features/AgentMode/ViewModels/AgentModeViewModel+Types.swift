@@ -668,8 +668,8 @@ extension AgentModeViewModel {
 
     enum AttachmentTurnState: Equatable {
         case idle
-        case reserved(reservationID: UUID, attachments: [AgentImageAttachment])
-        case consumed(reservationID: UUID, attachments: [AgentImageAttachment])
+        case reserved(reservationID: UUID, attachments: [AgentFileAttachment])
+        case consumed(reservationID: UUID, attachments: [AgentFileAttachment])
     }
 
     struct CodexComputerUseActivation: Equatable {
@@ -789,6 +789,7 @@ extension AgentModeViewModel {
         case fresh
         case resumed
         case resumeFellBackToFresh
+        case resumeTimedOut
     }
 
     /// Exact provider reference known to exceed the resume frame budget in this session.
@@ -1217,13 +1218,13 @@ extension AgentModeViewModel {
     /// Internal for cross-file AgentModeViewModel extension access after the mechanical file split.
     struct PendingUserTurnState: Equatable {
         let workflow: AgentWorkflowDefinition?
-        let imageAttachments: [AgentImageAttachment]
+        let attachments: [AgentFileAttachment]
         let taggedFileAttachments: [AgentTaggedFileAttachment]
         let initialStartLocation: InitialStartLocation
 
         var isEmpty: Bool {
             workflow == nil
-                && imageAttachments.isEmpty
+                && attachments.isEmpty
                 && taggedFileAttachments.isEmpty
                 && initialStartLocation == .local
         }
@@ -1238,12 +1239,6 @@ extension AgentModeViewModel {
         let message: String
         let strategy: AgentModeRunService.DraftRestorationStrategy
         let operation: AgentComposerDraftRestorationOperation?
-    }
-
-    /// Internal for cross-file AgentModeViewModel extension access after the mechanical file split.
-    struct ImageAttachmentFingerprint: Hashable {
-        let byteCount: Int64
-        let digestHex: String
     }
 
     struct SlashSkillToken: Equatable {

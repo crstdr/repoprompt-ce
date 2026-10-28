@@ -5603,7 +5603,6 @@ extension AgentSessionLinkAutoWakeTests {
             XCTAssertFalse(fixture.viewModel.selfNoopHintIsCurrent(for: fixture.session), "A family-ready fixture without the returned definition is not quiet support")
             XCTAssertFalse(claim.routineQuietCheckIn)
             XCTAssertFalse(claim.fragment.contains("Nothing needed? Call self_noop."))
-
             let owner = try beginAndAcquireQuietWake(fixture, claim: claim)
             XCTAssertNil(fixture.session.quietLedger.candidateStartKey(owner: owner))
             XCTAssertTrue(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(for: fixture.session, dispatchID: claim.dispatchID))
@@ -6582,7 +6581,6 @@ extension AgentSessionLinkAutoWakeTests {
                         let sent = await fixture.nativeController.sentMessages
                         let physical = try XCTUnwrap(sent.last)
                         XCTAssertFalse(physical.contains("Nothing needed? Call self_noop."), "Missing proof preserves ordinary transport even for the routine basis")
-
                         XCTAssertTrue(physical.contains(claim.fragment), "measure the physical provider bytes, not only a render handed to the test")
                         texts.append(physical)
                         fragmentBytes.append(claim.fragment.utf8.count)
@@ -6835,6 +6833,17 @@ extension AgentSessionLinkAutoWakeTests {
         let authority = DomainAgentSessionLinkAuthority(identity: DomainRuntimeIdentity(runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: .distantPast))
         let bridge = AgentSessionLinkRuntimeBridge(authority: authority, host: host, toolAdvertisementInvalidator: { _ in })
         guard case .added = await bridge.addMonitorLink(observerSessionID: observer.sessionID, rawTargetSessionID: target.sessionID.uuidString) else { return XCTFail("readiness grant failed") }
+        // The link-time seed carries no paired proof, and first paired facts baseline a new lane.
+        // Settle the lane's paired resting baseline before the target runs; otherwise whether the
+        // owed run is visible depends on whether a refresh happened to sample it mid-run.
+        var targetSamples: [AgentSessionLinkPassiveStatusNotices.Sample] = []
+        bridge.test_onPassiveSample = { sample in
+            if sample.targetSessionID == target.sessionID { targetSamples.append(sample) }
+        }
+        await bridge.test_settleTargetPublications()
+        await bridge.test_refreshStatus(sessionIDs: [observer.sessionID])
+        XCTAssertEqual(targetSamples.last?.status, .idle)
+        XCTAssertEqual(targetSamples.last?.runFacts, .zero, "the observer must hold the lane's paired resting baseline")
         observer.session.oversight.autoWakeOnUpdates = true
         observer.session.isPreparingInitialWorktree = true
         let replay = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() }, replayTranscript: true)

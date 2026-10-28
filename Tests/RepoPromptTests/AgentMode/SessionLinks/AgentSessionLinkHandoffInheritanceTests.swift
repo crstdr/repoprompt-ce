@@ -2732,13 +2732,13 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 let b = fixture.rootURL.appendingPathComponent("later.txt")
                 try "submitted file content".write(to: a, atomically: true, encoding: .utf8)
                 try "later file content".write(to: b, atomically: true, encoding: .utf8)
-                let imageA = AgentImageAttachment(source: .localFile(path: a.path), title: "A")
-                let imageB = AgentImageAttachment(source: .localFile(path: b.path), title: "B")
+                let imageA = AgentFileAttachment(source: .localFile(path: a.path), title: "A")
+                let imageB = AgentFileAttachment(source: .localFile(path: b.path), title: "B")
                 let fileA = AgentTaggedFileAttachment(relativePath: a.path, displayName: "A")
                 let fileB = AgentTaggedFileAttachment(relativePath: b.path, displayName: "B")
                 let workflowA = AgentWorkflowDefinition(customID: UUID(), displayName: "W1", template: "W1 $ARGUMENTS")
                 let workflowB = AgentWorkflowDefinition(customID: UUID(), displayName: "W2", template: "W2 $ARGUMENTS")
-                session.pendingImageAttachments = [imageA]
+                session.pendingFileAttachments = [imageA]
                 session.pendingTaggedFileAttachments = [fileA]
                 vm.selectWorkflow(workflowA)
                 session.hasLoadedPersistedState = false
@@ -2758,7 +2758,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 XCTAssertEqual(immediate, .submitted)
                 let deferred = try XCTUnwrap(pending)
                 await entered.value()
-                session.pendingImageAttachments.append(imageB)
+                session.pendingFileAttachments.append(imageB)
                 session.pendingTaggedFileAttachments.append(fileB)
                 vm.selectWorkflow(workflowB)
                 release.finish(())
@@ -2769,7 +2769,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 XCTAssertEqual(row.attachments.map(\.id), [imageA.id])
                 XCTAssertEqual(row.taggedFileAttachments.map(\.id), [fileA.id])
                 XCTAssertEqual(row.workflow, workflowA)
-                XCTAssertEqual(session.pendingImageAttachments.map(\.id), [imageB.id])
+                XCTAssertEqual(session.pendingFileAttachments.map(\.id), [imageB.id])
                 XCTAssertEqual(session.pendingTaggedFileAttachments.map(\.id), [fileB.id])
                 XCTAssertEqual(session.selectedWorkflow, workflowB)
                 XCTAssertTrue(starts[0].contains("W1 submitted draft"))
@@ -2861,11 +2861,11 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                         vm.storeDraftText(for: session.tabID, "keep current draft")
                         let file = fixture.rootURL.appendingPathComponent("kept.txt")
                         try "keep attachment".write(to: file, atomically: true, encoding: .utf8)
-                        session.pendingImageAttachments = [.init(source: .localFile(path: file.path), title: "kept image")]
+                        session.pendingFileAttachments = [.init(source: .localFile(path: file.path), title: "kept image")]
                         session.pendingTaggedFileAttachments = [.init(relativePath: file.path, displayName: "kept.txt")]
                         let workflow = AgentWorkflowDefinition(customID: UUID(), displayName: "Kept workflow", template: "workflow $ARGUMENTS")
                         session.selectedWorkflow = workflow
-                        let images = session.pendingImageAttachments
+                        let images = session.pendingFileAttachments
                         let files = session.pendingTaggedFileAttachments
                         let rows = session.items.map(\.id)
                         let slot = session.pendingHandoff
@@ -2927,7 +2927,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                         XCTAssertEqual(session.items.map(\.id), rows)
                         XCTAssertEqual(session.draftText, "keep current draft")
                         XCTAssertEqual(session.selectedWorkflow, workflow)
-                        XCTAssertEqual(session.pendingImageAttachments, images)
+                        XCTAssertEqual(session.pendingFileAttachments, images)
                         XCTAssertEqual(session.pendingTaggedFileAttachments, files)
                         XCTAssertEqual(session.pendingHandoff, slot)
                         XCTAssertNil(session.activeComposerSubmitAttempt)
@@ -3007,7 +3007,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 session.selectedAgent = .codexExec
                 let draft = String(repeating: "current draft ", count: 1000)
                 vm.storeDraftText(for: session.tabID, draft)
-                session.pendingImageAttachments = [.init(source: .localFile(path: fixture.rootURL.appendingPathComponent("image.png").path), title: "destination image")]
+                session.pendingFileAttachments = [.init(source: .localFile(path: fixture.rootURL.appendingPathComponent("image.png").path), title: "destination image")]
                 await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
                 let preview = try XCTUnwrap(vm.providerSwitchPreview)
                 let expected = vm.renderProviderMessage(text: draft.trimmingCharacters(in: .whitespacesAndNewlines), attachments: preview.composition.images, agent: .openCode)

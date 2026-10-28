@@ -297,7 +297,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     var contextUsageSnapshot: ContextUsageSnapshot?
-    @Published var pendingImageAttachments: [AgentImageAttachment] = []
+    @Published var pendingFileAttachments: [AgentFileAttachment] = []
     @Published var pendingTaggedFileAttachments: [AgentTaggedFileAttachment] = []
     @Published var draftRestorationEvent: DraftRestorationEvent? = nil
     @Published private(set) var codexDynamicModels: [CodexAppServerClient.RemoteModel] = []
@@ -861,8 +861,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private var isActiveUISyncSuppressed: Bool {
         activeUISyncSuppressionDepth > 0
     }
-
-    private var lastProcessedTabID: UUID?
 
     /// Last `AgentSessionRunState` the sidebar attention system observed for
     /// each tab. Used to detect *transitions* (not steady-state) so we only
@@ -2879,6 +2877,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             testCodexActiveToolQuery: CodexActiveToolQuery? = nil,
             testCodexManagedAuthRecovery: (any CodexManagedAuthRecovering)? = nil,
             testCodexHookApprovalSettingsProvider: (any CodexHookApprovalSettingsProviding)? = nil,
+            testCodexComputerUseRuntimeUnavailableMessage: @escaping () -> String? = { nil },
+            testCodexComputerUseRuntimePreflight: (() async -> String?)? = nil,
             testCodexComputerUseCompanionReady: @escaping () -> Bool = { CodexNativeSessionController.computerUseClientPath() != nil },
             testCodexComputerUseReservedEntryExists: @escaping () -> Bool = { CodexNativeSessionController.hasReservedComputerUseEntry(MCPIntegrationHelper.codexMCPServerEntries()) },
             testCodexCapabilitiesForLaunch: @escaping (_ isMCPRelated: Bool) -> CodexCapabilitySettings = { _ in .disabled },
@@ -2960,6 +2960,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 routeOwnerValidator: testCodexRouteOwnerValidator,
                 shouldManageCodexTooling: shouldManageCodexTooling,
                 codexCapabilitiesForLaunch: testCodexCapabilitiesForLaunch,
+                computerUseRuntimeUnavailableMessage: testCodexComputerUseRuntimeUnavailableMessage,
+                computerUseRuntimePreflight: testCodexComputerUseRuntimePreflight,
                 computerUseCompanionReady: testCodexComputerUseCompanionReady,
                 computerUseReservedEntryExists: testCodexComputerUseReservedEntryExists,
                 authRecovery: testCodexManagedAuthRecovery ?? CodexManagedAuthRecoveryService.shared,
@@ -3955,6 +3957,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 && session.persistentSessionBindingIdentity == binding && session.bindingTransitionGeneration == generation
                 && computerUseComposerProps(session: session).isVisible
         }
+        let runtimeMessage = await codexCoordinator.computerUseRuntimeRequirementMessage()
+        guard stillCurrent() else { return CodexComputerUseWorkflow.ineligibleMessage }
+        if let runtimeMessage { return runtimeMessage }
         if !CodexComputerUseWorkflow.isEnabled {
             let accepted: Bool = if let confirmOptIn {
                 await confirmOptIn()
@@ -4754,7 +4759,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     static func pendingUserTurnState(from session: TabSession?) -> PendingUserTurnState {
         PendingUserTurnState(
             workflow: session?.selectedWorkflow,
-            imageAttachments: session?.pendingImageAttachments ?? [],
+            attachments: session?.pendingFileAttachments ?? [],
             taggedFileAttachments: session?.pendingTaggedFileAttachments ?? [],
             initialStartLocation: session?.pendingInitialStartLocation ?? .local
         )
@@ -4764,20 +4769,20 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         #if DEBUG
             assert(
                 destinationSession.selectedWorkflow == nil
-                    && destinationSession.pendingImageAttachments.isEmpty
+                    && destinationSession.pendingFileAttachments.isEmpty
                     && destinationSession.pendingTaggedFileAttachments.isEmpty,
                 "installPendingUserTurnState should only target a fresh destination session"
             )
         #endif
         destinationSession.selectedWorkflow = pendingState.workflow
-        destinationSession.pendingImageAttachments = pendingState.imageAttachments
+        destinationSession.pendingFileAttachments = pendingState.attachments
         destinationSession.pendingTaggedFileAttachments = pendingState.taggedFileAttachments
         destinationSession.pendingInitialStartLocation = pendingState.initialStartLocation
     }
 
     private func clearPendingUserTurnState(on session: TabSession?) {
         session?.selectedWorkflow = nil
-        session?.pendingImageAttachments.removeAll()
+        session?.pendingFileAttachments.removeAll()
         session?.pendingTaggedFileAttachments.removeAll()
         session?.pendingInitialStartLocation = .local
     }
@@ -4910,7 +4915,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
             return
         }
-        lastProcessedTabID = nil
         let targetTabID = pendingTabIDForLoad ?? currentTabID
         #if DEBUG
             let targetTabIDForLog = targetTabID?.uuidString.prefix(8).description ?? "nil"
@@ -5137,9 +5141,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             pendingTabIDForLoad = tabID
             return
         }
-
-        guard lastProcessedTabID != tabID else { return }
-        lastProcessedTabID = tabID
 
         guard let session = session(for: tabID, createIfNeeded: false) else {
             if workspaceSwitchInFlight,
@@ -7981,7 +7982,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session.queuedUserInputRequests.removeAll()
         session.queuedMCPElicitationRequests.removeAll()
         session.pendingInstructions.removeAll()
-        session.pendingImageAttachments.removeAll()
+        session.pendingFileAttachments.removeAll()
         session.pendingTaggedFileAttachments.removeAll()
         session.pendingTurnRuntimeAnchors.removeAll()
         session.agentMessageRuntimeFootersByItemID.removeAll()
@@ -8771,8 +8772,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
-    private func mcpApprovalDecisionOptions(for approval: AgentApprovalRequest) -> [AgentRunMCPSnapshot.Interaction.Option] {
-        mcpApprovalDecisionLabels(for: approval, includeAliases: false).map { label in
+    private func mcpApprovalDecisionOptions(for approval: AgentApprovalRequest, session: TabSession) -> [AgentRunMCPSnapshot.Interaction.Option] {
+        mcpApprovalDecisionLabels(for: approval, session: session, includeAliases: false).map { label in
             let description: String? = switch label {
             case "accept":
                 "Allow this action"
@@ -8792,19 +8793,26 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     }
 
-    private func mcpApprovalDecisionLabels(for approval: AgentApprovalRequest, includeAliases: Bool = true) -> [String] {
-        var labels = approval.supportsPlainApprove ? ["accept"] : []
-        if approval.supportsAlwaysAllow {
+    private func mcpApprovalDecisionLabels(for approval: AgentApprovalRequest, session: TabSession, includeAliases: Bool = true) -> [String] {
+        func allows(_ decision: AgentApprovalDecision) -> Bool {
+            CodexAgentModeCoordinator.allowsApprovalDecision(decision, request: approval, session: session)
+        }
+        var labels = allows(.accept) ? ["accept"] : []
+        if allows(.acceptForSession) {
             labels.append("accept_for_session")
         }
-        if approval.kind == .commandExecution, approval.sessionApprovalScope == nil {
+        // Legacy requests permit caller-supplied amendments; present lists require an advertised payload.
+        let allowsRememberedDecision: Bool = if case .codex = approval.requestID {
+            CodexAgentModeCoordinator.computerUseAllowsDecision(.acceptForSession, session: session)
+        } else { true }
+        if approval.supportsExecpolicyAmendment, allowsRememberedDecision {
             labels.append("accept_with_amendment")
         }
-        labels.append("decline")
-        if includeAliases {
-            labels.append("reject")
+        if allows(.decline) {
+            labels.append("decline")
+            if includeAliases { labels.append("reject") }
         }
-        labels.append("cancel")
+        if allows(.cancel) { labels.append("cancel") }
         return labels
     }
 
@@ -9030,7 +9038,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             if let grantRoot = approval.grantRoot, !grantRoot.isEmpty {
                 details.append(.init(label: "Requested Scope", value: grantRoot, isCode: false))
             }
-            if let amendment = approval.proposedExecpolicyAmendmentJSON, !amendment.isEmpty {
+            if let amendment = approval.presentedExecpolicyAmendmentJSON, !amendment.isEmpty {
                 details.append(.init(label: "Suggested Amendment", value: amendment, isCode: true))
             }
             for detail in approval.details {
@@ -9044,7 +9052,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 prompt: approval.reason,
                 context: nil,
                 allowsMultiple: nil,
-                options: mcpApprovalDecisionOptions(for: approval),
+                options: mcpApprovalDecisionOptions(for: approval, session: session),
                 fields: [],
                 details: details
             )
@@ -13691,28 +13699,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let decision: AgentApprovalDecision
             switch rawDecision {
             case "accept", "approve":
-                guard approval.supportsPlainApprove else {
-                    throw MCPError.invalidParams(
-                        "Plain approval is unavailable because this ACP request offers no selectable one-time allow option. Choose an explicit decision. No response was applied."
-                    )
-                }
                 decision = .accept
             case "accept_for_session", "always_allow", "approve_for_session":
-                guard approval.supportsAlwaysAllow else {
-                    throw MCPError.invalidParams(
-                        "response must be one of: \(mcpApprovalDecisionLabels(for: approval, includeAliases: false).joined(separator: ", ")). No response was applied."
-                    )
-                }
                 decision = .acceptForSession
             case "accept_with_amendment", "amend":
-                guard approval.kind == .commandExecution, approval.sessionApprovalScope == nil else {
-                    throw MCPError.invalidParams(
-                        "response must be one of: \(mcpApprovalDecisionLabels(for: approval, includeAliases: false).joined(separator: ", ")). No response was applied."
-                    )
-                }
                 let amendment = payload.amendment?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 guard !amendment.isEmpty else {
-                    throw MCPError.invalidParams("amendment is required for accept_with_amendment.")
+                    throw MCPError.invalidParams(
+                        "amendment is required for accept_with_amendment. response must be one of: \(mcpApprovalDecisionLabels(for: approval, session: session, includeAliases: false).joined(separator: ", ")). No response was applied."
+                    )
                 }
                 decision = .acceptWithExecpolicyAmendment(amendment)
             case "decline", "reject":
@@ -13721,7 +13716,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 decision = .cancel
             default:
                 throw MCPError.invalidParams(
-                    "response must be one of: \(mcpApprovalDecisionLabels(for: approval, includeAliases: false).joined(separator: ", "))."
+                    "response must be one of: \(mcpApprovalDecisionLabels(for: approval, session: session, includeAliases: false).joined(separator: ", "))."
+                )
+            }
+            guard CodexAgentModeCoordinator.allowsApprovalDecision(decision, request: approval, session: session) else {
+                throw MCPError.invalidParams(
+                    "response must be one of: \(mcpApprovalDecisionLabels(for: approval, session: session, includeAliases: false).joined(separator: ", ")). No response was applied."
                 )
             }
             return .approval(request: approval, decision: decision)
@@ -13756,8 +13756,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             submitWorktreeMergeReviewDecision(tabID: session.tabID, reviewID: reviewID, decision: decision)
         case let .permissions(request, decision):
             codexCoordinator.submitPermissionsDecision(session: session, request: request, decision: decision)
-        case let .approval(_, decision):
-            submitApprovalDecision(tabID: session.tabID, decision: decision)
+        case let .approval(request, decision):
+            guard submitApprovalDecision(tabID: session.tabID, requestID: request.id, decision: decision) else {
+                let current = session.pendingApproval ?? request
+                throw MCPError.invalidParams(
+                    "The approval is unavailable, unsupported, or no longer matches interaction_id. response must be one of: \(mcpApprovalDecisionLabels(for: current, session: session, includeAliases: false).joined(separator: ", ")). No response was applied."
+                )
+            }
         }
     }
 
@@ -14293,8 +14298,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 contextUsageSnapshot = session.contextUsageSnapshot
             }
             syncActiveTranscriptFollowBindings(from: session)
-            if pendingImageAttachments != session.pendingImageAttachments {
-                pendingImageAttachments = session.pendingImageAttachments
+            if pendingFileAttachments != session.pendingFileAttachments {
+                pendingFileAttachments = session.pendingFileAttachments
             }
             if pendingTaggedFileAttachments != session.pendingTaggedFileAttachments {
                 pendingTaggedFileAttachments = session.pendingTaggedFileAttachments
@@ -14349,7 +14354,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             autoEditPermissionGuidance = nil
             contextUsage = nil
             contextUsageSnapshot = nil
-            pendingImageAttachments = []
+            pendingFileAttachments = []
             pendingTaggedFileAttachments = []
             selectedWorkflow = nil
         }
@@ -14885,8 +14890,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             if activeTranscriptFollowBindingState != previousFollowBindingState {
                 invalidation.insert(.transcript)
             }
-            if pendingImageAttachments != session.pendingImageAttachments {
-                pendingImageAttachments = session.pendingImageAttachments
+            if pendingFileAttachments != session.pendingFileAttachments {
+                pendingFileAttachments = session.pendingFileAttachments
                 invalidation.insert(.composer)
             }
             if pendingTaggedFileAttachments != session.pendingTaggedFileAttachments {
@@ -16854,7 +16859,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         persistedLoadAttemptByTabID.removeAll()
         persistedLoadProducerByTabID.removeAll()
         activeTranscriptPresentationScope = nil
-        lastProcessedTabID = nil
         if workspace == nil {
             workspaceSwitchInFlight = false
             clearBindings()
@@ -17348,7 +17352,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         guard workspaceManager?.isSwitchingWorkspace != true else {
             return false
         }
-        lastProcessedTabID = nil
         onTabChanged(targetTabID)
         return true
     }
@@ -19001,7 +19004,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let acpModelParameterSelections: [ACPModelParameterSelection]
         let autoEditEnabled: Bool
         let selectedWorkflow: AgentWorkflowDefinition?
-        let imageAttachments: [AgentImageAttachment]
+        let attachments: [AgentFileAttachment]
         let taggedFileAttachments: [AgentTaggedFileAttachment]
         let initialStartLocation: InitialStartLocation
 
@@ -19019,7 +19022,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             acpModelParameterSelections = session?.acpModelParameterSelections ?? []
             autoEditEnabled = session?.autoEditEnabled ?? fallbackAutoEditEnabled
             selectedWorkflow = session?.selectedWorkflow
-            imageAttachments = session?.pendingImageAttachments ?? []
+            attachments = session?.pendingFileAttachments ?? []
             taggedFileAttachments = session?.pendingTaggedFileAttachments ?? []
             initialStartLocation = session?.pendingInitialStartLocation ?? .local
         }
@@ -19033,7 +19036,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 && acpModelParameterSelections == session.acpModelParameterSelections
                 && autoEditEnabled == session.autoEditEnabled
                 && selectedWorkflow == session.selectedWorkflow
-                && imageAttachments == session.pendingImageAttachments
+                && attachments == session.pendingFileAttachments
                 && taggedFileAttachments == session.pendingTaggedFileAttachments
                 && initialStartLocation == session.pendingInitialStartLocation
         }
@@ -19054,14 +19057,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             && session.activeRunAttemptID == nil
             && session.items.isEmpty
             && session.transcript.turns.isEmpty
-            && session.pendingImageAttachments.isEmpty
+            && session.pendingFileAttachments.isEmpty
             && session.pendingTaggedFileAttachments.isEmpty
             && session.selectedWorkflow == nil
     }
 
     private func preflightInitialUserTurn(text: String, session: TabSession) -> UserTurnSubmissionResult? {
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        let attachments = session.pendingImageAttachments
+        let attachments = session.pendingFileAttachments
         let taggedFiles = session.pendingTaggedFileAttachments
         guard !trimmedText.isEmpty || !attachments.isEmpty || !taggedFiles.isEmpty else {
             return .blocked(message: "")
@@ -19079,7 +19082,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                session: session,
                attachments: attachments,
                taggedFiles: taggedFiles,
-               activeWorkflow: workflow
+               activeWorkflow: workflow,
+               deferComputerUseRuntimeCheckUntilArming: true
            )
         {
             return validationFailure
@@ -19308,7 +19312,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let session = session(for: tabID)
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard repromptedText == nil || isLocalComposerInput else { return .blocked(message: "Re-prompt is local composer input only.") }
-        let attachmentsToSend = session.pendingImageAttachments
+        let attachmentsToSend = session.pendingFileAttachments
         let taggedFilesToSend = session.pendingTaggedFileAttachments
         if Self.providerSwitchUnconfirmed(session) {
             return .blocked(message: AgentSessionLinkSendFailure.providerSwitchUnconfirmed.message)
@@ -19448,7 +19452,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         {
             session.selectedWorkflow = nil
             selectedWorkflow = nil
-            session.pendingImageAttachments.removeAll()
+            session.pendingFileAttachments.removeAll()
             session.pendingTaggedFileAttachments.removeAll()
         }
 
@@ -19523,7 +19527,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         originalSession: TabSession,
         originalBinding: AgentPersistentSessionBindingIdentity?,
         trimmedText: String,
-        attachmentsToSend: [AgentImageAttachment],
+        attachmentsToSend: [AgentFileAttachment],
         taggedFilesToSend: [AgentTaggedFileAttachment],
         activeWorkflow: AgentWorkflowDefinition?,
         nativePreparedTurn: NativeSlashPreparedUserTurn? = nil,
@@ -19552,7 +19556,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     repromptedText: repromptedText,
                     tabID: tabID, session: session,
                     draftText: retrieveDraftText(for: tabID) == submittedDraft ? "" : submittedDraft,
-                    images: attachmentsToSend, taggedFiles: taggedFilesToSend,
+                    attachments: attachmentsToSend, taggedFiles: taggedFilesToSend,
                     selectedWorkflow: restorationSelectedWorkflow,
                     selectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
                     message: message
@@ -19612,7 +19616,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
             let imageIDs = Set(attachmentsToSend.map(\.id))
             let fileIDs = Set(taggedFilesToSend.map(\.id))
-            hydratedSession.pendingImageAttachments.removeAll { imageIDs.contains($0.id) }
+            hydratedSession.pendingFileAttachments.removeAll { imageIDs.contains($0.id) }
             hydratedSession.pendingTaggedFileAttachments.removeAll { fileIDs.contains($0.id) }
         }
         return result
@@ -19694,7 +19698,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         userItemID: UUID,
         turnRuntimeAnchorRollback: AgentTurnUserAnchorRollbackState,
         draftText: String,
-        images: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         taggedFiles: [AgentTaggedFileAttachment],
         selectedWorkflow: AgentWorkflowDefinition?,
         selectedWorkflowMutationGeneration: UInt64?,
@@ -19723,7 +19727,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             tabID: tabID,
             session: session,
             draftText: draftText,
-            images: images,
+            attachments: attachments,
             taggedFiles: taggedFiles,
             selectedWorkflow: selectedWorkflow,
             selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
@@ -19736,7 +19740,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         tabID: UUID,
         session: TabSession,
         text: String,
-        attachments: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         taggedFiles: [AgentTaggedFileAttachment],
         userItemID: UUID,
         turnRuntimeAnchorRollback: AgentTurnUserAnchorRollbackState,
@@ -19791,7 +19795,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     userItemID: userItemID,
                     turnRuntimeAnchorRollback: turnRuntimeAnchorRollback,
                     draftText: draftText,
-                    images: attachments,
+                    attachments: attachments,
                     taggedFiles: taggedFiles,
                     selectedWorkflow: selectedWorkflow,
                     selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
@@ -19817,7 +19821,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     userItemID: userItemID,
                     turnRuntimeAnchorRollback: turnRuntimeAnchorRollback,
                     draftText: draftText,
-                    images: attachments,
+                    attachments: attachments,
                     taggedFiles: taggedFiles,
                     selectedWorkflow: selectedWorkflow,
                     selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
@@ -19837,7 +19841,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     userItemID: userItemID,
                     turnRuntimeAnchorRollback: turnRuntimeAnchorRollback,
                     draftText: draftText,
-                    images: attachments,
+                    attachments: attachments,
                     taggedFiles: taggedFiles,
                     selectedWorkflow: selectedWorkflow,
                     selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
@@ -19855,7 +19859,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     userItemID: userItemID,
                     turnRuntimeAnchorRollback: turnRuntimeAnchorRollback,
                     draftText: draftText,
-                    images: attachments,
+                    attachments: attachments,
                     taggedFiles: taggedFiles,
                     selectedWorkflow: selectedWorkflow,
                     selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
@@ -19873,7 +19877,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     userItemID: userItemID,
                     turnRuntimeAnchorRollback: turnRuntimeAnchorRollback,
                     draftText: draftText,
-                    images: attachments,
+                    attachments: attachments,
                     taggedFiles: taggedFiles,
                     selectedWorkflow: selectedWorkflow,
                     selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
@@ -19897,7 +19901,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     userItemID: userItemID,
                     turnRuntimeAnchorRollback: turnRuntimeAnchorRollback,
                     draftText: draftText,
-                    images: attachments,
+                    attachments: attachments,
                     taggedFiles: taggedFiles,
                     selectedWorkflow: selectedWorkflow,
                     selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
@@ -19919,7 +19923,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     userItemID: userItemID,
                     turnRuntimeAnchorRollback: turnRuntimeAnchorRollback,
                     draftText: draftText,
-                    images: attachments,
+                    attachments: attachments,
                     taggedFiles: taggedFiles,
                     selectedWorkflow: selectedWorkflow,
                     selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
@@ -19945,7 +19949,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     userItemID: userItemID,
                     turnRuntimeAnchorRollback: turnRuntimeAnchorRollback,
                     draftText: draftText,
-                    images: attachments,
+                    attachments: attachments,
                     taggedFiles: taggedFiles,
                     selectedWorkflow: selectedWorkflow,
                     selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
@@ -20236,7 +20240,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         tabID: UUID,
         session: TabSession,
         trimmedText originalText: String,
-        attachmentsToSend: [AgentImageAttachment],
+        attachmentsToSend: [AgentFileAttachment],
         taggedFilesToSend: [AgentTaggedFileAttachment],
         activeWorkflow: AgentWorkflowDefinition?,
         nativePreparedTurn: NativeSlashPreparedUserTurn? = nil,
@@ -20298,7 +20302,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 bubbleText = trimmedText
             }
         } else if !attachmentsToSend.isEmpty {
-            bubbleText = "Sent \(attachmentsToSend.count) image\(attachmentsToSend.count == 1 ? "" : "s")"
+            bubbleText = "Sent \(attachmentsToSend.count) attachment\(attachmentsToSend.count == 1 ? "" : "s")"
         } else {
             bubbleText = "Included \(taggedFilesToSend.count) file\(taggedFilesToSend.count == 1 ? "" : "s")"
         }
@@ -20396,7 +20400,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
                 let imageIDs = Set(attachmentsToSend.map(\.id))
                 let fileIDs = Set(taggedFilesToSend.map(\.id))
-                session.pendingImageAttachments.removeAll { imageIDs.contains($0.id) }
+                session.pendingFileAttachments.removeAll { imageIDs.contains($0.id) }
                 session.pendingTaggedFileAttachments.removeAll { fileIDs.contains($0.id) }
             }
         }
@@ -20561,7 +20565,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let fallbackContext = TabSession.CodexFallbackSubmissionContext(
                 queueID: UUID(),
                 providerText: wrappedText,
-                images: attachmentsToSend,
+                attachments: attachmentsToSend,
                 taggedFileAttachments: taggedFilesToSend,
                 draftText: restorationDraftText,
                 optimisticUserItemID: userItem.id,
@@ -20671,7 +20675,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                             tabID: tabID,
                             session: authoritativeSession,
                             draftText: fallbackContext.draftText,
-                            images: attachmentsToSend,
+                            attachments: attachmentsToSend,
                             taggedFiles: taggedFilesToSend,
                             selectedWorkflow: restorationSelectedWorkflow,
                             selectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
@@ -20741,7 +20745,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                             tabID: tabID,
                             session: session,
                             draftText: restorationDraftText,
-                            images: attachmentsToSend,
+                            attachments: attachmentsToSend,
                             taggedFiles: taggedFilesToSend,
                             selectedWorkflow: restorationSelectedWorkflow,
                             selectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
@@ -20882,7 +20886,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     private func activeProviderSteeringRoute(
         for session: TabSession,
-        attachments: [AgentImageAttachment] = []
+        attachments: [AgentFileAttachment] = []
     ) -> ActiveProviderSteeringRoute? {
         guard session.runState == .running,
               session.pendingApproval == nil else { return nil }
@@ -20897,7 +20901,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     private func activeACPPromptIsAvailable(
         for session: TabSession,
-        attachments: [AgentImageAttachment]
+        attachments: [AgentFileAttachment]
     ) -> Bool {
         guard session.selectedAgent.acpProviderID != nil,
               session.runState == .running,
@@ -20957,7 +20961,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         _ route: ActiveProviderSteeringRoute,
         session: TabSession,
         wrappedText: String,
-        attachmentsToSend: [AgentImageAttachment],
+        attachmentsToSend: [AgentFileAttachment],
         taggedFilesToSend: [AgentTaggedFileAttachment],
         trimmedText: String,
         userItem: AgentChatItem,
@@ -21252,9 +21256,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private func validateNativeSlashCommandUsage(
         _ invocation: ResolvedNativeSlashCommand,
         session: TabSession,
-        attachments: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         taggedFiles: [AgentTaggedFileAttachment],
-        activeWorkflow: AgentWorkflowDefinition?
+        activeWorkflow: AgentWorkflowDefinition?,
+        deferComputerUseRuntimeCheckUntilArming: Bool = false
     ) -> UserTurnSubmissionResult? {
         let argumentsText = invocation.argumentsText
         if activeWorkflow != nil,
@@ -21300,7 +21305,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
            let availabilityMessage = codexCoordinator.nativeSlashCommandAvailabilityMessage(
                invocation.command,
                argumentsText: argumentsText,
-               session: session
+               session: session,
+               deferComputerUseRuntimeCheckUntilArming: deferComputerUseRuntimeCheckUntilArming
            )
         {
             return .blocked(message: availabilityMessage)
@@ -21450,7 +21456,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     func renderProviderMessage(
         text: String,
-        attachments: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         agent: AgentProviderKind
     ) -> String {
         guard !attachments.isEmpty else { return text }
@@ -21459,15 +21465,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return renderAtPathAttachmentMessage(text: text, attachments: attachments)
         case .codexExec, .grokBuild, .devin:
             // These transports deliver pixels natively but no file path, so the agent could not
-            // otherwise name the image in ask_oracle `images`.
+            // otherwise name the file in ask_oracle `attachments`.
             return renderAttachmentPathNote(text: text, attachments: attachments)
         }
     }
 
     static let attachmentPathNoteHeader =
-        "Attached image files (to share one with the Oracle, pass its path in ask_oracle `images`):"
+        "Attached files (to share one with the Oracle, pass its path in ask_oracle `attachments`):"
 
-    private func renderAttachmentPathNote(text: String, attachments: [AgentImageAttachment]) -> String {
+    private func renderAttachmentPathNote(text: String, attachments: [AgentFileAttachment]) -> String {
         let paths = attachments.compactMap { attachment -> String? in
             guard case let .localFile(path) = attachment.source else { return nil }
             let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -21478,7 +21484,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return text.isEmpty ? note : text + "\n\n" + note
     }
 
-    private func renderAtPathAttachmentMessage(text: String, attachments: [AgentImageAttachment]) -> String {
+    private func renderAtPathAttachmentMessage(text: String, attachments: [AgentFileAttachment]) -> String {
         var lines: [String] = []
         for attachment in attachments {
             switch attachment.source {
@@ -21920,7 +21926,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     @MainActor
     func augmentUserMessageForProviderSend(
         _ text: String,
-        attachments: [AgentImageAttachment] = [],
+        attachments: [AgentFileAttachment] = [],
         taggedFileAttachments: [AgentTaggedFileAttachment] = [],
         agent: AgentProviderKind? = nil,
         session: TabSession? = nil,
@@ -22198,7 +22204,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     func startAgentRun(
         tabID: UUID,
         initialMessage: String,
-        attachments: [AgentImageAttachment] = [],
+        attachments: [AgentFileAttachment] = [],
         taggedFileAttachments: [AgentTaggedFileAttachment] = [],
         codexFallbackContext: TabSession.CodexFallbackSubmissionContext? = nil,
         autoEffortSelection: AutoEffortTurnSelection? = nil,
@@ -22363,7 +22369,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             TabSession.CodexFallbackSubmissionContext(
                 queueID: context.queueID,
                 providerText: initialMessageForRun,
-                images: context.images,
+                attachments: context.attachments,
                 taggedFileAttachments: context.taggedFileAttachments,
                 draftText: context.draftText,
                 optimisticUserItemID: context.optimisticUserItemID,
@@ -22403,7 +22409,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session: TabSession,
         initialMessageForRun: String,
         runID: UUID,
-        attachments: [AgentImageAttachment]
+        attachments: [AgentFileAttachment]
     ) -> AgentMessage {
         // Build initial message - for providers with resumable sessions, use --resume when available.
         let supportsSessionResume = session.selectedAgent.usesClaudeNativeRuntime || session.selectedAgent.acpProviderID != nil
@@ -23952,7 +23958,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ) -> Bool {
         guard let continuation = session.instructionContinuation else { return false }
         session.noteAcceptedTaskInput() // User and lane-update continuations reuse, never reset, the attempt.
-
         let released = inputProof.flatMap { proof in
             claim.map { agentSessionLinkHandoffProviderInput(for: session, dispatchID: $0.dispatchID, claim: $0, proof: proof) }
         }
@@ -24383,7 +24388,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         func test_submitWaitingClaudeAttachment(
             session: TabSession,
             text: String,
-            attachment: AgentImageAttachment
+            attachment: AgentFileAttachment
         ) -> UserTurnSubmissionResult {
             submitPreparedUserTurn(
                 tabID: session.tabID, session: session, trimmedText: text,
@@ -24767,7 +24772,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         session.setItemsSilently([], reason: .clearedChat)
         session.clearDerivedTranscriptCaches()
-        session.pendingImageAttachments.removeAll()
+        session.pendingFileAttachments.removeAll()
         session.pendingTaggedFileAttachments.removeAll()
         session.attachmentsPendingProviderConsumptionCleanup.removeAll()
         session.nextSequenceIndex = 0
@@ -25074,10 +25079,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         let activeTabID = currentTabID
         if activeTabID.map(affectedTabIDs.contains) == true {
-            lastProcessedTabID = nil
             onTabChanged(activeTabID)
         } else if activeTabID == nil, !affectedTabIDs.isEmpty {
-            lastProcessedTabID = nil
             onTabChanged(nil)
         }
         syncSidebarUIState(refresh: true, reason: .sessionIndex)
@@ -25113,10 +25116,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         #endif
         let sessionID = boundSessionID(for: tabID)
         let liveSession = sessions[tabID]
-        let wasCurrentTab = currentTabID == tabID
-        if wasCurrentTab {
-            lastProcessedTabID = nil
-        }
         if let sessionID {
             liveSession?.saveDebounceTask?.cancel()
             liveSession?.saveDebounceTask = nil
@@ -25263,7 +25262,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         let hasTranscript = !session.transcript.turns.isEmpty || !session.items.isEmpty
         let hasDraft = !session.draftText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        let hasPendingAttachments = !session.pendingImageAttachments.isEmpty || !session.pendingTaggedFileAttachments.isEmpty
+        let hasPendingAttachments = !session.pendingFileAttachments.isEmpty || !session.pendingTaggedFileAttachments.isEmpty
         let hasPendingInteraction = session.runState == .waitingForUser
             || session.hasPendingQuestionUI
             || session.pendingApproval != nil

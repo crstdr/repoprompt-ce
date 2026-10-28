@@ -731,8 +731,10 @@ final class DomainWorkspacePresentationBridge {
               let workspaceID = event.workspaceID,
               projectedModels[workspaceID] != nil,
               let baselineGeneration = acceptedReconciliationGeneration,
-              workspaceManager?.admitsDomainSelfEcho(baselineGeneration: baselineGeneration) == true
+              let manager = workspaceManager,
+              manager.admitsDomainSelfEcho(baselineGeneration: baselineGeneration)
         else { return false }
+        let authorityHealthGeneration = manager.domainAuthorityHealthGeneration
         guard let workspace = await client.canonicalWorkspaceSnapshot(workspaceID),
               workspace.health.acceptsMutations
         else { return false }
@@ -746,11 +748,12 @@ final class DomainWorkspacePresentationBridge {
             catalogRevision: event.catalogRevision,
             publicationSequence: event.sequence,
             baselineGeneration: baselineGeneration,
+            authorityHealthGeneration: authorityHealthGeneration,
             operationID: event.operationID,
             eventRevisions: event.revisions
         ) == true else { return false }
         guard subscriptionRunID == ownerRunID, !Task.isCancelled,
-              let manager = workspaceManager, !manager.isPreparingForWindowClose,
+              !manager.isPreparingForWindowClose,
               let generation = manager.adoptedFullDocumentGeneration(
                   workspaceID: workspaceID, contentDigest: workspace.document.contentDigest
               ),
