@@ -4015,10 +4015,6 @@ private actor MonitorRemovalConnection: MCPServerConnection {
 }
 
 actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
-    func emit(_ event: NativeAgentRuntimeEvent) {
-        continuation?.yield(event)
-    }
-
     private var configuration = SessionLinkNativeConfigurationFixture()
     private(set) var sentMessages: [String] = []
     private var lastSentTurnID: UUID?
@@ -4066,12 +4062,6 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
     func emit(_ event: NativeAgentRuntimeEvent) {
         _ = events
         continuation?.yield(event)
-    }
-
-    private var sendSuspension: (@Sendable () async -> Void)?
-
-    func setSendSuspension(_ suspension: @escaping @Sendable () async -> Void) {
-        sendSuspension = suspension
     }
 
     func setTurnInFlight(_ value: Bool) {

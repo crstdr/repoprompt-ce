@@ -5656,7 +5656,7 @@ import XCTest
                     operationID: nil, eventRevisions: stale.revisions
                 ))
                 XCTAssertEqual(manager.domainCatalogReconciliationGeneration, baseline.reconciliationGeneration)
-                XCTAssertEqual(manager.catalogPreparationWitness.health[stale.document.workspaceID], degraded.health)
+                XCTAssertEqual(manager.debugDomainAuthorityBaseline(for: stale.document.workspaceID).health, degraded.health)
             }
         }
     }

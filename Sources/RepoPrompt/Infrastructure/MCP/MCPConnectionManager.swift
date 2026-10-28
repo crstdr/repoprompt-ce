@@ -7894,13 +7894,6 @@ actor ServerNetworkManager {
         isSessionInTerminationCooldown(sessionToken)
     }
 
-    /// Liveness fence for queued approval UI; process identity may be unavailable
-    /// even for a live connection, so a missing peer PID is not a close signal.
-    func isConnectionLiveForApproval(_ connectionID: UUID) -> Bool {
-        guard let generation = connectionLifecycleGenerationByID[connectionID] else { return false }
-        return isCurrentConnection(connectionID, lifecycleGeneration: generation)
-    }
-
     /// Checks if a clientID is in user-initiated kill cooldown.
     /// Returns true if the client was killed by user action within the cooldown period.
     private func isClientInUserKillCooldown(_ clientID: String) -> Bool {
@@ -14286,7 +14279,6 @@ actor ServerNetworkManager {
                         || toolName == MCPWindowToolName.sessionAdmin
                         || toolName == MCPWindowToolName.selfNoop
                 )
-
                     ? await liveSessionLinkGrantSnapshot(connectionID: connectionID, modelOnly: isMemoryOnlyModelCall)
                     : nil
                 guard await isCurrentToolPolicyAdmission(policyAdmissionToken) else {
@@ -14313,7 +14305,9 @@ actor ServerNetworkManager {
                         return policyChangedResult()
                     }
                 } catch MCPDomainCallPolicyDenial.missingAdditionalGrant
-                    where AgentSessionLinkCatalogSurface.toolNames.contains(toolName)
+                    where toolName == MCPWindowToolName.agentSessionLink
+                    || toolName == MCPWindowToolName.becomeOverseer
+                    || toolName == MCPWindowToolName.sessionAdmin
                 {
                     #if DEBUG
                         await debugPolicyDiagnostic("toolsCallRejected", connectionID: connectionID, policy: effectivePolicy, extra: [
@@ -14395,7 +14389,6 @@ actor ServerNetworkManager {
                         || toolName == MCPWindowToolName.sessionAdmin
                         || toolName == MCPWindowToolName.selfNoop
                 )
-
                     ? await liveSessionLinkGrantSnapshot(connectionID: connectionID, modelOnly: isMemoryOnlyModelCall)
                     : nil
                 guard await isCurrentToolPolicyAdmission(policyAdmissionToken) else {
@@ -17032,6 +17025,13 @@ actor ServerNetworkManager {
             .map { String(format: "%02x", $0) }
             .joined()
         return (fingerprint, nil)
+    }
+
+    /// Liveness fence for queued approval UI; process identity may be unavailable
+    /// even for a live connection, so a missing peer PID is not a close signal.
+    func isConnectionLiveForApproval(_ connectionID: UUID) -> Bool {
+        guard let generation = connectionLifecycleGenerationByID[connectionID] else { return false }
+        return isCurrentConnection(connectionID, lifecycleGeneration: generation)
     }
 
     /// Returns the verified peer PID for a bootstrap socket connection, if available.

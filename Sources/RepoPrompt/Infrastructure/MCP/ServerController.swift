@@ -10,6 +10,7 @@ import Darwin
 import Foundation
 import Logging
 import OSLog
+import RepoPromptSettingsCore
 import RepoPromptShared
 import SwiftUI
 
@@ -38,10 +39,16 @@ final actor ServerController: ObservableObject {
     private var pendingConnectionID: String?
     weak var mcpService: MCPService?
 
-    /// Legacy display-name records are retained for inspection/removal only.
-    /// Initialize metadata is not a verified principal and never grants admission.
+    /// Default ("Always allow") mode deliberately trusts self-reported names, as before #1346.
+    /// Strict mode ignores both this persisted list and the built-in set.
     private static let alwaysAllowedKey = "mcp.alwaysAllowedClients"
-    private var alwaysAllowedClients: Set<String> = ServerController.loadLegacyClientNames()
+    private static let defaultAlwaysAllowedClients: Set<String> = [
+        "claude-code", "codex-mcp-client", "gemini-cli-mcp-client",
+        "opencode", "cursor", "cursor-mcp-client", "claude-ai"
+    ]
+    private var alwaysAllowedClients: Set<String>
+    private let approvalDefaults: UserDefaults
+    private let strictConnectionApprovalEnabled: @Sendable () async -> Bool
 
     /// –––––  Private implementation helpers  –––––
     private enum DesiredTransportState: Equatable {
@@ -60,17 +67,40 @@ final actor ServerController: ObservableObject {
         case controllerReleased
     }
 
-    private let networkManager = ServerNetworkManager.shared
+    private let networkManager: ServerNetworkManager
     private let globalRegistrationOperation: @Sendable () async throws -> Void
     private let beforeTransportActivationOperation: @Sendable () async throws -> Void
     private var lifecycleGeneration: UInt64 = 0
     private var desiredTransportState: DesiredTransportState = .stopped
     private var activeStartAttempt: StartAttempt?
     private var activeApprovalDialogs: Set<String> = []
-    private var pendingApprovals: [(String, () -> Void, () -> Void)] = []
+    private struct ApprovalRequest {
+        let clientID: String
+        let principal: MCPApprovalProcessIdentity?
+        let validate: @Sendable () async -> Bool
+        let isConnectionLive: @Sendable () async -> Bool
+        let approve: () -> Void
+        let deny: () -> Void
+    }
+
+    private struct SessionDecision {
+        let allowed: Bool
+        let deniedUntil: TimeInterval
+        let order: UInt64
+    }
+
+    private var pendingApprovals: [ApprovalRequest] = []
+    private var currentApproval: ApprovalRequest?
+    /// Reserves the FIFO head across asynchronous liveness/session checks.
+    private var preparingApproval = false
+    private var sessionDecisions: [MCPApprovalProcessIdentity: SessionDecision] = [:]
+    private var decisionOrder: UInt64 = 0
+    private let monotonicNow: @Sendable () -> TimeInterval
+    private let processIsCurrent: @Sendable (MCPApprovalProcessIdentity) -> Bool
+    private let denialCooldown: TimeInterval = 60
 
     // –––––  Injected callbacks for approval flow  –––––
-    nonisolated(unsafe) var onApprovalRequest: ((String, UInt64) async -> Void)?
+    nonisolated(unsafe) var onApprovalRequest: ((String, UInt64, String?) async -> Void)?
     nonisolated(unsafe) var onApprovalResolved: ((Bool) -> Void)?
 
     /// Activity token used to disable App Nap while the server runs.
@@ -78,7 +108,7 @@ final actor ServerController: ObservableObject {
     private var wakeObserver: NSObjectProtocol?
 
     /// Set the approval callback
-    func setApprovalCallback(_ callback: @escaping (String, UInt64) async -> Void) {
+    func setApprovalCallback(_ callback: @escaping (String, UInt64, String?) async -> Void) {
         onApprovalRequest = callback
     }
 
@@ -88,12 +118,28 @@ final actor ServerController: ObservableObject {
 
     /// –––––  Init: wire approval-flow & kick off the listener  –––––
     init(
+        networkManager: ServerNetworkManager = .shared,
         globalRegistrationOperation: @escaping @Sendable () async throws -> Void = {
             try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
         },
         beforeTransportActivationOperation: @escaping @Sendable () async throws -> Void = {},
-        installNetworkCallbacks: Bool = true
+        installNetworkCallbacks: Bool = true,
+        approvalDefaults: UserDefaults = .standard,
+        strictConnectionApprovalEnabled: @escaping @Sendable () async -> Bool = {
+            await MainActor.run { GlobalSettingsStore.shared.mcpStrictConnectionApproval() }
+        },
+        monotonicNow: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        processIsCurrent: @escaping @Sendable (MCPApprovalProcessIdentity) -> Bool = {
+            MCPApprovalProcessIdentity.read(pid: $0.pid) == $0
+        }
     ) {
+        self.networkManager = networkManager
+        self.approvalDefaults = approvalDefaults
+        alwaysAllowedClients = Self.loadLegacyClientNames(defaults: approvalDefaults)
+            .filter { !Self.isRepoPromptCLIClientName($0) }
+        self.strictConnectionApprovalEnabled = strictConnectionApprovalEnabled
+        self.monotonicNow = monotonicNow
+        self.processIsCurrent = processIsCurrent
         self.globalRegistrationOperation = globalRegistrationOperation
         self.beforeTransportActivationOperation = beforeTransportActivationOperation
         if installNetworkCallbacks {
@@ -105,7 +151,7 @@ final actor ServerController: ObservableObject {
 
     private func bootstrapCallbacks() async {
         // Wire up dashboard update callback to notify MCPService
-        await ServerNetworkManager.shared.setOnDashboardUpdate { [weak self] in
+        await networkManager.setOnDashboardUpdate { [weak self] in
             guard let self else { return }
             Task {
                 guard let service = await self.mcpService else { return }
@@ -114,7 +160,7 @@ final actor ServerController: ObservableObject {
         }
 
         // Wire up identity escalation callback
-        await ServerNetworkManager.shared.setOnIdentityEscalation { [weak self] reason in
+        await networkManager.setOnIdentityEscalation { [weak self] reason in
             guard let self else { return }
             Task {
                 guard let service = await self.mcpService else { return }
@@ -128,82 +174,112 @@ final actor ServerController: ObservableObject {
         }
 
         // Set up approval handler
-        await networkManager.setConnectionApprovalHandler { [weak self]
-            connectionID, client in
-                guard let self else { return false }
+        await networkManager.setConnectionApprovalHandler { [weak self] connectionID, client in
+            guard let self else { return false }
+            return await authorizeConnection(connectionID: connectionID, clientName: client.name)
+        }
+        await installWakeObserverIfNeeded()
+    }
 
-                serverControllerDebugLog("Approval handler called for client: '\(client.name)' connectionID: \(connectionID)")
+    /// Shared by live socket initialization and isolated transport regression tests.
+    private func authorizeConnection(connectionID: UUID, clientName: String) async -> Bool {
+        serverControllerDebugLog("Approval handler called for client: '\(clientName)' connectionID: \(connectionID)")
 
-                // Reserve a slot BEFORE any UI to avoid stampedes
-                guard await networkManager.tryReserveConnectionSlot(
-                    connectionID: connectionID, clientID: client.name
-                ) else {
-                    log.warning("Failed to reserve connection slot for '\(client.name)'")
-                    return false
-                }
-
-                // Global auto-approve: skip UI for all new clients
-                if await autoApproveAllClients {
-                    serverControllerDebugLog("Auto-approving '\(client.name)' (global auto-approve enabled)")
-                    if let service = await mcpService {
-                        await service.clientConnectedSuccessfully(name: client.name)
-                    }
-                    return true
-                }
-
-                // Built-in auto-approve for RepoPrompt's own CLI clients requires
-                // executable verification. Do not consult the generic allow-list for these
-                // spoofable client names.
-                let isRepoCLI = Self.isRepoPromptCLIClientName(client.name)
-                let verifiedHelperPID = await bundledRepoPromptHelperPID(connectionID: connectionID)
-                let verifiedBundledCLI = verifiedHelperPID != nil
-                let appManagedAgent = if let verifiedHelperPID {
-                    await networkManager.authorizeAutomaticAppManagedAgentAdmission(
-                        connectionID: connectionID,
-                        clientName: client.name,
-                        verifiedBundledHelperPID: verifiedHelperPID
-                    )
-                } else {
-                    false
-                }
-                if Self.canAutomaticallyApprove(clientName: client.name, bundledCLI: verifiedBundledCLI) || appManagedAgent {
-                    serverControllerDebugLog("Auto-approving '\(client.name)' (bundled helper verified; appManagedAgent=\(appManagedAgent))")
-                    if let service = await mcpService {
-                        await service.clientConnectedSuccessfully(name: client.name)
-                    }
-                    return true
-                } else if isRepoCLI {
-                    log.warning("RepoPrompt CLI name matched but executable path verification failed for connectionID=\(connectionID)")
-                }
-
-                // All other peers require a connection-specific decision. Built-in and
-                // legacy saved names are display metadata, not executable principals.
-
-                // Otherwise request approval through the callback
-                let approved = await withCheckedContinuation { c in
-                    Task {
-                        await self.requestApproval(
-                            clientID: client.name,
-                            approve: { c.resume(returning: true) },
-                            deny: { c.resume(returning: false) }
-                        )
-                    }
-                }
-                if !approved {
-                    await networkManager.terminateConnection(
-                        connectionID,
-                        reason: .approvalDenied,
-                        message: "Denied by user"
-                    )
-                } else {
-                    // Client manually approved - clear any previous errors for this client
-                    if let service = await mcpService {
-                        await service.clientConnectedSuccessfully(name: client.name)
-                    }
-                }
-                return approved
+        // Reserve a slot BEFORE any UI to avoid stampedes
+        guard await networkManager.tryReserveConnectionSlot(
+            connectionID: connectionID, clientID: clientName
+        ) else {
+            log.warning("Failed to reserve connection slot for '\(clientName)'")
+            return false
         }
 
+        // The explicit global bypass applies in both approval modes; strict mode
+        // only disables name-based grants (built-in and saved client names).
+        if autoApproveAllClients {
+            serverControllerDebugLog("Auto-approving '\(clientName)' (global auto-approve enabled)")
+            if let service = mcpService {
+                await service.clientConnectedSuccessfully(name: clientName)
+            }
+            return true
+        }
+
+        // Built-in auto-approve for RepoPrompt's own CLI clients requires
+        // executable verification. Do not consult the generic allow-list for these
+        // spoofable client names.
+        let isRepoCLI = Self.isRepoPromptCLIClientName(clientName)
+        let verifiedHelperPID = await bundledRepoPromptHelperPID(connectionID: connectionID)
+        let verifiedBundledCLI = verifiedHelperPID != nil
+        let appManagedAgent = if let verifiedHelperPID {
+            await networkManager.authorizeAutomaticAppManagedAgentAdmission(
+                connectionID: connectionID,
+                clientName: clientName,
+                verifiedBundledHelperPID: verifiedHelperPID
+            )
+        } else {
+            false
+        }
+        if Self.canAutomaticallyApprove(clientName: clientName, bundledCLI: verifiedBundledCLI) || appManagedAgent {
+            serverControllerDebugLog("Auto-approving '\(clientName)' (bundled helper verified; appManagedAgent=\(appManagedAgent))")
+            if let service = mcpService {
+                await service.clientConnectedSuccessfully(name: clientName)
+            }
+            return true
+        } else if isRepoCLI {
+            log.warning("RepoPrompt CLI name matched but executable path verification failed for connectionID=\(connectionID)")
+        }
+
+        if await !strictConnectionApprovalEnabled(), isClientAlwaysAllowed(clientName) {
+            serverControllerDebugLog("Auto-approving '\(clientName)' (always-allowed client name)")
+            await mcpService?.clientConnectedSuccessfully(name: clientName)
+            return true
+        }
+
+        // Reconnect consent belongs to an OS-observed process lifetime, never
+        // to initialize metadata. Bundled transports use their immediate launcher.
+        let principal = await approvalPrincipal(
+            connectionID: connectionID, bundledHelper: verifiedBundledCLI
+        )
+
+        let peerIdentity = await approvalPeerIdentity(connectionID: connectionID)
+
+        // Otherwise request approval through the callback
+        let approved = await withCheckedContinuation { c in
+            Task {
+                await self.requestApproval(
+                    clientID: clientName,
+                    principal: principal,
+                    validate: {
+                        guard await self.networkManager.isConnectionLiveForApproval(connectionID) else { return false }
+                        guard let principal else { return true }
+                        guard let peerIdentity,
+                              await self.approvalPeerIdentity(connectionID: connectionID) == peerIdentity
+                        else { return false }
+                        return await self.approvalPrincipal(
+                            connectionID: connectionID, bundledHelper: verifiedBundledCLI
+                        ) == principal
+                    },
+                    isConnectionLive: { await self.networkManager.isConnectionLiveForApproval(connectionID) },
+                    approve: { c.resume(returning: true) },
+                    deny: { c.resume(returning: false) }
+                )
+            }
+        }
+        if !approved {
+            await networkManager.terminateConnection(
+                connectionID,
+                reason: .approvalDenied,
+                message: "Denied by user"
+            )
+        } else {
+            // Client manually approved - clear any previous errors for this client
+            if let service = mcpService {
+                await service.clientConnectedSuccessfully(name: clientName)
+            }
+        }
+        return approved
+    }
+
+    private func installWakeObserverIfNeeded() async {
         // Register wake observer if not already registered
         guard wakeObserver == nil else { return }
         let networkMgr = networkManager
@@ -229,17 +305,34 @@ final actor ServerController: ObservableObject {
 
     // MARK: – Allow-list helpers –
 
-    /// Compatibility surface for the dashboard: no display name is inherently trusted.
-    static func isBuiltInAlwaysAllowedClient(_: String) -> Bool {
-        false
+    static func isBuiltInAlwaysAllowedClient(_ clientID: String) -> Bool {
+        !isRepoPromptCLIClientName(clientID)
+            && defaultAlwaysAllowedClients.contains { MCPClientIdentity.matches($0, clientID) }
+    }
+
+    private func isClientAlwaysAllowed(_ clientID: String) -> Bool {
+        // RepoPrompt CLI names must still pass bundled executable verification.
+        guard !Self.isRepoPromptCLIClientName(clientID) else { return false }
+        if Self.isBuiltInAlwaysAllowedClient(clientID) { return true }
+        return alwaysAllowedClients.contains { MCPClientIdentity.matches($0, clientID) }
+    }
+
+    /// RepoPrompt CLI names are reserved for verified bundled helpers and are never saved.
+    static func canSaveAlwaysAllowed(clientName: String) -> Bool {
+        !isRepoPromptCLIClientName(clientName)
+    }
+
+    private func addAlwaysAllowed(clientID: String) {
+        guard Self.canSaveAlwaysAllowed(clientName: clientID), !isClientAlwaysAllowed(clientID) else { return }
+        alwaysAllowedClients.insert(clientID)
+        approvalDefaults.set(Array(alwaysAllowedClients).sorted(), forKey: Self.alwaysAllowedKey)
     }
 
     static func loadLegacyClientNames(defaults: UserDefaults = .standard) -> Set<String> {
         Set(defaults.stringArray(forKey: alwaysAllowedKey) ?? [])
     }
 
-    /// Only the existing kernel-observed bundled-executable check may authorize a
-    /// named client automatically. Saved names deliberately do not enter this policy.
+    /// Verified bundled-helper admission is independent of the selected approval mode.
     static func canAutomaticallyApprove(clientName: String, bundledCLI verified: Bool) -> Bool {
         isRepoPromptCLIClientName(clientName) && verified
     }
@@ -249,12 +342,27 @@ final actor ServerController: ObservableObject {
     }
 
     #if DEBUG
+        func test_authorizeConnection(connectionID: UUID, clientName: String) async -> Bool {
+            await authorizeConnection(connectionID: connectionID, clientName: clientName)
+        }
+
+        func test_timeoutApproval(generation: UInt64) async {
+            guard let clientID = pendingConnectionID else { return }
+            await handleApprovalTimeout(clientID: clientID, expectedGeneration: generation)
+        }
+
         func test_requestApproval(
             clientID: String,
+            principal: MCPApprovalProcessIdentity? = nil,
+            validate: @escaping @Sendable () async -> Bool = { true },
+            isConnectionLive: @escaping @Sendable () async -> Bool = { true },
             approve: @escaping () -> Void,
             deny: @escaping () -> Void
         ) async {
-            await requestApproval(clientID: clientID, approve: approve, deny: deny)
+            await requestApproval(
+                clientID: clientID, principal: principal, validate: validate,
+                isConnectionLive: isConnectionLive, approve: approve, deny: deny
+            )
         }
     #endif
 
@@ -270,6 +378,16 @@ final actor ServerController: ObservableObject {
         return actual == expected ? peerPID : nil
     }
 
+    private func approvalPeerIdentity(connectionID: UUID) async -> MCPApprovalProcessIdentity? {
+        guard let pid = await networkManager.peerPID(for: connectionID), pid > 1, pid <= Int(Int32.max) else { return nil }
+        return MCPApprovalProcessIdentity.read(pid: Int32(pid))
+    }
+
+    private func approvalPrincipal(connectionID: UUID, bundledHelper: Bool) async -> MCPApprovalProcessIdentity? {
+        guard let pid = await networkManager.peerPID(for: connectionID), pid > 1, pid <= Int(Int32.max) else { return nil }
+        return MCPApprovalProcessIdentity.resolve(peerPID: Int32(pid), bundledHelper: bundledHelper)
+    }
+
     private nonisolated static func executablePath(forPID pid: Int) -> String? {
         var buffer = [CChar](repeating: 0, count: 4096)
         let result = proc_pidpath(pid_t(pid), &buffer, UInt32(buffer.count))
@@ -283,7 +401,7 @@ final actor ServerController: ObservableObject {
     func alwaysAllowedClientIDs() -> [String] {
         var seen = Set<String>()
         var values: [String] = []
-        for clientID in alwaysAllowedClients.sorted() {
+        for clientID in alwaysAllowedClients.union(Self.defaultAlwaysAllowedClients).sorted() {
             let dedupeKey = MCPClientIdentity.storageKey(clientID) ?? clientID
             guard seen.insert(dedupeKey).inserted else { continue }
             values.append(clientID)
@@ -293,11 +411,13 @@ final actor ServerController: ObservableObject {
 
     /// Add or remove a client from the persistent allow-list
     func setAlwaysAllowed(clientID: String, allowed: Bool) async {
-        // Name-only standing approvals are no longer supported. Keep old records
-        // unchanged unless the user explicitly removes a displayed record.
-        if !allowed {
-            alwaysAllowedClients.remove(clientID)
-            UserDefaults.standard.set(
+        if allowed {
+            guard await !strictConnectionApprovalEnabled() else { return }
+            addAlwaysAllowed(clientID: clientID)
+        } else {
+            guard !Self.isBuiltInAlwaysAllowedClient(clientID) else { return }
+            alwaysAllowedClients = alwaysAllowedClients.filter { !MCPClientIdentity.matches($0, clientID) }
+            approvalDefaults.set(
                 Array(alwaysAllowedClients),
                 forKey: Self.alwaysAllowedKey
             )
@@ -311,8 +431,8 @@ final actor ServerController: ObservableObject {
 
     /// Whether to auto-approve all new clients without user confirmation
     private var autoApproveAllClients: Bool {
-        get { UserDefaults.standard.bool(forKey: Self.autoApproveAllClientsKey) }
-        set { UserDefaults.standard.set(newValue, forKey: Self.autoApproveAllClientsKey) }
+        get { approvalDefaults.bool(forKey: Self.autoApproveAllClientsKey) }
+        set { approvalDefaults.set(newValue, forKey: Self.autoApproveAllClientsKey) }
     }
 
     func getAutoApproveAllClients() -> Bool {
@@ -528,35 +648,88 @@ final actor ServerController: ObservableObject {
     /// Approval requests are handled in strict FIFO order: exactly one active request at a time.
     private func requestApproval(
         clientID: String,
+        principal: MCPApprovalProcessIdentity? = nil,
+        validate: @escaping @Sendable () async -> Bool = { true },
+        isConnectionLive: @escaping @Sendable () async -> Bool = { true },
         approve: @escaping () -> Void,
         deny: @escaping () -> Void
     ) async {
-        // Single-flight guard: queue while another approval is active.
-        if currentApprovalCallbacks != nil {
-            pendingApprovals.append((clientID, approve, deny))
+        let request = ApprovalRequest(
+            clientID: clientID, principal: principal, validate: validate,
+            isConnectionLive: isConnectionLive, approve: approve, deny: deny
+        )
+        await enqueueApproval(request)
+    }
+
+    private func enqueueApproval(_ request: ApprovalRequest) async {
+        // Register arrival and reserve capacity before any actor suspension.
+        // Include the head being validated, which has already left the array.
+        guard pendingApprovals.count + (currentApproval != nil || preparingApproval ? 1 : 0) < 32 else {
+            request.deny()
             return
         }
-        await beginApprovalRequest(clientID: clientID, approve: approve, deny: deny)
+        pendingApprovals.append(request)
+        await activateNextQueuedApprovalIfNeeded()
+    }
+
+    /// Returns true if the request was resolved without presenting UI.
+    private func resolveSessionDecision(_ request: ApprovalRequest) async -> Bool {
+        guard let principal = request.principal else { return false }
+        guard processIsCurrent(principal) else {
+            sessionDecisions.removeValue(forKey: principal)
+            request.deny()
+            return true
+        }
+        guard let decision = sessionDecisions[principal] else { return false }
+        if !decision.allowed, monotonicNow() >= decision.deniedUntil {
+            sessionDecisions.removeValue(forKey: principal)
+            return false
+        }
+        if decision.allowed {
+            if await request.validate(), processIsCurrent(principal) { request.approve() } else { request.deny() }
+        } else {
+            request.deny()
+        }
+        return true
+    }
+
+    private func rememberDecision(for request: ApprovalRequest, allow: Bool) {
+        guard let principal = request.principal, processIsCurrent(principal) else { return }
+        let now = monotonicNow()
+        // Dead process entries are harmless: each lookup checks the full process
+        // lifetime. Prune expiry here and bound storage without scanning 256 PIDs.
+        sessionDecisions = sessionDecisions.filter { $0.value.allowed || $0.value.deniedUntil > now }
+        if sessionDecisions[principal] == nil, sessionDecisions.count >= 256 {
+            // Only at capacity, retire dead lifetimes before evicting a long-lived
+            // launcher's consent. Routine decisions never scan every process.
+            sessionDecisions = sessionDecisions.filter { processIsCurrent($0.key) }
+            if sessionDecisions.count >= 256,
+               let oldest = sessionDecisions.min(by: { $0.value.order < $1.value.order })?.key
+            {
+                sessionDecisions.removeValue(forKey: oldest)
+            }
+        }
+        decisionOrder &+= 1
+        sessionDecisions[principal] = SessionDecision(
+            allowed: allow, deniedUntil: now + denialCooldown, order: decisionOrder
+        )
     }
 
     /// Starts a single active approval request and schedules its timeout watchdog.
-    private func beginApprovalRequest(
-        clientID: String,
-        approve: @escaping () -> Void,
-        deny: @escaping () -> Void
-    ) async {
+    private func beginApprovalRequest(_ request: ApprovalRequest) async {
+        let clientID = request.clientID
         approvalTimeoutTask?.cancel()
         approvalTimeoutTask = nil
         pendingConnectionID = clientID
         activeApprovalDialogs.insert(clientID)
-        currentApprovalCallbacks = (approve, deny)
+        currentApproval = request
         approvalGeneration &+= 1
 
         let expectedClientID = clientID
         let expectedGeneration = approvalGeneration
         let timeout = approvalTimeout
         approvalTimeoutTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(timeout))
+            do { try await Task.sleep(for: .seconds(timeout)) } catch { return }
             guard let self else { return }
             await handleApprovalTimeout(
                 clientID: expectedClientID,
@@ -564,37 +737,50 @@ final actor ServerController: ObservableObject {
             )
         }
 
-        await onApprovalRequest?(clientID, expectedGeneration)
+        await onApprovalRequest?(clientID, expectedGeneration, request.principal?.executablePath)
     }
 
     /// Starts the next queued approval request, if any.
     private func activateNextQueuedApprovalIfNeeded() async {
-        guard currentApprovalCallbacks == nil else { return }
-        guard pendingConnectionID == nil else { return }
-        guard !pendingApprovals.isEmpty else { return }
-        let (nextClientID, approve, deny) = pendingApprovals.removeFirst()
-        await beginApprovalRequest(clientID: nextClientID, approve: approve, deny: deny)
+        guard !preparingApproval, currentApproval == nil, pendingConnectionID == nil else { return }
+        preparingApproval = true
+        defer { preparingApproval = false }
+        while currentApproval == nil, !pendingApprovals.isEmpty {
+            let request = pendingApprovals.removeFirst()
+            guard await request.isConnectionLive() else {
+                request.deny()
+                continue
+            }
+            if await !strictConnectionApprovalEnabled(), isClientAlwaysAllowed(request.clientID) {
+                if await request.validate() { request.approve() } else { request.deny() }
+                continue
+            }
+            if await resolveSessionDecision(request) { continue }
+            await beginApprovalRequest(request)
+        }
     }
 
-    /// Handle approval timeout - auto-deny the active request and any queued duplicates for that client.
+    /// Timeout creates the same process-scoped cooldown as explicit denial.
     private func handleApprovalTimeout(clientID: String, expectedGeneration: UInt64) async {
-        guard let (_, deny) = currentApprovalCallbacks,
+        guard let request = currentApproval,
               pendingConnectionID == clientID,
               approvalGeneration == expectedGeneration else { return }
 
         approvalTimeoutTask?.cancel()
         approvalTimeoutTask = nil
-        currentApprovalCallbacks = nil
+        currentApproval = nil
         pendingConnectionID = nil
         activeApprovalDialogs.remove(clientID)
-        deny()
-
-        // Also auto-deny queued requests for the same client to avoid backlog/slot buildup.
-        while let idx = pendingApprovals.firstIndex(where: { $0.0 == clientID }) {
-            let (_, _, queuedDeny) = pendingApprovals.remove(at: idx)
-            queuedDeny()
+        rememberDecision(for: request, allow: false)
+        request.deny()
+        // With no process identity, preserve the old denial-only duplicate drain.
+        // This never grants trust to a name and avoids a backlog of timeout dialogs.
+        if request.principal == nil {
+            while let index = pendingApprovals.firstIndex(where: { $0.principal == nil && $0.clientID == clientID }) {
+                pendingApprovals.remove(at: index).deny()
+            }
         }
-
+        await mcpService?.clearPendingApproval(generation: expectedGeneration)
         onApprovalResolved?(false)
 
         if let service = mcpService {
@@ -609,13 +795,17 @@ final actor ServerController: ObservableObject {
         await activateNextQueuedApprovalIfNeeded()
     }
 
-    /// Store current approval callbacks
-    private var currentApprovalCallbacks: (() -> Void, () -> Void)?
-
     /// Called by MCPService when the UI has made a decision.
-    func resolvePendingApproval(allow: Bool, generation: UInt64) async {
+    func resolvePendingApproval(allow: Bool, generation: UInt64, alwaysAllow: Bool = false) async {
         guard generation == approvalGeneration,
-              let (approve, deny) = currentApprovalCallbacks else { return }
+              let request = currentApproval else { return }
+        // Validate this connection independently of consent for its displayed
+        // launching process. A host can replace the helper while the dialog is
+        // open; that must not discard a decision for a still-running launcher.
+        // Awaiting process observation may race timeout or another window's response.
+        let valid = await request.validate()
+        let strictApproval = await strictConnectionApprovalEnabled()
+        guard generation == approvalGeneration, currentApproval != nil else { return }
         let resolvedClientID = pendingConnectionID
         approvalTimeoutTask?.cancel()
         approvalTimeoutTask = nil
@@ -629,19 +819,23 @@ final actor ServerController: ObservableObject {
             Task { await service.updateDiagnostics(diag) }
         }
 
-        if allow {
-            // Approval applies only to this connection, never to its display name.
-            approve()
+        rememberDecision(for: request, allow: allow)
+        let principalIsCurrent = request.principal.map(processIsCurrent)
+        if allow, alwaysAllow, !strictApproval, principalIsCurrent ?? valid {
+            addAlwaysAllowed(clientID: request.clientID)
+        }
+        if allow, valid, principalIsCurrent ?? true {
+            request.approve()
         } else {
-            deny()
+            request.deny()
         }
 
-        // A queued peer with the same display name must receive its own prompt.
+        // Queue entries recheck the current mode's saved-name and process-session policy.
         if let clientID = resolvedClientID {
             activeApprovalDialogs.remove(clientID)
         }
 
-        currentApprovalCallbacks = nil
+        currentApproval = nil
         pendingConnectionID = nil
 
         // Notify resolution callback if needed

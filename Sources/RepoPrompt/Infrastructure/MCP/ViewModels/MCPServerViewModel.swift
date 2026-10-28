@@ -1193,6 +1193,7 @@ final class MCPServerViewModel: ObservableObject {
     @Published private(set) var isRunning = false // overall status
     @Published private(set) var pendingClientID: String? // approval state
     @Published private(set) var pendingApprovalGeneration: UInt64?
+    @Published private(set) var pendingApprovalExecutablePath: String?
     @Published private(set) var diagnostics: MCPDiagnostics = .init(
         issue: .none,
         lastEventAt: nil,
@@ -1533,13 +1534,30 @@ final class MCPServerViewModel: ObservableObject {
                 windowID: windowID
             )
         },
-        buildTabSelectionReply: { [weak self] selection, includeBlocks, display, codeMapUsageOverride, lookupContextOverride, reviewGitContextOverride in
+        buildTabSelectionReply: { [weak self] resultTab, resultWorkspaceID, includeBlocks, display, codeMapUsageOverride, lookupContextOverride, reviewGitContextOverride in
             guard let self else { throw MCPError.internalError("Window deallocated while building context_builder selection reply") }
+            // The window token counter describes only the active compose tab. Any other result tab is
+            // accounted from its own prompt, stored prompts, and selection. Lookup and review-git
+            // overrides are always supplied here, so this context selects only the token accounting.
+            let resultTabIsActive = workspaceManager?.activeWorkspaceID == resultWorkspaceID
+                && promptVM.activeComposeTabID == resultTab.id
+            let accountingContext: MCPTabContextSnapshot? = resultTabIsActive ? nil : MCPTabContextSnapshot(
+                tabID: resultTab.id,
+                windowID: windowID,
+                workspaceID: resultWorkspaceID,
+                promptText: resultTab.promptText,
+                selection: resultTab.selection,
+                selectedMetaPromptIDs: resultTab.selectedMetaPromptIDs,
+                tabName: resultTab.name,
+                runID: nil,
+                explicitlyBound: false
+            )
             let reply = await buildTabSelectionReply(
-                from: selection,
+                from: resultTab.selection,
                 includeBlocks: includeBlocks,
                 display: display,
                 codeMapUsageOverride: codeMapUsageOverride,
+                virtualContext: accountingContext,
                 lookupContextOverride: lookupContextOverride,
                 // Context Builder owns the selection authority before rendering: a completed run has
                 // already validated the exact committed snapshot revision, while a cancelled or failed
@@ -1550,7 +1568,7 @@ final class MCPServerViewModel: ObservableObject {
                 reviewGitContextOverride: reviewGitContextOverride
             )
             #if DEBUG
-                contextBuilderSelectionReplyObserverForTesting?(selection, lookupContextOverride, reply)
+                contextBuilderSelectionReplyObserverForTesting?(resultTab.selection, lookupContextOverride, reply)
             #endif
             return reply
         },
@@ -3250,6 +3268,7 @@ final class MCPServerViewModel: ObservableObject {
         isRunning = snap.isRunning
         pendingClientID = snap.pendingClientID
         pendingApprovalGeneration = snap.pendingApprovalGeneration
+        pendingApprovalExecutablePath = snap.pendingApprovalExecutablePath
         diagnostics = snap.diagnostics
         lastErrorMessage = humanReadableError(from: snap.diagnostics.issue)
 
@@ -3534,8 +3553,8 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     /// Called by UI after the alert sheet closes
-    func resolveApproval(allow: Bool, generation: UInt64) async {
-        await service.continuePendingApproval(allow: allow, generation: generation)
+    func resolveApproval(allow: Bool, generation: UInt64, alwaysAllow: Bool = false) async {
+        await service.continuePendingApproval(allow: allow, generation: generation, alwaysAllow: alwaysAllow)
     }
 
     // MARK: - Dashboard Methods

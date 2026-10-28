@@ -378,8 +378,8 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             await cleanup(fixture)
         }
 
-        private func findPickerEditor(in view: NSView) -> ImageAwareTextView? {
-            if let editor = view as? ImageAwareTextView { return editor }
+        private func findPickerEditor(in view: NSView) -> AttachmentAwareTextView? {
+            if let editor = view as? AttachmentAwareTextView { return editor }
             for child in view.subviews {
                 if let editor = findPickerEditor(in: child) { return editor }
             }

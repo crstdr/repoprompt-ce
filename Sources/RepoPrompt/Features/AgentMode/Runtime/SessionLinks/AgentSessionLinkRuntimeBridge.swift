@@ -46,12 +46,6 @@ extension AgentSessionLinkEndpointHost {
         nil
     }
 
-    func agentSessionLinkRunFacts(
-        for _: AgentSessionLinkEndpointCandidate, capturedStatus _: DomainAgentSessionLinkStatus
-    ) -> AgentRunQuietFacts? {
-        nil
-    }
-
     func agentSessionLinkBootstrapState(for _: DomainAgentSessionLinkEndpointIdentity) -> AgentSessionOverseerBootstrapState? {
         nil
     }
