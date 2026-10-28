@@ -16,6 +16,13 @@ struct AgentSessionLinkRunCatalogRouteToken: Equatable, Hashable {
     let connectionID: UUID
     let routingAuthorityGeneration: UInt64
     let connectionLifecycleGeneration: UInt64
+
+    /// An offer may survive a benign policy renewal, never another client or observer incarnation.
+    func hasSameClientIncarnation(as other: Self) -> Bool {
+        runID == other.runID && observerEndpoint == other.observerEndpoint
+            && connectionID == other.connectionID
+            && connectionLifecycleGeneration == other.connectionLifecycleGeneration
+    }
 }
 
 /// MainActor projection of the server's latest exact catalog observation for one run.
@@ -34,6 +41,8 @@ struct AgentSessionLinkRunCatalogProjection: Equatable {
     /// Preserve all values and duplicates in this same immutable slot; no support cache or registry.
     /// Evidence only, separate from repair fingerprints; cleared on invalidation/overlap/teardown.
     let returnedCatalog: [String: [MCP.Tool]]?
+    let offerInputs: MCPRunCatalogOfferInputs?
+    let offerExpiresAt: Date?
 
     init(
         runID: UUID,
@@ -44,7 +53,9 @@ struct AgentSessionLinkRunCatalogProjection: Equatable {
         hasActiveOutboundLink: Bool? = true,
         expectedSurface: Data? = nil,
         returnedSurface: Data? = nil,
-        returnedCatalog: [String: [MCP.Tool]]? = nil
+        returnedCatalog: [String: [MCP.Tool]]? = nil,
+        offerInputs: MCPRunCatalogOfferInputs? = nil,
+        offerExpiresAt: Date? = nil
     ) {
         self.runID = runID
         self.routeToken = routeToken
@@ -55,6 +66,8 @@ struct AgentSessionLinkRunCatalogProjection: Equatable {
         self.expectedSurface = expectedSurface
         self.returnedSurface = returnedSurface
         self.returnedCatalog = returnedCatalog
+        self.offerInputs = offerInputs
+        self.offerExpiresAt = offerExpiresAt
     }
 
     /// Positive definition evidence, not a role, dispatch grant or attempt authorization.
@@ -62,6 +75,17 @@ struct AgentSessionLinkRunCatalogProjection: Equatable {
     func containsReturnedTool(_ definition: MCP.Tool) -> Bool {
         guard let matches = returnedCatalog?[definition.name], matches.count == 1 else { return false }
         return matches[0] == definition
+    }
+
+    /// Mirror-side necessary condition only; the server also revalidates all input revisions and
+    /// current route authorization. The actual offer's original generation is never rewritten.
+    var hasUnchangedOffer: Bool {
+        hasUnchangedOffer(at: Date())
+    }
+
+    func hasUnchangedOffer(at date: Date) -> Bool {
+        offerInputs?.advertisementRevision == ServerNetworkManager.catalogAdvertisementRevision
+            && (offerExpiresAt.map { date < $0 } ?? true)
     }
 
     var isReady: Bool {

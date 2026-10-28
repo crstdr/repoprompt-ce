@@ -16,6 +16,56 @@ import XCTest
             try await exerciseRunner(.codexExec)
         }
 
+        func testClaudeRunnerRetainsActualOfferAcrossBenignPolicyRenewal() async throws {
+            try await exerciseRetainedOffer(.benign)
+        }
+
+        func testAbsentOfferCannotResurrectUntilFreshPositiveList() async throws {
+            try await exerciseRetainedOffer(.absentThenFresh)
+        }
+
+        func testReconnectionCannotInheritPredecessorOffer() async throws {
+            try await exerciseRetainedOffer(.reconnect)
+        }
+
+        func testAmbiguousReturnedDefinitionCannotRetainOffer() async throws {
+            try await exerciseRetainedOffer(.ambiguous)
+        }
+
+        func testCatalogCaptureCannotBorrowAnotherBindingIncarnation() async throws {
+            try await exerciseRetainedOffer(.mismatchedIngress)
+        }
+
+        func testAvailabilityProducerABAVetoesRetainedOffer() async throws {
+            try await exerciseRetainedOffer(.availabilityABA)
+        }
+
+        func testActualOfferCapturesConsentExpiryWithoutTimer() async throws {
+            try await exerciseRetainedOffer(.expiry)
+        }
+
+        func testCommittedDeletionInvalidatesActualOfferBeforeCleanup() async throws {
+            try await exerciseRetainedOffer(.committedDeletion)
+        }
+
+        func testReversibleDeletionInvalidatesActualOffersOnBeginAndFailure() async throws {
+            try await exerciseRetainedOffer(.failedDeletion)
+        }
+
+        private enum RetainedOfferCase {
+            case benign, absentThenFresh, reconnect, ambiguous, mismatchedIngress, availabilityABA, expiry, committedDeletion, failedDeletion
+
+            var qualifies: Bool {
+                self == .benign || self == .absentThenFresh || self == .expiry
+            }
+        }
+
+        private func exerciseRetainedOffer(_ scenario: RetainedOfferCase) async throws {
+            try await MCPSharedServerTestLease.shared.withLease { _ in
+                try await self.exerciseRunner(.claudeCode, catalogBeforeSend: scenario.qualifies, retainedOffer: scenario)
+            }
+        }
+
         func testQualificationLogCost() throws {
             try XCTSkipUnless(ProcessInfo.processInfo.environment["RPCE_RUN_SCALE_TESTS"] == "quiet-qualification", "Opt-in qualification diagnostic cost")
             let tabID = UUID()
@@ -45,7 +95,8 @@ import XCTest
             }
         }
 
-        private func exerciseRunner(_ kind: AgentProviderKind, catalogBeforeSend: Bool) async throws {
+        private func exerciseRunner(_ kind: AgentProviderKind, catalogBeforeSend: Bool, retainedOffer: RetainedOfferCase? = nil) async throws {
+            let reusesConnection = retainedOffer != nil
             let manager = ServerNetworkManager.shared
             try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
             let window = WindowState(domainRuntime: AppDomainRuntimeComposition.shared.runtime)
@@ -57,6 +108,7 @@ import XCTest
             let wasClaudeConnected = window.apiSettingsViewModel.isClaudeCodeConnected
             let wasCodexConnected = window.apiSettingsViewModel.isCodexConnected
             let bridge = AgentSessionLinkRuntimeBridge.shared
+            let wasDecisionSuppressed = bridge.delegationScopes.test_suppressDecisionDelivery
             let provider = HeldDiscoveryProvider()
             let clientName = kind == .codexExec ? AgentProviderKind.codexMCPClientID : AgentProviderKind.claudeMCPClientID
             let runID = UUID()
@@ -66,6 +118,7 @@ import XCTest
             var grant: DomainAgentSessionLinkReference?
             var session: AgentTabSession?
             var native: ClaudeNativeProcessSessionController?
+            var expiringScope: DomainDelegationScopeRecord?
             let codex = MonitorFakeCodexController(dispatches: MonitorCodexDispatchRecorder(), processID: getpid())
             let frames = WrittenFrames()
             let cleanup: @MainActor () async -> Void = {
@@ -77,7 +130,14 @@ import XCTest
                 await session?.agentTask?.value
                 await provider.shutdown()
                 await manager.debugSetReturnedCatalogToolsForTesting(nil)
-                if let grant { await bridge.revokeLink(linkID: grant.linkID, generation: grant.generation) }
+                await manager.debugSetCatalogOfferRouteForTesting(nil)
+                if let expiringScope {
+                    bridge.delegationScopes.revoke(scopeID: expiringScope.id)
+                }
+                bridge.delegationScopes.test_suppressDecisionDelivery = wasDecisionSuppressed
+                if let grant {
+                    await bridge.revokeLink(linkID: grant.linkID, generation: grant.generation)
+                }
                 for transport in transports {
                     transport.client.close()
                     await transport.connectionManager.stop()
@@ -123,16 +183,29 @@ import XCTest
                 let links = await AppDomainRuntimeComposition.shared.runtime.agentSessionLinkAuthority.links(forObserver: endpoint.sessionID)
                 let link = try XCTUnwrap(links.items.first)
                 grant = .init(linkID: link.linkID, generation: link.generation)
-                // The initial actual tools/list proves only the oversight family. There is no
-                // preloaded self_noop definition and no injected projection or route token.
-                await manager.debugSetReturnedCatalogToolsForTesting { tools, _ in tools.filter { $0.name != MCPWindowToolName.selfNoop } }
-                await manager.installClientConnectionPolicy(for: clientName, windowID: windowID, restrictedTools: AgentModeMCPToolPolicy.restrictedTools, oneShot: true, reason: "late-catalog fixture", ttl: 60, tabID: observerTab, runID: runID, additionalTools: nil, purpose: .agentModeRun, taskLabelKind: nil, allowsAgentExternalControlTools: false)
+                if retainedOffer == .expiry {
+                    let grantee = endpoint.sessionID
+                    bridge.delegationScopes.test_suppressDecisionDelivery = true
+                    let request = try bridge.delegationScopes.requestScope(
+                        requesterSessionID: grantee, requesterTabID: nil, kind: .tree(rootSessionID: grantee),
+                        capabilities: [.observe], guardrails: .init(), expiresInSeconds: 60,
+                        reason: nil, idempotencyKey: nil
+                    ).get()
+                    expiringScope = try bridge.delegationScopes.approve(requestID: request.id).get()
+                }
+                // Only the retention cases begin with a positive actual list. No fixture installs
+                // a positive projection, expected definition, or route token.
+                if !reusesConnection {
+                    await manager.debugSetReturnedCatalogToolsForTesting { tools, _ in tools.filter { $0.name != MCPWindowToolName.selfNoop } }
+                }
+                await manager.installClientConnectionPolicy(for: clientName, windowID: windowID, restrictedTools: AgentModeMCPToolPolicy.restrictedTools, oneShot: true, reason: "late-catalog fixture", ttl: 60, tabID: observerTab, runID: runID, additionalTools: reusesConnection ? AgentModeMCPPolicyInstaller.additionalTools(for: kind) : nil, purpose: .agentModeRun, taskLabelKind: nil, allowsAgentExternalControlTools: false)
                 await manager.setEnabled(true)
                 let initial = try await PersistentMCPTestEndpoint.make(label: "late-catalog-initial", networkManager: manager, clientName: clientName, requiredToolNames: [MCPWindowToolName.agentSessionLink])
                 transports.append(initial)
                 await provider.attach(initial)
                 _ = try await provider.listTools()
-                XCTAssertFalse(vm.selfNoopHintIsCurrent(for: observer))
+                XCTAssertEqual(vm.selfNoopHintIsCurrent(for: observer), reusesConnection)
+                let initialOffer = await manager.debugRunCatalogProjection(for: runID)
                 observer.isPreparingInitialWorktree = true
                 observer.oversight.autoWakeOnUpdates = true
                 target.installRunID(UUID())
@@ -150,6 +223,111 @@ import XCTest
                 XCTAssertFalse(early.routineQuietCheckIn)
                 observer.isPreparingInitialWorktree = false
                 XCTAssertNotNil(vm.agentSessionLinkPrepareAutoWakeDispatch(wakeID: attempt.wakeID, endpoint: endpoint))
+                if retainedOffer == .committedDeletion {
+                    let prior = try XCTUnwrap(initialOffer)
+                    let route = try XCTUnwrap(prior.routeToken)
+                    XCTAssertNotNil(prior.returnedCatalog?[MCPWindowToolName.becomeOverseer])
+                    let before = await manager.hasCurrentReturnedTool(AgentModeViewModel.selfNoopCatalogDefinition, routeToken: route, projectionRevision: prior.projectionRevision)
+                    XCTAssertTrue(before)
+                    XCTAssertNotNil(vm.agentSessionLinkBootstrapState(for: endpoint))
+                    let registry = AgentSessionDeletionRegistry.shared
+                    let oldCommit = registry.commitObserver
+                    let oldChange = registry.changeObserver
+                    let gate = TestReleaseFence(name: "committed deletion before authority cleanup")
+                    defer {
+                        gate.release()
+                        registry.commitObserver = oldCommit
+                        registry.changeObserver = oldChange
+                    }
+                    registry.commitObserver = { sessionID, origin, fileRemoved in
+                        if sessionID == endpoint.sessionID { await gate.enterAndWait() }
+                        await oldCommit?(sessionID, origin, fileRemoved)
+                    }
+                    // Begin notifies the existing eligibility audit normally; only commit cleanup
+                    // waits at the gate. No file deletion is invoked.
+                    let token = try registry.beginDurableDeletion(sessionID: endpoint.sessionID)
+                    defer { registry.didFailDurableDeletion(token) }
+                    _ = try await provider.listTools()
+                    let beforeCommitProjection = await manager.debugRunCatalogProjection(for: runID)
+                    let beforeCommit = try XCTUnwrap(beforeCommitProjection)
+                    let beforeCommitRoute = try XCTUnwrap(beforeCommit.routeToken)
+                    let supportBeforeCommit = await manager.hasCurrentReturnedTool(AgentModeViewModel.selfNoopCatalogDefinition, routeToken: beforeCommitRoute, projectionRevision: beforeCommit.projectionRevision)
+                    XCTAssertTrue(supportBeforeCommit)
+                    XCTAssertTrue(vm.selfNoopHintIsCurrent(for: observer))
+                    let deletion = Task { @MainActor in await registry.didCommitDurableDeletion(token) }
+                    guard await gate.waitUntilEntered() else {
+                        gate.release()
+                        await deletion.value
+                        throw CancellationError()
+                    }
+                    do {
+                        XCTAssertTrue(registry.isPermanentlyDeleted(sessionID: endpoint.sessionID))
+                        XCTAssertNil(vm.agentSessionLinkBootstrapState(for: endpoint))
+                        let currentInputs = await manager.debugCurrentRunCatalogOfferInputs(for: runID)
+                        let retained = await manager.hasCurrentReturnedTool(AgentModeViewModel.selfNoopCatalogDefinition, routeToken: beforeCommitRoute, projectionRevision: beforeCommit.projectionRevision)
+                        // Sample the independent physical fence before a fresh list can replace
+                        // the observation. Acquisition admits ordinary owed work, not quiet permission.
+                        let reserved = try XCTUnwrap(vm.agentSessionLinkPromptClaimStore.pendingClaim(dispatchID: dispatchID, observerSessionID: endpoint.sessionID))
+                        XCTAssertFalse(reserved.routineQuietCheckIn)
+                        let hintCurrent = vm.selfNoopHintIsCurrent(for: observer)
+                        let acquired = vm.agentSessionLinkAcquirePhysicalDispatch(for: observer, dispatchID: dispatchID)
+                        vm.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: observer, dispatchID: dispatchID)
+                        print("DELETION_RETAINED_OFFER inputsUnchanged=\(currentInputs == beforeCommit.offerInputs) serverProof=\(retained) mirrorHint=\(hintCurrent) physicalAcquisition=\(acquired)")
+                        XCTAssertFalse(retained, "A committed deletion changes advertisement eligibility before asynchronous authority cleanup")
+                        XCTAssertNotEqual(currentInputs, beforeCommit.offerInputs)
+                        XCTAssertFalse(hintCurrent)
+                        XCTAssertTrue(acquired, "Ordinary acquisition remains independent of quiet eligibility")
+                        XCTAssertTrue(frames.userMessages.isEmpty)
+                        XCTAssertTrue(codex.startedTurns.isEmpty)
+                        let names = try await provider.listTools()
+                        XCTAssertFalse(names.contains(MCPWindowToolName.becomeOverseer), "A fresh actual list must reflect the committed tombstone")
+                        XCTAssertTrue(names.contains(MCPWindowToolName.selfNoop), "Cleanup has not yet revoked the outbound link")
+                        XCTAssertNotEqual(Set(names), try Set(XCTUnwrap(prior.returnedCatalog).keys))
+                    } catch {
+                        gate.release()
+                        await deletion.value
+                        throw error
+                    }
+                    gate.release()
+                    await deletion.value
+                    registry.commitObserver = oldCommit
+                    registry.changeObserver = oldChange
+                    await cleanup()
+                    return
+                }
+                if retainedOffer == .failedDeletion {
+                    let registry = AgentSessionDeletionRegistry.shared
+                    let prior = try XCTUnwrap(initialOffer)
+                    let route = try XCTUnwrap(prior.routeToken)
+                    let supportBeforeBegin = await manager.hasCurrentReturnedTool(AgentModeViewModel.selfNoopCatalogDefinition, routeToken: route, projectionRevision: prior.projectionRevision)
+                    XCTAssertTrue(supportBeforeBegin)
+                    let before = ServerNetworkManager.catalogAdvertisementRevision
+                    let token = try registry.beginDurableDeletion(sessionID: endpoint.sessionID)
+                    defer { registry.didFailDurableDeletion(token) }
+                    XCTAssertNotEqual(ServerNetworkManager.catalogAdvertisementRevision, before)
+                    let oldSupport = await manager.hasCurrentReturnedTool(AgentModeViewModel.selfNoopCatalogDefinition, routeToken: route, projectionRevision: prior.projectionRevision)
+                    XCTAssertFalse(oldSupport, "Beginning deletion changes bootstrap eligibility before cleanup")
+                    XCTAssertFalse(vm.selfNoopHintIsCurrent(for: observer))
+                    _ = try await provider.listTools()
+                    let duringProjection = await manager.debugRunCatalogProjection(for: runID)
+                    let during = try XCTUnwrap(duringProjection)
+                    let duringRoute = try XCTUnwrap(during.routeToken)
+                    let currentSupport = await manager.hasCurrentReturnedTool(AgentModeViewModel.selfNoopCatalogDefinition, routeToken: duringRoute, projectionRevision: during.projectionRevision)
+                    XCTAssertTrue(currentSupport)
+                    let inProgress = ServerNetworkManager.catalogAdvertisementRevision
+                    registry.didFailDurableDeletion(token)
+                    XCTAssertNil(registry.state(forSessionID: endpoint.sessionID))
+                    XCTAssertNotEqual(ServerNetworkManager.catalogAdvertisementRevision, inProgress)
+                    let afterFailure = await manager.hasCurrentReturnedTool(AgentModeViewModel.selfNoopCatalogDefinition, routeToken: duringRoute, projectionRevision: during.projectionRevision)
+                    XCTAssertFalse(afterFailure, "Failure restores eligibility but cannot resurrect an earlier offer")
+                    XCTAssertFalse(vm.selfNoopHintIsCurrent(for: observer))
+                    _ = try await provider.listTools()
+                    XCTAssertTrue(vm.selfNoopHintIsCurrent(for: observer))
+                    XCTAssertTrue(frames.userMessages.isEmpty)
+                    XCTAssertTrue(codex.startedTurns.isEmpty)
+                    await cleanup()
+                    return
+                }
                 // Keep the production policy installer. Only process/PID admission is replaced
                 // with this test process's real socket client after that policy has been installed.
                 vm.test_initializeRunService(mcpServerEnabler: { true }, expectedPIDPolicyArmer: { spec in
@@ -157,7 +335,79 @@ import XCTest
                     await manager.registerExpectedAgentPID(getpid(), for: name, runID: spec.runID)
                     let armed = await manager.requireExpectedAgentPIDForPendingPolicy(for: name, runID: spec.runID, windowID: spec.windowID)
                     guard armed else { return false }
-                    if catalogBeforeSend { await manager.debugSetReturnedCatalogToolsForTesting(nil) }
+                    if let retainedOffer {
+                        if retainedOffer == .benign || retainedOffer == .expiry {
+                            let currentInputs = await manager.debugCurrentRunCatalogOfferInputs(for: runID)
+                            XCTAssertEqual(initialOffer?.offerInputs, currentInputs, "Only a semantically benign renewal may retain an offer")
+                        }
+                        let prior = try? XCTUnwrap(initialOffer)
+                        if retainedOffer == .mismatchedIngress {
+                            // Model a captured token just before rebinding, with colliding per-session
+                            // revision values. Actual definitions still come from the real socket list.
+                            await manager.debugSetCatalogOfferRouteForTesting { route in
+                                guard let route else { return nil }
+                                let endpoint = route.observerEndpoint
+                                return .init(
+                                    runID: route.runID,
+                                    observerEndpoint: .init(
+                                        windowID: endpoint.windowID, workspaceID: endpoint.workspaceID,
+                                        tabID: endpoint.tabID, sessionID: endpoint.sessionID,
+                                        persistentBindingGeneration: UUID(),
+                                        bindingTransitionGeneration: endpoint.bindingTransitionGeneration
+                                    ),
+                                    connectionID: route.connectionID,
+                                    routingAuthorityGeneration: route.routingAuthorityGeneration,
+                                    connectionLifecycleGeneration: route.connectionLifecycleGeneration
+                                )
+                            }
+                        }
+                        if retainedOffer == .availabilityABA {
+                            ToolAvailabilityStore.shared.debugDisableAndReenableWithoutPersistenceForTesting(MCPWindowToolName.selfNoop)
+                        }
+                        if retainedOffer == .absentThenFresh || retainedOffer == .reconnect {
+                            await manager.debugSetReturnedCatalogToolsForTesting { tools, _ in tools.filter { $0.name != MCPWindowToolName.selfNoop } }
+                        } else if retainedOffer == .ambiguous {
+                            await manager.debugSetReturnedCatalogToolsForTesting { tools, _ in
+                                tools + tools.filter { $0.name == MCPWindowToolName.selfNoop }
+                            }
+                        }
+                        do {
+                            if retainedOffer == .reconnect {
+                                let next = try await PersistentMCPTestEndpoint.make(label: "retained-offer-reconnect", networkManager: manager, clientName: name, useProductionAgentAdmission: true, requiredToolNames: [MCPWindowToolName.agentSessionLink])
+                                transports.append(next)
+                                await provider.attach(next)
+                            }
+                            if retainedOffer == .absentThenFresh || retainedOffer == .reconnect || retainedOffer == .ambiguous || retainedOffer == .mismatchedIngress {
+                                _ = try await provider.listTools()
+                            }
+                            await manager.debugSetCatalogOfferRouteForTesting(nil)
+                            if retainedOffer == .mismatchedIngress {
+                                let captured = await manager.debugRunCatalogProjection(for: runID)
+                                XCTAssertNil(captured?.returnedCatalog, "A list must not associate another binding's barriers or expiry with its shaped response")
+                            }
+                            if let prior, let token = prior.routeToken, retainedOffer != .benign, retainedOffer != .expiry {
+                                let oldSupport = await manager.hasCurrentReturnedTool(AgentModeViewModel.selfNoopCatalogDefinition, routeToken: token, projectionRevision: prior.projectionRevision)
+                                XCTAssertFalse(oldSupport, "A later absent/ambiguous list, reconnect or producer ABA cannot reuse a positive predecessor")
+                            }
+                            if retainedOffer == .absentThenFresh {
+                                await manager.debugSetReturnedCatalogToolsForTesting(nil)
+                                let absentProjection = await manager.debugRunCatalogProjection(for: runID)
+                                let absent = try XCTUnwrap(absentProjection)
+                                let token = try XCTUnwrap(absent.routeToken)
+                                let restoredWithoutList = await manager.hasCurrentReturnedTool(AgentModeViewModel.selfNoopCatalogDefinition, routeToken: token, projectionRevision: absent.projectionRevision)
+                                XCTAssertFalse(restoredWithoutList, "Restored expected presence is not a returned offer")
+                                _ = try await provider.listTools()
+                            }
+                        } catch {
+                            XCTFail("Retention edge fixture failed: \(error)")
+                        }
+                        let committed = await manager.isRunRouteAuthoritativelyCommitted(runID: spec.runID, windowID: spec.windowID, tabID: spec.tabID, expectedAgentPID: getpid())
+                        await manager.clearExpectedAgentPID(getpid(), for: name, runID: spec.runID)
+                        return committed
+                    }
+                    if catalogBeforeSend {
+                        await manager.debugSetReturnedCatalogToolsForTesting(nil)
+                    }
                     do {
                         let next = try await PersistentMCPTestEndpoint.make(label: "late-catalog-current-policy", networkManager: manager, clientName: name, useProductionAgentAdmission: true, requiredToolNames: [MCPWindowToolName.agentSessionLink])
                         transports.append(next)
@@ -177,7 +427,7 @@ import XCTest
                     window.apiSettingsViewModel.isClaudeCodeConnected = true
                     let controller = ClaudeNativeProcessSessionController(runID: runID, tabID: observerTab, windowID: windowID, workspacePath: nil, config: .discovery(commandName: "/usr/bin/false", runtimeVariant: .standard))
                     native = controller
-                    await controller.test_installConfigurationTransport(initialized: false, controlRequest: { _ in ["session_id": "late-catalog-claude"] }, write: { frames.append($0) })
+                    await controller.test_installConfigurationTransport(initialized: reusesConnection, controlRequest: { _ in ["session_id": "late-catalog-claude"] }, write: { frames.append($0) })
                     observer.claudeController = controller
                     let binding = vm.providerBindingService
                     let runtime = ClaudeControllerLaunchPolicy.resolve(permissionMode: binding.runtimePermission(for: kind, profile: observer.permissionProfile).claudePermissionMode, profile: observer.permissionProfile, defaults: binding.preferences.defaults, securePermissions: binding.preferences.securePermissions)
@@ -213,6 +463,18 @@ import XCTest
                 XCTAssertEqual(outcome.outcome, .accepted)
                 try await AsyncTestWait.waitUntil("one real runner physical input") { kind == .claudeCode ? !frames.userMessages.isEmpty : !codex.startedTurns.isEmpty }
                 let sent = kind == .claudeCode ? frames.userMessages : codex.startedTurns
+                if retainedOffer == .benign || retainedOffer == .expiry {
+                    let retained = await manager.debugRunCatalogProjection(for: runID)
+                    XCTAssertEqual(retained?.routeToken, initialOffer?.routeToken, "Renewal must not relabel the actual offer as a newer-generation list")
+                    XCTAssertEqual(retained?.projectionRevision, initialOffer?.projectionRevision, "No re-list or replacement observation was manufactured")
+                    XCTAssertEqual(transports.count, 1, "The initialized Claude process keeps its original socket")
+                    if retainedOffer == .expiry {
+                        let bound = try XCTUnwrap(expiringScope?.grant.guardrails.expiresAt)
+                        XCTAssertEqual(retained?.offerExpiresAt, bound)
+                        XCTAssertTrue(try XCTUnwrap(retained).hasUnchangedOffer(at: bound.addingTimeInterval(-0.001)))
+                        XCTAssertFalse(try XCTUnwrap(retained).hasUnchangedOffer(at: bound), "The same offer becomes negative at the captured consent expiry, without any timer or mutation")
+                    }
+                }
                 XCTAssertEqual(sent.count, 1)
                 XCTAssertEqual(try XCTUnwrap(sent.first).contains("Nothing needed? Call self_noop."), catalogBeforeSend)
                 let owner = try XCTUnwrap(observer.activeRunOwnership)
