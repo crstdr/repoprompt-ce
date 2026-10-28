@@ -1132,7 +1132,6 @@ final class AgentSessionLinkOutboundPromptClaimStore {
         allowsClaimlessAutoWake: Bool = false,
         routineQuietCheckIn: Bool = false,
         decorateLocalInputs: (AgentSessionLinkPromptRenderResult) -> AgentSessionLinkLocalInputDecoration? = { _ in nil },
-
         inventoryGuidanceRevision: UInt64 = AgentSessionLinkPrompts.currentInventoryGuidanceRevision,
         render: (AgentSessionLinkPromptRenderRequest) -> AgentSessionLinkPromptRenderResult
     ) -> AgentSessionLinkPromptClaimOutcome {

@@ -1,7 +1,6 @@
 import MCP
 
-// Call acknowledgement only. The app's exact live attempt owns declaration qualification.
-
+/// Call acknowledgement only. The app's exact live attempt owns declaration qualification.
 package enum AgentSelfNoopTool {
     package static let definition = MCPDomainToolDefinition(
         name: MCPWindowToolName.selfNoop,

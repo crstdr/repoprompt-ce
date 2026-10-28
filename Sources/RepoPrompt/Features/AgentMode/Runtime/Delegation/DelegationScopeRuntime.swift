@@ -578,6 +578,7 @@ final class DelegationScopeRuntime: ObservableObject {
 
     func scopeChain(from scopeID: UUID) -> [DomainDelegationScopeRecord] {
         guard canUseAuthority else { return [] }
+        expireDueScopes()
         return authority.scopeChain(from: scopeID)
     }
 

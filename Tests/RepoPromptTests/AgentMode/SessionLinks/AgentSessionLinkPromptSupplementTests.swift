@@ -4774,7 +4774,6 @@ extension AgentSessionLinkPromptClaimStoreTests {
                         let before = try makeClaim(offersQuiet: false)
                         let after = try makeClaim(offersQuiet: basis == "routine" || basis == "overflow" || basis == "attention")
                         let qualifies = AgentSessionLinkPrompts.supportsQuietCheckIn(provider) && (basis == "routine" || basis == "overflow")
-
                         XCTAssertEqual(
                             after.fragment.components(separatedBy: literal).count - 1,
                             qualifies ? 1 : 0,

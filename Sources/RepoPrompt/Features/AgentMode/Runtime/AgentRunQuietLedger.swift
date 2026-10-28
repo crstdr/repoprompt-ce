@@ -155,7 +155,6 @@ struct AgentRunQuietLedger {
             if current.baseline?.sourceRevision != sourceRevision {
                 attempt?.baseline = nil
             }
-
             markRoutineWake(owner: owner, wakeID: wakeID)
         } else {
             noteOccurrence(owner: owner)
@@ -409,7 +408,6 @@ struct AgentRunQuietLedger {
         if quiet, let wakeID = current.routineWakeID,
            hostMarkerIDs.contains(wakeID) || !current.markerProducerFinished,
            hiddenSourceIDs.insert(wakeID).inserted
-
         {
             displayMaskRevision &+= 1
         }

@@ -1,6 +1,6 @@
 import Foundation
 
-package enum AgentSessionLinkMenuGuard: String {
+package enum AgentSessionLinkMenuGuard: String, Sendable {
     case sessionUUIDMissing = "session_uuid_missing"
     case endpointMissing = "endpoint_missing"
     case projectionMissing = "projection_missing"
@@ -10,7 +10,7 @@ package enum AgentSessionLinkMenuGuard: String {
 }
 
 /// Closed diagnostic outcomes; callers cannot attach prompt, path, or provider payloads.
-package enum AgentSessionLinkCatalogOutcome: String, Equatable {
+package enum AgentSessionLinkCatalogOutcome: String, Equatable, Sendable {
     case accepted
     case rejectedEndpointMismatch = "rejected-endpoint-mismatch"
     case rejectedMissingSession = "rejected-missing-session"
@@ -33,7 +33,7 @@ package enum AgentSessionLinkReturnedDefinition: String, Sendable {
 
 /// The sink receives only identifiers, bounded generations, and closed presence/outcome values.
 /// Hashing and local logging remain the app adapter's responsibility.
-package enum AgentSessionLinkCatalogEvent {
+package enum AgentSessionLinkCatalogEvent: Sendable {
     case sidebarMenuUnavailable(
         reason: AgentSessionLinkMenuGuard, windowID: Int, tabID: UUID,
         expectedSessionID: UUID?, currentSessionID: UUID?,

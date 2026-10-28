@@ -219,7 +219,7 @@
         func testImageReferencesProduceOnlyNotInHandoverMarkerWithoutPathOrExistenceProbe() throws {
             var turn = fixture(request: "look")
             turn.request = AgentTranscriptRequestAnchor(from: .user("look", attachments: [
-                AgentImageAttachment(source: .localFile(path: "/nonexistent/private-image.png"))
+                AgentFileAttachment(source: .localFile(path: "/nonexistent/private-image.png"))
             ]))
             let projection = try Handover.project(AgentTranscript(turns: [turn]))
             for carrier in try [

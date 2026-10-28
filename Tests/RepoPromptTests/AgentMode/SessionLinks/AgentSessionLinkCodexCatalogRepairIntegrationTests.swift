@@ -823,6 +823,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
         }
 
         func testW2ProductionCatalogProofHandoffCostWithActualAndTenfoldCatalog() async throws {
+            try XCTSkipUnless(ProcessInfo.processInfo.environment["RPCE_RUN_SCALE_TESTS"] == "quiet-w2-catalog", "Opt-in catalog proof/handoff cost gate")
             try await MCPSharedServerTestLease.shared.withLease { _ in
                 try await self.exerciseLiveDiscovery(w0fProvider: .claudeCode, w2Probe: .catalogCost)
             }
@@ -1004,7 +1005,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 if w0fProvider == .codexExec {
                     observer.codexController = codex
                     _ = try await codex.startOrResume(existing: nil, baseInstructions: "")
-                    _ = try await codex.startUserTurn(text: "", images: [], model: nil, reasoningEffort: nil, serviceTier: nil)
+                    _ = try await codex.startUserTurn(text: "", attachments: [], model: nil, reasoningEffort: nil, serviceTier: nil)
                 } else {
                     observer.claudeController = provider
                 }

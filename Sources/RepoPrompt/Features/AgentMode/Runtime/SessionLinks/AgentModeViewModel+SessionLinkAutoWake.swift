@@ -654,7 +654,6 @@ extension AgentModeViewModel {
                         return
                     }
                 #endif
-
                 let startOutcome = await startAgentRun(
                     tabID: endpoint.tabID,
                     initialMessage: "",
