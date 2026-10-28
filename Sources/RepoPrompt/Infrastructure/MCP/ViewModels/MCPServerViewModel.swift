@@ -1104,6 +1104,14 @@ final class MCPServerViewModel: ObservableObject {
                 await resolveAgentSessionLinkObserverEndpoint(metadata: metadata, targetWindow: targetWindow)
             },
             captureCallOrigin: { AgentSelfMCPCallOrigin.current },
+            enterNoop: { window, origin, invocationID, argumentsAreEmpty in
+                window.agentModeViewModel.enterSelfNoopBody(
+                    origin: origin, invocationID: invocationID, argumentsAreEmpty: argumentsAreEmpty
+                )
+            },
+            acceptNoop: { window, origin, endpoint, invocationID in
+                window.agentModeViewModel.acceptSelfNoopBody(origin: origin, endpoint: endpoint, invocationID: invocationID)
+            },
             readSelf: { window, endpoint, origin in
                 window.agentModeViewModel.agentSelfContextSnapshot(endpoint: endpoint, origin: origin)
             },
