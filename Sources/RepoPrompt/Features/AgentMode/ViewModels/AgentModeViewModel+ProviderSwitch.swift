@@ -443,19 +443,69 @@ extension AgentModeViewModel {
         }
     }
 
+    /// Switch admission separates hard blockers (integrity or a real pending handover) from
+    /// forceable causes (the source session's own live state, which a confirmed Stop may end).
+    /// Derived from existing state only; nothing here is persisted.
+    enum ProviderSwitchAdmission: Equatable {
+        enum ForceableCause: Equatable {
+            case running
+            case waitingForInput
+            case compaction
+            case finishingTurn
+            case sessionTransfer
+            case stopping
+            case workInFlight
+
+            func message(provider: String) -> String {
+                switch self {
+                case .running: "\(provider) is still working on its last turn."
+                case .waitingForInput: "\(provider) is waiting for your input."
+                case .compaction: "\(provider) is still finishing a compaction."
+                case .finishingTurn: "\(provider) is still finishing its last turn."
+                case .sessionTransfer: "\(provider) is still finishing a session transfer."
+                case .stopping: "\(provider) is stopping."
+                case .workInFlight: "\(provider) still has work in flight."
+                }
+            }
+        }
+
+        case clear
+        case hard(String)
+        case forceable(ForceableCause)
+
+        func message(provider: String) -> String? {
+            switch self {
+            case .clear: nil
+            case let .hard(message): message
+            case let .forceable(cause): cause.message(provider: provider)
+            }
+        }
+
+        func isAdmissible(forcing: Bool) -> Bool {
+            switch self {
+            case .clear: true
+            case .hard: false
+            case .forceable: forcing
+            }
+        }
+    }
+
     /// Item 3's idle-only transition reads existing owners, ignoring only its own exact claim/slot.
     /// No saved idle bit, waiting worker, binding transition or provider action is introduced here.
-    func providerSwitchTransitionBlocker(
+    func providerSwitchTransitionAdmission(
         _ session: TabSession, ownsComposerClaim: Bool = false, resolvingHandoff: PendingHandoffState? = nil
-    ) -> String? {
-        if session.pendingSelfWorktreeRelocation != nil { return SendBlocker.changingExecutionLocation.rawValue }
-        if claudeCoordinator.hasPendingResumeTransfer(for: session) { return AgentSessionLinkSendFailure.targetBusy.message }
+    ) -> ProviderSwitchAdmission {
+        // A worktree relocation mutates bindings, not provider state; it stays uninterruptible.
+        if session.pendingSelfWorktreeRelocation != nil {
+            return .hard(SendBlocker.changingExecutionLocation.rawValue)
+        }
+        if claudeCoordinator.hasPendingResumeTransfer(for: session) { return .forceable(.sessionTransfer) }
         if session.selfCompactState.active != nil
             || session.selfCompactState.latest?.outcome == .recoveryRequired
             || session.selfCompactState.latest?.outcome == .deliveryUnknown
             || session.selfCompactState.latest?.noteDelivery == .deliveryUnknown
         {
-            return SendBlocker.pendingSelfCompact.rawValue
+            return .forceable(.compaction)
         }
         var snapshot = Self.agentSessionLinkDeliveryReadinessSnapshot(
             session: session, endpointMatchesGrant: sessions[session.tabID] === session, isClosing: false,
@@ -465,11 +515,55 @@ extension AgentModeViewModel {
             snapshot.providerSwitchUnconfirmed = false
             snapshot.providerHandoverNeedsReview = false
         }
-        if let failure = AgentSessionLinkDeliveryReadiness.failure(snapshot: snapshot) { return failure.message }
+        let evaluation = AgentSessionLinkDeliveryReadiness.evaluate(snapshot: snapshot)
+        if case let .blocked(reason) = evaluation {
+            switch reason {
+            case .targetNotIdle:
+                break
+            case .providerSwitchUnconfirmed, .providerHandoverNeedsReview,
+                 .endpointInvalidated, .targetLoading, .targetRestoreUnavailable,
+                 .targetCreationIncomplete:
+                return .hard(AgentSessionLinkSendFailure(reason).message)
+            }
+        }
+        if case .blocked(.targetNotIdle) = evaluation {
+            // An execution-location or initial-worktree mutation in flight stays hard like the
+            // relocation gate above; every other busy signal is source live state and forceable.
+            if snapshot.isChangingExecutionLocation || snapshot.isPreparingInitialWorktree {
+                return .hard(AgentSessionLinkSendFailure.targetNotIdle.message)
+            }
+            if snapshot.hasWaitingPrompt || snapshot.hasPendingAskUser || snapshot.hasPendingUserInputRequest
+                || snapshot.hasPendingApproval || snapshot.hasPendingPermissionsRequest
+                || snapshot.hasPendingMCPElicitationRequest || snapshot.hasPendingApplyEditsReview
+                || snapshot.hasPendingWorktreeMergeReview
+            {
+                return .forceable(.waitingForInput)
+            }
+            if snapshot.stopInProgress { return .forceable(.stopping) }
+            if snapshot.pendingSelfCompact || snapshot.backgroundCompactionSettling { return .forceable(.compaction) }
+            if snapshot.terminalCommitInProgress { return .forceable(.finishingTurn) }
+            if snapshot.runStateIsActive { return .forceable(.running) }
+            return .forceable(.workInFlight)
+        }
         if session.pendingHandoff.hasPayload, session.pendingHandoff.providerSwitchDelivery == nil,
-           !providerSwitchCanReplaceResumeRecovery(session) { return AgentSessionLinkSendFailure.targetBusy.message }
-        if !providerSwitchTerminalIsSettled(session) { return SendBlocker.terminalCommitInProgress.rawValue }
-        return nil
+           !providerSwitchCanReplaceResumeRecovery(session)
+        {
+            return .hard(AgentSessionLinkSendFailure.targetBusy.message)
+        }
+        if !providerSwitchTerminalIsSettled(session) { return .forceable(.finishingTurn) }
+        return .clear
+    }
+
+    func providerSwitchTransitionBlocker(
+        _ session: TabSession, ownsComposerClaim: Bool = false, resolvingHandoff: PendingHandoffState? = nil
+    ) -> String? {
+        switch providerSwitchTransitionAdmission(
+            session, ownsComposerClaim: ownsComposerClaim, resolvingHandoff: resolvingHandoff
+        ) {
+        case .clear: nil
+        case let .hard(message): message
+        case let .forceable(cause): cause.message(provider: session.selectedAgent.displayName)
+        }
     }
 
     /// Recognize only the existing app-authored recovery shape. Fork/unknown legacy slots remain
@@ -485,6 +579,45 @@ extension AgentModeViewModel {
               lines[1].hasSuffix(". Use the recovered transcript below, plus any preserved thread context, to continue seamlessly."),
               lines.last == "</forked_session>" else { return false }
         return true
+    }
+
+    /// Forced switch: decline pending interactions once, cancel an active self-compact, and stop
+    /// the run through the ordinary local-Stop path. The wait is bounded by the managed-stop
+    /// deadline; the stop itself keeps running in the background on timeout.
+    private func providerSwitchQuiesceSourceForForcedSwitch(_ session: TabSession) async {
+        providerSwitchDeclinePendingInteractions(for: session)
+        agentSelfCompactCancelForAcceptedLocalInput(session)
+        guard session.runState.isActive || session.agentTask != nil else { return }
+        #if DEBUG
+            if let hook = test_providerSwitchForceStop {
+                await hook(session)
+                return
+            }
+        #endif
+        await providerSwitchAwaitManagedStopDeadline { await self.cancelAgentRun(tabID: session.tabID) }
+    }
+
+    /// Waits `work` up to the shared managed-stop deadline; `work` is never cancelled on timeout,
+    /// so a still-running stop or provider shutdown finishes detached. Returns true on completion.
+    private func providerSwitchAwaitManagedStopDeadline(_ work: @escaping () async -> Void) async -> Bool {
+        let task = Task { await work() }
+        let finished = await withTaskGroup(of: Bool.self) { group in
+            group.addTask { _ = await task.value
+                return true
+            }
+            group.addTask {
+                #if DEBUG
+                    try? await Task.sleep(nanoseconds: UInt64(self.test_providerSwitchStopDeadlineSeconds * 1_000_000_000))
+                #else
+                    try? await Task.sleep(nanoseconds: UInt64(AgentRunStopState.managedStopDeadlineSeconds) * 1_000_000_000)
+                #endif
+                return false
+            }
+            defer { group.cancelAll() }
+            return await group.next() ?? true
+        }
+        if !finished { _ = Task.detached { await task.value } }
+        return finished
     }
 
     private func providerSwitchHistoryToolAllowed(_ session: TabSession, destination: AgentProviderKind? = nil) -> Bool {
@@ -820,17 +953,24 @@ extension AgentModeViewModel {
     }
 
     func providerSwitchPreviewBlocker(_ preview: ProviderSwitchPreview) -> String? {
-        guard providerSwitchPreviewIsCurrent(preview) else { return AgentSessionLinkSendFailure.providerHandoverNeedsReview.message }
-        if providerSwitchMutation != nil { return AgentSessionLinkSendFailure.targetBusy.message }
+        providerSwitchPreviewAdmission(preview).message(provider: preview.sourceAgent.displayName)
+    }
+
+    /// The sheet's one admission read: identity/intent/failure are hard, live state classifies.
+    func providerSwitchPreviewAdmission(_ preview: ProviderSwitchPreview) -> ProviderSwitchAdmission {
+        let needsReview = ProviderSwitchAdmission.hard(AgentSessionLinkSendFailure.providerHandoverNeedsReview.message)
+        guard providerSwitchPreviewIsCurrent(preview) else { return needsReview }
+        if providerSwitchMutation != nil { return .hard(AgentSessionLinkSendFailure.targetBusy.message) }
         if let intent = preview.cursorParameterIntent,
            preview.destination != .cursor || intent.applying(to: preview.sourceParameters, model: preview.model) == nil
         {
-            return AgentSessionLinkSendFailure.providerHandoverNeedsReview.message
+            return needsReview
         }
         if preview.source == nil || (preview.isReview && preview.originalDescriptor == nil) {
-            return AgentSessionLinkSendFailure.providerHandoverNeedsReview.message
+            return needsReview
         }
-        return preview.failure ?? providerSwitchTransitionBlocker(preview.session, resolvingHandoff: preview.originalHandoff)
+        if let failure = preview.failure { return .hard(failure) }
+        return providerSwitchTransitionAdmission(preview.session, resolvingHandoff: preview.originalHandoff)
     }
 
     private func buildProviderSwitchPreview(_ id: UUID) async {
@@ -1213,9 +1353,9 @@ extension AgentModeViewModel {
     /// One claimed, same-identity mutation for Switch/Replace and Discard. Native retirement is
     /// irreversible; rollback restores resumable references, never resurrects shutdown controllers.
     @discardableResult
-    func applyProviderSwitch(_ id: UUID, discard: Bool = false) async -> Bool {
+    func applyProviderSwitch(_ id: UUID, discard: Bool = false, force: Bool = false) async -> Bool {
         guard let preview = providerSwitchPreview, preview.id == id else { return false }
-        return await applyProviderSwitch(preview, discard: discard, requiresPresentedPreview: true)
+        return await applyProviderSwitch(preview, discard: discard, force: force, requiresPresentedPreview: true)
     }
 
     @discardableResult
@@ -1227,11 +1367,15 @@ extension AgentModeViewModel {
         return await applyProviderSwitch(preview, discard: true, requiresPresentedPreview: false)
     }
 
-    private func applyProviderSwitch(_ preview: ProviderSwitchPreview, discard: Bool, requiresPresentedPreview: Bool) async -> Bool {
+    private func applyProviderSwitch(_ preview: ProviderSwitchPreview, discard: Bool, force: Bool = false, requiresPresentedPreview: Bool) async -> Bool {
         let id = preview.id
+        // Force only bypasses the source's own liveness; every hard blocker still refuses.
+        let forcing = force && !discard && !preview.isReview
         guard !preview.building,
               preview.generationItemID == nil,
-              (discard ? providerSwitchDiscardBlocker(preview) : providerSwitchPreviewBlocker(preview)) == nil,
+              discard
+              ? providerSwitchDiscardBlocker(preview) == nil
+              : providerSwitchPreviewAdmission(preview).isAdmissible(forcing: forcing),
               discard ? preview.isReview : (preview.chosen != nil && preview.chosen?.unavailable == nil),
               let claim = providerSwitchClaim(preview), let workspaceID = workspaceManager?.activeWorkspaceID else { return false }
         defer { releaseComposerSubmitClaim(claim) }
@@ -1253,10 +1397,18 @@ extension AgentModeViewModel {
             }
         }
         func current() -> Bool {
-            composerSubmitClaimIsCurrent(claim) && providerSwitchMutation?.id == mutation.id
-                && (!requiresPresentedPreview || providerSwitchPreview?.id == id) && providerSwitchPreviewIsCurrent(preview)
+            // Forcing deliberately mutates the source's live state (declines interactions, stops
+            // the run); the content-revision currency check would abort on that intended drift.
+            // Identity (session, binding, workspace) still has to hold in either mode.
+            let previewCurrent = forcing
+                ? providerSwitchPreviewIdentityIsCurrent(preview)
+                : providerSwitchPreviewIsCurrent(preview)
+            return composerSubmitClaimIsCurrent(claim) && providerSwitchMutation?.id == mutation.id
+                && (!requiresPresentedPreview || providerSwitchPreview?.id == id) && previewCurrent
                 && workspaceManager?.activeWorkspaceID == workspaceID && providerSwitchHasExactOwner(session)
-                && providerSwitchTransitionBlocker(session, ownsComposerClaim: true, resolvingHandoff: preview.originalHandoff) == nil
+                && providerSwitchTransitionAdmission(
+                    session, ownsComposerClaim: true, resolvingHandoff: preview.originalHandoff
+                ).isAdmissible(forcing: forcing)
         }
         var noticeID: UUID?
         var phase: RequiredSavePhase = .beforeWrite
@@ -1275,9 +1427,18 @@ extension AgentModeViewModel {
             let payload = discard ? nil : await providerSwitchPayload(id, mode: preview.selected ?? .history)
             guard discard || payload != nil, current() else { return false }
             if !discard {
-                try await requireIdleProviderForWorktreeBindingTransition(session)
+                if forcing {
+                    await providerSwitchQuiesceSourceForForcedSwitch(session)
+                } else {
+                    try await requireIdleProviderForWorktreeBindingTransition(session)
+                }
                 guard current() else { return false }
-                await retireProviderContextForProviderSwitch(session)
+                // Detached shutdown can hang on a wedged provider; bound the wait on the shared
+                // managed-stop deadline, never the mutation. The work itself is never cancelled —
+                // a slow provider still finishes retiring detached.
+                _ = await providerSwitchAwaitManagedStopDeadline {
+                    await self.retireProviderContextForProviderSwitch(session)
+                }
                 guard current() else {
                     if sessions[session.tabID] === session, session.currentRestorationBindingToken == preview.binding,
                        composerSubmitClaimIsCurrent(claim), session.pendingHandoff == preview.originalHandoff,

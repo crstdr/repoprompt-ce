@@ -2648,6 +2648,164 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             }
         }
 
+        func testForceSwitchAdmissionClassifiesHardAndForceableCauses() async throws {
+            // Every blocker the sheet can show is either integrity (hard, unforceable) or the
+            // source session's own live state (forceable behind the confirmation).
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                XCTAssertEqual(vm.providerSwitchTransitionAdmission(session), .clear)
+
+                session.isChangingExecutionLocation = true
+                XCTAssertEqual(
+                    vm.providerSwitchTransitionAdmission(session),
+                    .hard(AgentSessionLinkSendFailure.targetNotIdle.message),
+                    "A worktree mutation in flight stays hard"
+                )
+                session.isChangingExecutionLocation = false
+
+                session.pendingHandoff = try .init(payload: "foreign-slot", createdAt: Date())
+                XCTAssertEqual(
+                    vm.providerSwitchTransitionAdmission(session),
+                    .hard(AgentSessionLinkSendFailure.targetBusy.message),
+                    "A foreign pending-handoff slot stays hard"
+                )
+                session.pendingHandoff = .init()
+
+                session.pendingHandoff = try .init(
+                    payload: switchCarrier(), createdAt: Date(), providerSwitchDelivery: .ready
+                )
+                session.items.append(.user("intruder", sequenceIndex: session.nextSequenceIndex))
+                if case .hard = vm.providerSwitchTransitionAdmission(session) {} else {
+                    XCTFail("A stale pending handover stays hard")
+                }
+                session.pendingHandoff = .init()
+
+                session.runState = .running
+                XCTAssertEqual(vm.providerSwitchTransitionAdmission(session), .forceable(.running))
+                session.waitingPrompt = "answer?"
+                XCTAssertEqual(vm.providerSwitchTransitionAdmission(session), .forceable(.waitingForInput))
+                session.waitingPrompt = nil
+                session.runState = .idle
+            }
+        }
+
+        func testForceSwitchDeclinesPendingInteractionOnceAndStagesHandover() async throws {
+            // A confirmed force declines the waiting approval through the ordinary cancel path
+            // exactly once, then stages the normal ready handover.
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                session.waitingPrompt = "answer?"
+                session.pendingApproval = AgentApprovalRequest(
+                    requestID: .codex(.int(1)),
+                    method: "item/commandExecution/requestApproval",
+                    kind: .commandExecution, threadID: "t", turnID: "t", itemID: "i"
+                )
+                var saves = 0
+                vm.test_setAgentSessionSaver { _, _, _ in
+                    saves += 1
+                    return fixture.rootURL.appendingPathComponent("forced.json")
+                }
+                var retirements = 0
+                vm.test_providerSwitchRetirement = { _ in retirements += 1 }
+                await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
+                let preview = try XCTUnwrap(vm.providerSwitchPreview)
+                if case .forceable(.waitingForInput) = vm.providerSwitchPreviewAdmission(preview) {} else {
+                    return XCTFail("A pending approval must classify as forceable waiting-for-input")
+                }
+                let refused = await vm.applyProviderSwitch(preview.id)
+                XCTAssertFalse(refused, "Without the explicit force confirmation the same state must refuse")
+                let forced = await vm.applyProviderSwitch(preview.id, force: true)
+                XCTAssertTrue(
+                    forced,
+                    "admission=\(vm.providerSwitchPreviewAdmission(preview)) selected=\(String(describing: preview.selected)) chosen=\(String(describing: preview.chosen?.mode)) failure=\(String(describing: preview.failure)) building=\(preview.building)"
+                )
+                XCTAssertEqual(saves, 1)
+                XCTAssertEqual(retirements, 1)
+                XCTAssertNil(session.pendingApproval, "The approval is declined, never accepted")
+                XCTAssertNil(session.waitingPrompt)
+                XCTAssertEqual(session.selectedAgent, .openCode)
+                XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .ready)
+                XCTAssertNotNil(session.pendingHandoff.payload)
+            }
+        }
+
+        func testForceSwitchStopsTheRunAndProceeds() async throws {
+            // A live run is stopped through the ordinary local-Stop path before the handover.
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                session.installRunID(UUID())
+                session.beginRunAttempt(source: "test.force")
+                session.runState = .running
+                vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("forced-run.json") }
+                var stops = 0
+                vm.test_providerSwitchForceStop = { s in
+                    stops += 1
+                    s.runState = .idle
+                    s.agentTask = nil
+                }
+                vm.test_providerSwitchRetirement = { _ in }
+                await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
+                let preview = try XCTUnwrap(vm.providerSwitchPreview)
+                XCTAssertEqual(vm.providerSwitchTransitionAdmission(session), .forceable(.running))
+                let forced = await vm.applyProviderSwitch(preview.id, force: true)
+                XCTAssertTrue(forced)
+                XCTAssertEqual(stops, 1, "Forcing goes through the ordinary stop exactly once")
+                XCTAssertEqual(session.selectedAgent, .openCode)
+                XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .ready)
+            }
+        }
+
+        func testForceSwitchRefusedOnHardBlocker() async throws {
+            // Force only bypasses source liveness; a foreign handoff slot still refuses outright.
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                let provider = session.selectedAgent
+                session.pendingHandoff = try .init(payload: "foreign-slot", createdAt: Date())
+                await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
+                let preview = try XCTUnwrap(vm.providerSwitchPreview)
+                let forced = await vm.applyProviderSwitch(preview.id, force: true)
+                XCTAssertFalse(forced)
+                XCTAssertEqual(session.selectedAgent, provider)
+                XCTAssertEqual(session.pendingHandoff.payload, "foreign-slot")
+            }
+        }
+
+        func testForceAffordanceNeverReachesOverseerOrMCP() async throws {
+            // The force gesture lives only in the local sheet: a linked send during the same busy
+            // state receives exactly today's retryable busy refusal, never a switch outcome.
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                session.runState = .running
+                let candidate = try XCTUnwrap(vm.agentSessionLinkCandidate(
+                    tabID: session.tabID, sessionID: XCTUnwrap(session.activeAgentSessionID),
+                    tabName: "Target", isWindowClosing: false
+                ))
+                let request = AgentSessionLinkSendRequest(
+                    linkID: UUID(), linkGeneration: 1,
+                    observerEndpoint: .init(
+                        windowID: 2, workspaceID: UUID(), tabID: UUID(), sessionID: UUID(),
+                        persistentBindingGeneration: UUID(), bindingTransitionGeneration: 1
+                    ),
+                    observerDisplayName: "Lane", message: "hi", workflow: nil
+                )
+                let outcome = await vm.agentSessionLinkPerformSend(
+                    to: candidate, request: request,
+                    liveness: { .init(observerEndpointIsLive: true, targetEndpointIsLive: true, targetWindowIsClosing: false) },
+                    commitAuthorization: { .committed }
+                )
+                guard case let .blocked(failure) = outcome else {
+                    return XCTFail("A send during a forceable-busy state must stay refused, got \(outcome)")
+                }
+                XCTAssertEqual(failure, .targetNotIdle)
+                XCTAssertTrue(failure.isRetryable, "The busy refusal stays retryable exactly as today")
+            }
+        }
+
         func testRestoredIdenticalNewestTurnsFallsBackToFullHistory() async throws {
             // The saved newest-turns carrier equals what the fresh budget renders as full history;
             // the hidden row must resolve to .history rather than a missing selection.

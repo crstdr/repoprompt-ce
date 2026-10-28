@@ -66,6 +66,7 @@ struct AgentProviderSwitchPreview: View {
     @ObservedObject var viewModel: AgentModeViewModel
     @State private var showsPayload = false
     @State private var payload = ""
+    @State private var forceArmed = false
 
     var body: some View {
         if let preview = viewModel.providerSwitchPreview {
@@ -115,6 +116,7 @@ struct AgentProviderSwitchPreview: View {
                         .frame(height: 180)
                 }
                 .disabled(preview.chosen?.bytes ?? 0 == 0)
+                .onChange(of: preview.id) { forceArmed = false }
                 .task(id: "\(preview.id)-\(preview.selected?.rawValue ?? "")-\(showsPayload)") {
                     payload = ""
                     if showsPayload, let mode = preview.selected {
@@ -124,7 +126,26 @@ struct AgentProviderSwitchPreview: View {
                         payload = rendered ?? ""
                     }
                 }
-                if let reason = viewModel.providerSwitchPreviewBlocker(preview) { Text("Can't switch: \(reason)").foregroundStyle(.secondary) }
+                let admission = viewModel.providerSwitchPreviewAdmission(preview)
+                if case let .forceable(cause) = admission, !preview.isReview {
+                    let provider = preview.sourceAgent.displayName
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(cause.message(provider: provider)).foregroundStyle(.secondary)
+                        if forceArmed {
+                            Text("This stops \(provider) mid-turn; whatever it was doing is dropped. The conversation carries over.")
+                                .foregroundStyle(.secondary)
+                            Button("Stop \(provider) and switch") {
+                                Task { await viewModel.applyProviderSwitch(preview.id, force: true) }
+                            }
+                            .disabled(viewModel.providerSwitchMutation != nil)
+                        } else {
+                            Button("Stop \(provider) and switch") { forceArmed = true }
+                                .disabled(viewModel.providerSwitchMutation != nil)
+                        }
+                    }
+                } else if let reason = admission.message(provider: preview.sourceAgent.displayName) {
+                    Text("Can't switch: \(reason)").foregroundStyle(.secondary)
+                }
                 HStack {
                     if preview.isReview {
                         Button("Discard handover") { Task { await viewModel.applyProviderSwitch(preview.id, discard: true) } }
