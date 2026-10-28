@@ -495,17 +495,11 @@ extension AgentModeViewModel {
     func providerSwitchTransitionAdmission(
         _ session: TabSession, ownsComposerClaim: Bool = false, resolvingHandoff: PendingHandoffState? = nil
     ) -> ProviderSwitchAdmission {
+        // Every integrity guard is evaluated before any source-liveness classification, so a
+        // force can never run its quiesce while a protected state holds.
         // A worktree relocation mutates bindings, not provider state; it stays uninterruptible.
         if session.pendingSelfWorktreeRelocation != nil {
             return .hard(SendBlocker.changingExecutionLocation.rawValue)
-        }
-        if claudeCoordinator.hasPendingResumeTransfer(for: session) { return .forceable(.sessionTransfer) }
-        if session.selfCompactState.active != nil
-            || session.selfCompactState.latest?.outcome == .recoveryRequired
-            || session.selfCompactState.latest?.outcome == .deliveryUnknown
-            || session.selfCompactState.latest?.noteDelivery == .deliveryUnknown
-        {
-            return .forceable(.compaction)
         }
         var snapshot = Self.agentSessionLinkDeliveryReadinessSnapshot(
             session: session, endpointMatchesGrant: sessions[session.tabID] === session, isClosing: false,
@@ -526,6 +520,19 @@ extension AgentModeViewModel {
                 return .hard(AgentSessionLinkSendFailure(reason).message)
             }
         }
+        if session.pendingHandoff.hasPayload, session.pendingHandoff.providerSwitchDelivery == nil,
+           !providerSwitchCanReplaceResumeRecovery(session)
+        {
+            return .hard(AgentSessionLinkSendFailure.targetBusy.message)
+        }
+        if claudeCoordinator.hasPendingResumeTransfer(for: session) { return .forceable(.sessionTransfer) }
+        if session.selfCompactState.active != nil
+            || session.selfCompactState.latest?.outcome == .recoveryRequired
+            || session.selfCompactState.latest?.outcome == .deliveryUnknown
+            || session.selfCompactState.latest?.noteDelivery == .deliveryUnknown
+        {
+            return .forceable(.compaction)
+        }
         if case .blocked(.targetNotIdle) = evaluation {
             // An execution-location or initial-worktree mutation in flight stays hard like the
             // relocation gate above; every other busy signal is source live state and forceable.
@@ -544,11 +551,6 @@ extension AgentModeViewModel {
             if snapshot.terminalCommitInProgress { return .forceable(.finishingTurn) }
             if snapshot.runStateIsActive { return .forceable(.running) }
             return .forceable(.workInFlight)
-        }
-        if session.pendingHandoff.hasPayload, session.pendingHandoff.providerSwitchDelivery == nil,
-           !providerSwitchCanReplaceResumeRecovery(session)
-        {
-            return .hard(AgentSessionLinkSendFailure.targetBusy.message)
         }
         if !providerSwitchTerminalIsSettled(session) { return .forceable(.finishingTurn) }
         return .clear
@@ -599,11 +601,20 @@ extension AgentModeViewModel {
 
     /// Waits `work` up to the shared managed-stop deadline; `work` is never cancelled on timeout,
     /// so a still-running stop or provider shutdown finishes detached. Returns true on completion.
+    /// The work runs in its own task and reports through a stream: the group only races two
+    /// cancellable children (a stream read and the deadline sleep), so it returns on the first
+    /// outcome instead of waiting out an uncancellable `task.value` child.
     private func providerSwitchAwaitManagedStopDeadline(_ work: @escaping () async -> Void) async -> Bool {
-        let task = Task { await work() }
+        let (stream, continuation) = AsyncStream<Bool>.makeStream()
+        Task { @MainActor in
+            await work()
+            continuation.yield(true)
+            continuation.finish()
+        }
         let finished = await withTaskGroup(of: Bool.self) { group in
-            group.addTask { _ = await task.value
-                return true
+            group.addTask {
+                var iterator = stream.makeAsyncIterator()
+                return await iterator.next() ?? false
             }
             group.addTask {
                 #if DEBUG
@@ -613,10 +624,11 @@ extension AgentModeViewModel {
                 #endif
                 return false
             }
-            defer { group.cancelAll() }
-            return await group.next() ?? true
+            let first = await group.next() ?? false
+            group.cancelAll()
+            return first
         }
-        if !finished { _ = Task.detached { await task.value } }
+        continuation.finish()
         return finished
     }
 

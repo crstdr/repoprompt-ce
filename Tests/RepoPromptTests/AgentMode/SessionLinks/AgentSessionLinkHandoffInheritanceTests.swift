@@ -2774,6 +2774,97 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             }
         }
 
+        func testForceSwitchCompletesBeforeHeldRetirementIsReleased() async throws {
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                session.waitingPrompt = "answer?"
+                vm.test_providerSwitchStopDeadlineSeconds = 0.01
+                vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("forced-deadline.json") }
+                let retirement = TestReleaseFence(name: "forced switch retirement")
+                var retirementEntered = false
+                var retirementFinished = false
+                vm.test_providerSwitchRetirement = { _ in
+                    retirementEntered = true
+                    await retirement.enterAndWait()
+                    retirementFinished = true
+                }
+                await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
+                let preview = try XCTUnwrap(vm.providerSwitchPreview)
+                XCTAssertEqual(vm.providerSwitchPreviewAdmission(preview), .forceable(.waitingForInput))
+                var applyFinished = false
+                let apply = Task {
+                    let result = await vm.applyProviderSwitch(preview.id, force: true)
+                    applyFinished = true
+                    return result
+                }
+                do {
+                    try await AsyncTestWait.waitUntil("forced switch retirement entered", timeout: 2) { retirementEntered }
+                    try await AsyncTestWait.waitUntil("forced switch completes while retirement is held", timeout: 1) { applyFinished }
+                    XCTAssertFalse(retirementFinished, "Outstanding retirement must remain running, not be cancelled to escape the wait")
+                    XCTAssertEqual(session.selectedAgent, .openCode)
+                    XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .ready)
+                    XCTAssertNotNil(session.pendingHandoff.payload)
+                    XCTAssertNil(vm.providerSwitchMutation)
+                } catch {
+                    retirement.release()
+                    _ = await apply.value
+                    throw error
+                }
+                retirement.release()
+                let applied = await apply.value
+                XCTAssertTrue(applied)
+                try await AsyncTestWait.waitUntil("released retirement finishes", timeout: 2) { retirementFinished }
+            }
+        }
+
+        func testForceSwitchForeignHandoffStaysHardWhileSourceIsBusy() async throws {
+            // Exercise the existing foreign-slot fixture with each independent live busy flag.
+            // These are VM admission states, not evidence of a provider producing the overlap.
+            for awaitingApproval in [false, true] {
+                try await withFixture { fixture in
+                    let vm = fixture.viewModel
+                    let session = fixture.sourceSession
+                    let provider = session.selectedAgent
+                    session.pendingHandoff = try .init(payload: "foreign-slot", createdAt: Date())
+                    if awaitingApproval {
+                        session.pendingApproval = AgentApprovalRequest(
+                            requestID: .codex(.int(1)),
+                            method: "item/commandExecution/requestApproval",
+                            kind: .commandExecution, threadID: "t", turnID: "t", itemID: "i"
+                        )
+                    } else {
+                        session.mcpFollowUpRunPending = true
+                    }
+                    let handoff = session.pendingHandoff
+                    let approval = session.pendingApproval
+                    var retirements = 0
+                    var saves = 0
+                    vm.test_providerSwitchRetirement = { _ in retirements += 1 }
+                    vm.test_setAgentSessionSaver { _, _, _ in
+                        saves += 1
+                        return fixture.rootURL.appendingPathComponent("unexpected-forced-switch.json")
+                    }
+                    await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
+                    let preview = try XCTUnwrap(vm.providerSwitchPreview)
+                    XCTAssertFalse(preview.building)
+                    XCTAssertNil(preview.failure)
+                    let chosen = try XCTUnwrap(preview.chosen)
+                    XCTAssertNil(chosen.unavailable)
+                    XCTAssertEqual(vm.providerSwitchPreviewAdmission(preview), .hard(AgentSessionLinkSendFailure.targetBusy.message))
+                    XCTAssertEqual(session.pendingApproval, approval, "Admission must not resolve the pending approval")
+                    let forced = await vm.applyProviderSwitch(preview.id, force: true)
+                    XCTAssertFalse(forced, "Foreign handoff remains hard; awaitingApproval=\(awaitingApproval)")
+                    XCTAssertEqual(session.selectedAgent, provider)
+                    XCTAssertEqual(session.pendingHandoff, handoff)
+                    XCTAssertEqual(session.pendingApproval, approval, "Force refusal must neither approve nor clear the pending approval")
+                    XCTAssertEqual(session.mcpFollowUpRunPending, !awaitingApproval)
+                    XCTAssertEqual(retirements, 0)
+                    XCTAssertEqual(saves, 0)
+                }
+            }
+        }
+
         func testForceAffordanceNeverReachesOverseerOrMCP() async throws {
             // The force gesture lives only in the local sheet: a linked send during the same busy
             // state receives exactly today's retryable busy refusal, never a switch outcome.
