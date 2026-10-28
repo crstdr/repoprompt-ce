@@ -22,6 +22,8 @@ struct AgentSelfMCPToolService {
     let requireTargetWindow: () throws -> WindowState
     let resolveObserverEndpoint: ObserverEndpointResolver
     let captureCallOrigin: () -> AgentSelfMCPCallOrigin?
+    let enterNoop: (WindowState, AgentSelfMCPCallOrigin, UUID, Bool) -> Void
+    let acceptNoop: (WindowState, AgentSelfMCPCallOrigin, Endpoint?, UUID) -> Void
     let readSelf: (WindowState, Endpoint, AgentSelfMCPCallOrigin) -> AgentSelfContextSnapshot?
     let scheduleCompact: (WindowState, Endpoint, AgentSelfMCPCallOrigin, String, String) async -> Admission
     var isToolEnabled: () -> Bool = { ToolAvailabilityStore.shared.isEnabled(MCPWindowToolName.agentSelf) }
@@ -38,18 +40,14 @@ struct AgentSelfMCPToolService {
         let context = MCPInvocationContextBridge.current
         let window = try requireTargetWindow()
         if let origin, let context {
-            window.agentModeViewModel.enterSelfNoopBody(
-                origin: origin, invocationID: context.invocationID, argumentsAreEmpty: args.isEmpty
-            )
+            enterNoop(window, origin, context.invocationID, args.isEmpty)
         }
         let metadata = await captureRequestMetadata()
         let endpoint = await AgentSessionTargetOperationGuard.resolveObserverEndpoint(
             metadata: metadata, targetWindow: window, resolveObserverEndpoint: resolveObserverEndpoint
         )
         if let origin, let context {
-            window.agentModeViewModel.acceptSelfNoopBody(
-                origin: origin, endpoint: window.isClosing ? nil : endpoint, invocationID: context.invocationID
-            )
+            acceptNoop(window, origin, window.isClosing ? nil : endpoint, context.invocationID)
         }
         return AgentSelfNoopTool.acknowledgement
     }

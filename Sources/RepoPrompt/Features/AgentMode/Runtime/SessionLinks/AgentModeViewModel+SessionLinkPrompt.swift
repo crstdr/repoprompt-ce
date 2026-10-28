@@ -1038,7 +1038,7 @@ extension AgentModeViewModel {
            current.wakeID == claim.dispatchID.autoWakeID, current.phase == .preparingDispatch,
            current.routineQuietCandidate
         {
-            let definition: AgentSessionLinkCatalogDiagnostics.ReturnedDefinition
+            let definition: AgentSessionLinkReturnedDefinition
             if let catalog = projection?.returnedCatalog {
                 let matches = catalog[MCPWindowToolName.selfNoop] ?? []
                 definition = matches.isEmpty ? .absent : matches.count != 1 ? .ambiguous
@@ -1046,13 +1046,13 @@ extension AgentModeViewModel {
             } else {
                 definition = .unknown
             }
-            AgentSessionLinkCatalogDiagnostics.quietQualification(
+            catalogDiagnosticsSink.record(.quietQualification(
                 tabID: session.tabID, reserved: claim.routineQuietCheckIn, candidate: true,
                 routingGeneration: projection?.routeToken?.routingAuthorityGeneration,
                 definition: definition, serverProof: supportsDeclaration,
                 ordinary: session.quietLedger.hasOrdinaryOccurrence(owner: owner),
                 qualified: supportHolds && finalized?.routineQuietCheckIn == true
-            )
+            ))
             current.routineQuietCandidate = false
             session.oversight.pendingAutoWake = current
         }

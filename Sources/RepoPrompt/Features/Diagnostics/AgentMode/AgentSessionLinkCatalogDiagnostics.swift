@@ -195,9 +195,7 @@ enum AgentSessionLinkCatalogDiagnostics {
         ))
     }
 
-    enum ReturnedDefinition: String {
-        case unknown, absent, exact, ambiguous, different
-    }
+    typealias ReturnedDefinition = AgentSessionLinkReturnedDefinition
 
     /// One bounded record at an attempt's final qualification; never input to the decision.
     @discardableResult
@@ -277,6 +275,11 @@ struct AppAgentSessionLinkCatalogEventSink: AgentSessionLinkCatalogEventSink {
             AgentSessionLinkCatalogDiagnostics.repairTransition(runID: runID, tabID: tabID, outcome: outcome)
         case let .toolCallReceived(runID, tabID, connectionID):
             AgentSessionLinkCatalogDiagnostics.toolCallReceived(runID: runID, tabID: tabID, connectionID: connectionID)
+        case let .quietQualification(tabID, reserved, candidate, routingGeneration, definition, serverProof, ordinary, qualified):
+            AgentSessionLinkCatalogDiagnostics.quietQualification(
+                tabID: tabID, reserved: reserved, candidate: candidate, routingGeneration: routingGeneration,
+                definition: definition, serverProof: serverProof, ordinary: ordinary, qualified: qualified
+            )
         }
     }
 }
