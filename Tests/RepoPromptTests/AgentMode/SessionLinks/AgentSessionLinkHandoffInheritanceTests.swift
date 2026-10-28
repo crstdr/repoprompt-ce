@@ -2865,6 +2865,52 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             }
         }
 
+        func testForceSwitchLatchedCompactFailureStaysHard() async throws {
+            // A settled compact failure is integrity state (failed required save / unconfirmed
+            // delivery), not live work: no force affordance, and a worktree flag still outranks
+            // any live-state classification.
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                session.selfCompactState = AgentSelfCompactState(latest: .malformedRecovery())
+                XCTAssertEqual(
+                    vm.providerSwitchTransitionAdmission(session),
+                    .hard(AgentModeViewModel.SendBlocker.pendingSelfCompact.rawValue),
+                    "A latched compact recovery is a persistence-integrity refusal"
+                )
+                session.isChangingExecutionLocation = true
+                XCTAssertEqual(
+                    vm.providerSwitchTransitionAdmission(session),
+                    .hard(AgentSessionLinkSendFailure.targetNotIdle.message),
+                    "The worktree guard must precede every live-state classification"
+                )
+            }
+        }
+
+        func testForceSwitchWithdrawsQueuedWorkWithNoActiveRun() async throws {
+            // Queued producers with no live run are withdrawn through the same claim-time path an
+            // explicit Stop runs — nothing stays armed to dispatch under the new provider.
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                session.mcpFollowUpRunPending = true
+                vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("forced-queued.json") }
+                vm.test_providerSwitchRetirement = { _ in }
+                await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
+                let preview = try XCTUnwrap(vm.providerSwitchPreview)
+                XCTAssertEqual(
+                    vm.providerSwitchTransitionAdmission(session),
+                    .forceable(.workInFlight),
+                    "Queued work with no live run classifies as forceable"
+                )
+                let forced = await vm.applyProviderSwitch(preview.id, force: true)
+                XCTAssertTrue(forced)
+                XCTAssertFalse(session.mcpFollowUpRunPending, "The armed follow-up is withdrawn, never replayed")
+                XCTAssertEqual(session.selectedAgent, .openCode)
+                XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .ready)
+            }
+        }
+
         func testForceAffordanceNeverReachesOverseerOrMCP() async throws {
             // The force gesture lives only in the local sheet: a linked send during the same busy
             // state receives exactly today's retryable busy refusal, never a switch outcome.

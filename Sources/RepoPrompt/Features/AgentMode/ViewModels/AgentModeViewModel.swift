@@ -24337,15 +24337,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// private paths the run-cancel hooks use. Called before the ordinary stop inside the switch
     /// mutation; each helper is idempotent, so anything `cancelRun` already cleared is a no-op.
     func providerSwitchDeclinePendingInteractions(for session: TabSession) {
+        // A Codex user-input request dies with the controller retirement that follows; it has no
+        // user-level decline response, only the cleared field the coordinator uses on turn end.
+        // Clear it before the cancels below so their reconcile/publish sees the final state.
+        session.pendingUserInputRequest = nil
+        session.queuedUserInputRequests.removeAll()
         cancelPendingInstruction(for: session)
         cancelPendingQuestion(for: session)
         cancelPendingApproval(for: session)
         cancelPendingApplyEditsReview(for: session, reason: "Provider switch")
         cancelPendingWorktreeMergeReview(for: session, reason: "Provider switch")
-        // A Codex user-input request dies with the controller retirement that follows; it has no
-        // user-level decline response, only the cleared field the coordinator uses on turn end.
-        session.pendingUserInputRequest = nil
-        session.queuedUserInputRequests.removeAll()
     }
 
     private func cancelPendingQuestion(for session: TabSession) {

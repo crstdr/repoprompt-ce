@@ -490,7 +490,9 @@ extension AgentModeViewModel {
         }
     }
 
-    /// Item 3's idle-only transition reads existing owners, ignoring only its own exact claim/slot.
+    /// Item 3's transition admission reads existing owners, ignoring only its own exact
+    /// claim/slot. Every integrity guard evaluates before any source live-state classification;
+    /// `.forceable` means the local sheet may offer the confirmed stop-and-switch gesture.
     /// No saved idle bit, waiting worker, binding transition or provider action is introduced here.
     func providerSwitchTransitionAdmission(
         _ session: TabSession, ownsComposerClaim: Bool = false, resolvingHandoff: PendingHandoffState? = nil
@@ -520,25 +522,27 @@ extension AgentModeViewModel {
                 return .hard(AgentSessionLinkSendFailure(reason).message)
             }
         }
+        // An execution-location or initial-worktree mutation in flight stays hard like the
+        // relocation gate above; it must precede every live-state classification.
+        if snapshot.isChangingExecutionLocation || snapshot.isPreparingInitialWorktree {
+            return .hard(AgentSessionLinkSendFailure.targetNotIdle.message)
+        }
         if session.pendingHandoff.hasPayload, session.pendingHandoff.providerSwitchDelivery == nil,
            !providerSwitchCanReplaceResumeRecovery(session)
         {
             return .hard(AgentSessionLinkSendFailure.targetBusy.message)
         }
-        if claudeCoordinator.hasPendingResumeTransfer(for: session) { return .forceable(.sessionTransfer) }
-        if session.selfCompactState.active != nil
-            || session.selfCompactState.latest?.outcome == .recoveryRequired
+        // A latched compact failure is integrity state (a failed required save or an unconfirmed
+        // delivery), not live work — it stays hard. Only a compact still in flight is forceable.
+        if session.selfCompactState.latest?.outcome == .recoveryRequired
             || session.selfCompactState.latest?.outcome == .deliveryUnknown
             || session.selfCompactState.latest?.noteDelivery == .deliveryUnknown
         {
-            return .forceable(.compaction)
+            return .hard(SendBlocker.pendingSelfCompact.rawValue)
         }
+        if claudeCoordinator.hasPendingResumeTransfer(for: session) { return .forceable(.sessionTransfer) }
+        if session.selfCompactState.active != nil { return .forceable(.compaction) }
         if case .blocked(.targetNotIdle) = evaluation {
-            // An execution-location or initial-worktree mutation in flight stays hard like the
-            // relocation gate above; every other busy signal is source live state and forceable.
-            if snapshot.isChangingExecutionLocation || snapshot.isPreparingInitialWorktree {
-                return .hard(AgentSessionLinkSendFailure.targetNotIdle.message)
-            }
             if snapshot.hasWaitingPrompt || snapshot.hasPendingAskUser || snapshot.hasPendingUserInputRequest
                 || snapshot.hasPendingApproval || snapshot.hasPendingPermissionsRequest
                 || snapshot.hasPendingMCPElicitationRequest || snapshot.hasPendingApplyEditsReview
@@ -589,14 +593,24 @@ extension AgentModeViewModel {
     private func providerSwitchQuiesceSourceForForcedSwitch(_ session: TabSession) async {
         providerSwitchDeclinePendingInteractions(for: session)
         agentSelfCompactCancelForAcceptedLocalInput(session)
-        guard session.runState.isActive || session.agentTask != nil else { return }
         #if DEBUG
             if let hook = test_providerSwitchForceStop {
                 await hook(session)
                 return
             }
         #endif
-        await providerSwitchAwaitManagedStopDeadline { await self.cancelAgentRun(tabID: session.tabID) }
+        if session.runState.isActive || session.agentTask != nil || session.runState.isTerminalForCommit {
+            // The switch destroys provider infrastructure next, so the stop awaits teardown.
+            _ = await providerSwitchAwaitManagedStopDeadline {
+                await self.cancelAgentRun(tabID: session.tabID, completion: .terminalTeardownCompleted)
+            }
+        } else {
+            // Queued work with no live run gets the same claim-time withdrawal an explicit Stop
+            // runs — without manufacturing a cancelled attempt the way cancelRun would on idle.
+            prepareAgentRunCancellation(session: session, intent: .userStop, origin: .explicitStop)
+            withdrawQueuedWorkForManagedStop(session: session)
+            retireTimedOutManagedStopIfEligible(session)
+        }
     }
 
     /// Waits `work` up to the shared managed-stop deadline; `work` is never cancelled on timeout,
@@ -611,17 +625,18 @@ extension AgentModeViewModel {
             continuation.yield(true)
             continuation.finish()
         }
+        #if DEBUG
+            let deadlineSeconds = test_providerSwitchStopDeadlineSeconds
+        #else
+            let deadlineSeconds = AgentRunStopState.managedStopDeadlineSeconds
+        #endif
         let finished = await withTaskGroup(of: Bool.self) { group in
             group.addTask {
                 var iterator = stream.makeAsyncIterator()
                 return await iterator.next() ?? false
             }
             group.addTask {
-                #if DEBUG
-                    try? await Task.sleep(nanoseconds: UInt64(self.test_providerSwitchStopDeadlineSeconds * 1_000_000_000))
-                #else
-                    try? await Task.sleep(nanoseconds: UInt64(AgentRunStopState.managedStopDeadlineSeconds) * 1_000_000_000)
-                #endif
+                try? await Task.sleep(nanoseconds: UInt64(deadlineSeconds * 1_000_000_000))
                 return false
             }
             let first = await group.next() ?? false
@@ -935,7 +950,12 @@ extension AgentModeViewModel {
             && session.selectedAgent == preview.sourceAgent && session.selectedModelRaw == preview.sourceModel
             && session.selectedReasoningEffortRaw == preview.sourceReasoningEffort
             && session.selectedClaudeEffortRaw == preview.sourceClaudeEffort
-            && session.pendingHandoff == preview.originalHandoff && preview.stopFence.permitsStart(of: session)
+            && session.pendingHandoff == preview.originalHandoff
+            // Fence identity, not permission: an in-progress managed stop is live state the
+            // admission layer classifies, not preview drift. Run-start denial stays in the
+            // start path (permitsStart), which admission still consults.
+            && preview.stopFence.binding == session.persistentSessionBindingIdentity
+            && preview.stopFence.cancellationGeneration == session.stopState.cancellationGeneration
             && session.acpModelParameterSelections == preview.sourceParameters
             && (!content || (
                 session.sourceItemsRevision == preview.sourceRevision
@@ -1444,7 +1464,13 @@ extension AgentModeViewModel {
                 } else {
                     try await requireIdleProviderForWorktreeBindingTransition(session)
                 }
-                guard current() else { return false }
+                guard current() else {
+                    // The quiesce already ran; a late refusal must surface, not fail silently.
+                    if forcing, requiresPresentedPreview, providerSwitchPreview?.id == id {
+                        providerSwitchPreview?.failure = AgentSessionLinkSendFailure.providerHandoverNeedsReview.message
+                    }
+                    return false
+                }
                 // Detached shutdown can hang on a wedged provider; bound the wait on the shared
                 // managed-stop deadline, never the mutation. The work itself is never cancelled —
                 // a slow provider still finishes retiring detached.
