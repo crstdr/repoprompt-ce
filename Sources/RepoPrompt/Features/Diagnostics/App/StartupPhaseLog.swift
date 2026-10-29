@@ -1,7 +1,7 @@
 import Darwin
 import Foundation
 import os
-import RepoPromptDomainRuntime
+import RepoPromptInstrumentation
 
 /// Always-on, low-volume startup phase timing for launch-latency diagnosis.
 ///
@@ -148,18 +148,13 @@ enum StartupPhaseLog {
         )
     }
 
-    enum OversightRestoreOutcome: String {
-        case restored
-        case blocked
-        case endpointUnresolved = "endpoint_unresolved"
-        case terminal
-    }
+    typealias OversightRestoreOutcome = WorkspaceRestoreOversightOutcome
 
     static func oversightRestoreAttempt(
-        _ pair: AgentSessionOversightIntent,
+        observer: UUID,
+        target: UUID,
         outcome: OversightRestoreOutcome,
-        failure: AgentSessionLinkResolveFailure? = nil,
-        terminalReason: AgentSessionOversightLaunchTerminalReason? = nil
+        reason: String? = nil
     ) {
         let runtime = runtime()
         var message = render(
@@ -167,9 +162,8 @@ enum StartupPhaseLog {
             elapsedMS: elapsedMilliseconds(now: runtime.uptime(), processStart: runtime.processStartUptime),
             spanMS: nil, fields: [:]
         )
-        message += " observer=\(pair.observerSessionID.uuidString) target=\(pair.targetSessionID.uuidString) outcome=\(outcome.rawValue)"
-        if let failure { message += " reason=\(failure.rawValue)" }
-        if let terminalReason { message += " reason=\(terminalReason.rawValue)" }
+        message += " observer=\(observer.uuidString) target=\(target.uuidString) outcome=\(outcome.rawValue)"
+        if let reason { message += " reason=\(reason)" }
         runtime.emit(message)
     }
 
