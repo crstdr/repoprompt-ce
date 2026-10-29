@@ -99,6 +99,10 @@ final class AgentTabSession: ObservableObject {
         return token
     }
 
+    func hasLocalComposerCandidate(itemID: UUID, fence: AgentRunStartStopFence) -> Bool {
+        localComposerCandidates.values.contains { $0.itemID == itemID && $0.fence == fence }
+    }
+
     enum LocalComposerDisposition { case retained, rolledBack }
 
     @discardableResult
@@ -633,7 +637,10 @@ final class AgentTabSession: ObservableObject {
     /// Claude turn IDs whose terminal events should be treated as superseded by accepted steering.
     var claudeSupersedingProtectedTurnIDs: Set<UUID> = []
     /// Task that drains `pendingClaudeSteeringInstructions` one-by-one, waiting for MCP tool idle between each.
+    var claudeSteeringFlushID: UUID?
     var claudeSteeringFlushTask: Task<Void, Never>?
+    /// Runner-owned, attempt-scoped notification; never a synthetic provider terminal.
+    var claudeSteeringAbandonment: (attemptID: UUID, notify: (Set<UUID>) -> Void, probe: () -> Void, uncertainWrite: () -> Void)?
 
     /// ACP steering queue — carries text accepted for serialized live steering.
     struct ACPSteeringManagedContext {
@@ -1185,6 +1192,45 @@ final class AgentTabSession: ObservableObject {
         }
     }
 
+    /// A transient rollback value, not another occupancy owner or persisted record. Callers restore
+    /// only under their exact mutation claim and only with definite pre-write evidence.
+    struct ProviderSwitchContextSnapshot {
+        let usage: ContextUsageSnapshot?
+        let codexUsage: AgentContextUsage?
+        let compactedAt: Date?
+        let count: ContextUsageVouch?
+        let window: ContextUsageVouch?
+        let confidence: ContextUsageSnapshotConfidence?
+        let pendingTokens: [Int]
+        let accumulator: AgentModeViewModel.NonCodexTurnTokenAccumulator?
+    }
+
+    func captureProviderSwitchContext() -> ProviderSwitchContextSnapshot {
+        .init(
+            usage: contextUsageSnapshot,
+            codexUsage: codexContextUsage,
+            compactedAt: contextCompactedAt,
+            count: vouchedContextCount,
+            window: vouchedContextWindow,
+            confidence: vouchedContextCountConfidence,
+            pendingTokens: pendingNonCodexUserInputTokenQueue,
+            accumulator: activeNonCodexTurnTokenAccumulator
+        )
+    }
+
+    func restoreProviderSwitchContext(_ snapshot: ProviderSwitchContextSnapshot) {
+        contextUsageSnapshot = snapshot.usage
+        codexContextUsage = snapshot.codexUsage
+        contextCompactedAt = snapshot.compactedAt
+        batchingContextVouchSignals {
+            vouchedContextCount = snapshot.count
+            vouchedContextWindow = snapshot.window
+            vouchedContextCountConfidence = snapshot.confidence
+        }
+        pendingNonCodexUserInputTokenQueue = snapshot.pendingTokens
+        activeNonCodexTurnTokenAccumulator = snapshot.accumulator
+    }
+
     var contextCompactedAt: Date? {
         didSet {
             // A compaction invalidates the count; the window is unchanged.
@@ -1476,6 +1522,7 @@ final class AgentTabSession: ObservableObject {
     }
 
     var claudeController: (any NativeAgentRuntimeControlling)?
+
     var acpController: ACPAgentSessionController?
 
     var codexEventTask: Task<Void, Never>?
@@ -1522,8 +1569,14 @@ final class AgentTabSession: ObservableObject {
     /// Cleared only after the provider accepts the turn.
     var pendingHandoff: AgentModeViewModel.PendingHandoffState = .init() {
         didSet {
-            if oldValue.executionLocationFailure != pendingHandoff.executionLocationFailure {
+            if oldValue.executionLocationFailure != pendingHandoff.executionLocationFailure
+                || oldValue.providerSwitchDelivery != pendingHandoff.providerSwitchDelivery
+                || oldValue.providerSwitchDispatch != pendingHandoff.providerSwitchDispatch
+                || oldValue.sourceItemID != pendingHandoff.sourceItemID
+                || oldValue.isStagedForSend != pendingHandoff.isStagedForSend
+            {
                 noteMonitorObservationInputsChanged()
+                objectWillChange.send()
             }
         }
     }
@@ -1723,6 +1776,7 @@ final class AgentTabSession: ObservableObject {
         pendingCommandRunningByKey.removeAll()
         claudeSteeringFlushTask?.cancel()
         claudeSteeringFlushTask = nil
+        claudeSteeringFlushID = nil
         acpSteeringFlushTask?.cancel()
         acpSteeringFlushTask = nil
         acpSteeringFlushID = nil
@@ -1814,6 +1868,7 @@ final class AgentTabSession: ObservableObject {
         resetQuietLedgerForBinding()
         oversight.clearWakeSuppression()
         invalidateLocalInputStructure()
+
         oversight.overseerActivation = nil
         // Clear the outgoing proof before the generation moves so it cannot be observed under the
         // incoming incarnation.
@@ -2102,6 +2157,22 @@ final class AgentTabSession: ObservableObject {
             ),
             attemptID: attemptID
         )
+        if pendingHandoff.providerSwitchDelivery == .sending,
+           let proof = pendingHandoff.providerSwitchDispatch
+        {
+            if pendingHandoff.isStagedForSend, proof.binding == currentRestorationBindingToken,
+               proof.stopFence.permitsStart(of: self),
+               !AgentModeViewModel.providerSwitchNeedsReview(self, excluding: proof.acceptedInputID),
+               let associated = proof.associatingRun(ownership)
+            {
+                // Association borrows existing value identities; it owns no runtime lifetime.
+                pendingHandoff.providerSwitchDispatch = associated
+            } else {
+                // A second start cannot adopt this attempt's proof, even at the same binding.
+                pendingHandoff.isStagedForSend = false
+            }
+        }
+
         let previousFacts = quietLedger.facts
         quietLedger.begin(owner: ownership, startKey: nextSequenceIndex, provider: .init(agentKind: selectedAgent), baseline: baseline)
         if previousFacts != quietLedger.facts {

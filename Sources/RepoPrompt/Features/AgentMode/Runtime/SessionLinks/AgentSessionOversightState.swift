@@ -77,13 +77,25 @@ struct AgentSessionOversightState {
 
     // MARK: Reserved wake attempt
 
+    /// Diagnostic correlation only: independent of persistent identities and never saved.
+    let wakeDiagnosticObserver = AgentSessionLinkAutoWakeDiagnostics.ObserverCorrelationID()
+
     /// The one automatic lane-update follow-up this exact incarnation has reserved, if any.
     ///
     /// Ephemeral by construction: it lives beside the run lifecycle it competes with, is never
     /// persisted, and dies with the incarnation. Appearing or clearing feeds the owning session's
     /// observation signal, because another observer must not `send` into a session that has already
     /// reserved a turn.
-    var pendingAutoWake: AgentSessionLinkAutoWakeAttempt?
+    var pendingAutoWake: AgentSessionLinkAutoWakeAttempt? {
+        didSet {
+            if oldValue?.wakeID != pendingAutoWake?.wakeID {
+                AgentSessionLinkAutoWakeDiagnostics.reservationChanged(observer: wakeDiagnosticObserver, from: oldValue?.phase, to: nil)
+                AgentSessionLinkAutoWakeDiagnostics.reservationChanged(observer: wakeDiagnosticObserver, from: nil, to: pendingAutoWake?.phase)
+            } else {
+                AgentSessionLinkAutoWakeDiagnostics.reservationChanged(observer: wakeDiagnosticObserver, from: oldValue?.phase, to: pendingAutoWake?.phase)
+            }
+        }
+    }
 
     /// Whether one queue publication was absorbed while the current Auto-wake could not schedule a
     /// reevaluation of its own.

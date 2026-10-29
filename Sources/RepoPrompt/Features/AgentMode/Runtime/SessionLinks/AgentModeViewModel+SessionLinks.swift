@@ -949,7 +949,7 @@ extension AgentModeViewModel {
     ///
     /// This is the sole mutation boundary for `monitorPillPropsByEndpoint`. The status-pill snapshot
     /// is synchronized before the notification so every consumer can immediately re-read the same
-    /// completed state. Equal replacements are true no-ops and publish nothing.
+    /// completed state. Equal props and equal creator names are true no-ops and publish nothing.
     ///
     /// The snapshot's only storage-derived field is `monitor`. The full snapshot (Model Router
     /// availability, execution location, ...) is rebuilt only when the published `monitor` differs
@@ -1124,19 +1124,44 @@ extension AgentModeViewModel {
     /// an in-place rebind from inheriting either the enclosing projection or its target menu.
     func agentSidebarOversightMenuProps(
         tabID: UUID,
-        expectedSessionID: UUID?
+        expectedSessionID: UUID?,
+        diagnoseUnavailable: Bool = false
     ) -> AgentSidebarOversightMenuProps? {
-        guard let expectedSessionID,
-              let endpoint = agentSidebarOversightTargetEndpoint(tabID: tabID, expectedSessionID: expectedSessionID),
-              var menu = AgentSessionLinkRuntimeBridge.shared.sidebarOversightMenu(for: endpoint),
-              menu.targetEndpoint == endpoint, menu.targetSessionID == expectedSessionID
-        else { return nil }
+        let session = sessions[tabID]
+        let currentSessionID = session?.activeAgentSessionID
+        func unavailable(_ reason: AgentSessionLinkMenuGuard) -> AgentSidebarOversightMenuProps? {
+            if diagnoseUnavailable {
+                let now = ProcessInfo.processInfo.systemUptime
+                sidebarOversightMenuDiagnosticTimes = sidebarOversightMenuDiagnosticTimes.filter { now - $0.value < 60 }
+                if sidebarOversightMenuDiagnosticTimes[tabID] == nil {
+                    sidebarOversightMenuDiagnosticTimes[tabID] = now
+                    catalogDiagnosticsSink.record(.sidebarMenuUnavailable(
+                        reason: reason, windowID: windowID, tabID: tabID,
+                        expectedSessionID: expectedSessionID, currentSessionID: currentSessionID,
+                        tabPresent: session != nil,
+                        bindingNil: session != nil && session?.persistentSessionBindingIdentity == nil,
+                        rowIsCurrentTab: currentTabID == tabID,
+                        vmIsRegisteredWindowVM: sidebarMenuIsRegisteredWindowVM(),
+                        runtimeEntryEverRemoved: sidebarRemovedRuntimeTabIDs.contains(tabID)
+                            ? true : (sidebarRuntimeRemovalHistoryOverflowed ? nil : false)
+                    ))
+                }
+            }
+            return nil
+        }
+        guard let expectedID = expectedSessionID, currentSessionID != nil else { return unavailable(.sessionUUIDMissing) }
+        guard let endpoint = agentSidebarOversightTargetEndpoint(tabID: tabID, expectedSessionID: expectedID)
+        else { return unavailable(.endpointMissing) }
+        guard var menu = AgentSessionLinkRuntimeBridge.shared.sidebarOversightMenu(for: endpoint) else { return unavailable(.projectionMissing) }
+        guard menu.targetEndpoint == endpoint, menu.targetSessionID == expectedID else { return unavailable(.targetMismatch) }
         let creatorID = agentSessionLinkLaneCreatorSessionID(tabID: endpoint.tabID, expectedSessionID: endpoint.sessionID)
         menu.creatorSessionID = creatorID
         menu.createdByLabel = creatorID.map { sidebarCreatorDisplayNames[$0] ?? agentSessionLinkLocalCreatorLabel(creatorID: $0) }
-        // Match the pill's persistence blocker without changing lifecycle eligibility.
+        // The stored projection carries lifecycle-only eligibility; overlay the shared
+        // persistence blocker so the inverse menu's greyed reason matches the pill's Add reason.
         return menu.withObserverIneligibleReason(
-            agentSessionLinkPersistencePresentation.addBlockerMessage ?? menu.observerIneligibleReason
+            agentSessionLinkPersistencePresentation.addBlockerMessage
+                ?? menu.observerIneligibleReason
         )
     }
 
@@ -1645,6 +1670,8 @@ extension AgentModeViewModel {
         case stopInProgress = "stop_in_progress"
         case backgroundCompactionSettling = "background_compaction_settling"
         case candidateClosing = "candidate_closing"
+        case providerSwitchUnconfirmed = "provider_switch_unconfirmed"
+        case providerHandoverNeedsReview = "provider_handover_needs_review"
     }
 
     /// One sample of every send-readiness condition. The board and `idleForSend` consume the same
@@ -1667,6 +1694,8 @@ extension AgentModeViewModel {
         var stopInProgress: Bool
         var backgroundCompactionSettling = false
         var isCandidateClosing: Bool
+        var providerSwitchUnconfirmed = false
+        var providerHandoverNeedsReview = false
     }
 
     static func sendReadinessInputs(
@@ -1676,7 +1705,7 @@ extension AgentModeViewModel {
     ) -> SendReadinessInputs {
         SendReadinessInputs(
             status: status,
-            runStateIsActive: session.runState.isActive,
+            runStateIsActive: session.runState.isActive || providerSwitchHasOwnedCarryingAttempt(session),
             hasLoadedPersistedState: session.hasLoadedPersistedState,
             bindingTransitionInProgress: session.bindingTransitionInProgress,
             terminalCommitInProgress: session.terminalCommitInProgress,
@@ -1691,7 +1720,9 @@ extension AgentModeViewModel {
             hasPendingSelfCompact: session.selfCompactState.blocksOverseerDelivery,
             stopInProgress: session.stopState.isStopping(binding: session.persistentSessionBindingIdentity),
             backgroundCompactionSettling: session.isSettlingACPBackgroundCompaction,
-            isCandidateClosing: candidate.isClosing
+            isCandidateClosing: candidate.isClosing,
+            providerSwitchUnconfirmed: providerSwitchUnconfirmed(session),
+            providerHandoverNeedsReview: providerSwitchNeedsReview(session)
         )
     }
 
@@ -1714,6 +1745,8 @@ extension AgentModeViewModel {
         if input.stopInProgress { blockers.append(.stopInProgress) }
         if input.backgroundCompactionSettling { blockers.append(.backgroundCompactionSettling) }
         if input.isCandidateClosing { blockers.append(.candidateClosing) }
+        if input.providerSwitchUnconfirmed { blockers.append(.providerSwitchUnconfirmed) }
+        if input.providerHandoverNeedsReview { blockers.append(.providerHandoverNeedsReview) }
         return blockers.sorted { $0.rawValue < $1.rawValue }
     }
 

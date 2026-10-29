@@ -5,47 +5,84 @@ import RepoPromptSettingsCore
 import XCTest
 
 final class AgentMCPModelParameterSupportTests: XCTestCase {
+    /// Cursor's selectors are advertised per model by discovery, so the Cursor cases below run
+    /// against a published catalogue rather than a compiled model table.
     override func setUp() {
         super.setUp()
-        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+        CursorDiscoveredCatalogTestSupport.reset()
+        CursorDiscoveredCatalogTestSupport.seedStandardCatalog()
+    }
+
+    override func tearDown() {
+        CursorDiscoveredCatalogTestSupport.reset()
+        super.tearDown()
+    }
+
+    func testDevinCatalogAdvertisesAndValidatesPerModelThoughtLevel() throws {
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: .devin) }
+        AgentACPModelRegistry.shared.test_reset(providerID: .devin)
+        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(
+            ACPDiscoveredSessionModels(
+                options: [AgentModelOption(
+                    rawValue: "swe-2-high", displayName: "SWE-2", description: nil,
+                    isPlaceholderDefault: false, isProviderDefault: true
+                )],
+                currentModelRaw: "swe-2-high",
+                modelParameterSets: [ACPModelParameterSet(
+                    baseModelRaw: "swe-2-high",
+                    parameters: [ACPModelParameterDefinition(
+                        kind: .thinking,
+                        configID: "thought_level",
+                        displayName: "Thinking",
+                        choices: ["medium", "high", "max"].map {
+                            ACPModelParameterChoice(rawValue: $0, displayName: $0)
+                        },
+                        currentValueRaw: "high"
+                    )]
+                )]
+            ),
+            for: .devin
+        )
+        let definitions = AgentMCPModelParameterSupport.definitions(agent: .devin, modelRaw: "swe-2-high")
+        XCTAssertEqual(definitions.first?.configID, "thought_level")
+        XCTAssertEqual(definitions.first?.choices.map(\.rawValue), ["medium", "high", "max"])
+        let selections = try AgentMCPModelParameterSupport.resolve(
+            value: .array([.object(["config_id": .string("thought_level"), "value": .string("max")])]),
+            agent: .devin,
+            modelRaw: "swe-2-high"
+        )
+        XCTAssertEqual(selections.first?.valueRaw, "max")
+    }
+
+    func testDevinResolverRequiresOneCanonicalModelParameterSet() {
+        AgentACPModelRegistry.shared.test_reset(providerID: .devin)
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: .devin) }
+        let option = AgentModelOption(
+            rawValue: "swe-2-high", displayName: "SWE-2", description: nil,
+            isPlaceholderDefault: false, isProviderDefault: true
+        )
+        let definition = ACPModelParameterDefinition(
+            kind: .thinking, configID: "thought_level", displayName: "Thinking",
+            choices: [.init(rawValue: "high", displayName: "High")], currentValueRaw: "high"
+        )
+        let set = ACPModelParameterSet(baseModelRaw: option.rawValue, parameters: [definition])
+        for (sets, expectedModel) in [
+            ([set], " SWE-2-HIGH "),
+            ([set, set], "other-model"),
+            ([set, set], "swe-2-high")
+        ] {
+            _ = AgentACPModelRegistry.shared.updateDiscoveredModels(
+                ACPDiscoveredSessionModels(options: [option], currentModelRaw: option.rawValue, modelParameterSets: sets),
+                for: .devin
+            )
+            let resolved = ACPModelParameterResolver.parameterSet(providerID: .devin, selectedModelRaw: expectedModel)
+            XCTAssertEqual(resolved, expectedModel == " SWE-2-HIGH " ? set : nil)
+        }
     }
 
     private func installCursorMetadata() {
-        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
-        // Scripted ACP advertisement: this test must not rely on offline product choices.
-        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(
-            ACPDiscoveredSessionModels(
-                options: [
-                    .init(rawValue: "grok-4.6", displayName: "Grok 4.6", description: nil, isDefault: false),
-                    .init(rawValue: "composer-2.5", displayName: "Composer 2.5", description: nil, isDefault: false)
-                ],
-                currentModelRaw: "grok-4.6",
-                modelParameterSets: [.init(baseModelRaw: "grok-4.6", parameters: [
-                    .init(
-                        kind: .thinking,
-                        configID: "effort",
-                        displayName: "Effort",
-                        choices: ["low", "medium", "high", "xhigh"].map { .init(rawValue: $0, displayName: $0.capitalized) },
-                        currentValueRaw: "high"
-                    ),
-                    .init(
-                        kind: .speed,
-                        configID: "fast",
-                        displayName: "Speed",
-                        choices: [.init(rawValue: "false", displayName: "Standard"), .init(rawValue: "true", displayName: "Fast")],
-                        currentValueRaw: "true"
-                    )
-                ]), .init(baseModelRaw: "composer-2.5", parameters: [
-                    .init(
-                        kind: .speed,
-                        configID: "fast",
-                        displayName: "Speed",
-                        choices: [.init(rawValue: "false", displayName: "Standard"), .init(rawValue: "true", displayName: "Fast")],
-                        currentValueRaw: "false"
-                    )
-                ])]
-            ), for: .cursor
-        )
+        CursorDiscoveredCatalogTestSupport.reset()
+        CursorDiscoveredCatalogTestSupport.seedStandardCatalog()
     }
 
     func testCursorDefinitionsPreserveExactWireIdentifiersAndChoices() {

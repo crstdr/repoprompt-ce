@@ -224,15 +224,62 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertNil(editor.validationMessage)
         let inventory = await fixture.authority.links(forObserver: fixture.observer.sessionID)
         XCTAssertTrue(inventory.items.isEmpty, "Preview recovery must not grant oversight")
+    }
+
+    func testSessionIDEditorIdenticalPasteAndRetryResolveAgain() async {
+        let fixture = makeFixture()
+        fixture.host.candidates = [fixture.observer]
+        let editor = makeSessionIDEditor(fixture)
+        let raw = fixture.target.sessionID.uuidString
+        editor.updateIdentifier(raw)
+        XCTAssertNil(editor.preview)
+
+        fixture.host.candidates = [fixture.observer, fixture.target]
+        editor.updateIdentifier(raw) // Same text, no readiness notification: the Paste path.
+        XCTAssertEqual(editor.preview?.sessionID, fixture.target.sessionID)
+        XCTAssertNil(editor.validationMessage)
+
         fixture.host.candidates = [fixture.observer]
         await refreshSessionIDEditorForReadiness(fixture, editor: editor)
-        XCTAssertNil(editor.preview, "Readiness loss must invalidate a stale successful preview")
+        XCTAssertNil(editor.preview)
+        fixture.host.candidates = [fixture.observer, fixture.target]
+        editor.refresh() // Explicit Retry with unchanged text.
+        XCTAssertEqual(editor.preview?.sessionID, fixture.target.sessionID)
+        XCTAssertNil(editor.validationMessage)
+        editor.updateIdentifier(" ")
+        XCTAssertNil(editor.preview)
+        XCTAssertNil(editor.validationMessage)
+    }
+
+    func testSessionIDEditorReadinessInvalidatesStaleSuccess() async {
+        let fixture = makeFixture()
+        let editor = makeSessionIDEditor(fixture)
+        editor.updateIdentifier(fixture.target.sessionID.uuidString)
+        let closing = makeCandidate(windowID: fixture.target.windowID, sessionID: fixture.target.sessionID, isClosing: true)
+        let rebinding = makeCandidate(windowID: fixture.target.windowID, sessionID: fixture.target.sessionID, bindingTransitionInProgress: true)
+        let cases: [([AgentSessionLinkEndpointCandidate], AgentSessionLinkResolveFailure)] = [
+            ([fixture.observer], .notFound),
+            ([fixture.observer, closing], .closing),
+            ([fixture.observer, rebinding], .rebinding),
+            ([fixture.observer, fixture.target, fixture.target], .ambiguous)
+        ]
+        for (candidates, failure) in cases {
+            fixture.host.candidates = [fixture.observer, fixture.target]
+            editor.refresh()
+            XCTAssertNotNil(editor.preview)
+            fixture.host.candidates = candidates
+            await refreshSessionIDEditorForReadiness(fixture, editor: editor)
+            XCTAssertNil(editor.preview, "\(failure) must invalidate a prior success")
+            XCTAssertEqual(editor.validationMessage, failure.uiMessage)
+        }
     }
 
     // MARK: - Fake host
 
     final class FakeEndpointHost: AgentSessionLinkEndpointHost {
         weak var promptViewModel: AgentModeViewModel?
+        var observationViewModels: [UUID: AgentModeViewModel] = [:]
+        var forwardsNativeQueues = false
         var beforeActivation: ((DomainAgentSessionLinkEndpointIdentity) async -> Void)?
         func agentSessionLinkWillActivate(_ endpoint: DomainAgentSessionLinkEndpointIdentity) async {
             await beforeActivation?(endpoint)
@@ -509,6 +556,9 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         func agentSessionLinkObservationSnapshot(
             for candidate: AgentSessionLinkEndpointCandidate
         ) -> DomainAgentSessionObservationSnapshot {
+            if let viewModel = observationViewModels[candidate.sessionID] {
+                return viewModel.agentSessionLinkObservationSnapshot(for: candidate)
+            }
             observationSnapshotCalls[candidate.sessionID, default: 0] += 1
             return snapshotOverrides[candidate.sessionID] ?? DomainAgentSessionObservationSnapshot(
                 sessionID: candidate.sessionID,
@@ -551,6 +601,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         func agentSessionLinkStatusProjection(
             for candidate: AgentSessionLinkEndpointCandidate
         ) -> AgentSessionLinkStatusProjection? {
+            if let viewModel = observationViewModels[candidate.sessionID] { return viewModel.agentSessionLinkStatusProjection(for: candidate) }
             statusProjectionCalls[candidate.sessionID, default: 0] += 1
             let snapshot = snapshotOverrides[candidate.sessionID]
             return AgentSessionLinkStatusProjection(
@@ -575,6 +626,9 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             for candidate: AgentSessionLinkEndpointCandidate,
             onChange: @escaping @MainActor () -> Void
         ) -> AgentSessionLinkObservationToken? {
+            if let viewModel = observationViewModels[candidate.sessionID] {
+                return viewModel.agentSessionLinkInstallObservation(for: candidate, onChange: onChange)
+            }
             duringObservationInstall?(self)
             guard !failObservationInstall else { return nil }
             let sessionID = candidate.sessionID
@@ -607,6 +661,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             publishedInventoriesByEndpoint[endpoint] = inventory
             publishedPromptInventories[endpoint.sessionID] = inventory
             promptViewModel?.agentSessionLinkPublishPromptInventory(inventory, to: endpoint)
+            if forwardsNativeQueues { observationViewModels[endpoint.sessionID]?.agentSessionLinkPublishPromptInventory(inventory, to: endpoint) }
         }
 
         /// Passive queues recorded per exact endpoint, with a publication counter: a test has to be
@@ -623,6 +678,10 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             passiveNoticePublicationCount += 1
             publishedPassiveNoticesByEndpoint[endpoint] = snapshot
             promptViewModel?.agentSessionLinkPublishPassiveStatusNotices(snapshot, to: endpoint)
+            if forwardsNativeQueues, let vm = observationViewModels[endpoint.sessionID] {
+                vm.agentSessionLinkPublishPassiveStatusNotices(snapshot, to: endpoint)
+                vm.sessions[endpoint.tabID]?.oversight.pendingAutoWake?.task?.cancel()
+            }
         }
 
         /// Mirrors the real store's fence, because the bridge's contract is that a publication
@@ -916,7 +975,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
 
     // MARK: - Fixtures
 
-    private func makeAuthority() -> DomainAgentSessionLinkAuthority {
+    func makeAuthority() -> DomainAgentSessionLinkAuthority {
         DomainAgentSessionLinkAuthority(
             identity: DomainRuntimeIdentity(
                 runtimeID: UUID(),
@@ -989,7 +1048,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
     /// These interaction fixtures supply the restored in-memory payload themselves. Install that
     /// payload's durable identity and current-generation proof before exercising link authority;
     /// allocating a fresh creation alone deliberately leaves ordinary operations unavailable.
-    private func installRestoredFixtureBinding(
+    func installRestoredFixtureBinding(
         _ session: AgentModeViewModel.TabSession,
         in viewModel: AgentModeViewModel,
         file: StaticString = #filePath,
@@ -4459,13 +4518,13 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(fixture.bridge.sidebarOversightSummary(for: targets[1].domainEndpoint)?.availableObserverCount, 248, "A new membership revision cannot reuse the old census")
     }
 
-    func testStatusWorkIsBoundedAndFresh() async {
-        for windowCount in [3] {
+    func testStatusWorkIsBoundedAtReferenceScale() async {
+        for windowCount in [3, 25] {
             let fixture = makeFixture()
             let identity: (Int) -> UUID = { index in
                 UUID(uuidString: String(format: "00000000-0000-0000-0000-%012X", index + 1))!
             }
-            let candidates = (0 ..< 60).map { index in
+            let candidates = (0 ..< 1500).map { index in
                 makeCandidate(
                     windowID: index % windowCount + 1, sessionID: identity(index),
                     workspaceID: identity(2000 + index % windowCount), tabID: identity(3000 + index),
@@ -4473,7 +4532,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
                 )
             }
             // Install links before the unrelated population so activation setup is not the work
-            // under test. The subsequent settled topology pass sees all 60 real fake addresses.
+            // under test. The subsequent settled topology pass sees all 1,500 real fake addresses.
             fixture.host.candidates = Array(candidates.prefix(50))
             for observerIndex in 0 ..< 10 {
                 for lane in 0 ..< 4 {
@@ -4487,7 +4546,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             }
             fixture.host.candidates = candidates
             await fixture.bridge.test_settleProjections()
-            XCTAssertEqual(fixture.host.publishedPropsByEndpoint.count, 50, "Only linked endpoints, not the 60 candidate population, are projected")
+            XCTAssertEqual(fixture.host.publishedPropsByEndpoint.count, 50)
             let fullReads = fixture.host.candidateReadCount
             await fixture.bridge.test_settleProjections()
             XCTAssertEqual(fixture.host.candidateReadCount - fullReads, 2)
@@ -4496,6 +4555,8 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             })
             let reads = fixture.host.candidateReadCount
             let visits = fixture.host.boundedCandidateVisits
+            let clock = ContinuousClock()
+            let refreshStart = clock.now
             for target in candidates[10 ..< 50] {
                 fixture.host.snapshotOverrides[target.sessionID] = DomainAgentSessionObservationSnapshot(
                     sessionID: target.sessionID, displayName: target.displayName, providerDisplayName: "Codex CLI",
@@ -4510,6 +4571,9 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             await fixture.bridge.test_settleTargetPublications()
             XCTAssertEqual(fixture.bridge.test_sourcePublicationSequence(for: candidates[10].sessionID), sequence, "Equal snapshots must not allocate sequences")
             await fixture.bridge.test_refreshStatus(sessionIDs: Set(candidates.prefix(10).map(\.sessionID)))
+            let refreshTime = refreshStart.duration(to: clock.now)
+            XCTAssertLessThan(refreshTime, .seconds(5))
+            print("STATUS_SCALE chats=1500 windows=\(windowCount) overseers=10 links=40 refresh=\(refreshTime) fullDiscoveryReads=\(fixture.host.candidateReadCount - reads) candidateVisits=\(fixture.host.boundedCandidateVisits - visits) budget=5s")
             XCTAssertEqual(fixture.host.candidateReadCount, reads, "No discovery at \(windowCount) windows / 40 links")
             XCTAssertLessThanOrEqual(fixture.host.boundedCandidateVisits - visits, 300, "Count underlying candidates, not just query calls")
             for observer in candidates.prefix(10) {
@@ -4521,6 +4585,35 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
                 XCTAssertEqual(props?.outbound.map(\.status), Array(repeating: .awaitingUser, count: 4))
                 XCTAssertEqual(passiveTransitions(fixture.host.publishedPassiveNoticesByEndpoint[observer.domainEndpoint]), Array(repeating: "idle->waiting", count: 4))
             }
+            // Same-endpoint deletion begins during the scoped presentation census, after the
+            // subject was captured. Fresh subject eligibility must hide Add choices in BOTH
+            // directions without losing unlink actions or rebuilding the complete peer lists.
+            let subject = candidates[0]
+            XCTAssertGreaterThan((menus[subject.domainEndpoint] ?? nil)?.availableObserverCount ?? 0, 0)
+            let deleting = makeCandidate(
+                windowID: subject.windowID, sessionID: subject.sessionID,
+                workspaceID: subject.workspaceID, tabID: subject.tabID,
+                persistentBindingGeneration: subject.persistentBindingGeneration,
+                displayName: subject.resolvedDisplayName, isDeletionInProgress: true
+            )
+            XCTAssertEqual(deleting.domainEndpoint, subject.domainEndpoint)
+            fixture.host.onUUIDCandidatesRead = { ids in
+                if ids.contains(candidates[10].sessionID) { fixture.host.candidates[0] = deleting }
+            }
+            await fixture.bridge.test_refreshStatus(sessionIDs: [subject.sessionID])
+            let statusReads = fixture.host.candidateReadCount
+            let menu = fixture.bridge.sidebarOversightMenu(for: subject.domainEndpoint)
+            XCTAssertEqual(fixture.host.candidateReadCount, statusReads + 1, "Only explicit opening enumerates choices")
+            XCTAssertEqual(menu?.targetIneligibleReason, AgentSessionLinkEndpointEligibility.targetResolveFailure(for: deleting)?.uiMessage)
+            XCTAssertEqual(menu?.observerIneligibleReason, AgentSessionLinkEndpointEligibility.addDisabledReason(deleting.eligibilityInput, roleAllowsOutboundMonitoring: deleting.roleAllowsOutboundMonitoring))
+            XCTAssertEqual(menu?.availableObservers, [])
+            XCTAssertEqual(menu?.availableTargets, [])
+            XCTAssertEqual(menu?.linkedTargets.count, 4)
+            fixture.host.onUUIDCandidatesRead = nil
+            fixture.host.candidates[0] = subject
+            await fixture.bridge.test_refreshStatus(sessionIDs: [subject.sessionID])
+            XCTAssertEqual(fixture.bridge.sidebarOversightSummary(for: subject.domainEndpoint), menus[subject.domainEndpoint] ?? nil)
+            XCTAssertEqual(fixture.host.candidateReadCount, reads + 1, "Only the explicit menu opening enumerated peers")
             // Ambiguity introduced after authority awaits must remove the provenance claim.
             fixture.host.onUUIDCandidatesRead = { ids in
                 if ids.contains(candidates[10].sessionID) {
@@ -4529,7 +4622,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             }
             await fixture.bridge.test_refreshStatus(sessionIDs: [candidates[0].sessionID])
             fixture.host.onUUIDCandidatesRead = nil
-            XCTAssertEqual(fixture.host.candidateReadCount, reads)
+            XCTAssertEqual(fixture.host.candidateReadCount, reads + 1)
             XCTAssertEqual(fixture.host.publishedInventoriesByEndpoint[candidates[0].domainEndpoint]?.items.first?.createdByYou, false)
         }
     }
@@ -9471,22 +9564,11 @@ final class AgentSessionLinkTransportLocalInputFixture {
     private var tick: TimeInterval = 1000
     private var lastBaseline: AgentSessionLinkPromptRenderResult?
 
-    private init(viewModel: AgentModeViewModel, observer: DomainAgentSessionLinkEndpointIdentity) {
+    private init(viewModel: AgentModeViewModel, observer: DomainAgentSessionLinkEndpointIdentity) throws {
         self.viewModel = viewModel
         self.observer = observer
-        func candidate(_ endpoint: DomainAgentSessionLinkEndpointIdentity, name: String) -> AgentSessionLinkEndpointCandidate {
-            let readiness: AgentSessionRestorationReadiness
-            if let generation = endpoint.persistentBindingGeneration {
-                let token = AgentSessionRestorationBindingToken(
-                    bindingIdentity: AgentPersistentSessionBindingIdentity(
-                        tabID: endpoint.tabID, sessionID: endpoint.sessionID, generation: generation
-                    ),
-                    bindingTransitionGeneration: endpoint.bindingTransitionGeneration
-                )
-                readiness = .authoritative(token, .persistedPayloadApplied)
-            } else {
-                readiness = .unbound
-            }
+        func candidate(_ endpoint: DomainAgentSessionLinkEndpointIdentity, name: String) throws -> AgentSessionLinkEndpointCandidate {
+            let bindingGeneration = try XCTUnwrap(endpoint.persistentBindingGeneration)
             return .init(
                 windowID: endpoint.windowID,
                 workspaceID: endpoint.workspaceID,
@@ -9504,10 +9586,19 @@ final class AgentSessionLinkTransportLocalInputFixture {
                 displayName: name,
                 providerDisplayName: "Fake",
                 locationLabel: nil,
-                restorationReadiness: readiness
+                restorationReadiness: .authoritative(
+                    AgentSessionRestorationBindingToken(
+                        bindingIdentity: AgentPersistentSessionBindingIdentity(
+                            tabID: endpoint.tabID, sessionID: endpoint.sessionID,
+                            generation: bindingGeneration
+                        ),
+                        bindingTransitionGeneration: endpoint.bindingTransitionGeneration
+                    ),
+                    .persistedPayloadApplied
+                )
             )
         }
-        target = candidate(.init(
+        target = try candidate(.init(
             windowID: 702,
             workspaceID: UUID(),
             tabID: UUID(),
@@ -9515,7 +9606,7 @@ final class AgentSessionLinkTransportLocalInputFixture {
             persistentBindingGeneration: UUID(),
             bindingTransitionGeneration: 1
         ), name: "Alpha")
-        host.candidates = [candidate(observer, name: "Delta"), target]
+        host.candidates = try [candidate(observer, name: "Delta"), target]
         host.promptViewModel = viewModel
         host.localInputIndexes[target.domainEndpoint] = .init()
     }
@@ -9526,7 +9617,7 @@ final class AgentSessionLinkTransportLocalInputFixture {
         session.oversight.autoWakeOnUpdates = false
         session.oversight.retirePeriodicScheduling()
         let endpoint = try XCTUnwrap(viewModel.agentSessionLinkObserverEndpoint(tabID: session.tabID))
-        let fixture = AgentSessionLinkTransportLocalInputFixture(viewModel: viewModel, observer: endpoint)
+        let fixture = try AgentSessionLinkTransportLocalInputFixture(viewModel: viewModel, observer: endpoint)
         fixture.bridge.attach(host: fixture.host)
         guard case .added = await fixture.bridge.addMonitorLink(observerSessionID: endpoint.sessionID, rawTargetSessionID: fixture.target.sessionID.uuidString) else {
             throw NSError(domain: "LocalInputTransportFixture", code: 1)
@@ -10183,8 +10274,8 @@ extension AgentSessionLinkRuntimeBridgeTests {
                 let scanMS = measured.reduce(0.0) { $0 + milliseconds($1.elapsed) }
                 let recordVisits = measured.reduce(0) { $0 + $1.recordVisits }
                 let measuredFanout = try XCTUnwrap(currentFanout)
-                XCTAssertEqual(measured.count, 2, "one inherited inbound scan and one presentation pass")
-                XCTAssertEqual(recordVisits, linkCount * 2)
+                XCTAssertEqual(measured.count, 2, "one indexed inbound inventory and one presentation pass")
+                XCTAssertEqual(recordVisits, linkCount + links.count(where: { $0.1 == targetIndex }))
                 let affectedObservers = Set(links.filter { $0.1 == targetIndex }.map(\.0))
                 let affectedUnits = links.count(where: { affectedObservers.contains($0.0) })
                 XCTAssertEqual(sampleCount, affectedUnits, "reduction visits only affected observers' outbound units")

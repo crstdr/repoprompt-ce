@@ -450,8 +450,12 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         let controls = WrittenLines()
         let writes = WrittenLines()
         await controller.test_installConfigurationTransport(initialized: false, controlRequest: { request in
-            if request["subtype"] as? String == "initialize" { return await gate.respond() }
-            if request["subtype"] as? String == "apply_flag_settings" { controls.append(Data()) }
+            if request["subtype"] as? String == "initialize" {
+                return await gate.respond()
+            }
+            if request["subtype"] as? String == "apply_flag_settings" {
+                controls.append(Data())
+            }
             return [:]
         }, write: { writes.append($0) })
         let (coordinator, session, intent) = try ordinaryTurnFixture(controller: controller)
@@ -544,7 +548,9 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
             calls += 1
             let reject = rejectFirst && calls == 1
             _ = await gate.respond()
-            if reject { throw ResolverError.unsupportedModel }
+            if reject {
+                throw ResolverError.unsupportedModel
+            }
             return ClaudeCodeLaunchEnvironment(effectiveModel: requestedModel, environmentOverrides: [:], backend: .defaultClaude)
         }
     }
@@ -684,7 +690,9 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
             }
             try await gate.waitUntilEntered()
             XCTAssertEqual(writes.count, 0, "An ordinary turn must await application even without Auto")
-            if changeModel { session.selectedModelRaw = "claude-sonnet-4-6:high" }
+            if changeModel {
+                session.selectedModelRaw = "claude-sonnet-4-6:high"
+            }
             gate.resume()
             let outcome = await send.value
             XCTAssertEqual(outcome, changeModel ? .superseded : .sent)
@@ -771,7 +779,9 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
             let settings = request["settings"] as? [String: Any]
             models.append(settings?["model"] as? String)
             efforts.append(settings?["effortLevel"] as? String)
-            if efforts.count == 1 { throw ResolverError.unsupportedModel }
+            if efforts.count == 1 {
+                throw ResolverError.unsupportedModel
+            }
             return [:]
         }
     }
@@ -804,6 +814,58 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
     }
 
     @MainActor
+    func testNativeNotificationInputCarriesParkedNoteBeforeUpdatesOnlyOnPhysicalAcceptance() async throws {
+        for allowPhysicalDispatch in [false, true] {
+            let controller = applicationController()
+            let writes = WrittenLines()
+            await controller.test_installConfigurationTransport(initialized: true, write: { writes.append($0) })
+            let (coordinator, session, intent) = try ordinaryTurnFixture(controller: controller)
+            let updates = "<repoprompt_session_oversight_status_changes>updates</repoprompt_session_oversight_status_changes>"
+            var composed: String?
+            var accepted = 0
+            coordinator.installHostCapabilities(.init(
+                isSessionCurrent: { $0 === session }, requestUIRefresh: { _, _ in }, scheduleSave: { _ in },
+                stageClaudeResumeRecoveryHandoff: { _ in }, prependPendingHandoff: { text, _ in text },
+                decorateAgentSessionLinkPrompt: { text, _, _ in
+                    composed = text + "\n\n" + updates
+                    return .init(text: composed!, claim: nil, mustAbortDispatch: false)
+                },
+                acquireAgentSessionLinkPhysicalDispatch: { _, _ in allowPhysicalDispatch },
+                recordAgentSessionLinkPhysicalDispatchNotAttempted: { _, _ in },
+                recordAgentSessionLinkPhysicalDispatchFailure: { _, _ in },
+                acceptAgentSessionLinkPromptClaim: { _, _, _ in accepted += 1 }
+            ), providerBindingService: AgentModeProviderBindingService())
+            var state = session.selfCompactState
+            _ = state.reserve(note: "verified continuation", idempotencyKey: "native-wake", maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes)
+            state.active?.phase = .parked
+            state.active?.compactTurnSucceeded = true
+            let requestID = try XCTUnwrap(state.active?.id)
+            session.selfCompactState = state
+            let outcome = await coordinator.sendClaudeNativeMessage(
+                session: session, text: "", attachments: [], intent: intent,
+                allowsCatalogRouteControllerRecovery: false
+            )
+            XCTAssertEqual(composed, AgentSelfCompactNoteEnvelope.frame("verified continuation") + "\n\n\n\n" + updates)
+            XCTAssertEqual(outcome, allowPhysicalDispatch ? .sent : .superseded)
+            XCTAssertEqual(writes.count, allowPhysicalDispatch ? 1 : 0)
+            XCTAssertEqual(accepted, allowPhysicalDispatch ? 1 : 0)
+            if allowPhysicalDispatch {
+                let wire = try XCTUnwrap(writes.line(at: 0))
+                let user = try XCTUnwrap(JSONSerialization.jsonObject(with: wire) as? [String: Any])
+                XCTAssertEqual(user["type"] as? String, "user")
+                XCTAssertEqual(session.selfCompactState.latest?.requestID, requestID)
+                XCTAssertEqual(session.selfCompactState.latest?.noteDelivery, .prepended)
+                XCTAssertEqual(session.selfCompactState.latest?.completionVerified, true)
+                XCTAssertNil(session.selfCompactState.active)
+            } else {
+                XCTAssertEqual(session.selfCompactState.parkedNote?.dispatchID.requestID, requestID)
+                XCTAssertEqual(session.selfCompactState.active?.noteDispatchStarted, false)
+                XCTAssertNil(session.selfCompactState.latest)
+            }
+        }
+    }
+
+    @MainActor
     func testParkedNoteProofRefusalIsUnattemptedAndRetryableButWriteFailureIsUnknown() async throws {
         // Only the typed entry refusal is definitely unsent; a writer's CancellationError is not.
         for (invalidateProof, cancelBeforeWrite, writerThrowsCancellation) in [
@@ -815,8 +877,12 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
             let writes = WrittenLines()
             await controller.test_installConfigurationTransport(initialized: true, write: {
                 writes.append($0)
-                if writerThrowsCancellation { throw CancellationError() }
-                if !isPreWriteRefusal { throw NativeAgentRuntimeControllerError.inputWriteFailed("uncertain write") }
+                if writerThrowsCancellation {
+                    throw CancellationError()
+                }
+                if !isPreWriteRefusal {
+                    throw NativeAgentRuntimeControllerError.inputWriteFailed("uncertain write")
+                }
             })
             await controller.test_setBeforeConfigurationSend { _ = await gate.respond() }
             let (coordinator, session, intent) = try ordinaryTurnFixture(controller: controller)
@@ -858,7 +924,9 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
             if invalidateProof {
                 _ = try await controller.applyModelAndEffortWithProof(model: "claude-sonnet-4-6:high", effortLevel: .high)
             }
-            if cancelBeforeWrite { send.cancel() }
+            if cancelBeforeWrite {
+                send.cancel()
+            }
             gate.resume()
             let outcome = await send.value
             guard case .failed = outcome else { return XCTFail("Expected send refusal/failure") }

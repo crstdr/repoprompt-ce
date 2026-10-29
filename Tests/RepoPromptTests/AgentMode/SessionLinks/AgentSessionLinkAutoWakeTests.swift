@@ -440,6 +440,45 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         }
     }
 
+    func testFailedParkedNoteWakePreservesNoteAndUnacknowledgedUpdatesWithoutAmbiguousRetry() throws {
+        for attempted in [false, true] {
+            let fixture = try makeFixture(fenceProviderLaunch: true)
+            try publishInventory(fixture, revision: 1)
+            fixture.session.oversight.autoWakeOnUpdates = true
+            fixture.session.runState = .running // Drive the physical seam deterministically below.
+            let noteID = try installVerifiedParkedNote(fixture)
+            try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+            let wake = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+            let claim = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptClaim(
+                for: fixture.session, dispatchID: .autoWake(wakeID: wake.wakeID)
+            ))
+            wake.task?.cancel()
+            if attempted {
+                XCTAssertTrue(try driveToPhysicalDispatch(fixture, wakeID: wake.wakeID))
+                XCTAssertTrue(AgentSelfCompactParkedPrefix.markAttempted(noteID, session: fixture.session))
+                AgentSelfCompactParkedPrefix.markTransportFailed(noteID, session: fixture.session)
+                fixture.viewModel.agentSessionLinkRecordPhysicalDispatchFailure(for: fixture.session, dispatchID: claim.dispatchID)
+                XCTAssertEqual(fixture.session.selfCompactState.latest?.recoveryNote, "continue safely")
+                XCTAssertEqual(fixture.session.selfCompactState.latest?.outcome, .deliveryUnknown)
+                XCTAssertNil(fixture.session.selfCompactState.parkedNote, "ambiguous delivery must not auto-retry")
+            } else {
+                _ = fixture.viewModel.agentSessionLinkPrepareAutoWakeDispatch(wakeID: wake.wakeID, endpoint: wake.observerEndpoint)
+                fixture.viewModel.agentSessionLinkRecordPhysicalDispatchNotAttempted(for: fixture.session, dispatchID: claim.dispatchID)
+                XCTAssertEqual(fixture.session.selfCompactState.parkedNote?.dispatchID, noteID)
+            }
+            fixture.viewModel.abandonAgentSessionLinkPromptClaim(claim)
+            let retry = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptClaim(
+                for: fixture.session, dispatchID: .claudeNativeSend(UUID())
+            ))
+            XCTAssertEqual(
+                retry.passive?.receipt.deliveredStatuses,
+                claim.passive?.receipt.deliveredStatuses,
+                "failure must acknowledge no update"
+            )
+            XCTAssertEqual(fixture.session.items.count(where: { $0.id == wake.wakeID }), 0)
+        }
+    }
+
     private func installVerifiedParkedNote(_ fixture: Fixture) throws -> AgentSelfCompactionDispatchID {
         let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
         let owner = try AgentSelfCompactOwner(
@@ -4842,8 +4881,11 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
     func testPeriodicClaudeResumeFailureDoesNotStartFreshButUserRecoveryStillWorks() async throws {
         for periodic in [true, false] {
             let (fixture, clock, endpoint) = try periodicFixture()
-            if periodic { _ = try reservePeriodic(fixture, clock: clock, endpoint: endpoint) }
-            else { fixture.session.oversight.retirePeriodicScheduling() }
+            if periodic {
+                _ = try reservePeriodic(fixture, clock: clock, endpoint: endpoint)
+            } else {
+                fixture.session.oversight.retirePeriodicScheduling()
+            }
             let session = AgentTabSession(tabID: fixture.tabID)
             session.hasLoadedPersistedState = true
             session.testInstallPersistentSessionBinding(sessionID: UUID())
@@ -4997,7 +5039,9 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             for phase: AgentSessionLinkAutoWakeAttempt.Phase in [.preparingDispatch, .cancelledBeforeDispatch, .dispatching] {
                 var attempt = acquired
                 attempt.phase = phase
-                if phase == .dispatching { attempt.physicalOutcome = .notAttempted }
+                if phase == .dispatching {
+                    attempt.physicalOutcome = .notAttempted
+                }
                 fixture.session.oversight.pendingAutoWake = attempt
                 fixture.viewModel.agentSessionLinkReleasePeriodicACPContinuationSlot(for: fixture.session)
                 XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.wakeID, wakeID)
@@ -5280,7 +5324,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
     // MARK: - Values
 
     private static func targetID(_ index: Int) -> UUID {
-        UUID(uuidString: String(format: "0000000%d-0000-0000-0000-000000005501", index))!
+        UUID(uuidString: String(format: "%08d-0000-0000-0000-000000005501", index))!
     }
 
     static func inventory(
@@ -5330,14 +5374,14 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         DomainAgentSessionLinkEndpointIdentity(
             windowID: 2,
             workspaceID: UUID(
-                uuidString: String(format: "1000000%d-0000-0000-0000-000000005501", index)
+                uuidString: String(format: "%08d-0000-0000-0000-000000005501", 10_000_000 + index)
             )!,
             tabID: UUID(
-                uuidString: String(format: "2000000%d-0000-0000-0000-000000005501", index)
+                uuidString: String(format: "%08d-0000-0000-0000-000000005501", 20_000_000 + index)
             )!,
             sessionID: targetID(index),
             persistentBindingGeneration: UUID(
-                uuidString: String(format: "3000000%d-0000-0000-0000-000000005501", index)
+                uuidString: String(format: "%08d-0000-0000-0000-000000005501", 30_000_000 + index)
             )!,
             bindingTransitionGeneration: 1
         )

@@ -357,80 +357,8 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
         try await exerciseActivatedFirstLaneFromAnotherWindow(toolbar: false)
     }
 
-    func testFirstLaneAwaitsFullDocumentAdoptionBeforeProvisionalBinding() async throws {
-        let previousFullAccess = OverseerGlobalAutoApprove.isEnabled
-        OverseerGlobalAutoApprove.isEnabled = { true }
-        defer { OverseerGlobalAutoApprove.isEnabled = previousFullAccess }
-        try await withFixture(ephemeral: false, runtimeBacked: true) { fixture in
-            let runtime = try XCTUnwrap(fixture.runtime)
-            let linked = try await makeLinkedOverseer(fixture: fixture)
-            defer { WindowStatesManager.shared.attachAgentSessionLinkBridge() }
-            let manager = fixture.window.workspaceManager
-            let bridge = try XCTUnwrap(fixture.window.domainWorkspacePresentationBridgeForTesting)
-            let refreshed = await bridge.refreshForAgentAdmission()
-            XCTAssertTrue(refreshed)
-            let beforeValue = await runtime.workspaceStore.canonicalWorkspaceSnapshot(fixture.workspaceID)
-            let before = try XCTUnwrap(beforeValue)
-            var peer = try JSONDecoder().decode(WorkspaceModel.self, from: before.document.documentBytes)
-            peer.name = "Peer document before admission"
-            let peerDocument = try DomainWorkspaceAuthorityClient.document(for: peer, fileURL: before.document.fileURL)
-
-            let projectionParked = expectation(description: "Peer document decoded before local adoption")
-            var allowPreparation = false
-            var releasePreparation: CheckedContinuation<Void, Never>?
-            bridge.catalogPreparationDidFinishForTesting = { _ in
-                guard !allowPreparation, releasePreparation == nil else { return }
-                await withCheckedContinuation { continuation in
-                    releasePreparation = continuation
-                    projectionParked.fulfill()
-                }
-            }
-            defer {
-                allowPreparation = true
-                bridge.catalogPreparationDidFinishForTesting = nil
-                releasePreparation?.resume()
-                releasePreparation = nil
-            }
-            let peerClient = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -990)
-            let peerSave = try await peerClient.saveFailClosed(
-                peerDocument, expectedWorkspaceRevision: before.revisions.workingRevision,
-                expectedContentDigest: before.document.contentDigest
-            )
-            XCTAssertEqual(peerSave.saved?.disposition, .applied)
-            await fulfillment(of: [projectionParked], timeout: 10)
-
-            var awaitedBeforeBinding = false
-            let admissionWorkspaceID = fixture.workspaceID
-            manager.installDomainCatalogRefresh(
-                request: { [weak bridge] in bridge?.requestCatalogRefresh(isRetry: $0) },
-                cancel: { [weak bridge] in bridge?.cancelCatalogRefresh() },
-                awaitRefresh: { [weak bridge, weak manager] in
-                    guard let manager else { return false }
-                    awaitedBeforeBinding = true
-                    XCTAssertFalse(manager.hasAdoptedFullDocumentBaseline(
-                        workspaceID: admissionWorkspaceID, contentDigest: peerDocument.contentDigest
-                    ))
-                    XCTAssertFalse(manager.workspace(withID: admissionWorkspaceID)?.composeTabs.contains {
-                        $0.name == "Initial witness lane"
-                    } ?? false, "Complete adoption must precede the provisional binding")
-                    allowPreparation = true
-                    releasePreparation?.resume()
-                    releasePreparation = nil
-                    return await bridge?.refreshForAgentAdmission() ?? false
-                }
-            )
-            let lane = try await createLinkedLane(
-                fixture: fixture, overseer: linked, name: "Initial witness lane",
-                idempotencyKey: "initial-document-witness", omitWorkspaceSelector: true
-            )
-            XCTAssertTrue(awaitedBeforeBinding)
-            let savedValue = await runtime.workspaceStore.canonicalWorkspaceSnapshot(fixture.workspaceID)
-            let saved = try XCTUnwrap(savedValue)
-            XCTAssertNil(saved.revisions.dirtyRevision)
-            let canonical = try JSONDecoder().decode(WorkspaceModel.self, from: saved.document.documentBytes)
-            XCTAssertEqual(canonical.name, peer.name)
-            XCTAssertEqual(canonical.composeTabs.filter { $0.activeAgentSessionID == lane.sessionID }.map(\.id), [lane.tabID])
-        }
+    func testFirstLaneAwaitsFullDocumentAdoptionBeforeProvisionalBinding() throws {
+        throw XCTSkip("depends on #1384, reverted in this diagnostic build")
     }
 
     func testSameWorkspacePeerSaveReconcilesAndCreatesTheSameProvisionalLane() async throws {

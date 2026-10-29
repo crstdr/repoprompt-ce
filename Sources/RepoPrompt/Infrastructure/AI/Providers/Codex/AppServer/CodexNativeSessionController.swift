@@ -4320,8 +4320,12 @@ final class CodexNativeSessionController {
             turnScope(threadID: params["threadId"] as? String, turnID: params["turnId"] as? String) != nil
                 && params["metadata"] != nil ? .protocolMetadata : nil
         case "thread/settings/updated":
+            // Settings are an opaque snapshot, not model output; validate the outer envelope.
             nonEmptyString(params["threadId"] as? String) != nil
-                && isThreadSettingsMetadata(params["threadSettings"]) ? .protocolMetadata : nil
+                && params["threadSettings"] is [String: Any] ? .protocolMetadata : nil
+        case "thread/name/updated":
+            nonEmptyString(params["threadId"] as? String) != nil
+                && (params["threadName"] == nil || params["threadName"] is NSNull || params["threadName"] is String) ? .protocolMetadata : nil
         case "thread/status/changed":
             .threadStatusChanged
         case "turn/plan/updated":
