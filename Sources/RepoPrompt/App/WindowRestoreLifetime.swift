@@ -3,11 +3,11 @@ import Foundation
 /// Per-window lifetime of accepted session-restore entries.
 ///
 /// Every acceptance carries two independent obligations, and they must not be collapsed:
-/// - **Execution** — a not-yet-dispatched entry plus the completion owed to its caller. It ends
-///   exactly once: by dispatch (the completion then belongs to the dispatch task), by retirement
-///   (explicit intent or close), or by displacement through a newer acceptance. The completion is
-///   the caller's run-wide persistence obligation; a catalog failure may release it early while
-///   the entry keeps waiting for an accepted catalog, so it is still invoked at most once.
+/// - **Execution** covers a pending entry or an in-flight dispatch. Pending execution ends by
+///   retirement (explicit intent or close) or displacement. A dispatch ends when its switch finishes.
+///   The completion is a separate run-wide persistence obligation. A catalog failure may release
+///   it early while the entry keeps waiting for an accepted catalog. Releasing persistence cannot
+///   prove saved sessions absent while execution is unfinished. Each completion runs at most once.
 /// - **Protection** — the entry session capture preserves instead of a nil/System fallback. It is
 ///   armed at acceptance and released only by a real selection *published after* that acceptance,
 ///   by a newer acceptance, or by its own dispatch successfully selecting a System workspace. Retiring
@@ -54,10 +54,16 @@ struct WindowRestoreLifetime {
 
     private var acceptanceSequence: UInt64 = 0
     private var pending: Dispatch?
+    private var inFlightAcceptances: Set<UInt64> = []
     private var protection: Protection?
 
     var hasPendingEntry: Bool {
         pending != nil
+    }
+
+    /// Unfinished execution keeps absence unproven after persistence is released.
+    var hasUnfinishedExecution: Bool {
+        pending != nil || !inFlightAcceptances.isEmpty
     }
 
     var protectedEntry: WindowSessionEntry? {
@@ -102,7 +108,12 @@ struct WindowRestoreLifetime {
     mutating func takePendingForDispatch() -> Dispatch? {
         guard let taken = pending else { return nil }
         pending = nil
+        inFlightAcceptances.insert(taken.acceptanceSequence)
         return taken
+    }
+
+    mutating func finishDispatch(acceptanceSequence: UInt64) {
+        inFlightAcceptances.remove(acceptanceSequence)
     }
 
     /// A real (non-System) selection was published. Releases protection only for acceptances

@@ -591,6 +591,10 @@ class WindowState: ObservableObject {
     /// Accepted restore execution and the protection session capture relies on. See
     /// `WindowRestoreLifetime` for why the two lifetimes stay independent.
     private var restoreLifetime = WindowRestoreLifetime()
+    var hasUnfinishedRestoreExecution: Bool {
+        restoreLifetime.hasUnfinishedExecution
+    }
+
     private(set) var claimedInitialRefreshDeferralID: UUID?
     private(set) var claimedInitialRefreshDeferralWaiterID: UUID?
 
@@ -1852,6 +1856,7 @@ class WindowState: ObservableObject {
         // before the restore (or failed startup) runs. The newer state is installed before the
         // displaced completion runs so reentrant capture or explicit intent sees it.
         let displacedCompletion = restoreLifetime.accept(entry, completion: completion)
+        windowStatesManager?.windowRestoreExecutionDidChange()
         displacedCompletion?()
         StartupPhaseLog.mark(.restoreEntryAssigned, window: windowID)
         applyPendingRestoreEntryIfPossible()
@@ -1861,6 +1866,7 @@ class WindowState: ObservableObject {
     /// is untouched, so session capture keeps the requested entry if explicit intent is refused.
     private func retirePendingRestoreEntry() {
         let completion = restoreLifetime.retirePending()
+        windowStatesManager?.windowRestoreExecutionDidChange()
         completion?()
     }
 
@@ -1893,6 +1899,8 @@ class WindowState: ObservableObject {
             }
             guard let dispatch = self.restoreLifetime.takePendingForDispatch() else { return }
             await self.restoreWorkspace(from: dispatch.entry, acceptanceSequence: dispatch.acceptanceSequence)
+            self.restoreLifetime.finishDispatch(acceptanceSequence: dispatch.acceptanceSequence)
+            self.windowStatesManager?.windowRestoreExecutionDidChange()
             // The dispatch owns this acceptance's completion, even if a newer acceptance
             // arrived while it ran.
             dispatch.completion?()
