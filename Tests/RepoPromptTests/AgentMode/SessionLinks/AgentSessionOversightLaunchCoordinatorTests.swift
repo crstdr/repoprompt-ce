@@ -1669,6 +1669,75 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         XCTAssertEqual(fixture.bridge.test_launchReservationStartCount(), 0)
     }
 
+    func testCatalogDeferredRestoreCannotProveAbsenceBeforeLastDispatchFinishes() async throws {
+        for targetAppears in [true, false] {
+            try seedSavedPair()
+            let fixture = makeFixture()
+            defer { fixture.bridge.freezeForTermination() }
+            var gate = WindowSessionRestorePersistenceGate()
+            gate.beginRestoreSessionLoad()
+            gate.finishRestoreSessionLoad(pendingEntryCount: 2)
+            var lifetimes = [WindowRestoreLifetime(), WindowRestoreLifetime()]
+            for index in lifetimes.indices {
+                let windowID = index + 1
+                gate.consumePendingRestoreEntry()
+                gate.beginRestoringWindow(windowID)
+                let entry = WindowSessionEntry(
+                    windowKind: .standard, workspaceID: UUID(), workspaceName: nil,
+                    isSystemWorkspace: false, isEphemeral: false, primaryRepoPath: nil,
+                    lastFocused: false, workspaceInstanceNumber: nil
+                )
+                _ = lifetimes[index].accept(entry) { gate.finishRestoringWindow(windowID) }
+                // Catalog failure leaves execution pending after releasing persistence.
+                lifetimes[index].releasePendingCompletion()?()
+            }
+            XCTAssertFalse(gate.isRestoreInProgress, "Persistence may recover while catalog acceptance is deferred")
+            func topology() -> AgentSessionOversightRestoreTopologyState {
+                gate.oversightTopologyState(
+                    hasPendingWindowExecution: lifetimes.contains { $0.hasUnfinishedExecution },
+                    abandonedEntryCount: 0
+                )
+            }
+            fixture.host.topology = topology()
+            XCTAssertEqual(fixture.host.topology, .pending)
+            await fixture.bridge.bootstrapIntentStore(fixture.store)
+            await fixture.bridge.test_settleLaunchReconciliation()
+            XCTAssertEqual(
+                fixture.bridge.test_launchEntryState(for: pair),
+                .waiting,
+                "Initial/default-workspace discovery cannot terminalize the saved pair"
+            )
+
+            let first = try XCTUnwrap(lifetimes[0].takePendingForDispatch())
+            let last = try XCTUnwrap(lifetimes[1].takePendingForDispatch())
+            XCTAssertEqual(topology(), .pending, "Dispatched switches remain outstanding")
+            lifetimes[0].finishDispatch(acceptanceSequence: first.acceptanceSequence)
+            let observer = makeReadyCandidate(windowID: 1, sessionID: observerSessionID)
+            fixture.host.candidates = [observer]
+            fixture.host.descriptors = [descriptor(for: observer)]
+            fixture.host.topology = topology()
+            fixture.bridge.noteTopologyMayHaveChanged()
+            await fixture.bridge.test_settleLaunchReconciliation()
+            XCTAssertEqual(fixture.host.topology, .pending, "The last in-flight switch still fences absence")
+            XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .waiting)
+
+            if targetAppears {
+                let target = makeReadyCandidate(windowID: 2, sessionID: targetSessionID)
+                fixture.host.candidates.append(target)
+                fixture.host.descriptors.append(descriptor(for: target))
+            }
+            lifetimes[1].finishDispatch(acceptanceSequence: last.acceptanceSequence)
+            fixture.host.topology = topology()
+            XCTAssertEqual(fixture.host.topology, .completeAllEntriesConsumed)
+            fixture.bridge.noteTopologyMayHaveChanged()
+            await fixture.bridge.test_settleLaunchReconciliation()
+            XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), targetAppears ? .active : .terminal(.missing))
+            let token = await fixture.store.token(for: pair)
+            XCTAssertNotNil(token, "A missing session retires only this launch, never durable intent")
+            XCTAssertFalse(AgentSessionOversightLaunchTerminalReason.missing.removesDurableIntent)
+        }
+    }
+
     func testNothingIsReservedWhileAWindowsDiscoveryLevelIsIncomplete() async throws {
         try seedSavedPair()
         let fixture = makeFixture()
