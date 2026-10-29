@@ -2518,15 +2518,36 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         return true
     }
 
+    /// A Computer-Use-including controller retirement still in flight, or an
+    /// ownership-transition hold, is a transient admission fence: it resolves on its own.
+    private func computerUseTransientFenceActive(session: AgentTabSession) -> Bool {
+        !session.codexComputerUseOwnershipTransitionHolds.isEmpty
+            || codexControllerRetirementTaskByTabID[session.tabID]?.includesComputerUse == true
+    }
+
     private func computerUseForNextTurn(session: AgentTabSession) async throws -> Bool {
         guard let activation = session.pendingCodexComputerUseActivation else { return false }
-        guard session.pendingCodexComputerUseActivation?.id == activation.id,
-              computerUseAdmissionMessage(session: session) == nil
-        else {
-            if session.pendingCodexComputerUseActivation?.id == activation.id {
-                session.codexComputerUseArmingRequestID = nil
-                session.pendingCodexComputerUseActivation = nil
+        // A transient fence waits and re-evaluates; it never disarms. Any other refusal is
+        // structural and behaves exactly as before. A superseded attempt leaves the armed
+        // activation for its successor to evaluate.
+        while session.pendingCodexComputerUseActivation?.id == activation.id,
+              computerUseAdmissionMessage(session: session) == CodexComputerUseWorkflow.ineligibleMessage,
+              computerUseTransientFenceActive(session: session),
+              !Task.isCancelled
+        {
+            await awaitCodexComputerUseRetirement(for: session.tabID)
+            if !session.codexComputerUseOwnershipTransitionHolds.isEmpty {
+                try? await Task.sleep(nanoseconds: 10_000_000)
             }
+        }
+        // A vanished activation or superseded attempt reports not-admitted; teardown and the
+        // successor own the outcome. A live activation that refused disarms.
+        guard !Task.isCancelled, session.pendingCodexComputerUseActivation?.id == activation.id else {
+            return false
+        }
+        guard computerUseAdmissionMessage(session: session) == nil else {
+            session.codexComputerUseArmingRequestID = nil
+            session.pendingCodexComputerUseActivation = nil
             throw CodexAppServerClient.ClientError.executableUnavailable(
                 computerUseAdmissionMessage(session: session) ?? CodexComputerUseWorkflow.ineligibleMessage
             )
