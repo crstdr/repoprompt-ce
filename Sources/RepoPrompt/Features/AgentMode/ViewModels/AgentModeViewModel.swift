@@ -10314,6 +10314,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     func clearProviderContextForProviderSwitch(_ session: TabSession) {
         codexCoordinator.clearCodexSessionState(session)
+        claudeCoordinator.rotateClaudeRuntimeEpoch(for: session)
         session.providerSessionID = nil
         session.providerCleanupHandle = nil
         session.contextUsageSnapshot = nil

@@ -2930,6 +2930,71 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             }
         }
 
+        func testLateClaudeResumeTransferCannotWriteOntoSameFamilyDestination() async throws {
+            // B2 epoch guard: a forced .claudeCode → .claudeCodeGLM switch rotates the runtime
+            // context epoch, so a transfer stamped with the old epoch must not write the old
+            // Claude session ref onto the same-family destination.
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                session.selectedAgent = .claudeCode
+                session.providerSessionID = "old-claude-session"
+                let coordinator = vm.test_claudeCoordinator
+                coordinator.test_registerResumeTransfer(for: session, controller: LateTransferFakeRuntime())
+                XCTAssertTrue(coordinator.hasPendingResumeTransfer(for: session))
+                session.selectedAgent = .claudeCodeGLM
+                coordinator.rotateClaudeRuntimeEpoch(for: session)
+                session.providerSessionID = "glm-session"
+                await coordinator.awaitPendingClaudeResumeTransferIfNeeded(for: session)
+                XCTAssertEqual(session.providerSessionID, "glm-session")
+                XCTAssertFalse(coordinator.hasPendingResumeTransfer(for: session))
+            }
+        }
+
+        func testLateClaudeResumeTransferCannotWriteOntoSwitchBackSession() async throws {
+            // B2 epoch guard: Claude → Codex → Claude switch-back rotates the epoch twice, so
+            // the stale transfer completing late must not overwrite the new Claude session ref.
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                session.selectedAgent = .claudeCode
+                session.providerSessionID = "old-claude-session"
+                let coordinator = vm.test_claudeCoordinator
+                coordinator.test_registerResumeTransfer(for: session, controller: LateTransferFakeRuntime())
+                session.selectedAgent = .codexExec
+                coordinator.rotateClaudeRuntimeEpoch(for: session)
+                session.selectedAgent = .claudeCode
+                coordinator.rotateClaudeRuntimeEpoch(for: session)
+                session.providerSessionID = "new-claude-session"
+                await coordinator.awaitPendingClaudeResumeTransferIfNeeded(for: session)
+                XCTAssertEqual(session.providerSessionID, "new-claude-session")
+                XCTAssertFalse(coordinator.hasPendingResumeTransfer(for: session))
+            }
+        }
+
+        func testClaudeResumeTransferRetiredMidAwaitDoesNotWedgeLatch() async throws {
+            // B2 wedge: a transfer retired while its await is in flight on a non-Claude tab
+            // must drain the retired latch so hasPendingResumeTransfer returns false.
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                session.selectedAgent = .claudeCode
+                session.providerSessionID = "old-claude-session"
+                let coordinator = vm.test_claudeCoordinator
+                let runtime = LateTransferFakeRuntime()
+                await runtime.setHoldTeardown(true)
+                coordinator.test_registerResumeTransfer(for: session, controller: runtime)
+                session.selectedAgent = .openCode
+                async let wait: Void = coordinator.awaitPendingClaudeResumeTransferIfNeeded(for: session)
+                await runtime.waitUntilTeardownStarted()
+                coordinator.invalidatePendingClaudeResumeTransfer(for: session)
+                await runtime.releaseTeardown()
+                await wait
+                XCTAssertEqual(session.providerSessionID, "old-claude-session")
+                XCTAssertFalse(coordinator.hasPendingResumeTransfer(for: session))
+            }
+        }
+
         func testForceAffordanceNeverReachesOverseerOrMCP() async throws {
             // The force gesture lives only in the local sheet: a linked send during the same busy
             // state receives exactly today's retryable busy refusal, never a switch outcome.
@@ -3975,6 +4040,10 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
 private actor LateTransferFakeRuntime: NativeAgentRuntimeControlling {
     var hasActiveSession = false
     var hasTurnInFlight = false
+    var holdTeardown = false
+    private var teardownStarted = false
+    private var teardownStartedContinuation: CheckedContinuation<Void, Never>?
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
     var events: AsyncStream<NativeAgentRuntimeEvent> {
         AsyncStream { $0.finish() }
     }
@@ -3985,8 +4054,27 @@ private actor LateTransferFakeRuntime: NativeAgentRuntimeControlling {
 
     func ensureEventsStreamReady() {}
     func resetEventsStreamForNewRun() {}
-    func currentSessionRef() -> NativeAgentRuntimeSessionRef {
-        .init(sessionID: "late-claude-ref")
+    func currentSessionRef() async -> NativeAgentRuntimeSessionRef {
+        teardownStarted = true
+        teardownStartedContinuation?.resume()
+        if holdTeardown {
+            await withCheckedContinuation { releaseContinuation = $0 }
+        }
+        return .init(sessionID: "late-claude-ref")
+    }
+
+    func setHoldTeardown(_ value: Bool) {
+        holdTeardown = value
+    }
+
+    func waitUntilTeardownStarted() async {
+        if teardownStarted { return }
+        await withCheckedContinuation { teardownStartedContinuation = $0 }
+    }
+
+    func releaseTeardown() {
+        holdTeardown = false
+        releaseContinuation?.resume()
     }
 
     func applyModelAndEffort(model: String?, effortLevel: NativeAgentRuntimeEffortLevel?) {}
