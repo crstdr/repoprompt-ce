@@ -355,6 +355,8 @@ actor AgentSessionOversightIntentStore {
                 }
                 didLoad = true
                 lastFailure = nil
+                // A recovered read may have no pending writes to publish its ready transition.
+                postContinuityChange()
             } catch {
                 lastFailure = "Link continuity could not open (\(error)). Current explicit links remain usable in this process; saved links were preserved and saving will retry."
                 scheduleRetry()
@@ -362,6 +364,12 @@ actor AgentSessionOversightIntentStore {
             }
         }
         return .ready(.init(source: tokenByPair.isEmpty ? .missing : .loaded, storeRevision: storeRevision, tokenByPair: tokenByPair))
+    }
+
+    /// Observes readiness without starting another read or retry from a notification consumer.
+    var readyLaunchLoad: AgentSessionOversightIntentReadyLoad? {
+        guard didLoad else { return nil }
+        return .init(source: tokenByPair.isEmpty ? .missing : .loaded, storeRevision: storeRevision, tokenByPair: tokenByPair)
     }
 
     func insert(_ pair: AgentSessionOversightIntent) async -> AgentSessionOversightIntentMutationReceipt {

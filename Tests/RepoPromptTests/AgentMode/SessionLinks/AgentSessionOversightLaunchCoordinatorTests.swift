@@ -387,6 +387,43 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         fixture.host.descriptors = candidates.map { descriptor(for: $0) }
     }
 
+    func testRecoveredInitialLoadSeedsRealBridgeOnceWithoutPendingWrites() async throws {
+        try seedSavedPair()
+        // A file in place of the database directory fails the first real repository read only.
+        let obstruction = directory.appendingPathComponent("Overseer")
+        try Data("temporary obstruction".utf8).write(to: obstruction)
+        let fixture = makeFixture()
+        let observer = makeReadyCandidate(windowID: 1, sessionID: observerSessionID)
+        let target = makeReadyCandidate(windowID: 2, sessionID: targetSessionID)
+        replaceTopology(fixture, with: [observer, target])
+
+        await fixture.bridge.bootstrapIntentStore(fixture.store)
+        XCTAssertNil(fixture.bridge.test_launchEntryState(for: pair))
+        let initialDiagnostic = await fixture.store.diagnostic
+        XCTAssertNotNil(initialDiagnostic)
+        let initialLoad = await fixture.store.readyLaunchLoad
+        XCTAssertNil(initialLoad)
+        try FileManager.default.removeItem(at: obstruction)
+
+        // No manual retry/bootstrap: the store's scheduled retry must publish recovery itself.
+        try await AsyncTestWait.waitUntil("recovered continuity restores saved pair", timeout: 5) {
+            await self.isRestored(fixture)
+        }
+        await fixture.bridge.test_settleLaunchReconciliation()
+        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .active)
+        let restoredReference = await liveReference(fixture)
+        let reference = try XCTUnwrap(restoredReference)
+        let saveState = await fixture.store.saveState
+        XCTAssertEqual(saveState, "saved")
+
+        NotificationCenter.default.post(name: .agentOverseerContinuityDidChange, object: nil)
+        await fixture.bridge.bootstrapIntentStore(fixture.store)
+        await fixture.bridge.test_settleLaunchReconciliation()
+        let repeatedReference = await liveReference(fixture)
+        XCTAssertEqual(repeatedReference, reference, "Repeated ready/save events cannot mint a successor grant")
+        XCTAssertEqual(fixture.host.providerTaskRequests, 0)
+    }
+
     func testThreeHundredChatsRestoreTenLinksAcrossReopenAndRestartWithinBudget() async throws {
         try await assertRestoreScale(chatCount: 300)
     }
@@ -1635,12 +1672,12 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
     func testNothingIsReservedWhileAWindowsDiscoveryLevelIsIncomplete() async throws {
         try seedSavedPair()
         let fixture = makeFixture()
-        fixture.host.discovery = [
+        fixture.host.discovery = (1 ... 35).map { windowID in
             AgentSessionLinkDiscoveryState(
-                epoch: AgentSessionLinkDiscoveryEpoch(windowID: 1, workspaceID: UUID(), generation: 2),
-                isComplete: false
+                epoch: AgentSessionLinkDiscoveryEpoch(windowID: windowID, workspaceID: UUID(), generation: 2),
+                isComplete: windowID != 35
             )
-        ]
+        }
         let observer = makeReadyCandidate(windowID: 1, sessionID: observerSessionID)
         let target = makeReadyCandidate(windowID: 2, sessionID: targetSessionID)
         fixture.host.candidates = [observer, target]
@@ -1650,7 +1687,14 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         await fixture.bridge.test_settleLaunchReconciliation()
 
         let restored = await isRestored(fixture)
-        XCTAssertFalse(restored)
+        XCTAssertFalse(restored, "One unrelated incomplete window blocks the otherwise-ready saved pair")
+        XCTAssertEqual(fixture.bridge.test_launchReservationStartCount(), 0)
+        let incomplete = fixture.host.discovery[34]
+        fixture.host.discovery[34] = AgentSessionLinkDiscoveryState(epoch: incomplete.epoch, isComplete: true)
+        fixture.bridge.noteTopologyMayHaveChanged()
+        await fixture.bridge.test_settleLaunchReconciliation()
+        let restoredAfterCompletion = await isRestored(fixture)
+        XCTAssertTrue(restoredAfterCompletion)
     }
 
     func testSameWindowReopenRestoresAfterPassiveHydrationIsInterruptedByDiscoveryChange() async throws {
