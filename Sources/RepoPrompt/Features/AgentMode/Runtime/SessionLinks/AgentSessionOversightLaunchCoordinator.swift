@@ -297,6 +297,16 @@ final class AgentSessionOversightLaunchCoordinator {
         _ load: AgentSessionOversightIntentReadyLoad,
         automaticRestoreEnabled: Bool
     ) {
+        let previousCount = launchPairOrder.count
+        defer {
+            StartupPhaseLog.mark(.oversightLaunchSeed, fields: [
+                "entries": load.tokenByPair.count,
+                "appended": launchPairOrder.count - previousCount,
+                "launch_entries": launchPairOrder.count,
+                "automatic_restore_enabled": automaticRestoreEnabled ? 1 : 0,
+                "did_load_entries": didLoadLaunchEntries ? 1 : 0
+            ])
+        }
         storeIsReady = true
         self.automaticRestoreEnabled = automaticRestoreEnabled
         guard automaticRestoreEnabled, !didLoadLaunchEntries else {
@@ -315,7 +325,7 @@ final class AgentSessionOversightLaunchCoordinator {
     func updateTopologyState(_ state: AgentSessionOversightRestoreTopologyState) {
         guard topology != state else { return }
         topology = state
-        StartupPhaseLog.debugMark(.oversightRestoreAdmission, fields: [
+        StartupPhaseLog.mark(.oversightRestoreAdmission, fields: [
             "outer_admitted": state.admitsAutomaticRestore ? 1 : 0,
             "topology_changed": 1
         ])
@@ -635,7 +645,7 @@ final class AgentSessionOversightLaunchCoordinator {
         )
         guard state != lastLoggedDiscoveryBarrier else { return }
         lastLoggedDiscoveryBarrier = state
-        StartupPhaseLog.debugMark(
+        StartupPhaseLog.mark(
             .oversightDiscoveryBarrier,
             fields: [
                 "windows": state.windows,

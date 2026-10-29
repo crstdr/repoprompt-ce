@@ -1896,9 +1896,13 @@ final class AgentSessionLinkRuntimeBridge {
         case .ready: 2
         }
         var loadFields = ["recovered": 0, "outcome": outcome]
-        if case let .ready(load) = result { loadFields["entries"] = load.tokenByPair.count }
-        StartupPhaseLog.debugMark(.oversightIntentLoad, fields: loadFields)
-        StartupPhaseLog.debugMark(.oversightRestoreAdmission, fields: [
+        if case let .ready(load) = result {
+            loadFields["entries"] = load.tokenByPair.count
+            loadFields["repository_rows"] = load.repositoryRowCount
+            loadFields["invalid_rows"] = load.invalidRowCount
+        }
+        StartupPhaseLog.mark(.oversightIntentLoad, fields: loadFields)
+        StartupPhaseLog.mark(.oversightRestoreAdmission, fields: [
             "persistence_enabled": mode.allowsAutomaticRestore ? 1 : 0,
             "performs_io": mode.performsProductionFileIO ? 1 : 0,
             "outer_admitted": host?.agentSessionLinkRestoreTopologyState().admitsAutomaticRestore == true ? 1 : 0
@@ -1932,11 +1936,10 @@ final class AgentSessionLinkRuntimeBridge {
         guard !didSeedLaunchEntries, !isFrozenForTermination else { return }
         didSeedLaunchEntries = true
         if recovered {
-            StartupPhaseLog.debugMark(.oversightIntentLoad, fields: ["recovered": 1, "outcome": 2, "entries": load.tokenByPair.count])
+            StartupPhaseLog.mark(.oversightIntentLoad, fields: ["recovered": 1, "outcome": 2, "entries": load.tokenByPair.count, "repository_rows": load.repositoryRowCount, "invalid_rows": load.invalidRowCount])
         }
-        StartupPhaseLog.debugMark(.oversightLaunchSeed, fields: ["entries": load.tokenByPair.count])
         let topology = host?.agentSessionLinkRestoreTopologyState()
-        StartupPhaseLog.debugMark(.oversightRestoreAdmission, fields: [
+        StartupPhaseLog.mark(.oversightRestoreAdmission, fields: [
             "persistence_enabled": mode.allowsAutomaticRestore ? 1 : 0,
             "performs_io": mode.performsProductionFileIO ? 1 : 0,
             "outer_admitted": topology?.admitsAutomaticRestore == true ? 1 : 0
