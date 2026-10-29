@@ -1901,8 +1901,8 @@ final class AgentSessionLinkRuntimeBridge {
             loadFields["repository_rows"] = load.repositoryRowCount
             loadFields["invalid_rows"] = load.invalidRowCount
         }
-        StartupPhaseLog.mark(.oversightIntentLoad, fields: loadFields)
-        StartupPhaseLog.mark(.oversightRestoreAdmission, fields: [
+        restorePerfRecorder.startupPhase(.oversightIntentLoad, fields: loadFields)
+        restorePerfRecorder.startupPhase(.oversightRestoreAdmission, fields: [
             "persistence_enabled": mode.allowsAutomaticRestore ? 1 : 0,
             "performs_io": mode.performsProductionFileIO ? 1 : 0,
             "outer_admitted": host?.agentSessionLinkRestoreTopologyState().admitsAutomaticRestore == true ? 1 : 0
@@ -1936,10 +1936,10 @@ final class AgentSessionLinkRuntimeBridge {
         guard !didSeedLaunchEntries, !isFrozenForTermination else { return }
         didSeedLaunchEntries = true
         if recovered {
-            StartupPhaseLog.mark(.oversightIntentLoad, fields: ["recovered": 1, "outcome": 2, "entries": load.tokenByPair.count, "repository_rows": load.repositoryRowCount, "invalid_rows": load.invalidRowCount])
+            restorePerfRecorder.startupPhase(.oversightIntentLoad, fields: ["recovered": 1, "outcome": 2, "entries": load.tokenByPair.count, "repository_rows": load.repositoryRowCount, "invalid_rows": load.invalidRowCount])
         }
         let topology = host?.agentSessionLinkRestoreTopologyState()
-        StartupPhaseLog.mark(.oversightRestoreAdmission, fields: [
+        restorePerfRecorder.startupPhase(.oversightRestoreAdmission, fields: [
             "persistence_enabled": mode.allowsAutomaticRestore ? 1 : 0,
             "performs_io": mode.performsProductionFileIO ? 1 : 0,
             "outer_admitted": topology?.admitsAutomaticRestore == true ? 1 : 0
@@ -8840,7 +8840,7 @@ final class AgentSessionLinkRuntimeBridge {
               ),
               host.agentSessionLinkLaneProvenance(for: matches[0].domainEndpoint) == observerEndpoint.sessionID
         else {
-            AgentSessionLinkCatalogDiagnostics.laneCreationAddFailed(branch: .targetBindingOrProvenance)
+            restorePerfRecorder.laneCreationAddFailed(branch: .targetBindingOrProvenance)
             return await receipt(false, .addFailed)
         }
         let laneEndpoint = matches[0].domainEndpoint
@@ -8851,7 +8851,7 @@ final class AgentSessionLinkRuntimeBridge {
                 observer: observer, target: matches[0], requireObserverAuthoritative: false
             )
         else {
-            AgentSessionLinkCatalogDiagnostics.laneCreationAddFailed(branch: .restorationProof)
+            restorePerfRecorder.laneCreationAddFailed(branch: .restorationProof)
             return await receipt(false, .addFailed)
         }
         let activationBasis: LaneCreationActivationBasis? = switch callerBasis {
@@ -8874,10 +8874,10 @@ final class AgentSessionLinkRuntimeBridge {
         switch add {
         case .added, .alreadyLinked: break
         case let .failed(reason):
-            AgentSessionLinkCatalogDiagnostics.laneCreationAddFailed(branch: .addFailed, reason: reason)
+            restorePerfRecorder.laneCreationAddFailed(branch: .addFailed, reason: reason.rawValue)
             return await receipt(false, isFrozenForTermination ? .shuttingDown : .addFailed)
         case .rejected:
-            AgentSessionLinkCatalogDiagnostics.laneCreationAddFailed(branch: .addRejected)
+            restorePerfRecorder.laneCreationAddFailed(branch: .addRejected)
             return await receipt(false, isFrozenForTermination ? .shuttingDown : .addFailed)
         }
         guard let message = request.message else { return await receipt(true, nil) }
