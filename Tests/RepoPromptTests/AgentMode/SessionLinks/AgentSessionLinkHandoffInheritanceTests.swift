@@ -2972,6 +2972,24 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             }
         }
 
+        func testOrdinaryClaudeResumeTransferStillWritesSessionIDUnderEpochGuard() async throws {
+            // Positive control: an ordinary stop/detach on a Claude tab — no provider-context
+            // clear, no epoch rotation — must still adopt the transferred session ref and
+            // clear the latch.
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                session.selectedAgent = .claudeCode
+                session.providerSessionID = "old-claude-session"
+                let coordinator = vm.test_claudeCoordinator
+                coordinator.test_registerResumeTransfer(for: session, controller: LateTransferFakeRuntime())
+                XCTAssertTrue(coordinator.hasPendingResumeTransfer(for: session))
+                await coordinator.awaitPendingClaudeResumeTransferIfNeeded(for: session)
+                XCTAssertEqual(session.providerSessionID, "late-claude-ref")
+                XCTAssertFalse(coordinator.hasPendingResumeTransfer(for: session))
+            }
+        }
+
         func testStaleDetachedEpochCannotWriteOntoSuccessorClaudeSession() async throws {
             // B2 ownership: the first detach captures E1 into its controller; after the forced
             // Claude → Codex switch and a switch-back, the successor cancel detaches with E2.
