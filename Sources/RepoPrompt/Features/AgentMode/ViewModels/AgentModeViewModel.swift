@@ -4116,6 +4116,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 guard let self else { return }
                 let owner = sessionIndexStore.receiveWorkspaceSwitchNotification(workspace)
                 queuedWorkspaceSwitchOwner = owner
+                logAgentSessionDiscoveryAdoption(owner: owner, workspace: workspace, stage: 0)
                 Task { @MainActor in
                     #if DEBUG
                         defer { self.test_afterWorkspaceSwitchAdoptionCompleted?(owner) }
@@ -16768,12 +16769,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ) async {
         // This queued adoption ends here (installed, superseded or bailed); never clears a successor's.
         defer { clearQueuedWorkspaceSwitchOwner(owner) }
+        logAgentSessionDiscoveryAdoption(owner: owner, workspace: workspace, stage: 1)
         guard sessionIndexStore.isWorkspaceActivationCurrent(owner, workspace: workspace) else { return }
         ui.sessionSidebar.invalidateSelectionForWorkspaceChange()
         sessionSidebarArchivedVisibleSessionCount = Self.sessionSidebarArchivedPageSize
         lastKnownWorkspaceSnapshot = workspace
         installSessionIndexOwner(owner, workspace: workspace)
         clearQueuedWorkspaceSwitchOwner(owner)
+        logAgentSessionDiscoveryAdoption(owner: owner, workspace: workspace, stage: 2)
         guard sessionIndexStore.isOwnerCurrent(owner) else { return }
         // One discovery level per activation that actually takes ownership. Opened *after* the
         // ownership guard, and before any suspension point, so an activation that bails without a
@@ -16886,6 +16889,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             windowID: windowID,
             reason: "Cancelled due to workspace switch"
         )
+        logAgentSessionDiscoveryAdoption(owner: owner, workspace: workspace, stage: 3)
         guard sessionIndexStore.isWorkspaceActivationCurrent(owner, workspace: workspace),
               sessionIndexStore.isOwnerCurrent(owner)
         else {

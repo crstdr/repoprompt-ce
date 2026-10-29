@@ -315,6 +315,10 @@ final class AgentSessionOversightLaunchCoordinator {
     func updateTopologyState(_ state: AgentSessionOversightRestoreTopologyState) {
         guard topology != state else { return }
         topology = state
+        StartupPhaseLog.debugMark(.oversightRestoreAdmission, fields: [
+            "outer_admitted": state.admitsAutomaticRestore ? 1 : 0,
+            "topology_changed": 1
+        ])
         #if DEBUG
             restorePerfRecorder.event(
                 "oversight.topology",
@@ -589,6 +593,58 @@ final class AgentSessionOversightLaunchCoordinator {
 
     // MARK: Diagnostics
 
+    private struct DiscoveryBarrierDiagnosticState: Equatable {
+        let windows: Int
+        let incompleteWindows: Int
+
+        var completed: Bool {
+            windows > 0 && incompleteWindows == 0
+        }
+    }
+
+    private var lastLoggedDiscoveryBarrier: DiscoveryBarrierDiagnosticState?
+    private var loggedUnresolvedPairs: Set<AgentSessionOversightIntent> = []
+
+    private func logUnresolvedPairIfNeeded(_ pair: AgentSessionOversightIntent) {
+        guard loggedUnresolvedPairs.insert(pair).inserted else { return }
+        StartupPhaseLog.oversightRestoreAttempt(pair, outcome: .endpointUnresolved)
+    }
+
+    private var lastLoggedDiscoveryByWindow: [Int: AgentSessionLinkDiscoveryState] = [:]
+
+    private func logDiscoveryBarrierChange(_ discovery: [AgentSessionLinkDiscoveryState]) {
+        var current: [Int: AgentSessionLinkDiscoveryState] = [:]
+        for level in discovery {
+            let windowID = level.epoch.windowID
+            current[windowID] = level
+            if lastLoggedDiscoveryByWindow[windowID] != level {
+                StartupPhaseLog.debugMark(
+                    .oversightDiscoveryBarrier,
+                    window: windowID,
+                    fields: ["registered": 1, "epoch": Int(clamping: level.epoch.generation), "completed": level.isComplete ? 1 : 0]
+                )
+            }
+        }
+        for windowID in lastLoggedDiscoveryByWindow.keys.sorted() where current[windowID] == nil {
+            StartupPhaseLog.debugMark(.oversightDiscoveryBarrier, window: windowID, fields: ["registered": 0])
+        }
+        lastLoggedDiscoveryByWindow = current
+        let state = DiscoveryBarrierDiagnosticState(
+            windows: discovery.count,
+            incompleteWindows: discovery.count { !$0.isComplete }
+        )
+        guard state != lastLoggedDiscoveryBarrier else { return }
+        lastLoggedDiscoveryBarrier = state
+        StartupPhaseLog.debugMark(
+            .oversightDiscoveryBarrier,
+            fields: [
+                "windows": state.windows,
+                "incomplete_windows": state.incompleteWindows,
+                "completed": state.completed ? 1 : 0
+            ]
+        )
+    }
+
     #if DEBUG
         /// Reported once per pending episode. Every candidate-readiness and topology event re-enters
         /// the pass, so an un-deduplicated "still waiting on discovery" line would drown the log.
@@ -680,6 +736,7 @@ final class AgentSessionOversightLaunchCoordinator {
             if isFrozen || delegate.launchCoordinatorIsFrozen { clearDuplicateFlags() }
         }
         let discovery = host.agentSessionLinkDiscoveryStates()
+        logDiscoveryBarrierChange(discovery)
         // An empty set means no window has registered a level yet — that is "not described", not
         // "nothing to describe".
         // Discovery and dirty-pass exits are transient: retain the last completed census until
@@ -726,7 +783,10 @@ final class AgentSessionOversightLaunchCoordinator {
         for pair in launchPairOrder {
             guard !isFrozen, !isDirty else { return }
             guard var entry = entries[pair] else { continue }
-            if uncertainSavedTargets.contains(pair.targetSessionID) { continue }
+            if uncertainSavedTargets.contains(pair.targetSessionID) {
+                logUnresolvedPairIfNeeded(pair)
+                continue
+            }
             if entry.parkedReference != nil {
                 let sessions = [pair.observerSessionID, pair.targetSessionID]
                 guard sessions.allSatisfy({ sessionID in
@@ -746,6 +806,7 @@ final class AgentSessionOversightLaunchCoordinator {
                     candidatesBySession: candidatesBySession
                 )
                 if case .wait = disposition {
+                    logUnresolvedPairIfNeeded(pair)
                     #if DEBUG
                         logWaitingOnce(pair: pair)
                     #endif
@@ -761,8 +822,11 @@ final class AgentSessionOversightLaunchCoordinator {
                 case .wait:
                     continue
                 case let .terminal(reason):
+                    loggedUnresolvedPairs.remove(pair)
+                    StartupPhaseLog.oversightRestoreAttempt(pair, outcome: .terminal, terminalReason: reason)
                     await retire(pair: pair, reason: reason)
                 case let .establish(proof):
+                    loggedUnresolvedPairs.remove(pair)
                     #if DEBUG
                         logReconcile(pair: pair, outcome: "ready")
                     #endif
@@ -1055,6 +1119,14 @@ final class AgentSessionOversightLaunchCoordinator {
             proof: proof
         )
         let outcome = result.outcome
+        switch outcome {
+        case .added, .alreadyLinked:
+            StartupPhaseLog.oversightRestoreAttempt(pair, outcome: .restored)
+        case let .failed(reason):
+            StartupPhaseLog.oversightRestoreAttempt(pair, outcome: .blocked, failure: reason)
+        case .rejected:
+            StartupPhaseLog.oversightRestoreAttempt(pair, outcome: .blocked)
+        }
 
         guard var settled = entries[pair], settled.state == .establishing else { return }
         switch outcome {

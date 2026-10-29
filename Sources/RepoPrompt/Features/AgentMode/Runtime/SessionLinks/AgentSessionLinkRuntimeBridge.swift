@@ -1330,6 +1330,8 @@ final class AgentSessionLinkRuntimeBridge {
     /// store would perform production Application Support I/O inside every focused test that builds a
     /// bridge. Until one is installed, Add and Stop still linearize by pair but persist nothing.
     private var intentStore: AgentSessionOversightIntentStore?
+    private var didFinishInitialIntentLoad = false
+    private var didSeedLaunchEntries = false
     /// Bounded automatic reauthorization of the launch snapshot. Created lazily so a bridge with no
     /// durable layer never allocates one.
     private var launchCoordinator: AgentSessionOversightLaunchCoordinator?
@@ -1604,10 +1606,17 @@ final class AgentSessionLinkRuntimeBridge {
             }
     }
 
-    /// Continuity notifications repaint diagnostics only; they can neither grant nor revoke live
-    /// authority, re-establish a link, deliver a message, or admit a wake.
+    /// Continuity notifications also observe a recovered initial read. Only the first ready snapshot
+    /// seeds the ordinary launch coordinator; later save notifications repaint diagnostics only.
     private func refreshContinuityDiagnostics() async {
         guard let intentStore, !isFrozenForTermination else { return }
+        if didFinishInitialIntentLoad, !didSeedLaunchEntries,
+           let load = await intentStore.readyLaunchLoad
+        {
+            let mode = await intentStore.persistenceMode
+            guard self.intentStore === intentStore, !isFrozenForTermination else { return }
+            seedLaunchEntriesIfNeeded(load, mode: mode, recovered: true)
+        }
         let state = await intentStore.saveState
         let detail = await intentStore.diagnostic
         if state == "saved" {
@@ -1879,7 +1888,21 @@ final class AgentSessionLinkRuntimeBridge {
         // a launch worklist during shutdown.
         guard !isFrozenForTermination else { return }
         let result = await store.loadForLaunch()
-        guard !isFrozenForTermination else { return }
+        guard intentStore === store, !isFrozenForTermination else { return }
+        didFinishInitialIntentLoad = true
+        let outcome = switch result {
+        case .suppressed: 0
+        case .blocked: 1
+        case .ready: 2
+        }
+        var loadFields = ["recovered": 0, "outcome": outcome]
+        if case let .ready(load) = result { loadFields["entries"] = load.tokenByPair.count }
+        StartupPhaseLog.debugMark(.oversightIntentLoad, fields: loadFields)
+        StartupPhaseLog.debugMark(.oversightRestoreAdmission, fields: [
+            "persistence_enabled": mode.allowsAutomaticRestore ? 1 : 0,
+            "performs_io": mode.performsProductionFileIO ? 1 : 0,
+            "outer_admitted": host?.agentSessionLinkRestoreTopologyState().admitsAutomaticRestore == true ? 1 : 0
+        ])
         switch result {
         case .suppressed:
             persistencePresentation.availability = .suppressed
@@ -1895,12 +1918,30 @@ final class AgentSessionLinkRuntimeBridge {
                     message: AgentSessionOversightPersistenceCopy.quarantined
                 )
             }
-            launchCoordinatorIfNeeded().loadLaunchEntries(
-                load,
-                automaticRestoreEnabled: mode.allowsAutomaticRestore
-            )
+            seedLaunchEntriesIfNeeded(load, mode: mode, recovered: false)
         }
         publishPersistencePresentation()
+        noteTopologyMayHaveChanged()
+    }
+
+    private func seedLaunchEntriesIfNeeded(
+        _ load: AgentSessionOversightIntentReadyLoad,
+        mode: AgentSessionOversightPersistenceMode,
+        recovered: Bool
+    ) {
+        guard !didSeedLaunchEntries, !isFrozenForTermination else { return }
+        didSeedLaunchEntries = true
+        if recovered {
+            StartupPhaseLog.debugMark(.oversightIntentLoad, fields: ["recovered": 1, "outcome": 2, "entries": load.tokenByPair.count])
+        }
+        StartupPhaseLog.debugMark(.oversightLaunchSeed, fields: ["entries": load.tokenByPair.count])
+        let topology = host?.agentSessionLinkRestoreTopologyState()
+        StartupPhaseLog.debugMark(.oversightRestoreAdmission, fields: [
+            "persistence_enabled": mode.allowsAutomaticRestore ? 1 : 0,
+            "performs_io": mode.performsProductionFileIO ? 1 : 0,
+            "outer_admitted": topology?.admitsAutomaticRestore == true ? 1 : 0
+        ])
+        launchCoordinatorIfNeeded().loadLaunchEntries(load, automaticRestoreEnabled: mode.allowsAutomaticRestore)
         noteTopologyMayHaveChanged()
     }
 
@@ -8795,7 +8836,10 @@ final class AgentSessionLinkRuntimeBridge {
                   bindingToken, .freshBindingDurablyCreated
               ),
               host.agentSessionLinkLaneProvenance(for: matches[0].domainEndpoint) == observerEndpoint.sessionID
-        else { return await receipt(false, .addFailed) }
+        else {
+            AgentSessionLinkCatalogDiagnostics.laneCreationAddFailed(branch: .targetBindingOrProvenance)
+            return await receipt(false, .addFailed)
+        }
         let laneEndpoint = matches[0].domainEndpoint
         guard let observer = host.agentSessionLinkCandidates().first(where: {
             $0.domainEndpoint == observerEndpoint
@@ -8803,7 +8847,10 @@ final class AgentSessionLinkRuntimeBridge {
             let proof = AgentSessionOversightRestorationProof(
                 observer: observer, target: matches[0], requireObserverAuthoritative: false
             )
-        else { return await receipt(false, .addFailed) }
+        else {
+            AgentSessionLinkCatalogDiagnostics.laneCreationAddFailed(branch: .restorationProof)
+            return await receipt(false, .addFailed)
+        }
         let activationBasis: LaneCreationActivationBasis? = switch callerBasis {
         case .linked: nil
         case let .activated(activation):
@@ -8823,7 +8870,12 @@ final class AgentSessionLinkRuntimeBridge {
         )
         switch add {
         case .added, .alreadyLinked: break
-        case .failed, .rejected: return await receipt(false, isFrozenForTermination ? .shuttingDown : .addFailed)
+        case let .failed(reason):
+            AgentSessionLinkCatalogDiagnostics.laneCreationAddFailed(branch: .addFailed, reason: reason)
+            return await receipt(false, isFrozenForTermination ? .shuttingDown : .addFailed)
+        case .rejected:
+            AgentSessionLinkCatalogDiagnostics.laneCreationAddFailed(branch: .addRejected)
+            return await receipt(false, isFrozenForTermination ? .shuttingDown : .addFailed)
         }
         guard let message = request.message else { return await receipt(true, nil) }
         guard !isFrozenForTermination else { return await receipt(true, nil, .failed, "shutdown") }
