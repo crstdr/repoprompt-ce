@@ -124,7 +124,7 @@ extension AgentModeViewModel {
 
     /// Stages: queued (0), entered (1), installed (2), and asynchronous cleanup finished (3).
     func logAgentSessionDiscoveryAdoption(owner: SessionIndexOwner, workspace: WorkspaceModel?, stage: Int) {
-        StartupPhaseLog.debugMark(.oversightDiscoveryAdoption, window: windowID, fields: [
+        restorePerfRecorder.startupPhase(.oversightDiscoveryAdoption, debug: true, window: windowID, fields: [
             "stage": stage,
             "activation": Int(clamping: owner.activationEpoch),
             "epoch": Int(clamping: agentSessionLinkDiscoveryGeneration),
@@ -144,7 +144,7 @@ extension AgentModeViewModel {
     func beginAgentSessionLinkDiscoveryEpoch(workspaceID: UUID?) -> AgentSessionLinkDiscoveryEpoch {
         agentSessionLinkDiscoveryGeneration &+= 1
         agentSessionLinkDiscoveryWorkspaceID = workspaceID
-        StartupPhaseLog.debugMark(.oversightDiscoveryCompletion, window: windowID, fields: [
+        restorePerfRecorder.startupPhase(.oversightDiscoveryCompletion, debug: true, window: windowID, fields: [
             "epoch": Int(clamping: agentSessionLinkDiscoveryGeneration), "completed": 0
         ])
         // Discovery state is pane presentation input (§4.2); it grants no session-link authority.
@@ -184,8 +184,8 @@ extension AgentModeViewModel {
         let didComplete = agentSessionLinkDiscoveryCompletedGeneration != epoch.generation
         agentSessionLinkDiscoveryCompletedGeneration = epoch.generation
         if didComplete {
-            StartupPhaseLog.debugMark(
-                .oversightDiscoveryCompletion,
+            restorePerfRecorder.startupPhase(
+                .oversightDiscoveryCompletion, debug: true,
                 window: epoch.windowID,
                 fields: ["epoch": Int(clamping: epoch.generation), "completed": 1]
             )

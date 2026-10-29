@@ -299,7 +299,7 @@ final class AgentSessionOversightLaunchCoordinator {
     ) {
         let previousCount = launchPairOrder.count
         defer {
-            StartupPhaseLog.mark(.oversightLaunchSeed, fields: [
+            restorePerfRecorder.startupPhase(.oversightLaunchSeed, fields: [
                 "entries": load.tokenByPair.count,
                 "appended": launchPairOrder.count - previousCount,
                 "launch_entries": launchPairOrder.count,
@@ -325,7 +325,7 @@ final class AgentSessionOversightLaunchCoordinator {
     func updateTopologyState(_ state: AgentSessionOversightRestoreTopologyState) {
         guard topology != state else { return }
         topology = state
-        StartupPhaseLog.mark(.oversightRestoreAdmission, fields: [
+        restorePerfRecorder.startupPhase(.oversightRestoreAdmission, fields: [
             "outer_admitted": state.admitsAutomaticRestore ? 1 : 0,
             "topology_changed": 1
         ])
@@ -617,7 +617,7 @@ final class AgentSessionOversightLaunchCoordinator {
 
     private func logUnresolvedPairIfNeeded(_ pair: AgentSessionOversightIntent) {
         guard loggedUnresolvedPairs.insert(pair).inserted else { return }
-        StartupPhaseLog.oversightRestoreAttempt(pair, outcome: .endpointUnresolved)
+        restorePerfRecorder.oversightRestoreAttempt(observer: pair.observerSessionID, target: pair.targetSessionID, outcome: .endpointUnresolved)
     }
 
     private var lastLoggedDiscoveryByWindow: [Int: AgentSessionLinkDiscoveryState] = [:]
@@ -628,15 +628,15 @@ final class AgentSessionOversightLaunchCoordinator {
             let windowID = level.epoch.windowID
             current[windowID] = level
             if lastLoggedDiscoveryByWindow[windowID] != level {
-                StartupPhaseLog.debugMark(
-                    .oversightDiscoveryBarrier,
+                restorePerfRecorder.startupPhase(
+                    .oversightDiscoveryBarrier, debug: true,
                     window: windowID,
                     fields: ["registered": 1, "epoch": Int(clamping: level.epoch.generation), "completed": level.isComplete ? 1 : 0]
                 )
             }
         }
         for windowID in lastLoggedDiscoveryByWindow.keys.sorted() where current[windowID] == nil {
-            StartupPhaseLog.debugMark(.oversightDiscoveryBarrier, window: windowID, fields: ["registered": 0])
+            restorePerfRecorder.startupPhase(.oversightDiscoveryBarrier, debug: true, window: windowID, fields: ["registered": 0])
         }
         lastLoggedDiscoveryByWindow = current
         let state = DiscoveryBarrierDiagnosticState(
@@ -645,7 +645,7 @@ final class AgentSessionOversightLaunchCoordinator {
         )
         guard state != lastLoggedDiscoveryBarrier else { return }
         lastLoggedDiscoveryBarrier = state
-        StartupPhaseLog.mark(
+        restorePerfRecorder.startupPhase(
             .oversightDiscoveryBarrier,
             fields: [
                 "windows": state.windows,
@@ -833,7 +833,7 @@ final class AgentSessionOversightLaunchCoordinator {
                     continue
                 case let .terminal(reason):
                     loggedUnresolvedPairs.remove(pair)
-                    StartupPhaseLog.oversightRestoreAttempt(pair, outcome: .terminal, terminalReason: reason)
+                    restorePerfRecorder.oversightRestoreAttempt(observer: pair.observerSessionID, target: pair.targetSessionID, outcome: .terminal, reason: reason.rawValue)
                     await retire(pair: pair, reason: reason)
                 case let .establish(proof):
                     loggedUnresolvedPairs.remove(pair)
@@ -1131,11 +1131,11 @@ final class AgentSessionOversightLaunchCoordinator {
         let outcome = result.outcome
         switch outcome {
         case .added, .alreadyLinked:
-            StartupPhaseLog.oversightRestoreAttempt(pair, outcome: .restored)
+            restorePerfRecorder.oversightRestoreAttempt(observer: pair.observerSessionID, target: pair.targetSessionID, outcome: .restored)
         case let .failed(reason):
-            StartupPhaseLog.oversightRestoreAttempt(pair, outcome: .blocked, failure: reason)
+            restorePerfRecorder.oversightRestoreAttempt(observer: pair.observerSessionID, target: pair.targetSessionID, outcome: .blocked, reason: reason.rawValue)
         case .rejected:
-            StartupPhaseLog.oversightRestoreAttempt(pair, outcome: .blocked)
+            restorePerfRecorder.oversightRestoreAttempt(observer: pair.observerSessionID, target: pair.targetSessionID, outcome: .blocked)
         }
 
         guard var settled = entries[pair], settled.state == .establishing else { return }
