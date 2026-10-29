@@ -880,18 +880,18 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
                     lastFocused: false, workspaceInstanceNumber: nil
                 )
                 _ = lifetimes[index].accept(entry) { gate.finishRestoringWindow(windowID) }
-                // Catalog failure leaves execution pending after releasing persistence.
+                // Catalog failure abandons execution while preserving the queued entry.
                 lifetimes[index].releasePendingCompletion()?()
             }
             XCTAssertFalse(gate.isRestoreInProgress, "Persistence may recover while catalog acceptance is deferred")
             func topology() -> AgentSessionOversightRestoreTopologyState {
                 gate.oversightTopologyState(
                     hasPendingWindowExecution: lifetimes.contains { $0.hasUnfinishedExecution },
-                    abandonedEntryCount: 0
+                    abandonedEntryCount: lifetimes.reduce(0) { $0 + $1.abandonedRestoreCount }
                 )
             }
             fixture.host.topology = topology()
-            XCTAssertEqual(fixture.host.topology, .pending)
+            XCTAssertEqual(fixture.host.topology, .incompleteLeftoversAbandoned(count: 2))
             await fixture.bridge.bootstrapIntentStore(fixture.store)
             await fixture.bridge.test_settleLaunchReconciliation()
             XCTAssertEqual(
@@ -928,6 +928,68 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
             XCTAssertNotNil(token, "A missing session retires only this launch, never durable intent")
             XCTAssertFalse(AgentSessionOversightLaunchTerminalReason.missing.removesDurableIntent)
         }
+    }
+
+    func testAbandonedCatalogAdmitsVisiblePairsAndWaitsForMissingPairsUntilRecovery() async throws {
+        let absent = AgentSessionOversightIntent(observerSessionID: UUID(), targetSessionID: UUID())
+        try JSONEncoder().encode(AgentSessionOversightIntentDocument(links: [pair, absent])).write(
+            to: directory.appendingPathComponent(AgentSessionOversightIntentStore.filename), options: .atomic
+        )
+        let fixture = makeFixture()
+        defer { fixture.bridge.freezeForTermination() }
+        let observer = makeReadyCandidate(windowID: 1, sessionID: observerSessionID)
+        let target = makeReadyCandidate(windowID: 2, sessionID: targetSessionID)
+        fixture.host.candidates = [observer, target]
+        fixture.host.descriptors = [descriptor(for: observer), descriptor(for: target)]
+        var gate = WindowSessionRestorePersistenceGate()
+        gate.finishRestoreSessionLoad(pendingEntryCount: 1)
+        gate.consumePendingRestoreEntry()
+        gate.beginRestoringWindow(3)
+        var lifetime = WindowRestoreLifetime()
+        let entry = WindowSessionEntry(
+            windowKind: .standard, workspaceID: UUID(), workspaceName: nil,
+            isSystemWorkspace: false, isEphemeral: false, primaryRepoPath: nil,
+            lastFocused: false, workspaceInstanceNumber: nil
+        )
+        _ = lifetime.accept(entry) { gate.finishRestoringWindow(3) }
+        lifetime.releasePendingCompletion()?()
+        XCTAssertTrue(lifetime.hasPendingEntry)
+        XCTAssertFalse(lifetime.hasUnfinishedExecution)
+        XCTAssertEqual(lifetime.abandonedRestoreCount, 1)
+        XCTAssertNil(lifetime.releasePendingCompletion(), "Repeated failure keeps exactly one abandoned entry")
+        func topology() -> AgentSessionOversightRestoreTopologyState {
+            gate.oversightTopologyState(
+                hasPendingWindowExecution: lifetime.hasUnfinishedExecution,
+                abandonedEntryCount: lifetime.abandonedRestoreCount
+            )
+        }
+        fixture.host.topology = topology()
+        XCTAssertEqual(fixture.host.topology, .incompleteLeftoversAbandoned(count: 1))
+        await fixture.bridge.bootstrapIntentStore(fixture.store)
+        await fixture.bridge.test_settleLaunchReconciliation()
+        XCTAssertEqual(
+            fixture.bridge.test_launchEntryState(for: pair),
+            .active,
+            "A permanently failed catalog cannot block unrelated visible pairs"
+        )
+        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: absent), .waiting)
+
+        let dispatch = try XCTUnwrap(lifetime.takePendingForDispatch())
+        XCTAssertEqual(lifetime.abandonedRestoreCount, 0)
+        fixture.host.topology = topology()
+        XCTAssertEqual(fixture.host.topology, .pending, "Late dispatch reopens the execution barrier")
+        fixture.bridge.noteTopologyMayHaveChanged()
+        await fixture.bridge.test_settleLaunchReconciliation()
+        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: absent), .waiting)
+
+        lifetime.finishDispatch(acceptanceSequence: dispatch.acceptanceSequence)
+        fixture.host.topology = topology()
+        XCTAssertEqual(fixture.host.topology, .completeAllEntriesConsumed)
+        fixture.bridge.noteTopologyMayHaveChanged()
+        await fixture.bridge.test_settleLaunchReconciliation()
+        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: absent), .terminal(.missing))
+        let retained = await fixture.store.token(for: absent)
+        XCTAssertNotNil(retained)
     }
 
     func testNothingIsReservedWhileAWindowsDiscoveryLevelIsIncomplete() async throws {

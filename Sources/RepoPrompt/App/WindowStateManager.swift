@@ -757,9 +757,10 @@ class WindowStatesManager: ObservableObject {
         if AppLaunchConfiguration.current.suppressesAgentSessionOversightPersistence { return .suppressed }
         guard autoRestoreWorkspacesEnabled else { return .dormantAutoRestoreDisabled }
         guard hasLoadedRestoreSession else { return .pending }
+        let restoringWindows = allWindows.filter { !$0.isClosing }
         return restorePersistenceGate.oversightTopologyState(
-            hasPendingWindowExecution: allWindows.contains { !$0.isClosing && $0.hasUnfinishedRestoreExecution },
-            abandonedEntryCount: abandonedRestoreEntryCount
+            hasPendingWindowExecution: restoringWindows.contains { $0.hasUnfinishedRestoreExecution },
+            abandonedEntryCount: abandonedRestoreEntryCount + restoringWindows.reduce(0) { $0 + $1.abandonedRestoreCount }
         )
     }
 
