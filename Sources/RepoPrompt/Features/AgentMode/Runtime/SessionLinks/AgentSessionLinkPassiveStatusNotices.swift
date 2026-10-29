@@ -586,8 +586,11 @@ struct AgentSessionLinkPassiveStatusNotices {
     private struct DeliveredRunPosition {
         let target: DomainAgentSessionLinkEndpointIdentity
         var through: UInt64?
-        /// Evicted ordinary coverage is already represented by overflow, but is not paid.
-        var overflowRepresentedOrdinaryThrough: UInt64?
+        /// Ordinary watermark this lane's evicted rows already disclosed as anonymous overflow.
+        /// Representation-only: it never pays, and a late exact receipt still advances `through`.
+        /// A quiet close may not re-represent this debt as a fresh occurrence; only a newer ordinary
+        /// watermark can, which keeps quiet churn from inflating overflow or failure identity.
+        var overflowDisclosedOrdinaryThrough: UInt64?
     }
 
     /// One position per live lane, not per pending row. Target unreadability does not retire it.
@@ -828,11 +831,10 @@ struct AgentSessionLinkPassiveStatusNotices {
             let owesCoverage = known.map { facts in
                 delivered.map { facts.ordinaryThrough > $0 } ?? (oldEntry != nil || immediateEdge)
             } ?? false
+            let overflowDisclosed = deliveredRunThrough[reference]?.overflowDisclosedOrdinaryThrough
+            let owesUndisclosedCoverage = owesCoverage
+                && known.map { facts in overflowDisclosed.map { facts.ordinaryThrough > $0 } ?? true } ?? false
             let freshIdleDebt = sample.status == .idle && sample.runFacts != nil && owesCoverage
-            let overflowRepresented = deliveredRunThrough[reference]?.overflowRepresentedOrdinaryThrough
-            let unrepresentedCoverage = owesCoverage && (known.map { facts in
-                overflowRepresented.map { facts.ordinaryThrough > $0 } ?? true
-            } ?? false)
             let newOrdinary = sample.runFacts.map { $0.ordinaryThrough > (preceding?.lastKnownRunFacts?.ordinaryThrough ?? 0) } ?? false
             let reacquired = sample.runFacts != nil && preceding?.sample.runFacts == nil
             changed = changed || statusChanged
@@ -851,7 +853,7 @@ struct AgentSessionLinkPassiveStatusNotices {
             }
             // A first observation is a silent baseline, but a surviving position returning from an
             // unavailable/proof gap must recover owed work BEFORE same-status early return.
-            let recoverDebt = freshIdleDebt && unrepresentedCoverage && !isBaseline && (newOrdinary || reacquired)
+            let recoverDebt = freshIdleDebt && owesUndisclosedCoverage && !isBaseline && (newOrdinary || reacquired)
             if preceding == nil && !recoverDebt { continue }
             let quietClose = sample.status == .idle && quietInterval
             var origin = oldEntry?.fromStatus ?? priorStatus
@@ -862,9 +864,10 @@ struct AgentSessionLinkPassiveStatusNotices {
             let coalescedEdge = PendingEntry.isStatusEdge(from: origin, to: sample.status)
             let retainsCoverage = oldEntry != nil && owesCoverage
             // A quiet successor may be the first observed close after ordinary coverage was
-            // sampled only while running. Quiet proof cannot suppress that unrepresented coverage.
+            // sampled only while running. Quiet proof cannot suppress that still-unpaid coverage,
+            // but debt an eviction already disclosed as overflow is not a fresh occurrence.
             let shouldRepresent = retainsCoverage || recoverDebt || (oldEntry != nil && !statusChanged)
-                || (statusChanged && coalescedEdge && (!quietClose || unrepresentedCoverage))
+                || (statusChanged && coalescedEdge && (!quietClose || owesUndisclosedCoverage))
             if !shouldRepresent {
                 if statusChanged, oldEntry != nil {
                     pendingByReference.removeValue(forKey: reference)
@@ -1121,13 +1124,13 @@ struct AgentSessionLinkPassiveStatusNotices {
         let overflowCount = max(0, pendingByReference.count - Self.maximumPendingTargetCount)
         guard overflowCount > 0 else { return 0 }
         for entry in orderedPendingEntries.prefix(overflowCount) {
-            if let ordinary = entry.ordinaryThrough,
-               var position = deliveredRunThrough[entry.reference], position.target == entry.targetEndpoint
+            pendingByReference.removeValue(forKey: entry.reference)
+            if let ordinary = entry.ordinaryThrough, var position = deliveredRunThrough[entry.reference],
+               position.target == entry.targetEndpoint
             {
-                position.overflowRepresentedOrdinaryThrough = max(position.overflowRepresentedOrdinaryThrough ?? 0, ordinary)
+                position.overflowDisclosedOrdinaryThrough = max(position.overflowDisclosedOrdinaryThrough ?? 0, ordinary)
                 deliveredRunThrough[entry.reference] = position
             }
-            pendingByReference.removeValue(forKey: entry.reference)
         }
         return overflowCount
     }

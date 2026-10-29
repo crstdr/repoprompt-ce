@@ -1096,6 +1096,9 @@ struct DomainCatalogAttempt: Equatable {
     let generation: UInt64
     let failureWitness: FailureWitness?
     let projectionIssueWitness: DomainProjectionIssueWitness?
+    /// Health observations are ordered independently of document/catalog revisions. Captured
+    /// before the authority read, so every full/metadata application shares the same fence.
+    let authorityHealthGeneration: UInt64
 }
 
 enum WorkspaceChooserRecovery: Equatable {
@@ -1936,6 +1939,8 @@ class WorkspaceManagerViewModel: ObservableObject {
     private var domainWorkspaceRevisionsByID: [UUID: DomainRevisionState] = [:]
     private var domainWorkspaceDigestsByID: [UUID: String] = [:]
     private var domainWorkspaceHealthByID: [UUID: DomainAuthorityHealth] = [:]
+    private(set) var domainAuthorityHealthGeneration: UInt64 = 0
+    private var domainWorkspaceHealthGenerations: [UUID: UInt64] = [:]
     /// Observed authority metadata also comes from health, conflict and root-only reads. Only
     /// this derived witness proves the ancestry from which a whole local document may be written.
     private struct FullDocumentWriteBaseline: Equatable {
@@ -3176,8 +3181,11 @@ class WorkspaceManagerViewModel: ObservableObject {
                 #if DEBUG
                     try await gate(.beforeUnload)
                 #endif
-                await files.unloadRootFolderPath(root.standardizedFullPath)
+                // Pin the observed lifetime: a shell-less actor root still unloads, and a
+                // same-path replacement is left alone and reported as a stale invocation.
+                let unload = await files.unloadRootFolder(root, kind: .primaryWorkspace)
                 _ = try dependencies()
+                if unload == .superseded { throw failure(.staleInvocation) }
             }
             let loaded = Set(observation.requestedRoots.map(\.standardizedFullPath))
             let shells = Set(files.visibleRootShellProjections.map(\.fullPath))
@@ -8336,7 +8344,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         preserveSameDocumentWriteBaseline(workspaceID: workspaceID, revisions: revisions, digest: digest)
         domainWorkspaceRevisionsByID[workspaceID] = revisions
         domainWorkspaceDigestsByID[workspaceID] = digest
-        domainWorkspaceHealthByID[workspaceID] = health
+        observeDomainWorkspaceHealth(health, workspaceID: workspaceID)
         domainWorkspaceCatalogRevision = max(domainWorkspaceCatalogRevision, catalogRevision)
         synchronizeDomainAuthorityIssueForActiveWorkspace(operation: "authority_projection")
     }
@@ -8361,9 +8369,24 @@ class WorkspaceManagerViewModel: ObservableObject {
             domainWorkspaceDigestsByID[workspaceID] = digest
         }
         if let health {
-            domainWorkspaceHealthByID[workspaceID] = health
+            observeDomainWorkspaceHealth(health, workspaceID: workspaceID)
         }
         domainWorkspaceCatalogRevision = max(domainWorkspaceCatalogRevision, catalogRevision)
+    }
+
+    /// Stamp every authority observation, even an equal value: a suspended snapshot may contain
+    /// an intermediate health state this manager never observed. Local edits do not use this owner.
+    private func observeDomainWorkspaceHealth(_ health: DomainAuthorityHealth?, workspaceID: UUID) {
+        domainAuthorityHealthGeneration += 1
+        domainWorkspaceHealthByID[workspaceID] = health
+        domainWorkspaceHealthGenerations[workspaceID] = health == nil ? nil : domainAuthorityHealthGeneration
+    }
+
+    private func hasNewerConflictingDomainHealth(
+        workspaceID: UUID, health: DomainAuthorityHealth, since generation: UInt64
+    ) -> Bool {
+        domainWorkspaceHealthGenerations[workspaceID, default: 0] > generation
+            && domainWorkspaceHealthByID[workspaceID] != health
     }
 
     private func authorityIssue(
@@ -8507,6 +8530,13 @@ class WorkspaceManagerViewModel: ObservableObject {
             diagnostic: error.localizedDescription
         ))
         Self.logger.error("Domain workspace authority \(operation, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
+    }
+
+    func reportWindowRestoreFailure(_ error: Error, workspaceID: UUID?) {
+        guard !isPreparingForWindowClose else { return }
+        reportDomainAuthorityFailure(error, workspaceID: workspaceID, operation: "window_restore")
+        guard !isPreparingForWindowClose else { return }
+        pendingWorkspaceSwitchBlockedNotice = WorkspaceSwitchBlockedNotice(message: error.localizedDescription)
     }
 
     func refreshDomainWorkspaceAuthority() async {
@@ -8929,7 +8959,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         for id in domainWorkspaceRevisionsByID.keys where revisions[id] == nil && !retainingWorkspaceIDs.contains(id) {
             domainWorkspaceRevisionsByID.removeValue(forKey: id)
             domainWorkspaceDigestsByID.removeValue(forKey: id)
-            domainWorkspaceHealthByID.removeValue(forKey: id)
+            observeDomainWorkspaceHealth(nil, workspaceID: id)
             invalidateFullDocumentAdoption(workspaceID: id)
             forgetWorkingPublicationTracking(workspaceID: id)
         }
@@ -8937,7 +8967,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             preserveSameDocumentWriteBaseline(workspaceID: id, revisions: revision, digest: digests[id])
             domainWorkspaceRevisionsByID[id] = revision
             domainWorkspaceDigestsByID[id] = digests[id]
-            domainWorkspaceHealthByID[id] = health[id]
+            observeDomainWorkspaceHealth(health[id], workspaceID: id)
         }
         domainWorkspaceCatalogRevision = max(domainWorkspaceCatalogRevision, catalogRevision)
     }
@@ -8955,6 +8985,26 @@ class WorkspaceManagerViewModel: ObservableObject {
     /// Set by unaccepted bulk replacement or an uncertain save; only an accepted complete full
     /// reconciliation clears it, so metadata/self-echo cannot certify unresolved retained state.
     private(set) var requiresFullCatalogReconciliation = false
+
+    /// Initialization can finish after only the System Default point read. Restoring a saved
+    /// identity needs accepted catalog membership, never the constructor's legacy disk index.
+    /// Legacy managers have no separate authority catalog to await.
+    var hasAcceptedDomainCatalogForRestoration: Bool {
+        domainWorkspaceAuthorityClient == nil
+            || (domainCatalogReconciliationGeneration > 0 && !requiresFullCatalogReconciliation)
+    }
+
+    /// Retained unavailable rows and consolidated recovery copies are not restore targets.
+    /// Authority-backed System workspaces need the same accepted membership as other saved IDs.
+    func isWorkspaceAvailableForWindowRestoration(_ workspaceID: UUID) -> Bool {
+        guard let workspace = workspace(withID: workspaceID), !workspace.isEphemeral,
+              workspace.consolidatedIntoWorkspaceID == nil,
+              !pendingConsolidatedRestoreIDs.contains(workspaceID)
+        else { return false }
+        guard domainWorkspaceAuthorityClient != nil else { return true }
+        guard hasAcceptedDomainCatalogForRestoration, let membership = acceptedCatalogMembership else { return false }
+        return membership.available.contains(workspaceID) && !membership.unavailable.contains(workspaceID)
+    }
 
     /// The only production boundary that may establish accepted catalog membership. Validates the
     /// whole catalog before reconciling decoded models and last-known unavailable members.
@@ -9111,6 +9161,18 @@ class WorkspaceManagerViewModel: ObservableObject {
         if snapshot.publicationSequence < lastDomainProjectionSequence { return .stalePublication }
         if snapshot.catalogRevision < domainWorkspaceCatalogRevision { return .staleCatalogRevision }
         if !isOrderedAfterResolvedCatalogAttempt(snapshot.publicationSequence, attempt) { return .superseded }
+        // A point read can learn a health-only transition without advancing any revision or
+        // publication floor. Fence the entire read/preparation attempt, including metadata and
+        // covering handoffs. A later attempt may read a legitimate recovery; merely disagreeing
+        // with health known before its read is not evidence that its snapshot is stale.
+        if snapshot.workspaces.contains(where: { record in
+            hasNewerConflictingDomainHealth(
+                workspaceID: record.document.workspaceID, health: record.health,
+                since: attempt.authorityHealthGeneration
+            )
+        }) {
+            return .superseded
+        }
         return nil
     }
 
@@ -9204,6 +9266,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     /// Accepts a self-echo's one-record baseline; never certifies or replaces catalog membership.
+    /// The health generation belongs to the canonical read's start, before its await.
     func acceptDomainAuthoritySelfEchoBaseline(
         workspaceID: UUID,
         revisions: DomainRevisionState,
@@ -9212,6 +9275,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         catalogRevision: UInt64,
         publicationSequence: UInt64,
         baselineGeneration: UInt64,
+        authorityHealthGeneration: UInt64,
         operationID: UUID?,
         eventRevisions: DomainRevisionState?
     ) -> Bool {
@@ -9228,7 +9292,10 @@ class WorkspaceManagerViewModel: ObservableObject {
               !Task.isCancelled,
               publicationSequence >= lastDomainProjectionSequence,
               catalogRevision >= domainWorkspaceCatalogRevision,
-              !isOlderDomainRevision(revisions, workspaceID: workspaceID)
+              !isOlderDomainRevision(revisions, workspaceID: workspaceID),
+              !hasNewerConflictingDomainHealth(
+                  workspaceID: workspaceID, health: health, since: authorityHealthGeneration
+              )
         else { return false }
         applyDomainAuthorityBaseline(
             workspaceID: workspaceID, revisions: revisions, digest: digest, health: health,
@@ -9279,7 +9346,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         return DomainCatalogAttempt(
             generation: domainCatalogAttemptGeneration,
             failureWitness: workspaceChooserPresentation.failure.map { .init(id: $0.id, reportVersion: $0.reportVersion) },
-            projectionIssueWitness: currentProjectionIssueWitness
+            projectionIssueWitness: currentProjectionIssueWitness,
+            authorityHealthGeneration: domainAuthorityHealthGeneration
         )
     }
 

@@ -162,14 +162,14 @@ protocol CodexSessionControlling: AnyObject {
     func setThreadName(_ name: String, threadID: String?) async throws
     func startUserTurn(
         text: String,
-        images: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         model: String?,
         reasoningEffort: String?,
         serviceTier: String?
     ) async throws -> CodexTurnStartReceipt
     func steerUserTurn(
         text: String,
-        images: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         expectedTurnID: String
     ) async throws -> CodexTurnSteerReceipt
     func prepareLifecycleAuthorityReconciliationAfterAcceptedMismatch(
@@ -2227,13 +2227,13 @@ final class CodexNativeSessionController {
 
     func startUserTurn(
         text: String,
-        images: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         model: String?,
         reasoningEffort: String?,
         serviceTier: String?
     ) async throws -> CodexTurnStartReceipt {
         guard let threadID else { throw CodexAppServerClient.ClientError.invalidResponse }
-        let input = try Self.turnInput(text: text, images: images)
+        let input = try Self.turnInput(text: text, attachments: attachments)
 
         var params: [String: Any] = [
             "threadId": threadID,
@@ -2303,14 +2303,14 @@ final class CodexNativeSessionController {
 
     func steerUserTurn(
         text: String,
-        images: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         expectedTurnID: String
     ) async throws -> CodexTurnSteerReceipt {
         guard let threadID else { throw CodexAppServerClient.ClientError.invalidResponse }
         guard let expectedTurnID = Self.nonEmptyString(expectedTurnID) else {
             throw CodexAppServerClient.ClientError.invalidResponse
         }
-        let input = try Self.turnInput(text: text, images: images)
+        let input = try Self.turnInput(text: text, attachments: attachments)
         do {
             let result = try await performRequest(
                 method: "turn/steer",
@@ -2504,12 +2504,12 @@ final class CodexNativeSessionController {
 
     private static func turnInput(
         text: String,
-        images: [AgentImageAttachment]
+        attachments: [AgentFileAttachment]
     ) throws -> [[String: Any]] {
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         var input: [[String: Any]] = []
-        for image in images {
-            switch image.source {
+        for attachment in attachments where attachment.kind == .image {
+            switch attachment.source {
             case let .localFile(path):
                 guard let path = nonEmptyString(path) else { continue }
                 input.append([
@@ -4353,6 +4353,26 @@ final class CodexNativeSessionController {
         }
     }
 
+    /// Decode the required snapshot structure, not settings policy or model-output content.
+    /// Optional/future settings are not applied here. Incomplete envelopes retain uncertainty.
+    private static func isThreadSettingsMetadata(_ value: Any?) -> Bool {
+        guard let settings = value as? [String: Any],
+              ["cwd", "model", "modelProvider", "approvalsReviewer"].allSatisfy({ nonEmptyString(settings[$0] as? String) != nil }),
+              let approvalPolicy = settings["approvalPolicy"],
+              nonEmptyString(approvalPolicy as? String) != nil || (approvalPolicy as? [String: Any])?.isEmpty == false,
+              let sandbox = settings["sandboxPolicy"] as? [String: Any], nonEmptyString(sandbox["type"] as? String) != nil,
+              let collaboration = settings["collaborationMode"] as? [String: Any], nonEmptyString(collaboration["mode"] as? String) != nil,
+              let collaborationSettings = collaboration["settings"] as? [String: Any], nonEmptyString(collaborationSettings["model"] as? String) != nil
+        else { return false }
+        let optionalStrings = ["serviceTier", "effort", "summary", "personality"]
+        guard optionalStrings.allSatisfy({ settings[$0] == nil || settings[$0] is NSNull || settings[$0] is String }),
+              settings["multiAgentMode"] == nil || settings["multiAgentMode"] is String,
+              settings["disabledPluginIds"] == nil || settings["disabledPluginIds"] is [String],
+              settings["activePermissionProfile"] == nil || settings["activePermissionProfile"] is NSNull || settings["activePermissionProfile"] is [String: Any]
+        else { return false }
+        return true
+    }
+
     private static func notificationActiveFlags(from params: [String: Any]) -> [String] {
         for candidate in notificationEnvelopeDictionaries(from: params) {
             if let status = candidate["status"] {
@@ -5657,6 +5677,29 @@ final class CodexNativeSessionController {
             return .fileChange
         }()
 
+        // This authority is top-level only: nested fields must never resurrect legacy choices.
+        let availableDecisions: [AgentApprovalDecision]? = {
+            guard let value = params["availableDecisions"], !(value is NSNull) else { return nil }
+            guard let entries = value as? [Any] else { return [] }
+            return entries.compactMap { entry in
+                if let name = entry as? String {
+                    switch name {
+                    case "accept": return .accept
+                    case "acceptForSession": return .acceptForSession
+                    case "decline": return .decline
+                    case "cancel": return .cancel
+                    default: return nil
+                    }
+                }
+                guard let object = entry as? [String: Any], object.count == 1,
+                      let amendment = object["acceptWithExecpolicyAmendment"] as? [String: Any],
+                      let values = amendment["execpolicy_amendment"] as? [String], !values.isEmpty,
+                      let data = try? JSONSerialization.data(withJSONObject: values)
+                else { return nil }
+                return .acceptWithExecpolicyAmendment(String(decoding: data, as: UTF8.self))
+            }
+        }()
+
         let approvalID = AgentApprovalRequest.stableID(
             requestID: .codex(requestID),
             method: method,
@@ -5665,6 +5708,25 @@ final class CodexNativeSessionController {
             turnID: stableTurnID,
             itemID: itemID
         )
+        func makeRequest(details: [AgentApprovalDetail]) -> AgentApprovalRequest {
+            AgentApprovalRequest(
+                id: approvalID,
+                requestID: .codex(requestID),
+                method: method,
+                kind: kind,
+                threadID: threadID,
+                turnID: turnID,
+                itemID: itemID,
+                reason: reason,
+                command: command,
+                cwd: cwd,
+                grantRoot: grantRoot,
+                proposedExecpolicyAmendmentJSON: proposedExecpolicyAmendmentJSON,
+                availableDecisions: availableDecisions,
+                details: details
+            )
+        }
+        let presentedAmendment = makeRequest(details: []).presentedExecpolicyAmendmentJSON
         let detailSeed = approvalID.uuidString
         var details: [AgentApprovalDetail] = []
         var detailIndex = 0
@@ -5700,28 +5762,14 @@ final class CodexNativeSessionController {
         if let commandActionsJSON, !commandActionsJSON.isEmpty {
             appendDetail(label: "Command Actions", value: commandActionsJSON, isCode: true)
         }
-        if let proposedExecpolicyAmendmentJSON, !proposedExecpolicyAmendmentJSON.isEmpty {
-            appendDetail(label: "Execpolicy Amendment", value: proposedExecpolicyAmendmentJSON, isCode: true)
+        if let presentedAmendment, !presentedAmendment.isEmpty {
+            appendDetail(label: "Execpolicy Amendment", value: presentedAmendment, isCode: true)
         }
         if details.isEmpty {
             appendDetail(label: "Method", value: method, isCode: true)
         }
 
-        return AgentApprovalRequest(
-            id: approvalID,
-            requestID: .codex(requestID),
-            method: method,
-            kind: kind,
-            threadID: threadID,
-            turnID: turnID,
-            itemID: itemID,
-            reason: reason,
-            command: command,
-            cwd: cwd,
-            grantRoot: grantRoot,
-            proposedExecpolicyAmendmentJSON: proposedExecpolicyAmendmentJSON,
-            details: details
-        )
+        return makeRequest(details: details)
     }
 
     private static func firstString(in value: Any, keys: [String]) -> String? {
@@ -9775,14 +9823,14 @@ enum CommandExecutionOutputSanitizer {
 }
 
 enum CodexSessionControllerError: LocalizedError {
-    case imageAttachmentsUnsupported
+    case attachmentsUnsupported
     case emptyUserTurn
     case invalidResumeReferenceMissingThreadID
     case invalidLifecycleState(String)
 
     var errorDescription: String? {
         switch self {
-        case .imageAttachmentsUnsupported:
+        case .attachmentsUnsupported:
             "This Codex session controller does not support image attachments."
         case .emptyUserTurn:
             "Cannot send an empty user turn."

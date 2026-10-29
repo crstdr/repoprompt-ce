@@ -854,7 +854,6 @@ extension AgentModeViewModel {
                     observer: context.epoch.endpoint, inventory: context.inventory, baseline: baseline
                 )
             },
-
             render: AgentSessionLinkPrompts.rendered
         )
     }

@@ -884,7 +884,6 @@ import XCTest
                 } catch {
                     server.setBeforeDomainReadContextResolutionForTesting(nil)
                     await manager.debugSetDomainPeerIdentityForTesting(connectionID: endpoint.connectionID, identity: nil)
-
                     await fixture.cleanup()
                     throw error
                 }
