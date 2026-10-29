@@ -2066,11 +2066,27 @@ final class ClaudeAgentModeCoordinator {
         guard pendingResumeTransferGenerationByTabID[session.tabID] == generation else { return }
         pendingResumeTransferTasksByTabID.removeValue(forKey: session.tabID)
         pendingResumeTransferGenerationByTabID.removeValue(forKey: session.tabID)
+        // A transfer that outlives its provider (forced switch whose stop outlasted the
+        // managed-stop deadline, or any late teardown) must not write a Claude session
+        // reference — or a destination-stamped cleanup handle — onto the new provider.
+        // The latch is already cleared above, so this cannot wedge hasPendingResumeTransfer.
+        guard session.selectedAgent.usesClaudeNativeRuntime else { return }
         updateProviderSessionIDIfNeeded(
             sessionRef.sessionID,
             for: session
         )
     }
+
+    #if DEBUG
+        /// Registers a transfer the way a detached-controller teardown would, for tests that
+        /// need the completion path without a live controller.
+        func test_registerResumeTransfer(for session: AgentTabSession, controller: any NativeAgentRuntimeControlling) {
+            beginClaudeResumeTransferIfNeeded(
+                for: session,
+                oldController: DetachedClaudeController(controller: controller, toolHandler: nil)
+            )
+        }
+    #endif
 
     func hasPendingResumeTransfer(
         for session: AgentTabSession

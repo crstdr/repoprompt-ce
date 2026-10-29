@@ -2911,6 +2911,25 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             }
         }
 
+        func testLateClaudeResumeTransferWriteCannotReachDestinationProvider() async throws {
+            // B2: a transfer whose teardown completes after the forced switch retired the source
+            // provider must not write the old Claude providerSessionID — or a destination-stamped
+            // cleanup handle — onto the new provider, and the latch must not wedge.
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                session.selectedAgent = .claudeCode
+                session.providerSessionID = "old-claude-session"
+                let coordinator = vm.test_claudeCoordinator
+                coordinator.test_registerResumeTransfer(for: session, controller: LateTransferFakeRuntime())
+                XCTAssertTrue(coordinator.hasPendingResumeTransfer(for: session))
+                session.selectedAgent = .openCode
+                await coordinator.awaitPendingClaudeResumeTransferIfNeeded(for: session)
+                XCTAssertEqual(session.providerSessionID, "old-claude-session")
+                XCTAssertFalse(coordinator.hasPendingResumeTransfer(for: session))
+            }
+        }
+
         func testForceAffordanceNeverReachesOverseerOrMCP() async throws {
             // The force gesture lives only in the local sheet: a linked send during the same busy
             // state receives exactly today's retryable busy refusal, never a switch outcome.
@@ -3948,5 +3967,40 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
         let sourceTabID: UUID
         let sourceSession: AgentModeViewModel.TabSession
         let workspace: WorkspaceModel
+    }
+}
+
+/// Minimal runtime for the B2 late-transfer-write regression: tears down immediately and
+/// reports a fixed session ref, so the transfer completion path is exercised without a provider.
+private actor LateTransferFakeRuntime: NativeAgentRuntimeControlling {
+    var hasActiveSession = false
+    var hasTurnInFlight = false
+    var events: AsyncStream<NativeAgentRuntimeEvent> {
+        AsyncStream { $0.finish() }
+    }
+
+    func availableSlashCommands() async -> [NativeAgentRuntimeSlashCommand] {
+        []
+    }
+
+    func ensureEventsStreamReady() {}
+    func resetEventsStreamForNewRun() {}
+    func currentSessionRef() -> NativeAgentRuntimeSessionRef {
+        .init(sessionID: "late-claude-ref")
+    }
+
+    func applyModelAndEffort(model: String?, effortLevel: NativeAgentRuntimeEffortLevel?) {}
+    func shutdown() {}
+    func respondToPermissionRequest(id: String, decision: AgentApprovalDecision) {}
+    func startOrResume(existingSessionID: String?, model: String?, effortLevel: NativeAgentRuntimeEffortLevel?, systemPromptOverride: String?) -> NativeAgentRuntimeSessionRef {
+        .init(sessionID: "late-claude-ref")
+    }
+
+    func sendUserMessage(_ text: String) -> UUID {
+        UUID()
+    }
+
+    func interruptTurn(reason: String) -> NativeAgentRuntimeInterruptOutcome {
+        .noTurnInFlight
     }
 }
