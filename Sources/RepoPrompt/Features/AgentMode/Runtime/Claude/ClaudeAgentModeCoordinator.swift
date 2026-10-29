@@ -197,6 +197,10 @@ final class ClaudeAgentModeCoordinator {
     struct DetachedClaudeController {
         fileprivate let controller: any NativeAgentRuntimeControlling
         fileprivate let toolHandler: ClaudeAgentToolTrackingHandler?
+        /// The Claude runtime context epoch captured when this controller was
+        /// detached; travels with the owner so a late transfer registration
+        /// cannot inherit a successor cancellation's epoch.
+        fileprivate let contextEpoch: UUID?
     }
 
     struct ControllerLaunchSettings: Equatable {
@@ -247,7 +251,6 @@ final class ClaudeAgentModeCoordinator {
     private var pendingResumeTransferGenerationByTabID: [UUID: UUID] = [:]
     private var pendingResumeTransferEpochByTabID: [UUID: UUID] = [:]
     private var claudeRuntimeEpochByTabID: [UUID: UUID] = [:]
-    private var detachedClaudeEpochByTabID: [UUID: UUID] = [:]
     private var retiredResumeTransferTasksByTabID: [UUID: [Task<NativeAgentRuntimeSessionRef, Never>]] = [:]
     var toolTrackingHooks: AgentToolTrackingHooks = .noOp {
         didSet {
@@ -351,7 +354,6 @@ final class ClaudeAgentModeCoordinator {
         pendingResumeTransferGenerationByTabID.removeAll()
         pendingResumeTransferEpochByTabID.removeAll()
         claudeRuntimeEpochByTabID.removeAll()
-        detachedClaudeEpochByTabID.removeAll()
         retiredResumeTransferTasksByTabID.removeAll()
     }
 
@@ -710,7 +712,11 @@ final class ClaudeAgentModeCoordinator {
         guard sessionOwnsClaudeController(controller, for: session) else { return nil }
         let toolHandler = removeToolTracking ? toolHandlerByTabID.removeValue(forKey: session.tabID) : nil
         clearClaudeControllerLaunchMetadata(for: session)
-        return DetachedClaudeController(controller: controller, toolHandler: toolHandler)
+        return DetachedClaudeController(
+            controller: controller,
+            toolHandler: toolHandler,
+            contextEpoch: currentClaudeRuntimeEpoch(for: session)
+        )
     }
 
     private func clearClaudeControllerLaunchMetadata(
@@ -1981,10 +1987,6 @@ final class ClaudeAgentModeCoordinator {
         let detached = session.claudeController.flatMap {
             detachClaudeController($0, from: session, removeToolTracking: true)
         }
-        // Stamp the detach with the current Claude runtime context epoch so a
-        // resume transfer registered by this teardown can be proven to belong
-        // to the context that was active when the controller was detached.
-        detachedClaudeEpochByTabID[session.tabID] = currentClaudeRuntimeEpoch(for: session)
         if detached == nil {
             clearClaudeControllerLaunchMetadata(for: session)
         }
@@ -2055,7 +2057,7 @@ final class ClaudeAgentModeCoordinator {
         }
         let generation = UUID()
         pendingResumeTransferGenerationByTabID[session.tabID] = generation
-        pendingResumeTransferEpochByTabID[session.tabID] = detachedClaudeEpochByTabID[session.tabID]
+        pendingResumeTransferEpochByTabID[session.tabID] = oldController.contextEpoch
         pendingResumeTransferTasksByTabID[session.tabID] = Task { @MainActor [self, session] in
             await cancelClaudeRunAndCaptureSessionRef(session, oldController: oldController)
         }
@@ -2125,13 +2127,27 @@ final class ClaudeAgentModeCoordinator {
         /// Registers a transfer the way a detached-controller teardown would, for tests that
         /// need the completion path without a live controller.
         func test_registerResumeTransfer(for session: AgentTabSession, controller: any NativeAgentRuntimeControlling) {
-            // Mirror the production ordering: the detach stamps the current
-            // context epoch before the transfer registers it.
-            detachedClaudeEpochByTabID[session.tabID] = currentClaudeRuntimeEpoch(for: session)
-            beginClaudeResumeTransferIfNeeded(
+            test_registerResumeTransfer(
                 for: session,
-                oldController: DetachedClaudeController(controller: controller, toolHandler: nil)
+                oldController: test_makeDetachedClaudeController(for: session, controller: controller)
             )
+        }
+
+        /// Builds a detached controller the way `detachClaudeController` would: the current
+        /// context epoch is captured into the owner at this point, not at registration.
+        func test_makeDetachedClaudeController(
+            for session: AgentTabSession,
+            controller: any NativeAgentRuntimeControlling
+        ) -> DetachedClaudeController {
+            DetachedClaudeController(
+                controller: controller,
+                toolHandler: nil,
+                contextEpoch: currentClaudeRuntimeEpoch(for: session)
+            )
+        }
+
+        func test_registerResumeTransfer(for session: AgentTabSession, oldController: DetachedClaudeController) {
+            beginClaudeResumeTransferIfNeeded(for: session, oldController: oldController)
         }
     #endif
 

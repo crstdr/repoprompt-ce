@@ -2972,6 +2972,41 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             }
         }
 
+        func testStaleDetachedEpochCannotWriteOntoSuccessorClaudeSession() async throws {
+            // B2 ownership: the first detach captures E1 into its controller; after the forced
+            // Claude → Codex switch and a switch-back, the successor cancel detaches with E2.
+            // The FIRST teardown's late transfer registration must use its own E1 stamp —
+            // it cannot inherit E2 — so its write is dropped while the second transfer
+            // (stamped E2) still completes normally.
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                session.selectedAgent = .claudeCode
+                let coordinator = vm.test_claudeCoordinator
+                let first = coordinator.test_makeDetachedClaudeController(
+                    for: session,
+                    controller: LateTransferFakeRuntime(sessionRefID: "first-ref")
+                )
+                session.selectedAgent = .codexExec
+                coordinator.rotateClaudeRuntimeEpoch(for: session)
+                session.selectedAgent = .claudeCode
+                coordinator.rotateClaudeRuntimeEpoch(for: session)
+                let second = coordinator.test_makeDetachedClaudeController(
+                    for: session,
+                    controller: LateTransferFakeRuntime(sessionRefID: "second-ref")
+                )
+                session.providerSessionID = "new-claude-session"
+                coordinator.test_registerResumeTransfer(for: session, oldController: first)
+                await coordinator.awaitPendingClaudeResumeTransferIfNeeded(for: session)
+                XCTAssertEqual(session.providerSessionID, "new-claude-session")
+                XCTAssertFalse(coordinator.hasPendingResumeTransfer(for: session))
+                coordinator.test_registerResumeTransfer(for: session, oldController: second)
+                await coordinator.awaitPendingClaudeResumeTransferIfNeeded(for: session)
+                XCTAssertEqual(session.providerSessionID, "second-ref")
+                XCTAssertFalse(coordinator.hasPendingResumeTransfer(for: session))
+            }
+        }
+
         func testClaudeResumeTransferRetiredMidAwaitDoesNotWedgeLatch() async throws {
             // B2 wedge: a transfer retired while its await is in flight on a non-Claude tab
             // must drain the retired latch so hasPendingResumeTransfer returns false.
@@ -4038,9 +4073,15 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
 /// Minimal runtime for the B2 late-transfer-write regression: tears down immediately and
 /// reports a fixed session ref, so the transfer completion path is exercised without a provider.
 private actor LateTransferFakeRuntime: NativeAgentRuntimeControlling {
+    let sessionRefID: String
     var hasActiveSession = false
     var hasTurnInFlight = false
     var holdTeardown = false
+
+    init(sessionRefID: String = "late-claude-ref") {
+        self.sessionRefID = sessionRefID
+    }
+
     private var teardownStarted = false
     private var teardownStartedContinuation: CheckedContinuation<Void, Never>?
     private var releaseContinuation: CheckedContinuation<Void, Never>?
@@ -4060,7 +4101,7 @@ private actor LateTransferFakeRuntime: NativeAgentRuntimeControlling {
         if holdTeardown {
             await withCheckedContinuation { releaseContinuation = $0 }
         }
-        return .init(sessionID: "late-claude-ref")
+        return .init(sessionID: sessionRefID)
     }
 
     func setHoldTeardown(_ value: Bool) {
@@ -4081,7 +4122,7 @@ private actor LateTransferFakeRuntime: NativeAgentRuntimeControlling {
     func shutdown() {}
     func respondToPermissionRequest(id: String, decision: AgentApprovalDecision) {}
     func startOrResume(existingSessionID: String?, model: String?, effortLevel: NativeAgentRuntimeEffortLevel?, systemPromptOverride: String?) -> NativeAgentRuntimeSessionRef {
-        .init(sessionID: "late-claude-ref")
+        .init(sessionID: sessionRefID)
     }
 
     func sendUserMessage(_ text: String) -> UUID {
