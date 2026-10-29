@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import OSLog
+import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 
 /// Low-volume, always-on local diagnostics for oversight catalog convergence.
@@ -70,6 +71,20 @@ enum AgentSessionLinkCatalogDiagnostics {
         subsystem: Bundle.main.bundleIdentifier ?? "RepoPrompt",
         category: "AgentSessionLinkCatalog"
     )
+
+    enum LaneCreationAddFailureBranch: String {
+        case targetBindingOrProvenance = "target_binding_or_provenance"
+        case restorationProof = "restoration_proof"
+        case addFailed = "add_failed"
+        case addRejected = "add_rejected"
+    }
+
+    static func laneCreationAddFailed(
+        branch: LaneCreationAddFailureBranch,
+        reason: AgentSessionLinkResolveFailure? = nil
+    ) {
+        logger.notice("event=create-lane-add-failed branch=\(branch.rawValue, privacy: .public) reason=\(reason?.rawValue ?? "none", privacy: .public)")
+    }
 
     #if DEBUG
         private final class TestCapture: @unchecked Sendable {
