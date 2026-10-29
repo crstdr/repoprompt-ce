@@ -66,6 +66,13 @@ struct AgentProviderSwitchPreview: View {
     @ObservedObject var viewModel: AgentModeViewModel
     @State private var showsPayload = false
     @State private var payload = ""
+    /// Local arm state only — never persisted. Keyed on switch identity so a same-identity
+    /// preview rebuild keeps the arm but a different destination/model/session drops it.
+    @State private var armedPreviewKey: String?
+
+    private func forceKey(_ preview: AgentModeViewModel.ProviderSwitchPreview) -> String {
+        "\(preview.session.tabID.uuidString)|\(preview.destination.rawValue)|\(preview.model)|\(preview.isReview)"
+    }
 
     var body: some View {
         if let preview = viewModel.providerSwitchPreview {
@@ -115,6 +122,11 @@ struct AgentProviderSwitchPreview: View {
                         .frame(height: 180)
                 }
                 .disabled(preview.chosen?.bytes ?? 0 == 0)
+                .onChange(of: preview.id) {
+                    // A same-identity rebuild (streaming drift, refreshed choices) keeps the arm;
+                    // a different destination/model/session drops it.
+                    if armedPreviewKey != forceKey(preview) { armedPreviewKey = nil }
+                }
                 .task(id: "\(preview.id)-\(preview.selected?.rawValue ?? "")-\(showsPayload)") {
                     payload = ""
                     if showsPayload, let mode = preview.selected {
@@ -124,7 +136,32 @@ struct AgentProviderSwitchPreview: View {
                         payload = rendered ?? ""
                     }
                 }
-                if let reason = viewModel.providerSwitchPreviewBlocker(preview) { Text("Can't switch: \(reason)").foregroundStyle(.secondary) }
+                let admission = viewModel.providerSwitchPreviewAdmission(preview)
+                if case let .forceable(cause) = admission, !preview.isReview {
+                    let provider = preview.sourceAgent.displayName
+                    // The force buttons carry the same payload-readiness gates as Switch; the
+                    // apply guard refuses anything they miss, so keep them aligned.
+                    let forceUnavailable = preview.building || preview.selected == nil
+                        || preview.chosen?.unavailable != nil || preview.chosen?.bytes ?? 0 == 0
+                        || preview.generationItemID != nil || viewModel.providerSwitchMutation != nil
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(cause.message(provider: provider)).foregroundStyle(.secondary)
+                        if armedPreviewKey == forceKey(preview) {
+                            Text("This stops \(provider) mid-turn; whatever it was doing is dropped. The conversation carries over.")
+                                .foregroundStyle(.secondary)
+                            Button("Stop \(provider) and switch") {
+                                armedPreviewKey = nil
+                                Task { await viewModel.applyProviderSwitch(preview.id, force: true) }
+                            }
+                            .disabled(forceUnavailable)
+                        } else {
+                            Button("Stop \(provider) and switch") { armedPreviewKey = forceKey(preview) }
+                                .disabled(forceUnavailable)
+                        }
+                    }
+                } else if let reason = admission.message(provider: preview.sourceAgent.displayName) {
+                    Text("Can't switch: \(reason)").foregroundStyle(.secondary)
+                }
                 HStack {
                     if preview.isReview {
                         Button("Discard handover") { Task { await viewModel.applyProviderSwitch(preview.id, discard: true) } }
