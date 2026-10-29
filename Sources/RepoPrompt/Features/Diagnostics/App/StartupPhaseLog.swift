@@ -170,7 +170,7 @@ enum StartupPhaseLog {
         message += " observer=\(pair.observerSessionID.uuidString) target=\(pair.targetSessionID.uuidString) outcome=\(outcome.rawValue)"
         if let failure { message += " reason=\(failure.rawValue)" }
         if let terminalReason { message += " reason=\(terminalReason.rawValue)" }
-        (runtime.debugEmit ?? runtime.emit)(message)
+        runtime.emit(message)
     }
 
     /// The emitted `begin` line keeps the request-time `elapsed_ms`, but the returned
