@@ -2743,7 +2743,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 var stops = 0
                 vm.test_providerSwitchForceStop = { s in
                     stops += 1
-                    s.runState = .idle
+                    s.runState = .cancelled
                     s.agentTask = nil
                 }
                 vm.test_providerSwitchRetirement = { _ in }
@@ -2755,6 +2755,164 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 XCTAssertEqual(stops, 1, "Forcing goes through the ordinary stop exactly once")
                 XCTAssertEqual(session.selectedAgent, .openCode)
                 XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .ready)
+            }
+        }
+
+        func testForceSwitchStagesPayloadRenderedFromPostStopTranscript() async throws {
+            // The staged handover must be projected after the managed stop, not from the
+            // preview's pre-stop carriers: the stop's own transcript rows belong in it, and
+            // the staged cutoff must reach them.
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                session.installRunID(UUID())
+                session.beginRunAttempt(source: "test.force")
+                session.runState = .running
+                vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("forced-post-stop.json") }
+                var stopItemID: UUID?
+                vm.test_providerSwitchForceStop = { s in
+                    // Production shape: a settled .cancelled run, not .idle.
+                    s.runState = .cancelled
+                    s.agentTask = nil
+                    let marker = AgentChatItem.assistant("post-stop-marker-text", sequenceIndex: s.nextSequenceIndex)
+                    stopItemID = marker.id
+                    s.appendItem(marker)
+                }
+                vm.test_providerSwitchRetirement = { _ in }
+                await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
+                let preview = try XCTUnwrap(vm.providerSwitchPreview)
+                let preStopPayload = try XCTUnwrap(preview.chosen?.carrier.map { AgentProviderHandover.render($0) })
+                XCTAssertFalse(preStopPayload.contains("post-stop-marker-text"))
+                let forced = await vm.applyProviderSwitch(preview.id, force: true)
+                XCTAssertTrue(forced)
+                let payload = try XCTUnwrap(session.pendingHandoff.payload)
+                XCTAssertNotEqual(payload, preStopPayload, "The preview's pre-stop carrier must never stage")
+                XCTAssertTrue(
+                    payload.contains("post-stop-marker-text"),
+                    "The staged carrier must be projected from the post-stop transcript"
+                )
+                XCTAssertEqual(session.pendingHandoff.sourceItemID, stopItemID, "The cutoff must reach the stop's own rows")
+                XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .ready)
+            }
+        }
+
+        func testForceSwitchRefusesWhenPostStopCarrierNoLongerFits() async throws {
+            // A post-stop projection that outgrows the budget refuses before retirement:
+            // source already stopped, Review surfaced, nothing staged, provider intact.
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                let provider = session.selectedAgent
+                session.installRunID(UUID())
+                session.beginRunAttempt(source: "test.force")
+                session.runState = .running
+                var stops = 0
+                var retirements = 0
+                var saves = 0
+                vm.test_setAgentSessionSaver { _, _, _ in
+                    saves += 1
+                    return fixture.rootURL.appendingPathComponent("unexpected-forced-save.json")
+                }
+                vm.test_providerSwitchForceStop = { s in
+                    stops += 1
+                    s.runState = .cancelled
+                    s.agentTask = nil
+                    s.appendItem(.assistant(String(repeating: "x", count: AgentProviderHandover.maximumBytes + 1), sequenceIndex: s.nextSequenceIndex))
+                }
+                vm.test_providerSwitchRetirement = { _ in retirements += 1 }
+                await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
+                let preview = try XCTUnwrap(vm.providerSwitchPreview)
+                XCTAssertEqual(vm.providerSwitchTransitionAdmission(session), .forceable(.running))
+                let forced = await vm.applyProviderSwitch(preview.id, force: true)
+                XCTAssertFalse(forced)
+                XCTAssertEqual(stops, 1, "The managed stop still ran before the refusal")
+                XCTAssertEqual(retirements, 0, "A predictable fit refusal precedes irreversible retirement")
+                XCTAssertEqual(
+                    vm.providerSwitchPreview?.failure,
+                    AgentSessionLinkSendFailure.providerHandoverNeedsReview.message,
+                    "The refusal surfaces Review like the existing late path"
+                )
+                XCTAssertEqual(session.selectedAgent, provider)
+                XCTAssertNil(session.pendingHandoff.payload)
+                XCTAssertNil(session.pendingHandoff.providerSwitchDelivery)
+                XCTAssertEqual(saves, 0)
+            }
+        }
+
+        func testForceSwitchRebuildsOnceWhenRowsLandDuringRetirement() async throws {
+            // Retirement writes no transcript rows itself, but a detached stop/provider tail can:
+            // the apply must rebuild once against the now-final transcript instead of staging
+            // the pre-retirement bytes.
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                session.installRunID(UUID())
+                session.beginRunAttempt(source: "test.force")
+                session.runState = .running
+                vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("forced-retire-drift.json") }
+                vm.test_providerSwitchForceStop = { s in
+                    s.runState = .cancelled
+                    s.agentTask = nil
+                }
+                var retireMarkerID: UUID?
+                var retirements = 0
+                vm.test_providerSwitchRetirement = { s in
+                    retirements += 1
+                    let marker = AgentChatItem.assistant("retire-tail-marker-text", sequenceIndex: s.nextSequenceIndex)
+                    retireMarkerID = marker.id
+                    s.appendItem(marker)
+                }
+                await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
+                let preview = try XCTUnwrap(vm.providerSwitchPreview)
+                let forced = await vm.applyProviderSwitch(preview.id, force: true)
+                XCTAssertTrue(forced)
+                XCTAssertEqual(retirements, 1)
+                let payload = try XCTUnwrap(session.pendingHandoff.payload)
+                XCTAssertTrue(
+                    payload.contains("retire-tail-marker-text"),
+                    "Rows landing during retirement must reach the rebuilt carrier"
+                )
+                XCTAssertEqual(session.pendingHandoff.sourceItemID, retireMarkerID)
+            }
+        }
+
+        func testForceSwitchRefusesWhenSourceStaysLiveAfterTheStop() async throws {
+            // A still-live source after the managed stop has no settled transcript to hand
+            // over; staging a carrier from it would repeat the in-flight-turn defect, so the
+            // apply refuses to Review before any retirement.
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                let provider = session.selectedAgent
+                session.installRunID(UUID())
+                session.beginRunAttempt(source: "test.force")
+                session.runState = .running
+                var stops = 0
+                var retirements = 0
+                var saves = 0
+                vm.test_setAgentSessionSaver { _, _, _ in
+                    saves += 1
+                    return fixture.rootURL.appendingPathComponent("unexpected-wedged-save.json")
+                }
+                vm.test_providerSwitchForceStop = { _ in
+                    stops += 1
+                    // Wedged provider: the stop hook leaves the source live, as a detached
+                    // stop that never settled would.
+                }
+                vm.test_providerSwitchRetirement = { _ in retirements += 1 }
+                await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
+                let preview = try XCTUnwrap(vm.providerSwitchPreview)
+                let forced = await vm.applyProviderSwitch(preview.id, force: true)
+                XCTAssertFalse(forced)
+                XCTAssertEqual(stops, 1)
+                XCTAssertEqual(retirements, 0, "Refusal precedes retirement; the detached stop is left to finish")
+                XCTAssertEqual(
+                    vm.providerSwitchPreview?.failure,
+                    AgentSessionLinkSendFailure.providerHandoverNeedsReview.message
+                )
+                XCTAssertEqual(session.selectedAgent, provider)
+                XCTAssertNil(session.pendingHandoff.payload)
+                XCTAssertEqual(saves, 0)
             }
         }
 
