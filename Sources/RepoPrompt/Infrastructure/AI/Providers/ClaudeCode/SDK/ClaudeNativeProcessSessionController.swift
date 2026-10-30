@@ -1416,7 +1416,7 @@ final actor ClaudeNativeProcessSessionController {
             "length": text.count
         ] as [String: Any])
         // Recovery is still subject to execution ownership; a queued host input is not its owner.
-        if !correlationFailed, !correlation.enabled || correlation.ownsOutput || correlation.providerTurnID != nil {
+        if !correlationFailed, !correlation.enabled || correlation.ownsOutput || correlation.ownsProviderOutput {
             emit(.stream(AIStreamResult(type: "content", text: text)))
         }
         return true
@@ -1600,7 +1600,8 @@ final actor ClaudeNativeProcessSessionController {
                     let status: TurnStatus = resolved.interrupted ? .cancelled : determineTurnStatus(from: payload, stopReasonHint: stopReason)
                     completion = DeferredCompletion(executionID: resolved.executionID, inputIDs: resolved.inputIDs + (resolved.providerTurnID.map { [$0] } ?? []), status: status, keyed: true)
                 } else {
-                    ownsOutput = frameOwnsOutput ?? (correlation.ownsOutput || correlation.providerTurnID != nil)
+                    // Reject subagent frames without changing main-thread ownership.
+                    ownsOutput = !Self.isSubagentActivity(payload) && (frameOwnsOutput ?? (correlation.ownsOutput || correlation.ownsProviderOutput))
                 }
             } catch {
                 correlationFailed = true
@@ -1714,9 +1715,15 @@ final actor ClaudeNativeProcessSessionController {
         }
     }
 
+    private static func isSubagentActivity(_ payload: [String: Any]) -> Bool {
+        ["parent_tool_use_id", "parentToolUseId"].contains { key in
+            guard let parent = payload[key] as? String else { return false }
+            return !parent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+    }
+
     private static func isMainThreadActivity(_ payload: [String: Any]) -> Bool {
-        if let parent = payload["parent_tool_use_id"], !(parent is NSNull),
-           !((parent as? String)?.isEmpty ?? false) { return false }
+        guard !isSubagentActivity(payload) else { return false }
         switch payload["type"] as? String {
         case "assistant", "message": return true
         case "stream_event": return (payload["event"] as? [String: Any])?["type"] as? String == "message_start"

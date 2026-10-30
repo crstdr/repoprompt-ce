@@ -1548,6 +1548,162 @@ final class ClaudeNativeTurnCorrelationTests: XCTestCase {
         })
     }
 
+    private func streamEvent(_ event: [String: Any], inputID: UUID? = nil, parentKey: String? = nil) -> [String: Any] {
+        var frame: [String: Any] = ["type": "stream_event", "event": event]
+        if let inputID { frame["user_message_uuid"] = inputID.uuidString }
+        if let parentKey { frame[parentKey] = "synthetic-parent-tool" }
+        return frame
+    }
+
+    func testCommandLifecycleStartedAdoptsProviderOutputAndMatchingResult() async throws {
+        let controller = await controller()
+        try await feed(initFrame, to: controller)
+        let providerInput = UUID()
+        try await feed(["type": "command_lifecycle", "state": "started", "command_uuid": providerInput.uuidString], to: controller)
+        try await feed(assistant(text: "provider start"), to: controller)
+        try await feed(streamEvent([
+            "type": "content_block_delta", "delta": ["type": "text_delta", "text": "provider continuation"]
+        ]), to: controller)
+        try await feed(result([providerInput], text: "provider final"), to: controller)
+        let events = await finish(controller)
+        let providerIDs = events.compactMap { event -> UUID? in
+            if case let .providerTurnStarted(id) = event { return id }
+            return nil
+        }
+        XCTAssertEqual(providerIDs.count, 1)
+        XCTAssertTrue(events.contains { event in
+            if case let .turnsCompleted(ids, status) = event, ids == providerIDs {
+                if case .completed = status { return true }
+            }
+            return false
+        })
+        let text = events.compactMap { event -> String? in
+            if case let .stream(value) = event { return value.text }
+            return nil
+        }.joined()
+        XCTAssertTrue(text.contains("provider continuation"))
+        XCTAssertTrue(text.contains("provider final"))
+    }
+
+    func testProviderPickupRejectsForeignDeltasWithoutHidingHostOutput() async throws {
+        let controller = await controller()
+        try await feed(initFrame, to: controller)
+        try await feed(assistant(text: "provider start"), to: controller)
+        let host = try await controller.sendUserMessage("B")
+        try await feed(assistant(host), to: controller)
+        let foreign = UUID()
+        try await feed(streamEvent([
+            "type": "message_start", "message": ["id": foreign.uuidString, "role": "assistant"]
+        ], inputID: foreign), to: controller)
+        try await feed(streamEvent([
+            "type": "content_block_delta", "delta": ["type": "text_delta", "text": "stale foreign delta"]
+        ]), to: controller)
+        try await feed(streamEvent([
+            "type": "message_start", "message": ["id": host.uuidString, "role": "assistant"]
+        ], inputID: host), to: controller)
+        try await feed(streamEvent([
+            "type": "content_block_delta", "delta": ["type": "text_delta", "text": "host delta"]
+        ]), to: controller)
+        try await feed(result([host]), to: controller)
+        let events = await finish(controller)
+        let providerIDs = events.compactMap { event -> UUID? in
+            if case let .providerTurnStarted(id) = event { return id }
+            return nil
+        }
+        XCTAssertEqual(providerIDs.count, 1)
+        let completed = events.compactMap { event -> [UUID]? in
+            if case let .turnsCompleted(ids, status) = event, case .completed = status { return ids }
+            return nil
+        }
+        XCTAssertEqual(completed.count, 1)
+        XCTAssertEqual(Set(completed.first ?? []), Set([host] + providerIDs))
+        let output = events.compactMap { event -> String? in
+            if case let .stream(value) = event { return value.text ?? value.reasoning }
+            return nil
+        }.joined()
+        XCTAssertFalse(output.contains("stale foreign delta"))
+        XCTAssertTrue(output.contains("host delta"))
+    }
+
+    func testForeignMessageRejectionPersistsAcrossDeltasWithoutRetiringHostInput() async throws {
+        let controller = await controller()
+        try await feed(initFrame, to: controller)
+        let retired = try await controller.sendUserMessage("previous input")
+        try await feed(result([retired]), to: controller)
+        let host = try await controller.sendUserMessage("host input")
+        try await feed(assistant(host), to: controller)
+        for foreign in [retired, UUID()] {
+            try await feed(streamEvent([
+                "type": "message_start", "message": ["id": host.uuidString, "role": "assistant"]
+            ], inputID: host), to: controller)
+            try await feed(streamEvent([
+                "type": "content_block_delta", "delta": ["type": "text_delta", "text": "accepted host delta"]
+            ]), to: controller)
+            try await feed(streamEvent([
+                "type": "message_start", "message": ["id": foreign.uuidString, "role": "assistant"]
+            ], inputID: foreign), to: controller)
+            try await feed(streamEvent([
+                "type": "content_block_delta", "delta": ["type": "text_delta", "text": "rejected foreign text"]
+            ]), to: controller)
+            try await feed(streamEvent([
+                "type": "content_block_delta", "delta": ["type": "thinking_delta", "thinking": "rejected foreign reasoning"]
+            ]), to: controller)
+            try await feed(streamEvent(["type": "message_stop"]), to: controller)
+            let pending = await controller.hasTurnInFlight
+            XCTAssertTrue(pending, "Rejecting a message must not retire the host execution")
+        }
+        // A keyed result still settles A even while the latest message is rejected.
+        try await feed(result([host], text: "host final"), to: controller)
+        let pending = await controller.hasTurnInFlight
+        XCTAssertFalse(pending)
+        let events = await finish(controller)
+        XCTAssertEqual(completions(events).map(\.0), [[retired], [host]])
+        let output = events.compactMap { event -> String? in
+            guard case let .stream(value) = event, ["content", "final_content", "reasoning"].contains(value.type) else { return nil }
+            return value.text ?? value.reasoning
+        }
+        XCTAssertFalse(output.joined().contains("rejected foreign"))
+        XCTAssertEqual(output.count(where: { $0 == "accepted host delta" }), 2)
+        XCTAssertTrue(output.joined().contains("host final"))
+    }
+
+    func testSubagentDeltasCannotBorrowOrReplaceMainThreadOutputOwnership() async throws {
+        let controller = await controller()
+        try await feed(initFrame, to: controller)
+        let host = try await controller.sendUserMessage("host input")
+        try await feed(streamEvent([
+            "type": "message_start", "message": ["id": host.uuidString, "role": "assistant"]
+        ], inputID: host), to: controller)
+        for parentKey in ["parent_tool_use_id", "parentToolUseId"] {
+            try await feed(streamEvent([
+                "type": "message_start", "message": ["id": "child-message", "role": "assistant"]
+            ], inputID: UUID(), parentKey: parentKey), to: controller)
+            try await feed(streamEvent([
+                "type": "content_block_delta", "delta": ["type": "text_delta", "text": "rejected child text"]
+            ], parentKey: parentKey), to: controller)
+            try await feed(streamEvent([
+                "type": "content_block_delta", "delta": ["type": "thinking_delta", "thinking": "rejected child reasoning"]
+            ], parentKey: parentKey), to: controller)
+            try await feed(streamEvent(["type": "message_stop"], parentKey: parentKey), to: controller)
+            // The main stream resumes without a new message_start; child frames must
+            // neither inherit its output owner nor overwrite it with their own.
+            try await feed(streamEvent([
+                "type": "content_block_delta", "delta": ["type": "text_delta", "text": "resumed host delta"]
+            ]), to: controller)
+        }
+        let pending = await controller.hasTurnInFlight
+        XCTAssertTrue(pending)
+        try await feed(result([host]), to: controller)
+        let events = await finish(controller)
+        XCTAssertEqual(completions(events).map(\.0), [[host]])
+        let output = events.compactMap { event -> String? in
+            guard case let .stream(value) = event, ["content", "final_content", "reasoning"].contains(value.type) else { return nil }
+            return value.text ?? value.reasoning
+        }
+        XCTAssertFalse(output.joined().contains("rejected child"))
+        XCTAssertEqual(output.count(where: { $0 == "resumed host delta" }), 2)
+    }
+
     func testGroupedPickupAndForeignIDsDoNotConsumeOtherPendingInputs() async throws {
         let controller = await controller()
         try await feed(initFrame, to: controller)
@@ -1818,6 +1974,101 @@ final class ClaudeNativeTurnCorrelationTests: XCTestCase {
         }
     }
 
+    func testUnownedStampedResultRetiresInterruptWithoutCancellingQueuedHostInputs() async throws {
+        for ackFirst in [true, false] {
+            for grouped in [false, true] {
+                let controller = await controller()
+                try await feed(initFrame, to: controller)
+                let unowned = UUID()
+                try await feed(assistant(), to: controller)
+                try await feed(assistant(unowned, text: "unowned activity"), to: controller)
+                let b = try await controller.sendUserMessage("B")
+                var hostIDs = [b]
+                if grouped { try await hostIDs.append(controller.sendUserMessage("C")) }
+                let gate = InterruptGate()
+                await controller.test_setConfigurationControlRequest { _ in try await gate.request() }
+                var entered = gate.entered.makeAsyncIterator()
+                let interrupt = Task { await controller.test_interruptRunningTurn(reason: "interrupt provider-owned work") }
+                await entered.next()
+                if ackFirst {
+                    await gate.release()
+                    let outcome = await interrupt.value
+                    XCTAssertEqual(outcome, .acknowledged)
+                }
+                try await feed(result([unowned], text: "unowned final"), to: controller)
+                let queued = await controller.hasTurnInFlight
+                XCTAssertTrue(queued, "U's result cannot settle B or C")
+                for id in hostIDs {
+                    try await feed(assistant(id), to: controller)
+                }
+                if !ackFirst {
+                    // Even a new host pickup before the old ACK must not inherit U's interrupt.
+                    await gate.release()
+                    let outcome = await interrupt.value
+                    XCTAssertEqual(outcome, .noTurnInFlight)
+                }
+                try await feed(result(hostIDs, text: "host final"), to: controller)
+                try await feed(result([unowned], text: "late unowned final"), to: controller)
+                try await feed(result(hostIDs, text: "duplicate host final"), to: controller)
+                let pending = await controller.hasTurnInFlight
+                XCTAssertFalse(pending)
+                let events = await finish(controller)
+                let answers = completions(events)
+                XCTAssertEqual(answers.map(\.0), [hostIDs], "Only B or the B/C group completes, exactly once")
+                if case .completed = answers.first?.1 {} else { XCTFail("Queued host work must not inherit U's cancellation") }
+                let output = events.compactMap { event -> String? in
+                    if case let .stream(value) = event { return value.text ?? value.reasoning }
+                    return nil
+                }.joined()
+                XCTAssertTrue(output.contains("unowned"), "An adopted provider turn keeps its own output")
+                XCTAssertFalse(output.contains("duplicate host final"))
+                XCTAssertTrue(output.contains("host final"))
+            }
+        }
+    }
+
+    func testLateForeignResultCannotClearInterruptForExecutingHostInput() async throws {
+        for ackFirst in [true, false] {
+            let controller = await controller()
+            try await feed(initFrame, to: controller)
+            let retiredUnowned = UUID()
+            try await feed(assistant(), to: controller)
+            try await feed(assistant(retiredUnowned), to: controller)
+            try await feed(result([retiredUnowned]), to: controller)
+            let a = try await controller.sendUserMessage("A")
+            try await feed(assistant(a), to: controller)
+            let b = try await controller.sendUserMessage("B")
+            let gate = InterruptGate()
+            await controller.test_setConfigurationControlRequest { _ in try await gate.request() }
+            var entered = gate.entered.makeAsyncIterator()
+            let interrupt = Task { await controller.test_interruptRunningTurn(reason: "interrupt host A") }
+            await entered.next()
+            if ackFirst {
+                await gate.release()
+                let outcome = await interrupt.value
+                XCTAssertEqual(outcome, .acknowledged)
+            }
+            // Even foreign activity cannot reidentify an already host-owned execution.
+            try await feed(assistant(retiredUnowned), to: controller)
+            try await feed(result([retiredUnowned]), to: controller)
+            try await feed(result([UUID()]), to: controller)
+            try await feed(result([a]), to: controller)
+            if !ackFirst {
+                await gate.release()
+                let outcome = await interrupt.value
+                XCTAssertEqual(outcome, .noTurnInFlight)
+            }
+            try await feed(assistant(b), to: controller)
+            try await feed(result([b]), to: controller)
+            let events = await finish(controller)
+            let answers = completions(events)
+            XCTAssertEqual(answers.map(\.0), [[a], [b]])
+            guard answers.count == 2 else { continue }
+            if case .cancelled = answers[0].1 {} else { XCTFail("Late foreign results cannot clear A's interrupt") }
+            if case .completed = answers[1].1 {} else { XCTFail("B must not inherit A's interrupt") }
+        }
+    }
+
     @MainActor
     func testGroupedCompletionTraversesRealRunnerConsumer() async throws {
         let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
@@ -1835,6 +2086,69 @@ final class ClaudeNativeTurnCorrelationTests: XCTestCase {
         XCTAssertEqual(session.claudeExpectedTurnIDs, [d])
         let terminal = await runner.testConsumeQuietEvents([.turnsCompleted(turnIDs: [d], status: .completed)], session: session, runID: runID, owner: owner)
         XCTAssertTrue(terminal)
+    }
+
+    @MainActor
+    func testRunnerRetainsStrongestUnprotectedOutcomeAcrossCompletionOrders() async throws {
+        typealias Status = ClaudeNativeProcessSessionController.TurnStatus
+        let cases: [(Status, Status, Status)] = [
+            (.failed, .completed, .failed), (.completed, .failed, .failed),
+            (.cancelled, .completed, .cancelled), (.completed, .cancelled, .cancelled),
+            (.failed, .cancelled, .failed), (.cancelled, .failed, .failed)
+        ]
+        for (first, second, expected) in cases {
+            let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
+            let session = harness.makeSession(agent: .claudeCode)
+            harness.host.test_installLiveSession(session)
+            let runID = UUID()
+            session.installRunID(runID)
+            session.runState = .running
+            let owner = session.beginRunAttempt(source: "mixed-outcome-consumer-test")
+            let b = UUID(), c = UUID()
+            session.claudeExpectedTurnIDs = [b, c]
+            let runner = try ClaudeIntegratedAgentModeRunner(claudeCoordinator: harness.host.claudeCoordinator, hooks: XCTUnwrap(harness.hooks), terminalCommitBarrier: AgentRunTerminalCommitBarrier())
+            let actual = await runner.testConsumeTurnStatus([
+                .turnsCompleted(turnIDs: [b], status: first),
+                .turnsCompleted(turnIDs: [c], status: second)
+            ], session: session, runID: runID, owner: owner)
+            switch (actual, expected) {
+            case (.failed, .failed), (.cancelled, .cancelled): break
+            default: XCTFail("Outcomes \(first), \(second) must settle as \(expected), not \(actual)")
+            }
+            XCTAssertTrue(session.claudeExpectedTurnIDs.isEmpty, "One consumer invocation must settle both inputs")
+        }
+    }
+
+    @MainActor
+    func testRunnerExcludesProtectedPredecessorOutcomesFromAggregate() async throws {
+        let predecessorStatuses: [ClaudeNativeProcessSessionController.TurnStatus] = [.failed, .cancelled]
+        for explicitlyProtected in [true, false] {
+            for predecessorStatus in predecessorStatuses {
+                let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
+                let session = harness.makeSession(agent: .claudeCode)
+                harness.host.test_installLiveSession(session)
+                let runID = UUID()
+                session.installRunID(runID)
+                session.runState = .running
+                let owner = session.beginRunAttempt(source: "protected-outcome-consumer-test")
+                let predecessor = UUID(), b = UUID(), c = UUID()
+                session.claudeExpectedTurnIDs = [predecessor, b, c]
+                if explicitlyProtected { session.claudeSupersedingProtectedTurnIDs = [predecessor] }
+                session.pendingSupersedingTurnCompletions = 1
+                let runner = try ClaudeIntegratedAgentModeRunner(claudeCoordinator: harness.host.claudeCoordinator, hooks: XCTUnwrap(harness.hooks), terminalCommitBarrier: AgentRunTerminalCommitBarrier())
+                let actual = await runner.testConsumeTurnStatus([
+                    .turnsCompleted(turnIDs: [predecessor], status: predecessorStatus),
+                    .turnsCompleted(turnIDs: [b], status: .completed),
+                    .turnsCompleted(turnIDs: [c], status: .completed)
+                ], session: session, runID: runID, owner: owner)
+                if case .completed = actual {} else {
+                    XCTFail("Protected predecessor \(predecessorStatus) must not poison successful replacements")
+                }
+                XCTAssertTrue(session.claudeExpectedTurnIDs.isEmpty)
+                XCTAssertTrue(session.claudeSupersedingProtectedTurnIDs.isEmpty)
+                XCTAssertEqual(session.pendingSupersedingTurnCompletions, 0)
+            }
+        }
     }
 
     @MainActor

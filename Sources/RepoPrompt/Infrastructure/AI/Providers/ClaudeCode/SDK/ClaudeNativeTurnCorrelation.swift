@@ -6,6 +6,8 @@ struct ClaudeNativeTurnCorrelation {
         let id: UUID
         let providerInitiated: Bool
         var inputIDs: Set<UUID>
+        /// Provider-owned inputs identify this execution but never settle host work.
+        var observedForeignInputIDs: Set<UUID> = []
     }
 
     enum CorrelationError: Error {
@@ -18,6 +20,8 @@ struct ClaudeNativeTurnCorrelation {
     private var outstanding: Set<UUID> = []
     private(set) var enabled = false
     private var execution: Execution?
+    /// Unstamped deltas follow the last observed main-thread message, not just an active host execution.
+    private var messageHasHostOwner = false
     private struct Interrupt {
         let token: UUID
         var executionID: UUID?
@@ -34,8 +38,12 @@ struct ClaudeNativeTurnCorrelation {
         execution.flatMap { $0.providerInitiated ? $0.id : nil }
     }
 
+    var ownsProviderOutput: Bool {
+        execution?.providerInitiated == true && execution?.inputIDs.isEmpty == true
+    }
+
     var ownsOutput: Bool {
-        guard let execution else { return false }
+        guard messageHasHostOwner, let execution else { return false }
         return !execution.inputIDs.isDisjoint(with: outstanding)
     }
 
@@ -63,14 +71,25 @@ struct ClaudeNativeTurnCorrelation {
         let ids = try Self.inputIDs(payload)
         if let ids {
             let known = Set(ids).intersection(outstanding)
-            guard !known.isEmpty else { return false }
+            guard !known.isEmpty else {
+                // A foreign identity may start or identify provider work; it cannot
+                // reidentify an active host execution or clear that host's interrupt.
+                if execution == nil { execution = Execution(id: UUID(), providerInitiated: true, inputIDs: []) }
+                if execution?.providerInitiated == true, execution?.inputIDs.isEmpty == true {
+                    execution?.observedForeignInputIDs.formUnion(ids)
+                    bindInterruptToObservedExecution()
+                }
+                messageHasHostOwner = false
+                return ownsProviderOutput
+            }
+            messageHasHostOwner = true
             if execution == nil { execution = Execution(id: UUID(), providerInitiated: false, inputIDs: known) }
             else { execution?.inputIDs.formUnion(known) }
         } else if execution == nil {
             execution = Execution(id: UUID(), providerInitiated: true, inputIDs: [])
         }
         bindInterruptToObservedExecution()
-        return ownsOutput || providerTurnID != nil
+        return ownsOutput || ownsProviderOutput
     }
 
     /// Accepted inputs are not execution evidence. A pre-reply interrupt stays unresolved
@@ -121,8 +140,12 @@ struct ClaudeNativeTurnCorrelation {
                 throw CorrelationError.missingAnswerIdentity
             }
         }
-        // Foreign/late results must not end a different executing host turn.
-        let closesExecution = ids.isEmpty || !matched.isEmpty
+        // An observed provider-owned foreign answer retires its interrupt;
+        // an unrelated late result cannot retire a different execution.
+        let answersObservedProviderExecution = execution.map {
+            $0.providerInitiated && $0.inputIDs.isEmpty && !$0.observedForeignInputIDs.isDisjoint(with: ids)
+        } ?? false
+        let closesExecution = ids.isEmpty || !matched.isEmpty || answersObservedProviderExecution
         let executionID = closesExecution ? (execution?.id ?? matched.first ?? UUID()) : UUID()
         if closesExecution, interrupt?.executionID == nil, interrupt?.cancellationDisarmed == false {
             interrupt?.executionID = executionID
@@ -131,6 +154,7 @@ struct ClaudeNativeTurnCorrelation {
         let providerID = closesExecution ? providerTurnID : nil
         if closesExecution {
             execution = nil
+            messageHasHostOwner = false
             interrupt = nil
         }
         for id in matched {
