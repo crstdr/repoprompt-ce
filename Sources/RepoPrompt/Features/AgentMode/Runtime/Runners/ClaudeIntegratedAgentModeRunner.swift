@@ -83,7 +83,7 @@ final class ClaudeIntegratedAgentModeRunner {
         else { return false }
         let owner = session.beginRunAttempt(source: "claudeNative.providerInitiated")
         session.claudeTerminalAnchor = (owner, .none)
-        session.activeNonCodexTurnTokenAccumulator = .init()
+        session.beginProviderInitiatedTurnAccounting()
         session.activeReasoningItemID = nil
         session.reasoningItemIDsByGroupID.removeAll()
         session.codexReasoningSegmentsByKey.removeAll()

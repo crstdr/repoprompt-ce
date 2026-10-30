@@ -1171,6 +1171,10 @@ final class AgentTabSession: ObservableObject {
     var pendingNonCodexUserInputTokenQueue: [Int] = []
     var activeNonCodexTurnTokenAccumulator: AgentModeViewModel.NonCodexTurnTokenAccumulator?
 
+    func beginProviderInitiatedTurnAccounting() {
+        activeNonCodexTurnTokenAccumulator = .init()
+    }
+
     // Codex native session identifiers and metadata
     var codexConversationID: String?
     var codexRolloutPath: String?

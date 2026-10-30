@@ -267,8 +267,8 @@ final actor ClaudeNativeProcessSessionController {
     private var eventsStream: AsyncStream<Event>
     private var eventsGeneration: UInt64 = 1
 
-    var eventStreamHandle: NativeAgentRuntimeEventStreamHandle {
-        NativeAgentRuntimeEventStreamHandle(generation: eventsGeneration, stream: eventsStream)
+    var eventStreamSnapshot: (generation: UInt64, stream: AsyncStream<Event>) {
+        (eventsGeneration, eventsStream)
     }
 
     var events: AsyncStream<Event> {

@@ -16,7 +16,7 @@ protocol NativeAgentRuntimeControlling: Actor {
     var hasActiveSession: Bool { get async }
     var hasTurnInFlight: Bool { get async }
     var events: AsyncStream<NativeAgentRuntimeEvent> { get async }
-    var eventStreamHandle: NativeAgentRuntimeEventStreamHandle { get async }
+    var eventStreamSnapshot: (generation: UInt64, stream: AsyncStream<NativeAgentRuntimeEvent>) { get async }
 
     func ensureEventsStreamReady() async
     func resetEventsStreamForNewRun() async
@@ -48,8 +48,18 @@ protocol NativeAgentRuntimeControlling: Actor {
 }
 
 extension NativeAgentRuntimeControlling {
+    var eventStreamSnapshot: (generation: UInt64, stream: AsyncStream<NativeAgentRuntimeEvent>) {
+        get async {
+            let stream = await events
+            return (0, stream)
+        }
+    }
+
     var eventStreamHandle: NativeAgentRuntimeEventStreamHandle {
-        get async { await NativeAgentRuntimeEventStreamHandle(generation: 0, stream: events) }
+        get async {
+            let snapshot = await eventStreamSnapshot
+            return NativeAgentRuntimeEventStreamHandle(generation: snapshot.generation, stream: snapshot.stream)
+        }
     }
 
     func availableSlashCommands() async -> [NativeAgentRuntimeSlashCommand] {
