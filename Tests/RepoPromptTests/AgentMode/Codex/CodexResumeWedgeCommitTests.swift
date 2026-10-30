@@ -1223,6 +1223,67 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         await fixture.coordinator.shutdownCodexSession(session)
     }
 
+    /// In production `handleCodexNativeEvent` runs on `session.codexEventTask`, so managed-auth
+    /// recovery retires the controller — and tears down the listener — from inside the listener
+    /// task itself. That intentional teardown must not count as supersession: Computer Use stays
+    /// armed through the retirement and the pending turn replays on the replacement controller.
+    func testManagedAuthRecoveryInsideEventTaskKeepsComputerUseArmed() async throws {
+        CodexComputerUseWorkflow.setEnabledForTesting(true)
+        defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
+        let fixture = makeFixture(
+            [[.success(Self.oldThreadID)]],
+            shouldManageCodexTooling: false,
+            authRecovery: MonitorStubCodexAuthRecovery()
+        )
+        let session = fixture.session
+        let gate = TestReleaseFence(name: "managed-auth event-task Computer Use retirement")
+        let controller = WedgeFakeCodexController(
+            runID: AgentModeProcessRunIdentity.startFreshProcessRun(for: session),
+            responses: []
+        )
+        controller.shutdownGate = gate
+        controller.setRecoverySnapshot(.init(
+            conversationID: Self.oldThreadID, rolloutPath: nil, model: nil, reasoningEffort: nil,
+            runtimeStatus: .idle, currentTurnID: nil, activeTurnIDs: [], latestTurnStatus: nil
+        ))
+        session.codexController = controller
+        session.codexControllerFeatureState = .init(computerUseEnabled: true, goalSupportEnabled: false, reasoningSummariesEnabled: false, memoriesEnabled: false, capabilities: .disabled)
+        session.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
+        session.codexPendingAuthRetryTurn = .init(
+            text: "recover auth", attachments: [], model: nil, reasoningEffort: nil, serviceTier: nil,
+            attachmentReservationID: nil, expectedTurnID: nil, auditTurnID: nil
+        )
+
+        session.codexEventTaskRunID = session.runID
+        session.codexEventTask = Task {
+            await fixture.coordinator.test_handleCodexNativeEvent(
+                .error("account/chatgptAuthTokens/refresh"),
+                session: session,
+                sourceController: controller,
+                dispatchedOnEventTask: true
+            )
+        }
+        let recovery = try XCTUnwrap(session.codexEventTask)
+        defer {
+            gate.release()
+            recovery.cancel()
+        }
+        let gateEntered = await gate.waitUntilEntered(timeout: 4)
+        XCTAssertTrue(gateEntered, "auth recovery must retire the CU controller")
+        XCTAssertTrue(session.isCodexComputerUseArmed, "The managed-auth retirement fence must not disarm Computer Use")
+
+        gate.release()
+        await recovery.value
+        XCTAssertTrue(session.isCodexComputerUseArmed, "Retiring the listener's own controller must not disarm Computer Use")
+        XCTAssertEqual(fixture.factory.computerUseEnabledFlags, [true])
+        XCTAssertEqual(session.codexControllerFeatureState?.computerUseEnabled, true)
+        XCTAssertEqual(fixture.factory.controllers.last?.startedTexts, ["recover auth"], "The recovered session must replay the pending auth-retry turn")
+        XCTAssertFalse(session.items.contains { $0.kind == .error && $0.text == CodexComputerUseWorkflow.ineligibleMessage })
+        XCTAssertNotNil(session.codexEventTask, "The replacement controller must install its own listener")
+        XCTAssertEqual(session.codexEventTaskRunID, session.runID)
+        await fixture.coordinator.shutdownCodexSession(session)
+    }
+
     /// A structural ineligibility arriving while a transient fence is still resolving must
     /// refuse and disarm once the fence clears, never wait forever and never activate.
     func testComputerUseStructuralIneligibilityArrivingDuringTransientWaitStillDisarms() async throws {
