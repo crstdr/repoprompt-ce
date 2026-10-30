@@ -5,6 +5,13 @@ import RepoPromptSettingsCore
 
 @MainActor
 final class ClaudeAgentModeCoordinator {
+    static let inputNotSentMessage = "Claude dispatch was cancelled or its configuration changed. No message was sent; retry the turn."
+    static let unexpectedStreamEndMessage = "Claude events stream ended unexpectedly. The run may need to be restarted."
+
+    static func mcpInitializationFailureMessage(sessionID: String?) -> String {
+        "RepoPrompt MCP failed to initialize for Claude (session \(sessionID ?? "unknown"))."
+    }
+
     typealias ClaudeControllerFactory = (
         _ runID: UUID,
         _ tabID: UUID,
@@ -76,6 +83,8 @@ final class ClaudeAgentModeCoordinator {
         let isSessionCurrent: @MainActor (_ session: AgentTabSession) -> Bool
         let requestUIRefresh: @MainActor (_ session: AgentTabSession, _ urgent: Bool) -> Void
         let scheduleSave: @MainActor (_ session: AgentTabSession) -> Void
+        var cleanupProviderRun: @MainActor (AgentTabSession, UUID) async -> Void = { _, _ in }
+        var adoptProviderTurn: @MainActor (AgentTabSession, ClaudeControllerEventListener, UUID, AgentRunStartStopFence) async -> Bool = { _, _, _, _ in false }
         let stageClaudeResumeRecoveryHandoff: @MainActor (_ session: AgentTabSession) async -> Void
         let prependPendingHandoff: @MainActor (_ text: String, _ session: AgentTabSession) -> String
         /// `routeWait` is non-nil only for a controller this send launched; see
@@ -201,6 +210,7 @@ final class ClaudeAgentModeCoordinator {
         /// detached; travels with the owner so a late transfer registration
         /// cannot inherit a successor cancellation's epoch.
         fileprivate let contextEpoch: UUID?
+        fileprivate var pendingPermissionIDs: [String] = []
     }
 
     struct ControllerLaunchSettings: Equatable {
@@ -214,6 +224,7 @@ final class ClaudeAgentModeCoordinator {
     private static let logger = Logger(subsystem: "com.repoprompt.agents", category: "ClaudeSteering")
     private static let flagSettingsLogger = Logger(subsystem: "com.repoprompt.agents", category: "ClaudeFlagSettings")
 
+    private var controllerListeners: [UUID: ClaudeControllerEventListener] = [:]
     private weak var providerBindingService: AgentModeProviderBindingService?
     private var hostCapabilities: HostCapabilities = .noOp
     private let windowID: Int
@@ -371,14 +382,168 @@ final class ClaudeAgentModeCoordinator {
         }
     }
 
-    func events(for session: AgentTabSession) async -> AsyncStream<NativeAgentRuntimeEvent>? {
-        guard let controller = session.claudeController else { return nil }
-        // Ensure the stream has a live continuation before returning. This
-        // handles the case where the stream was finished by handleStdoutEOF
-        // or another path that called finishEventsStreamIfNeeded. Without
-        // this, the runner would immediately see "stream ended unexpectedly".
+    #if DEBUG
+        func test_installEventListener(for session: AgentTabSession) async -> ClaudeControllerEventListener? {
+            guard let controller = session.claudeController else { return nil }
+            await reconcileEventListener(for: session, controller: controller)
+            return controllerListeners[session.tabID]
+        }
+    #endif
+
+    func notifySteeringSettlement(session: AgentTabSession, protectedIDs: Set<UUID>, inputWasAttempted: Bool = false) {
+        controllerListeners[session.tabID]?.subscription?.append(.steeringReleased(protectedIDs: protectedIDs, inputWasAttempted: inputWasAttempted))
+    }
+
+    func pendingProviderAdoption(for session: AgentTabSession) -> Task<Void, Never>? {
+        controllerListeners[session.tabID]?.adoptionTask
+    }
+
+    func reserveEventsForHostPreparation(for session: AgentTabSession) -> ClaudeAttemptEventReservation? {
+        let listener = eventListener(for: session)
+        guard listener.isCurrent(), let subscription = listener.reserve() else { return nil }
+        return (listener, subscription)
+    }
+
+    func reserveEvents(for session: AgentTabSession) -> ClaudeAttemptEventReservation? {
+        reserveEventsForHostPreparation(for: session)
+    }
+
+    func cleanupAdoptedRun(session: AgentTabSession, runID: UUID) async {
+        guard !ClaudeIntegratedAgentModeRunner.cancellationPreservesRunRoute(session: session, runID: runID) else { return }
+        await hostCapabilities.cleanupProviderRun(session, runID)
+    }
+
+    func hasPendingProviderAdoption(for session: AgentTabSession) -> Bool {
+        guard session.activeRunOwnership == nil, let listener = controllerListeners[session.tabID] else { return false }
+        return listener.isBusy || listener.adoptionTask != nil
+    }
+
+    func cancelPendingProviderAdoption(for session: AgentTabSession) {
+        guard hasPendingProviderAdoption(for: session) else { return }
+        if session.activeRunOwnership == nil {
+            session.mcpFollowUpRunPending = false
+            if !session.runLifecycle.terminalCommitInProgress { session.runState = .cancelled }
+        }
+        let runID = session.runID
+        let detached = prepareClaudeCancelSync(session)
+        beginClaudeResumeTransferIfNeeded(for: session, oldController: detached)
+        if let runID { Task { await self.cleanupAdoptedRun(session: session, runID: runID) } }
+    }
+
+    func hasPendingProviderWork(for session: AgentTabSession) -> Bool {
+        controllerListeners[session.tabID]?.isBusy == true
+    }
+
+    private func eventListener(for session: AgentTabSession) -> ClaudeControllerEventListener {
+        if let listener = controllerListeners[session.tabID], listener.isCurrent() { return listener }
+        controllerListeners.removeValue(forKey: session.tabID)?.retire()
+        let binding = session.persistentSessionBindingIdentity
+        let runID = session.runID
+        let bindingGeneration = session.bindingTransitionGeneration
+        let listener = ClaudeControllerEventListener { [weak self, weak session] in
+            guard let self, let session else { return false }
+            return hostCapabilities.isSessionCurrent(session) && session.persistentSessionBindingIdentity == binding
+                && session.runID == runID && session.bindingTransitionGeneration == bindingGeneration
+                && !session.bindingTransitionInProgress
+        }
+        controllerListeners[session.tabID] = listener
+        listener.onBusyChanged = { [weak self, weak session, weak listener] in
+            guard let self, let session, let listener else { return }
+            if listener.isBusy, session.activeRunOwnership == nil {
+                session.mcpFollowUpRunPending = true
+            }
+            hostCapabilities.requestUIRefresh(session, false)
+        }
+        listener.onProviderTurn = { [weak self, weak session, weak listener] id in
+            guard let self, let session, let listener else { return }
+            let fence = AgentRunStartStopFence(session: session)
+            if session.activeRunOwnership == nil {
+                session.mcpFollowUpRunPending = true
+                hostCapabilities.requestUIRefresh(session, false)
+            }
+            listener.adoptionTask = Task { [weak self, weak session, weak listener] in
+                guard let self, let session, let listener else { return }
+                let accepted = await hostCapabilities.adoptProviderTurn(session, listener, id, fence)
+                guard listener.isCurrent(), controllerListeners[session.tabID] === listener else { return }
+                listener.adoptionTask = nil
+                if !accepted, listener.pendingProviderTurnID == id {
+                    await refuseProviderTurn(session, listener: listener)
+                }
+            }
+        }
+        listener.onIdleEvent = { [weak self, weak session, weak listener] event in
+            guard let self, let session, let listener, listener.isCurrent() else { return }
+            switch event {
+            case let .runtimeInit(status):
+                observeRuntimeInit(status, session: session)
+                if status.isRepoPromptServerFailed { scheduleIdleFailure(session, listener: listener, error: Self.mcpInitializationFailureMessage(sessionID: status.sessionID)) }
+            case let .error(message): scheduleIdleFailure(session, listener: listener, error: message)
+            default: break
+            }
+        }
+        listener.onStreamEnd = { [weak self, weak session, weak listener] endingInstallation in
+            guard let self, let session, let listener, let controller = session.claudeController else { return }
+            let handle = await controller.eventStreamHandle
+            guard listener.isCurrent(), listener.hasInstallation(endingInstallation), controllerListeners[session.tabID] === listener,
+                  sessionOwnsClaudeController(controller, for: session) else { return }
+            if !listener.matches(controller: controller, handle: handle) {
+                listener.install(controller: controller, handle: handle)
+                return
+            }
+            listener.subscription?.finish()
+            if listener.subscription == nil {
+                scheduleIdleFailure(session, listener: listener, error: Self.unexpectedStreamEndMessage)
+            }
+        }
+        return listener
+    }
+
+    private func reconcileEventListener(for session: AgentTabSession, controller: any NativeAgentRuntimeControlling) async {
         await controller.ensureEventsStreamReady()
-        return await controller.events
+        let handle = await controller.eventStreamHandle
+        guard hostCapabilities.isSessionCurrent(session), sessionOwnsClaudeController(controller, for: session) else { return }
+        eventListener(for: session).install(controller: controller, handle: handle)
+    }
+
+    func observeRuntimeInit(_ status: NativeAgentRuntimeRuntimeInitStatus, session: AgentTabSession) {
+        if let id = status.sessionID, !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            updateProviderSessionIDIfNeeded(id, for: session)
+        }
+    }
+
+    private func scheduleIdleFailure(_ session: AgentTabSession, listener: ClaudeControllerEventListener, error: String) {
+        guard listener.runtimeFailure == nil else { return }
+        listener.runtimeFailure = error
+        let installation = listener.installationWitness
+        Task { [weak self, weak session, weak listener] in
+            guard let self, let session, let listener else { return }
+            await listener.awaitTerminalPublication()
+            guard listener.isCurrent(), listener.hasInstallation(installation) else { return }
+            if let subscription = listener.subscription {
+                subscription.append(.native(.error(error)))
+                subscription.finish()
+            } else {
+                retireIdleController(session, listener: listener, error: error)
+            }
+        }
+    }
+
+    private func retireIdleController(_ session: AgentTabSession, listener: ClaudeControllerEventListener, error: String) {
+        guard controllerListeners[session.tabID] === listener, listener.isCurrent() else { return }
+        session.appendItem(.error(error, sequenceIndex: session.nextSequenceIndex))
+        session.runState = .failed
+        hostCapabilities.scheduleSave(session)
+        let runID = session.runID
+        let detached = prepareClaudeCancelSync(session)
+        beginClaudeResumeTransferIfNeeded(for: session, oldController: detached)
+        if let runID { Task { await self.cleanupAdoptedRun(session: session, runID: runID) } }
+        hostCapabilities.requestUIRefresh(session, true)
+    }
+
+    private func refuseProviderTurn(_ session: AgentTabSession, listener: ClaudeControllerEventListener) async {
+        guard listener.isCurrent(), controllerListeners[session.tabID] === listener else { return }
+        // Retiring this exact controller cancels every pending permission without authorizing tools.
+        retireIdleController(session, listener: listener, error: "RepoPrompt stopped Claude work because it could not attach it to this session.")
     }
 
     func hasTurnInFlight(for session: AgentTabSession) async -> Bool {
@@ -607,7 +772,7 @@ final class ClaudeAgentModeCoordinator {
             invalidateControllerRetirement(for: session)
             session.claudeController = createdController
             controllerLaunchSettingsByTabID[session.tabID] = launchSettings
-            await createdController.ensureEventsStreamReady()
+            await reconcileEventListener(for: session, controller: createdController)
             guard intentIsCurrent(intent, for: session),
                   sessionOwnsClaudeController(createdController, for: session)
             else {
@@ -707,21 +872,35 @@ final class ClaudeAgentModeCoordinator {
     private func detachClaudeController(
         _ controller: any NativeAgentRuntimeControlling,
         from session: AgentTabSession,
-        removeToolTracking: Bool
+        removeToolTracking: Bool,
+        preservingAttemptEvents: Bool = true
     ) -> DetachedClaudeController? {
         guard sessionOwnsClaudeController(controller, for: session) else { return nil }
         let toolHandler = removeToolTracking ? toolHandlerByTabID.removeValue(forKey: session.tabID) : nil
-        clearClaudeControllerLaunchMetadata(for: session)
+        let pendingPermissionIDs = controllerListeners[session.tabID]?.pendingApprovalIDs ?? []
+        clearClaudeControllerLaunchMetadata(for: session, preservingAttemptEvents: preservingAttemptEvents)
         return DetachedClaudeController(
             controller: controller,
             toolHandler: toolHandler,
-            contextEpoch: currentClaudeRuntimeEpoch(for: session)
+            contextEpoch: currentClaudeRuntimeEpoch(for: session),
+            pendingPermissionIDs: pendingPermissionIDs
         )
     }
 
     private func clearClaudeControllerLaunchMetadata(
-        for session: AgentTabSession
+        for session: AgentTabSession,
+        preservingAttemptEvents: Bool = false
     ) {
+        if preservingAttemptEvents, let listener = controllerListeners[session.tabID], listener.subscription != nil {
+            let retiredIDs = listener.providerTurnIDs
+            session.claudeExpectedTurnIDs.subtract(retiredIDs)
+            let protected = session.claudeSupersedingProtectedTurnIDs.intersection(retiredIDs)
+            session.claudeSupersedingProtectedTurnIDs.subtract(retiredIDs)
+            session.pendingSupersedingTurnCompletions = max(0, session.pendingSupersedingTurnCompletions - protected.count)
+            listener.detachTransport()
+        } else {
+            controllerListeners.removeValue(forKey: session.tabID)?.retire()
+        }
         session.claudeController = nil
         controllerLaunchSettingsByTabID.removeValue(forKey: session.tabID)
         appliedAutoEffortByTabID.removeValue(forKey: session.tabID)
@@ -777,6 +956,7 @@ final class ClaudeAgentModeCoordinator {
         }
 
         func test_discardRuntimeState(for session: AgentTabSession) {
+            controllerListeners.removeValue(forKey: session.tabID)?.retire()
             session.claudeController = nil
             controllerLaunchSettingsByTabID.removeValue(forKey: session.tabID)
             appliedAutoEffortByTabID.removeValue(forKey: session.tabID)
@@ -916,6 +1096,7 @@ final class ClaudeAgentModeCoordinator {
             invalidateControllerRetirement(for: session)
             session.claudeController = freshController
             controllerLaunchSettingsByTabID[session.tabID] = launchSettings
+            await reconcileEventListener(for: session, controller: freshController)
             let sessionRef = try await freshController.startOrResume(
                 existingSessionID: nil,
                 model: model,
@@ -1110,7 +1291,8 @@ final class ClaudeAgentModeCoordinator {
         autoEffortSelection: AutoEffortTurnSelection? = nil,
         providerControlCommand: AgentProviderControlCommand? = nil,
         selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,
-        reinstallRunRoutingPolicy: (@MainActor () async -> Bool)? = nil
+        reinstallRunRoutingPolicy: (@MainActor () async -> Bool)? = nil,
+        inputAttemptChanged: (@MainActor (Bool) -> Void)? = nil
     ) async -> NativeSendOutcome {
         nativeSendsInFlightByTabID[session.tabID, default: 0] += 1
         defer {
@@ -1119,12 +1301,6 @@ final class ClaudeAgentModeCoordinator {
             else { nativeSendsInFlightByTabID[session.tabID] = remaining }
         }
         guard intentIsCurrent(intent, for: session) else { return .superseded }
-        if allowsCatalogRouteControllerRecovery, let retainedController = session.claudeController {
-            // Reset only an initial attempt's retained subscription, BEFORE startup can emit.
-            // Fresh/recycled controllers already create their stream before startOrResume.
-            await retainedController.resetEventsStreamForNewRun()
-            guard intentIsCurrent(intent, for: session), sessionOwnsClaudeController(retainedController, for: session) else { return .superseded }
-        }
         let isSelfNote = selfCompactDispatchID?.stage == .note
         let isMaintenance = providerControlCommand != nil || isSelfNote
         let auditTurnID = session.pendingTurnRuntimeAnchors.first?.userItemID
@@ -1321,13 +1497,9 @@ final class ClaudeAgentModeCoordinator {
                 return .superseded
             }
 
-            // Ensure the events stream has a live continuation before sending. If a
-            // previous cancel/EOF/reset cycle left eventsContinuation == nil, emit()
-            // would silently drop every inbound event. The runner subscribes to the
-            // stream *after* this method returns (send → release lease → events(for:)),
-            // so events that arrive in between must be buffered in a live stream.
-            // ensureEventsStreamReady is idempotent — it only recreates if nil.
-            await controller.ensureEventsStreamReady()
+            // Reconcile the lifetime reader before sending: an EOF/reset may have replaced
+            // its stream even while the attempt's recoverable inbox remains reserved.
+            await reconcileEventListener(for: session, controller: controller)
             guard intentIsCurrent(intent, for: session),
                   sessionOwnsClaudeController(controller, for: session)
             else {
@@ -1765,6 +1937,10 @@ final class ClaudeAgentModeCoordinator {
                 let released = hostCapabilities.handoffLocalInput(session, promptDispatchID, monitoring.claim, inputProof)
                 guard !released.mustAbortDispatch else { return .superseded }
                 let providerBoundText = providerBoundUserMessage(released.text(textWithNote), instructions: instructions)
+                let inputInbox = controllerListeners[session.tabID]?.subscription
+                inputInbox?.beginInputHandoff()
+                defer { inputInbox?.endInputHandoff() }
+                inputAttemptChanged?(true)
                 let turnID = try await controller.sendUserMessage(providerBoundText, configuration: configurationProof)
                 recordOrdinaryDispatchAttempt()
                 if let parked {
@@ -1805,6 +1981,7 @@ final class ClaudeAgentModeCoordinator {
             } catch NativeAgentRuntimeControllerError.configurationNotCurrent,
                 NativeAgentRuntimeControllerError.cancelledBeforeWrite
             {
+                inputAttemptChanged?(false)
                 // The controller guarantees zero writes for these typed refusals. Undo only this
                 // note's attempt marker, never a replacement's state or a transport failure.
                 if let attemptedParkedNoteID {
@@ -1819,7 +1996,7 @@ final class ClaudeAgentModeCoordinator {
                       sessionOwnsClaudeController(controller, for: session)
                 else { return .superseded }
                 return recordSendFailure(
-                    "Claude dispatch was cancelled or its configuration changed. No message was sent; retry the turn.",
+                    Self.inputNotSentMessage,
                     session: session,
                     intent: intent, providerWriteAttempted: false
                 )
@@ -1946,6 +2123,16 @@ final class ClaudeAgentModeCoordinator {
             }
         }
 
+        var permissionIDs = controllerListeners[session.tabID]?.pendingApprovalIDs ?? []
+        if let approval = session.pendingApproval, case let .claudeControl(id) = approval.requestID {
+            session.pendingApproval = nil
+            if !permissionIDs.contains(id) { permissionIDs.append(id) }
+        }
+        for id in permissionIDs {
+            controllerListeners[session.tabID]?.subscription?.cancelPendingApproval(id)
+            await controller.respondToPermissionRequest(id: id, decision: .cancel)
+            guard sessionOwnsClaudeController(controller, for: session) else { return false }
+        }
         let interruptOutcome = await controller.interruptTurn(reason: "interrupt")
         switch interruptOutcome {
         case .acknowledged, .noTurnInFlight:
@@ -1985,7 +2172,7 @@ final class ClaudeAgentModeCoordinator {
         guard session.selectedAgent.usesClaudeNativeRuntime else { return nil }
         invalidateControllerRetirement(for: session)
         let detached = session.claudeController.flatMap {
-            detachClaudeController($0, from: session, removeToolTracking: true)
+            detachClaudeController($0, from: session, removeToolTracking: true, preservingAttemptEvents: false)
         }
         if detached == nil {
             clearClaudeControllerLaunchMetadata(for: session)
@@ -2183,6 +2370,9 @@ final class ClaudeAgentModeCoordinator {
         oldController: DetachedClaudeController
     ) async -> NativeAgentRuntimeSessionRef {
         let controller = oldController.controller
+        for id in oldController.pendingPermissionIDs {
+            await controller.respondToPermissionRequest(id: id, decision: .cancel)
+        }
         let interruptOutcome = await controller.interruptTurn(reason: "interrupt")
         await stopToolTracking(oldController, for: session)
         if interruptOutcome == .acknowledged {
@@ -2219,7 +2409,8 @@ final class ClaudeAgentModeCoordinator {
             guard let detached = detachClaudeController(
                 controller,
                 from: session,
-                removeToolTracking: true
+                removeToolTracking: true,
+                preservingAttemptEvents: false
             ) else {
                 return
             }
@@ -2255,7 +2446,7 @@ final class ClaudeAgentModeCoordinator {
         invalidateControllerRetirement(for: session)
         invalidatePendingClaudeResumeTransfer(for: session)
         let detached = session.claudeController.flatMap {
-            detachClaudeController($0, from: session, removeToolTracking: true)
+            detachClaudeController($0, from: session, removeToolTracking: true, preservingAttemptEvents: false)
         }
         if detached == nil {
             clearClaudeControllerLaunchMetadata(for: session)
