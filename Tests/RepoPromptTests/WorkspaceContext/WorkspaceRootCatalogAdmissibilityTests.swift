@@ -873,8 +873,9 @@ final class WorkspaceRootCatalogRetentionTests: XCTestCase {
                 }
             }
             let metrics = try XCTUnwrap(current.pathSearchIndex?.overlayHistoryMetricsForTesting)
-            XCTAssertEqual(metrics.compactedPageCount, 2)
-            XCTAssertEqual(metrics.compactedPayloadCount, 34)
+            XCTAssertEqual(metrics.compactedPageCount, 0)
+            XCTAssertEqual(metrics.compactedPayloadCount, 0)
+            XCTAssertLessThanOrEqual(metrics.totalPayloadCount, 1)
             XCTAssertEqual(held.files.count, 8)
             XCTAssertEqual(held.pathSearchIndex?.search("Overlay", limit: 100).count, 0)
         }
