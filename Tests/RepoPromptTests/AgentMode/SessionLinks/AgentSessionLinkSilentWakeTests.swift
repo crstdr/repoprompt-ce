@@ -263,6 +263,14 @@ extension AgentSessionLinkRuntimeBridgeTests {
         try await assertClaudeSteeringSettlement(failsBeforeWrite: true)
     }
 
+    func testNativeClaudeGroupedProtectedCompletionSurvivesUnsentSteer() async throws {
+        try await assertClaudeSteeringSettlement(failsBeforeWrite: true, groupedCompletion: true)
+    }
+
+    func testNativeClaudeGroupedProtectedCompletionCannotReplayAfterUncertainSteer() async throws {
+        try await assertClaudeSteeringSettlement(failsBeforeWrite: false, uncertainWrite: true, groupedCompletion: true)
+    }
+
     func testNativeClaudeSuccessfulSteerKeepsSuccessorUntilItsOwnResult() async throws {
         try await assertClaudeSteeringSettlement(failsBeforeWrite: false)
     }
@@ -402,7 +410,7 @@ extension AgentSessionLinkRuntimeBridgeTests {
         }
     }
 
-    private func assertClaudeSteeringSettlement(failsBeforeWrite: Bool, uncertainWrite: Bool = false, recoveryBlocker: ClaudeRecoveryBlocker? = nil, completionAfterFailure: Bool = false, supersededBeforeWrite: Bool = false, probeIngress: Bool = false) async throws {
+    private func assertClaudeSteeringSettlement(failsBeforeWrite: Bool, uncertainWrite: Bool = false, recoveryBlocker: ClaudeRecoveryBlocker? = nil, completionAfterFailure: Bool = false, supersededBeforeWrite: Bool = false, probeIngress: Bool = false, groupedCompletion: Bool = false) async throws {
         let fixture = try await makeNativeWakeFixture(agent: .claudeCode)
         let vm = fixture.vm
         let session = fixture.session
@@ -424,15 +432,30 @@ extension AgentSessionLinkRuntimeBridgeTests {
         let ownership = try XCTUnwrap(session.activeRunOwnership)
         let runID = try XCTUnwrap(session.runID)
         let turnA = try XCTUnwrap(session.claudeExpectedTurnIDs.first)
+        let olderProtectedID = UUID()
+        let completedIDs = groupedCompletion ? [olderProtectedID, turnA] : [turnA]
+        session.claudeExpectedTurnIDs.formUnion(completedIDs)
+        if groupedCompletion {
+            // An earlier instruction owns this ID; the refused successor will claim only A.
+            session.claudeSupersedingProtectedTurnIDs.insert(olderProtectedID)
+            session.pendingSupersedingTurnCompletions += 1
+        }
+        let completion: NativeAgentRuntimeEvent = groupedCompletion
+            ? .turnsCompleted(turnIDs: completedIDs, status: .completed)
+            : .turnCompleted(turnID: turnA, status: .completed)
         await fixture.claude.setSteeringConfigurationGate(gate, fail: failsBeforeWrite)
         await fixture.claude.setFailSendAfterRecord(uncertainWrite)
         XCTAssertEqual(vm.submitUserTurn(text: "Unsent correction", tabID: fixture.tabID), .submitted)
         let entered = await gate.waitUntilEntered(timeout: 3)
         XCTAssertTrue(entered)
         XCTAssertTrue(session.claudeSupersedingProtectedTurnIDs.contains(turnA))
+        if groupedCompletion {
+            XCTAssertEqual(session.claudeSupersedingProtectedTurnIDs, Set(completedIDs))
+            XCTAssertEqual(session.pendingSupersedingTurnCompletions, 2)
+        }
         if !completionAfterFailure {
-            await fixture.claude.emit(.turnCompleted(turnID: turnA, status: .completed))
-            try await AsyncTestWait.waitUntil("protected A completion consumed") { !session.claudeExpectedTurnIDs.contains(turnA) }
+            await fixture.claude.emit(completion)
+            try await AsyncTestWait.waitUntil("protected completion consumed") { Set(completedIDs).isDisjoint(with: session.claudeExpectedTurnIDs) }
         }
         XCTAssertEqual(session.runState, .running, "A cannot terminate the promised successor")
         if supersededBeforeWrite {
@@ -440,7 +463,7 @@ extension AgentSessionLinkRuntimeBridgeTests {
         }
         gate.release()
         try await AsyncTestWait.waitUntil("failed steer restored") { session.claudeSteeringFlushTask == nil }
-        if completionAfterFailure { await fixture.claude.emit(.turnCompleted(turnID: turnA, status: .completed)) }
+        if completionAfterFailure { await fixture.claude.emit(completion) }
         let sent = await fixture.claude.sentCount
         if failsBeforeWrite || supersededBeforeWrite {
             XCTAssertEqual(vm.retrieveDraftText(for: fixture.tabID), "Unsent correction", "The accepted but unsent draft is restored exactly once")
