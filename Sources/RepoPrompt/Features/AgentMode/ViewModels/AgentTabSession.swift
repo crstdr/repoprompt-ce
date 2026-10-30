@@ -271,6 +271,12 @@ final class AgentTabSession: ObservableObject {
         }
     }
 
+    var claudeTerminalAnchor: (AgentRunOwnership, AgentRunTerminalCommitBarrier.TerminalAnchor)?
+
+    func terminalAnchor(for ownership: AgentRunOwnership) -> AgentRunTerminalCommitBarrier.TerminalAnchor {
+        claudeTerminalAnchor.flatMap { $0.0 == ownership ? $0.1 : nil } ?? .automatic
+    }
+
     var activeAgentRunStartedAt: Date?
 
     /// Last Auto Effort service choice submitted for this tab, plus a transient in-flight indication.
@@ -3370,6 +3376,9 @@ final class AgentTabSession: ObservableObject {
     }
 
     private func appendItem(_ item: AgentChatItem, certifiedWakeID: UUID?) {
+        if item.kind == .user, let owner = activeRunOwnership, claudeTerminalAnchor?.0 == owner {
+            claudeTerminalAnchor = (owner, .exact(item.id))
+        }
         if item.kind == .user {
             noteAcceptedTaskInput()
         }

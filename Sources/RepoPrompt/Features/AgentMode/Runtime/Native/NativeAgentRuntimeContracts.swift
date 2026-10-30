@@ -7,10 +7,16 @@ import Foundation
 /// use core app models (`AIStreamResult`, `AgentApprovalRequest`, and
 /// `AgentApprovalDecision`) because adapters/bridges are expected to translate
 /// plugin-owned DTOs before events reach Agent Mode.
+struct NativeAgentRuntimeEventStreamHandle {
+    let generation: UInt64
+    let stream: AsyncStream<NativeAgentRuntimeEvent>
+}
+
 protocol NativeAgentRuntimeControlling: Actor {
     var hasActiveSession: Bool { get async }
     var hasTurnInFlight: Bool { get async }
     var events: AsyncStream<NativeAgentRuntimeEvent> { get async }
+    var eventStreamHandle: NativeAgentRuntimeEventStreamHandle { get async }
 
     func ensureEventsStreamReady() async
     func resetEventsStreamForNewRun() async
@@ -42,6 +48,10 @@ protocol NativeAgentRuntimeControlling: Actor {
 }
 
 extension NativeAgentRuntimeControlling {
+    var eventStreamHandle: NativeAgentRuntimeEventStreamHandle {
+        get async { await NativeAgentRuntimeEventStreamHandle(generation: 0, stream: events) }
+    }
+
     func availableSlashCommands() async -> [NativeAgentRuntimeSlashCommand] {
         []
     }

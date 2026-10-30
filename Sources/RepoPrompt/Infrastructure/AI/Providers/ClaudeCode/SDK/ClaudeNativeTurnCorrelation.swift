@@ -4,6 +4,7 @@ import Foundation
 struct ClaudeNativeTurnCorrelation {
     private struct Execution {
         let id: UUID
+        let providerInitiated: Bool
         var inputIDs: Set<UUID>
     }
 
@@ -27,6 +28,10 @@ struct ClaudeNativeTurnCorrelation {
 
     var hasOutstanding: Bool {
         !outstanding.isEmpty
+    }
+
+    var providerTurnID: UUID? {
+        execution.flatMap { $0.providerInitiated ? $0.id : nil }
     }
 
     var ownsOutput: Bool {
@@ -59,13 +64,13 @@ struct ClaudeNativeTurnCorrelation {
         if let ids {
             let known = Set(ids).intersection(outstanding)
             guard !known.isEmpty else { return false }
-            if execution == nil { execution = Execution(id: UUID(), inputIDs: known) }
+            if execution == nil { execution = Execution(id: UUID(), providerInitiated: false, inputIDs: known) }
             else { execution?.inputIDs.formUnion(known) }
         } else if execution == nil {
-            execution = Execution(id: UUID(), inputIDs: [])
+            execution = Execution(id: UUID(), providerInitiated: true, inputIDs: [])
         }
         bindInterruptToObservedExecution()
-        return ownsOutput
+        return ownsOutput || providerTurnID != nil
     }
 
     /// Accepted inputs are not execution evidence. A pre-reply interrupt stays unresolved
@@ -102,7 +107,7 @@ struct ClaudeNativeTurnCorrelation {
         }
     }
 
-    mutating func resolve(_ payload: [String: Any]) throws -> (executionID: UUID, inputIDs: [UUID], interrupted: Bool) {
+    mutating func resolve(_ payload: [String: Any]) throws -> (executionID: UUID, inputIDs: [UUID], providerTurnID: UUID?, interrupted: Bool) {
         let ids = try Self.inputIDs(payload) ?? []
         // A session-scoped error before any execution evidence cannot answer a particular
         // input. Retire the failed transport rather than leave accepted inputs hanging.
@@ -123,6 +128,7 @@ struct ClaudeNativeTurnCorrelation {
             interrupt?.executionID = executionID
         }
         let interrupted = interrupt?.executionID == executionID
+        let providerID = closesExecution ? providerTurnID : nil
         if closesExecution {
             execution = nil
             interrupt = nil
@@ -131,7 +137,7 @@ struct ClaudeNativeTurnCorrelation {
             outstanding.remove(id)
         }
         compact()
-        return (executionID, matched, interrupted)
+        return (executionID, matched, providerID, interrupted)
     }
 
     mutating func takeFirst() -> UUID? {
@@ -143,7 +149,7 @@ struct ClaudeNativeTurnCorrelation {
 
     /// Only transport retirement calls this: eligibility and interrupt bindings retire too.
     mutating func drain() -> [UUID] {
-        let ids = order[head...].filter { outstanding.contains($0) }
+        let ids = order[head...].filter { outstanding.contains($0) } + (providerTurnID.map { [$0] } ?? [])
         self = Self()
         return ids
     }

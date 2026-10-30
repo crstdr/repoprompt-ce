@@ -39,6 +39,10 @@ actor ClaudeCompatibleNativeSessionAdapter: NativeAgentRuntimeControlling {
         get async { await controller.events }
     }
 
+    var eventStreamHandle: NativeAgentRuntimeEventStreamHandle {
+        get async { await controller.eventStreamHandle }
+    }
+
     func ensureEventsStreamReady() async {
         await controller.ensureEventsStreamReady()
     }
