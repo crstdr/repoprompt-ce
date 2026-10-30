@@ -9615,6 +9615,12 @@ actor WorkspaceFileContextStore {
             if removedFolderPaths.contains(folder.standardizedRelativePath) {
                 foundRemovedFolderPaths.insert(folder.standardizedRelativePath)
             }
+            if let replacement = folderReplacements[folder.id], folder.isByteIdentical(to: replacement) {
+                folderReplacements.removeValue(forKey: folder.id)
+                touchedFolderIDs.remove(folder.id)
+                if neededFolderIDs.contains(folder.id) { representedNeededFolderIDs.insert(folder.id) }
+                continue
+            }
             let replacement = folderReplacements[folder.id]
             let removed = removedFolderIDs.contains(folder.id)
                 || removedFolderPaths.contains(folder.standardizedRelativePath)
@@ -9669,6 +9675,22 @@ actor WorkspaceFileContextStore {
             if removedFileIDs.contains(file.id) { foundRemovedFileIDs.insert(file.id) }
             if removedFilePaths.contains(file.standardizedRelativePath) {
                 foundRemovedFilePaths.insert(file.standardizedRelativePath)
+            }
+            if let replacement = fileReplacements[file.id], file.isByteIdentical(to: replacement) {
+                touchedFileIDs.remove(file.id)
+                while fileCursor < sortedFileReplacements.count,
+                      searchRootCatalogFilePrecedes(sortedFileReplacements[fileCursor], file)
+                {
+                    files.append(sortedFileReplacements[fileCursor])
+                    fileCursor += 1
+                }
+                // Keep the original record and consume its byte-identical replacement.
+                guard fileCursor < sortedFileReplacements.count,
+                      sortedFileReplacements[fileCursor].id == file.id
+                else { return nil }
+                fileCursor += 1
+                files.append(file)
+                continue
             }
             let replaced = fileReplacements[file.id] != nil
             let removed = removedFileIDs.contains(file.id)
