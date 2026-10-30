@@ -3357,6 +3357,7 @@ actor WorkspaceFileContextStore {
     #if DEBUG
         private let debugNowNanoseconds: @Sendable () -> UInt64
         private let isCatalogShardShadowValidationEnabled: Bool
+        private let pathSearchCompactionPolicyForTesting: WorkspacePathSearchCompactionPolicy
     #endif
 
     #if DEBUG
@@ -3366,6 +3367,7 @@ actor WorkspaceFileContextStore {
             unloadTerminationPolicy: WorkspaceRootUnloadTerminationPolicy = .production,
             startupFeatureFlags: WorktreeStartupFeatureFlags = .standaloneOperationalDefault(),
             enableCatalogShardShadowValidation: Bool = true,
+            pathSearchCompactionPolicyForTesting: WorkspacePathSearchCompactionPolicy = .production,
             codemapRuntimeProvider: @escaping CodeMapArtifactRuntimeProvider.Factory = {
                 try CodeMapArtifactRuntime.processWide()
             },
@@ -3426,6 +3428,7 @@ actor WorkspaceFileContextStore {
             self.restorePerfRecorder = restorePerfRecorder
             self.perfRecorder = perfRecorder
             isCatalogShardShadowValidationEnabled = enableCatalogShardShadowValidation
+            self.pathSearchCompactionPolicyForTesting = pathSearchCompactionPolicyForTesting
             publisherIngressCoordinator = WorkspaceFileSystemIngressCoordinator(debugNowNanoseconds: debugNowNanoseconds)
             #if os(macOS)
                 let source = DispatchSource.makeMemoryPressureSource(
@@ -7413,6 +7416,50 @@ actor WorkspaceFileContextStore {
             )
         }
 
+        func catalogProjectionForTesting(rootID: UUID) -> (files: [WorkspaceFileRecord], folders: [WorkspaceFolderRecord], languages: [LanguageType], indexByID: [UUID: Int])? {
+            guard let shard = publishedRootCatalogShardsByRootID[rootID] else { return nil }
+            return (shard.projectionFiles.map(\.file), shard.folders, shard.projectionFiles.map(\.language), shard.projectionFileIndexByID)
+        }
+
+        func installProjectedPathSearchIndexForTesting(
+            rootID: UUID,
+            snapshot: WorkspaceRootReusableSnapshot,
+            plan: WorkspaceRootTargetSeedPlanHandle,
+            additionalChangedRelativePaths: FileSystemSeededInventoryChangedPaths = .empty
+        ) -> Bool {
+            guard let source = publishedRootCatalogShardsByRootID[rootID],
+                  let index = WorkspaceSearchRootPathIndex(
+                      identity: .init(
+                          rootID: rootID,
+                          lifetimeID: source.key.lifetimeID,
+                          topologyGeneration: source.key.topologyGeneration
+                      ),
+                      root: source.root, projectedSnapshot: snapshot, projectedPlanHandle: plan,
+                      additionalChangedRelativePaths: additionalChangedRelativePaths, entries: source.entries
+                  ) else { return false }
+            return installPathSearchIndexForTesting(rootID: rootID, index: index)
+        }
+
+        func installPathSearchIndexForTesting(rootID: UUID, index: WorkspaceSearchRootPathIndex) -> Bool {
+            guard let source = publishedRootCatalogShardsByRootID[rootID],
+                  index.identity == WorkspaceSearchRootPathIndexIdentity(
+                      rootID: rootID, lifetimeID: source.key.lifetimeID, topologyGeneration: source.key.topologyGeneration
+                  ),
+                  index.entries.count == source.entries.count,
+                  zip(index.entries, source.entries).allSatisfy({ previous, current in previous.isByteIdentical(to: current) })
+            else { return false }
+            let replacement = RootCatalogShard(
+                key: source.key, root: source.root, files: source.files,
+                precomputedProjectionFiles: source.projectionFiles, folders: source.folders,
+                entries: source.entries, pathSearchIndex: index,
+                appliedIndexGeneration: source.appliedIndexGeneration
+            )
+            searchCatalogSnapshotsByScope.removeAll()
+            publishedRootCatalogShardsByRootID[rootID] = replacement
+            registerPublishedRootCatalogShard(replacement, kind: .promotion)
+            return true
+        }
+
         func rootLifetimeIDForTesting(rootID: UUID) throws -> UUID {
             try state(for: rootID).lifetimeID
         }
@@ -9131,6 +9178,11 @@ actor WorkspaceFileContextStore {
         }
 
         let patchedEntries = builderOutput.files.map { WorkspaceSearchCatalogEntry(file: $0, root: state.root) }
+        #if DEBUG
+            let indexPolicy = pathSearchCompactionPolicyForTesting
+        #else
+            let indexPolicy = WorkspacePathSearchCompactionPolicy.production
+        #endif
         let patchedPathSearchIndex = previousShard.pathSearchIndex?.applyingPatch(
             identity: WorkspaceSearchRootPathIndexIdentity(
                 rootID: currentKey.rootID,
@@ -9138,7 +9190,8 @@ actor WorkspaceFileContextStore {
                 topologyGeneration: currentKey.topologyGeneration
             ),
             entries: patchedEntries,
-            changedFileIDs: builderOutput.pathIndexChangedFileIDs
+            changedFileIDs: builderOutput.pathIndexChangedFileIDs,
+            policy: indexPolicy
         )
         let patchedShard = RootCatalogShard(
             key: currentKey,
