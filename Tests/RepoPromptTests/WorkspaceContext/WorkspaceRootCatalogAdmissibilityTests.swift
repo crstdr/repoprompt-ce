@@ -1,5 +1,8 @@
+import Foundation
 @testable import RepoPromptApp
+import RepoPromptFileSystem
 import RepoPromptInstrumentation
+import RepoPromptWorkspaceCore
 import XCTest
 
 final class WorkspaceRootCatalogAdmissibilityTests: XCTestCase {
@@ -540,6 +543,196 @@ final class WorkspaceRootCatalogRetentionTests: XCTestCase {
     private func bufferIdentity(_ values: [some Any]) -> UInt {
         values.withUnsafeBufferPointer { buffer in
             buffer.baseAddress.map { UInt(bitPattern: $0) } ?? 0
+        }
+    }
+}
+
+final class WorkspaceRootCatalogNoOpTests: XCTestCase {
+    func testNestedAddUnderUnchangedAncestorsPatchesAtCapOne() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let before = await counts(fixture)
+        let oldValue = await fixture.store.appliedIndexRootSnapshot(rootID: fixture.root.id)
+        let old = try XCTUnwrap(oldValue)
+        let events = await fixture.store.appliedIndexEvents()
+        var iterator = events.makeAsyncIterator()
+        try await fixture.store.applyIndexDeltasWithFakeDiskForTesting(rootID: fixture.root.id, deltas: [.fileAdded("parent/new.swift")])
+        let eventValue = await iterator.next()
+        let event = try XCTUnwrap(eventValue)
+        XCTAssertEqual(event.upsertedFiles.map(\.relativePath), ["parent/new.swift"])
+        XCTAssertEqual(event.upsertedFolders.map(\.relativePath), ["parent"])
+        let after = await counts(fixture)
+        XCTAssertEqual(after.patches, before.patches + 1)
+        XCTAssertEqual(after.rebuilds, before.rebuilds)
+        let currentValue = await fixture.store.appliedIndexRootSnapshot(rootID: fixture.root.id)
+        let current = try XCTUnwrap(currentValue)
+        XCTAssertEqual(current.folders, old.folders)
+        XCTAssertEqual(current.generation, old.generation + 1)
+        try await assertAuthoritativeParity(fixture)
+        await fixture.store.unloadRoot(id: fixture.root.id)
+    }
+
+    func testNewAncestorStillCountsTowardCapOne() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let before = await counts(fixture)
+        try await fixture.store.applyIndexDeltasWithFakeDiskForTesting(rootID: fixture.root.id, deltas: [.folderAdded("parent/new"), .folderAdded("parent/new/deep")])
+        let after = await counts(fixture)
+        XCTAssertEqual(after.thresholds, before.thresholds + 1)
+        XCTAssertEqual(after.rebuilds, before.rebuilds + 1)
+        XCTAssertEqual(after.patches, before.patches)
+        try await assertAuthoritativeParity(fixture)
+        await fixture.store.unloadRoot(id: fixture.root.id)
+    }
+
+    func testMixedBatchesPreserveUnchangedUpsertsAndAuthoritativeParity() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let before = await counts(fixture)
+        try await fixture.store.applyIndexDeltasWithFakeDiskForTesting(rootID: fixture.root.id, deltas: [.fileAdded("old.swift"), .fileAdded("new.swift")])
+        let first = await counts(fixture)
+        XCTAssertEqual(first.patches, before.patches + 1)
+        XCTAssertEqual(first.rebuilds, before.rebuilds)
+        let oldFile = await fixture.store.file(rootID: fixture.root.id, relativePath: "old.swift")
+        XCTAssertNotNil(oldFile)
+        try await assertAuthoritativeParity(fixture)
+        let batches: [[FileSystemDelta]] = [
+            [.fileAdded("parent/new.swift")],
+            [.fileModified("old.swift", Date(timeIntervalSince1970: 100)), .folderModified("parent", Date(timeIntervalSince1970: 100))],
+            [.fileRemoved("parent/old.swift"), .fileAdded("parent/renamed.swift")],
+            [.folderRemoved("parent"), .fileAdded("reborn/new.swift")],
+            [.fileAdded("reborn/new.swift")]
+        ]
+        for batch in batches {
+            let prior = await counts(fixture)
+            try await fixture.store.applyIndexDeltasWithFakeDiskForTesting(rootID: fixture.root.id, deltas: batch)
+            if case .fileModified? = batch.first {
+                let current = await counts(fixture)
+                XCTAssertEqual(current.patches, prior.patches + 1)
+                XCTAssertEqual(current.rebuilds, prior.rebuilds)
+            }
+            try await assertAuthoritativeParity(fixture)
+        }
+        await fixture.store.unloadRoot(id: fixture.root.id)
+    }
+
+    func testEffectiveFolderAddKeepsUnchangedFolderUpsert() async throws {
+        let fixture = try await makeFixture(shadowValidation: false)
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let before = await counts(fixture)
+        try await fixture.store.applyIndexDeltasWithFakeDiskForTesting(
+            rootID: fixture.root.id,
+            deltas: [.folderAdded("parent"), .folderAdded("fresh")]
+        )
+        let after = await counts(fixture)
+        XCTAssertEqual(after.patches, before.patches + 1)
+        XCTAssertEqual(after.rebuilds, before.rebuilds)
+        try await assertAuthoritativeParity(fixture)
+        await fixture.store.unloadRoot(id: fixture.root.id)
+    }
+
+    func testMixedNoOpAndImplicitFolderAncestorsUseAuthoritativeFallback() async throws {
+        let fixture = try await makeFixture(shadowValidation: false)
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let before = await counts(fixture)
+        try await fixture.store.applyIndexDeltasWithFakeDiskForTesting(
+            rootID: fixture.root.id,
+            deltas: [.folderAdded("parent"), .folderAdded("fresh/deep")]
+        )
+        let after = await counts(fixture)
+        XCTAssertEqual(after.rebuilds, before.rebuilds + 1)
+        XCTAssertEqual(after.patches, before.patches)
+        try await assertAuthoritativeParity(fixture)
+        await fixture.store.unloadRoot(id: fixture.root.id)
+    }
+
+    func testReloadRestoresSameCatalogAfterNestedPatch() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        try Data().write(to: fixture.directory.appendingPathComponent("parent/new.swift"))
+        try await fixture.store.applyIndexDeltasWithFakeDiskForTesting(rootID: fixture.root.id, deltas: [.fileAdded("parent/new.swift")])
+        let beforeValue = await fixture.store.rootContextSnapshot()
+        let before = try XCTUnwrap(beforeValue?.catalog.rootPathIndexes.first)
+        let expected = before.entries.map { Array($0.standardizedRelativePath.utf8) }
+        await fixture.store.unloadRoot(id: fixture.root.id)
+        let restarted = WorkspaceFileContextStore(codeMapsGloballyDisabled: true, codemapGraphIndexBuildLaunchPolicyForTesting: .disabled)
+        let root = try await restarted.loadRoot(path: fixture.directory.path)
+        let reloadedValue = await restarted.rootContextSnapshot()
+        let reloaded = try XCTUnwrap(reloadedValue?.catalog.rootPathIndexes.first)
+        XCTAssertEqual(reloaded.entries.map { Array($0.standardizedRelativePath.utf8) }, expected)
+        XCTAssertTrue(Set(reloaded.entries.map(\.id)).isDisjoint(with: before.entries.map(\.id)))
+        for query in ["File", "new", "swift"] {
+            XCTAssertEqual(reloaded.search(query, limit: 1024).map { Array($0.entry.standardizedRelativePath.utf8) }, before.search(query, limit: 1024).map { Array($0.entry.standardizedRelativePath.utf8) })
+        }
+        await restarted.unloadRoot(id: root.id)
+    }
+
+    func testRecordEqualityPreservesUnicodeBytesParentsAndDates() {
+        let rootID = UUID(), id = UUID(), parent = UUID()
+        func file(_ path: String, parentID: UUID? = parent, date: Date? = nil) -> WorkspaceFileRecord {
+            WorkspaceFileRecord(id: id, rootID: rootID, name: path, relativePath: path, fullPath: "/tmp/" + path, parentFolderID: parentID, modificationDate: date)
+        }
+        func folder(_ path: String, parentID: UUID? = parent, date: Date? = nil) -> WorkspaceFolderRecord {
+            WorkspaceFolderRecord(id: id, rootID: rootID, name: path, relativePath: path, fullPath: "/tmp/" + path, parentFolderID: parentID, modificationDate: date)
+        }
+        XCTAssertEqual(file("é"), file("e\u{301}"))
+        XCTAssertFalse(file("é").isByteIdentical(to: file("e\u{301}")))
+        XCTAssertFalse(folder("é").isByteIdentical(to: folder("e\u{301}")))
+        XCTAssertTrue(file("File.swift").isByteIdentical(to: file("File.swift")))
+        XCTAssertTrue(folder("Folder").isByteIdentical(to: folder("Folder")))
+        XCTAssertFalse(file("File.swift").isByteIdentical(to: file("File.swift", parentID: nil)))
+        XCTAssertFalse(folder("Folder").isByteIdentical(to: folder("Folder", parentID: nil)))
+        XCTAssertFalse(file("File.swift").isByteIdentical(to: file("File.swift", date: .distantPast)))
+        XCTAssertFalse(folder("Folder").isByteIdentical(to: folder("Folder", date: .distantPast)))
+    }
+
+    private struct Fixture {
+        let directory: URL
+        let store: WorkspaceFileContextStore
+        let root: WorkspaceRootRecord
+    }
+
+    private func makeFixture(shadowValidation: Bool = true) async throws -> Fixture {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory.appendingPathComponent("parent"), withIntermediateDirectories: true)
+        for path in ["old.swift", "parent/old.swift"] {
+            try Data().write(to: directory.appendingPathComponent(path))
+        }
+        let store = WorkspaceFileContextStore(enableCatalogShardShadowValidation: shadowValidation, codeMapsGloballyDisabled: true, codemapGraphIndexBuildLaunchPolicyForTesting: .disabled)
+        let root = try await store.loadRoot(path: directory.path)
+        _ = await store.rootContextSnapshot()
+        return Fixture(directory: directory, store: store, root: root)
+    }
+
+    private func counts(_ fixture: Fixture) async -> (patches: Int, rebuilds: Int, thresholds: Int) {
+        let diagnostics = await fixture.store.storeWorkDiagnosticsSnapshot()
+        let root = diagnostics.rootCatalogShards.roots.first { $0.rootID == fixture.root.id }!
+        return (root.patchCount, root.authoritativeRebuildCount, root.fallbackReasonCounts[.patchThresholdExceeded] ?? 0)
+    }
+
+    private func assertAuthoritativeParity(_ fixture: Fixture, file: StaticString = #filePath, line: UInt = #line) async throws {
+        let priorValue = await fixture.store.rootContextSnapshot()
+        let prior = try XCTUnwrap(priorValue?.catalog.rootPathIndexes.first)
+        let projectionValue = await fixture.store.catalogProjectionForTesting(rootID: fixture.root.id)
+        let projection = try XCTUnwrap(projectionValue)
+        let canonicalValue = await fixture.store.appliedIndexRootSnapshot(rootID: fixture.root.id)
+        let canonical = try XCTUnwrap(canonicalValue)
+        let lifetime = try await fixture.store.rootLifetimeIDForTesting(rootID: fixture.root.id)
+        await fixture.store.applyAppliedIndexEventToRootCatalogShardForTesting(.init(rootID: fixture.root.id, rootPath: fixture.root.fullPath, generation: canonical.generation, rootLifetimeID: lifetime, requiresFullResync: true))
+        let rebuiltValue = await fixture.store.rootContextSnapshot()
+        let rebuilt = try XCTUnwrap(rebuiltValue?.catalog.rootPathIndexes.first)
+        let authoritativeValue = await fixture.store.catalogProjectionForTesting(rootID: fixture.root.id)
+        let authoritative = try XCTUnwrap(authoritativeValue)
+        XCTAssertTrue(projection.files.elementsEqual(authoritative.files, by: { $0.isByteIdentical(to: $1) }), file: file, line: line)
+        XCTAssertTrue(projection.folders.elementsEqual(authoritative.folders, by: { $0.isByteIdentical(to: $1) }), file: file, line: line)
+        XCTAssertEqual(projection.languages, authoritative.languages, file: file, line: line)
+        XCTAssertEqual(projection.indexByID, authoritative.indexByID, file: file, line: line)
+        XCTAssertEqual(prior.entries.count, rebuilt.entries.count, file: file, line: line)
+        for (actual, expected) in zip(prior.entries, rebuilt.entries) {
+            XCTAssertTrue(actual.isByteIdentical(to: expected), file: file, line: line)
+        }
+        for query in ["", "new", "swift", "old"] {
+            XCTAssertEqual(prior.search(query, limit: 1024).map(\.entry.id), rebuilt.search(query, limit: 1024).map(\.entry.id), file: file, line: line)
         }
     }
 }

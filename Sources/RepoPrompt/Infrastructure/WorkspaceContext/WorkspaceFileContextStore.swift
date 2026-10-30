@@ -9321,15 +9321,19 @@ actor WorkspaceFileContextStore {
               event.upsertedFolders.allSatisfy({ $0.rootID == event.rootID && foldersByID[$0.id] == $0 })
         else { return nil }
         let representedFolderIDs = Set(oldFoldersByID.keys).union(upsertedFoldersByID.keys)
-        for file in upsertedFilesByID.values {
-            var parentFolderID = file.parentFolderID
+        func ancestorsAreRepresented(parentFolderID: UUID?) -> Bool {
+            var parentFolderID = parentFolderID
             while let folderID = parentFolderID {
                 guard representedFolderIDs.contains(folderID),
                       let folder = foldersByID[folderID]
-                else { return nil }
+                else { return false }
                 parentFolderID = folder.parentFolderID
             }
+            return true
         }
+        guard upsertedFilesByID.values.allSatisfy({ ancestorsAreRepresented(parentFolderID: $0.parentFolderID) }),
+              upsertedFoldersByID.values.allSatisfy({ ancestorsAreRepresented(parentFolderID: $0.parentFolderID) })
+        else { return nil }
 
         let removedFileIDs = Set(event.removedFileIDs)
         let removedFolderIDs = Set(event.removedFolderIDs)
@@ -9374,12 +9378,6 @@ actor WorkspaceFileContextStore {
 
         let upsertedFilePaths = Set(upsertedFilesByID.values.map(\.standardizedRelativePath))
         let upsertedFolderPaths = Set(upsertedFoldersByID.values.map(\.standardizedRelativePath))
-        var pathIndexChangedFileIDs = touchedFileIDs
-        for path in removedFilePaths.union(upsertedFilePaths) {
-            if let oldFileID = oldFileIDsByPath[path] {
-                pathIndexChangedFileIDs.insert(oldFileID)
-            }
-        }
         guard removedFileIDs.isDisjoint(with: upsertedFilesByID.keys),
               removedFolderIDs.isDisjoint(with: upsertedFoldersByID.keys),
               removedFilePaths.isDisjoint(with: upsertedFilePaths),
@@ -9388,6 +9386,20 @@ actor WorkspaceFileContextStore {
               modifiedFolderIDs.isDisjoint(with: removedFolderIDs)
         else { return nil }
 
+        // Validate the original event before discarding projection no-ops. Content invalidation
+        // and publication still consume the complete event independently of catalog record changes.
+        touchedFileIDs = touchedFileIDs.filter { id in
+            guard let previous = oldFilesByID[id] else { return true }
+            if removedFileIDs.contains(id) || removedFilePaths.contains(previous.standardizedRelativePath) { return true }
+            guard let current = upsertedFilesByID[id] ?? filesByID[id] else { return true }
+            return !previous.isByteIdentical(to: current)
+        }
+        touchedFolderIDs = touchedFolderIDs.filter { id in
+            guard let previous = oldFoldersByID[id] else { return true }
+            if removedFolderIDs.contains(id) || removedFolderPaths.contains(previous.standardizedRelativePath) { return true }
+            guard let current = upsertedFoldersByID[id] ?? foldersByID[id] else { return true }
+            return !previous.isByteIdentical(to: current)
+        }
         let logicalMutationCount = touchedFileIDs.count + touchedFolderIDs.count
         guard logicalMutationCount <= Self.maxRootCatalogShardPatchLogicalMutationCount else {
             return RootCatalogShardBuilderOutput(
@@ -9398,6 +9410,14 @@ actor WorkspaceFileContextStore {
             )
         }
 
+        let effectiveUpsertedFilePaths = Set(touchedFileIDs.compactMap { upsertedFilesByID[$0]?.standardizedRelativePath })
+        let effectiveUpsertedFolderPaths = Set(touchedFolderIDs.compactMap { upsertedFoldersByID[$0]?.standardizedRelativePath })
+        var pathIndexChangedFileIDs = touchedFileIDs
+        for path in removedFilePaths.union(effectiveUpsertedFilePaths) {
+            if let oldFileID = oldFileIDsByPath[path] {
+                pathIndexChangedFileIDs.insert(oldFileID)
+            }
+        }
         func insertFile(_ file: WorkspaceFileRecord, into files: inout [WorkspaceFileRecord]) {
             var lowerBound = 0
             var upperBound = files.count
@@ -9431,7 +9451,7 @@ actor WorkspaceFileContextStore {
             files.removeAll { file in
                 file.id == touchedFileID
                     || removedFilePaths.contains(file.standardizedRelativePath)
-                    || upsertedFilePaths.contains(file.standardizedRelativePath)
+                    || effectiveUpsertedFilePaths.contains(file.standardizedRelativePath)
             }
             if let upserted = upsertedFilesByID[touchedFileID] {
                 insertFile(upserted, into: &files)
@@ -9445,7 +9465,7 @@ actor WorkspaceFileContextStore {
             folders.removeAll { folder in
                 folder.id == touchedFolderID
                     || removedFolderPaths.contains(folder.standardizedRelativePath)
-                    || upsertedFolderPaths.contains(folder.standardizedRelativePath)
+                    || effectiveUpsertedFolderPaths.contains(folder.standardizedRelativePath)
             }
             if let upserted = upsertedFoldersByID[touchedFolderID] {
                 insertFolder(upserted, into: &folders)
