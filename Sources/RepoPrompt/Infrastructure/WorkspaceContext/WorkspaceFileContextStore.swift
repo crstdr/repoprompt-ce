@@ -3357,6 +3357,7 @@ actor WorkspaceFileContextStore {
     #if DEBUG
         private let debugNowNanoseconds: @Sendable () -> UInt64
         private let isCatalogShardShadowValidationEnabled: Bool
+        private let pathSearchCompactionPolicyForTesting: WorkspacePathSearchCompactionPolicy
     #endif
 
     #if DEBUG
@@ -3366,6 +3367,7 @@ actor WorkspaceFileContextStore {
             unloadTerminationPolicy: WorkspaceRootUnloadTerminationPolicy = .production,
             startupFeatureFlags: WorktreeStartupFeatureFlags = .standaloneOperationalDefault(),
             enableCatalogShardShadowValidation: Bool = true,
+            pathSearchCompactionPolicyForTesting: WorkspacePathSearchCompactionPolicy = .production,
             codemapRuntimeProvider: @escaping CodeMapArtifactRuntimeProvider.Factory = {
                 try CodeMapArtifactRuntime.processWide()
             },
@@ -3426,6 +3428,7 @@ actor WorkspaceFileContextStore {
             self.restorePerfRecorder = restorePerfRecorder
             self.perfRecorder = perfRecorder
             isCatalogShardShadowValidationEnabled = enableCatalogShardShadowValidation
+            self.pathSearchCompactionPolicyForTesting = pathSearchCompactionPolicyForTesting
             publisherIngressCoordinator = WorkspaceFileSystemIngressCoordinator(debugNowNanoseconds: debugNowNanoseconds)
             #if os(macOS)
                 let source = DispatchSource.makeMemoryPressureSource(
@@ -7413,6 +7416,50 @@ actor WorkspaceFileContextStore {
             )
         }
 
+        func catalogProjectionForTesting(rootID: UUID) -> (files: [WorkspaceFileRecord], folders: [WorkspaceFolderRecord], languages: [LanguageType], indexByID: [UUID: Int])? {
+            guard let shard = publishedRootCatalogShardsByRootID[rootID] else { return nil }
+            return (shard.projectionFiles.map(\.file), shard.folders, shard.projectionFiles.map(\.language), shard.projectionFileIndexByID)
+        }
+
+        func installProjectedPathSearchIndexForTesting(
+            rootID: UUID,
+            snapshot: WorkspaceRootReusableSnapshot,
+            plan: WorkspaceRootTargetSeedPlanHandle,
+            additionalChangedRelativePaths: FileSystemSeededInventoryChangedPaths = .empty
+        ) -> Bool {
+            guard let source = publishedRootCatalogShardsByRootID[rootID],
+                  let index = WorkspaceSearchRootPathIndex(
+                      identity: .init(
+                          rootID: rootID,
+                          lifetimeID: source.key.lifetimeID,
+                          topologyGeneration: source.key.topologyGeneration
+                      ),
+                      root: source.root, projectedSnapshot: snapshot, projectedPlanHandle: plan,
+                      additionalChangedRelativePaths: additionalChangedRelativePaths, entries: source.entries
+                  ) else { return false }
+            return installPathSearchIndexForTesting(rootID: rootID, index: index)
+        }
+
+        func installPathSearchIndexForTesting(rootID: UUID, index: WorkspaceSearchRootPathIndex) -> Bool {
+            guard let source = publishedRootCatalogShardsByRootID[rootID],
+                  index.identity == WorkspaceSearchRootPathIndexIdentity(
+                      rootID: rootID, lifetimeID: source.key.lifetimeID, topologyGeneration: source.key.topologyGeneration
+                  ),
+                  index.entries.count == source.entries.count,
+                  zip(index.entries, source.entries).allSatisfy({ previous, current in previous.isByteIdentical(to: current) })
+            else { return false }
+            let replacement = RootCatalogShard(
+                key: source.key, root: source.root, files: source.files,
+                precomputedProjectionFiles: source.projectionFiles, folders: source.folders,
+                entries: source.entries, pathSearchIndex: index,
+                appliedIndexGeneration: source.appliedIndexGeneration
+            )
+            searchCatalogSnapshotsByScope.removeAll()
+            publishedRootCatalogShardsByRootID[rootID] = replacement
+            registerPublishedRootCatalogShard(replacement, kind: .promotion)
+            return true
+        }
+
         func rootLifetimeIDForTesting(rootID: UUID) throws -> UUID {
             try state(for: rootID).lifetimeID
         }
@@ -9283,12 +9330,18 @@ actor WorkspaceFileContextStore {
             return
         }
 
+        #if DEBUG
+            let indexPolicy = pathSearchCompactionPolicyForTesting
+        #else
+            let indexPolicy = WorkspacePathSearchCompactionPolicy.production
+        #endif
         let patchedShard = Self.makePatchedRootCatalogShard(
             root: state.root,
             key: currentKey,
             builderOutput: builderOutput,
             previousPathSearchIndex: previousShard.pathSearchIndex,
-            appliedIndexGeneration: event.generation
+            appliedIndexGeneration: event.generation,
+            pathIndexPolicy: indexPolicy
         )
         var publication = publishedRootCatalogShardsByRootID
         publication[event.rootID] = patchedShard
@@ -9307,7 +9360,8 @@ actor WorkspaceFileContextStore {
         key: RootCatalogShardKey,
         builderOutput: RootCatalogShardBuilderOutput,
         previousPathSearchIndex: WorkspaceSearchRootPathIndex?,
-        appliedIndexGeneration: UInt64
+        appliedIndexGeneration: UInt64,
+        pathIndexPolicy: WorkspacePathSearchCompactionPolicy = .production
     ) -> RootCatalogShard {
         let patchedEntries = builderOutput.files.map { WorkspaceSearchCatalogEntry(file: $0, root: root) }
         let patchedPathSearchIndex = previousPathSearchIndex?.applyingPatch(
@@ -9317,7 +9371,8 @@ actor WorkspaceFileContextStore {
                 topologyGeneration: key.topologyGeneration
             ),
             entries: patchedEntries,
-            changedFileIDs: builderOutput.pathIndexChangedFileIDs
+            changedFileIDs: builderOutput.pathIndexChangedFileIDs,
+            policy: pathIndexPolicy
         )
         return RootCatalogShard(
             key: key,
@@ -9560,6 +9615,12 @@ actor WorkspaceFileContextStore {
             if removedFolderPaths.contains(folder.standardizedRelativePath) {
                 foundRemovedFolderPaths.insert(folder.standardizedRelativePath)
             }
+            if let replacement = folderReplacements[folder.id], folder.isByteIdentical(to: replacement) {
+                folderReplacements.removeValue(forKey: folder.id)
+                touchedFolderIDs.remove(folder.id)
+                if neededFolderIDs.contains(folder.id) { representedNeededFolderIDs.insert(folder.id) }
+                continue
+            }
             let replacement = folderReplacements[folder.id]
             let removed = removedFolderIDs.contains(folder.id)
                 || removedFolderPaths.contains(folder.standardizedRelativePath)
@@ -9614,6 +9675,22 @@ actor WorkspaceFileContextStore {
             if removedFileIDs.contains(file.id) { foundRemovedFileIDs.insert(file.id) }
             if removedFilePaths.contains(file.standardizedRelativePath) {
                 foundRemovedFilePaths.insert(file.standardizedRelativePath)
+            }
+            if let replacement = fileReplacements[file.id], file.isByteIdentical(to: replacement) {
+                touchedFileIDs.remove(file.id)
+                while fileCursor < sortedFileReplacements.count,
+                      searchRootCatalogFilePrecedes(sortedFileReplacements[fileCursor], file)
+                {
+                    files.append(sortedFileReplacements[fileCursor])
+                    fileCursor += 1
+                }
+                // Keep the original record and consume its byte-identical replacement.
+                guard fileCursor < sortedFileReplacements.count,
+                      sortedFileReplacements[fileCursor].id == file.id
+                else { return nil }
+                fileCursor += 1
+                files.append(file)
+                continue
             }
             let replaced = fileReplacements[file.id] != nil
             let removed = removedFileIDs.contains(file.id)
