@@ -420,14 +420,22 @@ final class ClaudeIntegratedAgentModeRunner {
 
         @discardableResult
         func testConsumeQuietEvents(_ events: [NativeAgentRuntimeEvent], session: AgentTabSession, runID: UUID, owner: AgentRunOwnership) async -> Bool {
+            if case .completed = await testConsumeTurnStatus(events, session: session, runID: runID, owner: owner) { return true }
+            return false
+        }
+
+        func testConsumeTurnStatus(_ events: [NativeAgentRuntimeEvent], session: AgentTabSession, runID: UUID, owner: AgentRunOwnership) async -> ClaudeNativeProcessSessionController.TurnStatus {
             let stream = AsyncStream<NativeAgentRuntimeEvent> { continuation in
                 for event in events {
                     continuation.yield(event)
                 }
                 continuation.finish()
             }
-            if case .completed = await consumeEvents(stream, session: session, runID: runID, runAttemptID: owner.attemptID, recovery: RecoveryMark()) { return true }
-            return false
+            switch await consumeEvents(stream, session: session, runID: runID, runAttemptID: owner.attemptID, recovery: RecoveryMark()) {
+            case .completed: return .completed
+            case .cancelled: return .cancelled
+            case .failed: return .failed
+            }
         }
     #endif
 
@@ -439,6 +447,9 @@ final class ClaudeIntegratedAgentModeRunner {
         recovery: RecoveryMark
     ) async -> ConsumeEventsOutcome {
         var exitedDueToAttemptMismatch = false
+        // Keyed answers may settle several unprotected inputs across separate events.
+        // Keep their strongest outcome until the existing settlement boundary is terminal.
+        var unprotectedTurnStatus: ClaudeNativeProcessSessionController.TurnStatus = .completed
         // Only first-party Claude owns this subscription telemetry. No extra request or
         // process is started; compatible launchers cannot populate Claude account usage.
         var quotaLease: UUID?
@@ -638,34 +649,35 @@ final class ClaudeIntegratedAgentModeRunner {
                     }
                     hooks.bindingObservation.updateBindings(session)
                 }
-            case let .turnCompleted(turnID, turnStatus):
-                guard session.claudeExpectedTurnIDs.contains(turnID) else {
-                    // Stale completion from a previous cancelled run attempt; ignore.
+            case .turnCompleted, .turnsCompleted:
+                let ids: [UUID]
+                let turnStatus: ClaudeNativeProcessSessionController.TurnStatus
+                let keyed: Bool
+                switch event {
+                case let .turnCompleted(id, status): (ids, turnStatus, keyed) = ([id], status, false)
+                case let .turnsCompleted(group, status): (ids, turnStatus, keyed) = (group, status, true)
+                default: preconditionFailure("Expected Claude completion")
+                }
+                // Capture protection before settlement removes answered IDs.
+                let protectedID = ids.last { session.claudeExpectedTurnIDs.contains($0) && session.claudeSupersedingProtectedTurnIDs.contains($0) }
+                guard let settlement = Self.settleCompletedTurnIDsWithProtection(ids, session: session, waitForAllUnprotected: keyed) else {
                     continue eventLoop
                 }
-                session.claudeExpectedTurnIDs.remove(turnID)
-
-                let wasProtectedClaudeTurn = session.claudeSupersedingProtectedTurnIDs.remove(turnID) != nil
-                let hasLegacyUnscopedProtection = session.claudeSupersedingProtectedTurnIDs.isEmpty
-                    && session.pendingSupersedingTurnCompletions > 0
-                if wasProtectedClaudeTurn || hasLegacyUnscopedProtection {
-                    if wasProtectedClaudeTurn { protectedTerminal = (turnID, turnStatus) }
-                    session.pendingSupersedingTurnCompletions = max(0, session.pendingSupersedingTurnCompletions - 1)
-                    // Keep run alive for the next (superseding) turn regardless of the
-                    // stale turn's reported terminal status. Old interrupted turns can land
-                    // as .cancelled, .failed, or even .completed after the superseding send
-                    // is already in flight.
-                    if !session.runState.isActive {
-                        session.runState = .running
+                if let protectedID { protectedTerminal = (protectedID, turnStatus) }
+                if settlement.answeredUnprotected {
+                    switch (unprotectedTurnStatus, turnStatus) {
+                    case (.failed, _), (_, .failed): unprotectedTurnStatus = .failed
+                    case (.cancelled, _), (_, .cancelled): unprotectedTurnStatus = .cancelled
+                    default: unprotectedTurnStatus = .completed
                     }
+                }
+                if !settlement.terminal {
+                    if !session.runState.isActive { session.runState = .running }
                     hooks.presentation.setAgentRunActive(session, true)
                     hooks.bindingObservation.updateBindings(session)
                     continue eventLoop
                 }
-                // No superseding turn expected — terminal for this run.
-                session.pendingSupersedingTurnCompletions = 0
-                session.claudeSupersedingProtectedTurnIDs.removeAll()
-                return Self.terminalOutcome(turnStatus)
+                return Self.terminalOutcome(unprotectedTurnStatus)
             case let .error(message):
                 session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
                 session.setRunningStatus(nil, source: nil)
@@ -705,6 +717,33 @@ final class ClaudeIntegratedAgentModeRunner {
         case .cancelled: .cancelled
         case .failed: .failed(errorText: nil, shouldShutdownSession: false)
         }
+    }
+
+    /// A plural answer is one boundary: retire every target before deciding whether to return.
+    /// nil means stale; false means a protected/partial completion; true means terminal.
+    static func settleCompletedTurnIDs(_ ids: [UUID], session: AgentTabSession, waitForAllUnprotected: Bool = true) -> Bool? {
+        settleCompletedTurnIDsWithProtection(ids, session: session, waitForAllUnprotected: waitForAllUnprotected)?.terminal
+    }
+
+    private static func settleCompletedTurnIDsWithProtection(_ ids: [UUID], session: AgentTabSession, waitForAllUnprotected: Bool) -> (terminal: Bool, answeredUnprotected: Bool)? {
+        let matched = Set(ids).intersection(session.claudeExpectedTurnIDs)
+        guard !matched.isEmpty else { return nil }
+        let explicitlyProtected = matched.intersection(session.claudeSupersedingProtectedTurnIDs)
+        let legacyProtectedCount = session.claudeSupersedingProtectedTurnIDs.isEmpty
+            && session.pendingSupersedingTurnCompletions > 0 ? 1 : 0
+        session.claudeExpectedTurnIDs.subtract(matched)
+        session.claudeSupersedingProtectedTurnIDs.subtract(matched)
+        session.pendingSupersedingTurnCompletions = max(
+            0, session.pendingSupersedingTurnCompletions - explicitlyProtected.count - legacyProtectedCount
+        )
+        let answeredUnprotected = matched.count > explicitlyProtected.count + legacyProtectedCount
+        let otherUnprotected = session.claudeExpectedTurnIDs.subtracting(session.claudeSupersedingProtectedTurnIDs)
+        guard answeredUnprotected, !waitForAllUnprotected || otherUnprotected.isEmpty else {
+            return (false, answeredUnprotected)
+        }
+        session.pendingSupersedingTurnCompletions = 0
+        session.claudeSupersedingProtectedTurnIDs.removeAll()
+        return (true, answeredUnprotected)
     }
 
     private func handleAcquireFailure(
