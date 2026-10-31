@@ -20,6 +20,7 @@ extension Notification.Name {
     static let showCLIProvidersTab = Notification.Name("showCLIProvidersTab")
     /// Posted when the UI should show the Agent Mode settings tab
     static let showAgentModeSettingsTab = Notification.Name("showAgentModeSettingsTab")
+    static let showComputerUseSettingsTab = Notification.Name("showComputerUseSettingsTab")
     /// Posted when the UI should open Settings to the Model Router tab.
     static let showModelRouterSettingsTab = Notification.Name("showModelRouterSettingsTab")
     /// Posted when the UI should open Settings to the Agent Models tab.

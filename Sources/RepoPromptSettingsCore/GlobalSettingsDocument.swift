@@ -1137,6 +1137,9 @@ package struct GlobalScalarPreferences: Codable, Equatable {
         package var showBuiltInWorkflowCleanupGuidance: Bool?
         package var codexGoalSupportEnabled: Bool?
         package var codexComputerUseEnabled: Bool?
+        package var computerUseMasterEnabled: Bool?
+        package var computerUseSubagentEnabled: Bool?
+        package var computerUseModel: String?
         package var codexReasoningSummariesEnabled: Bool?
         package var autoEffortEnabled: Bool?
         package var autoEffortBackendRawValue: String?

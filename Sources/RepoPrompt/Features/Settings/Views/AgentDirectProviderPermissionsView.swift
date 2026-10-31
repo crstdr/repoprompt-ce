@@ -151,7 +151,8 @@ struct AgentDirectProviderPermissionsView: View {
                     isExpanded: toolsDisclosedProviderIDs.contains(providerID),
                     onToggle: { toggleToolsDisclosure(providerID) },
                     onApplyCodexToolSettingMutation: { viewModel.applyCodexToolSettingMutation($0) },
-                    onApplyClaudeToolSettingMutation: { viewModel.applyClaudeToolSettingMutation($0) }
+                    onApplyClaudeToolSettingMutation: { viewModel.applyClaudeToolSettingMutation($0) },
+                    onNavigate: onNavigate
                 )
             }
         } else {

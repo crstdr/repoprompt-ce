@@ -403,7 +403,8 @@ struct CLIProvidersSettingsView: View {
                         },
                         onApplyClaudeToolSettingMutation: {
                             providerPermissionsVM.applyClaudeToolSettingMutation($0)
-                        }
+                        },
+                        onNavigate: onNavigate
                     )
                 }
             }

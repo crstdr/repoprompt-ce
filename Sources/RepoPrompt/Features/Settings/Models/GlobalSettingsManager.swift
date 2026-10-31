@@ -3,6 +3,20 @@ import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 import RepoPromptShared
 
+/// Effective gates only; stored subagent/model choices cannot enable execution in slice 1.
+struct ComputerUsePolicy: Equatable {
+    static let masterDefaultsKey = "computerUseMasterEnabled"
+    let direct: Bool
+    let subagent = false
+    var runtime: Bool {
+        direct || subagent
+    }
+
+    init(master: Bool?, legacyDirect: Bool) {
+        direct = (master ?? true) && legacyDirect
+    }
+}
+
 // MARK: - Canonical Settings Keys
 
 //
@@ -162,7 +176,20 @@ extension GlobalSettingsStore {
     }
 
     func codexComputerUseEnabled() -> Bool {
-        CodexComputerUseWorkflow.isEnabled(persistedValue: scalarPreferences.agentMode?.codexComputerUseEnabled)
+        CodexComputerUseWorkflow.isEnabled(
+            persistedValue: scalarPreferences.agentMode?.codexComputerUseEnabled,
+            master: scalarPreferences.agentMode?.computerUseMasterEnabled
+        )
+    }
+
+    var computerUseMasterEnabled: Bool {
+        scalarPreferences.agentMode?.computerUseMasterEnabled ?? true
+    }
+
+    func setComputerUseMasterEnabled(_ enabled: Bool, commit: Bool = true) {
+        let oldValue = codexComputerUseEnabled()
+        updateAgentModeScalar(commit: commit) { $0.computerUseMasterEnabled = enabled }
+        CodexComputerUseWorkflow.postDidChangeIfNeeded(previousValue: oldValue, currentValue: codexComputerUseEnabled())
     }
 
     func setCodexComputerUseEnabled(_ enabled: Bool, commit: Bool = true) {
