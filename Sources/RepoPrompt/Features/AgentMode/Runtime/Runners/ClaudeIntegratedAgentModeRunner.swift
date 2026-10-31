@@ -514,6 +514,8 @@ final class ClaudeIntegratedAgentModeRunner {
         // Keyed answers may settle several unprotected inputs across separate events.
         // Keep their strongest outcome until the existing settlement boundary is terminal.
         var unprotectedTurnStatus: ClaudeNativeProcessSessionController.TurnStatus = .completed
+        var answeredUnprotected = false
+        var liveSuccessorProviderIDs: Set<UUID> = []
         // Only first-party Claude owns this subscription telemetry. No extra request or
         // process is started; compatible launchers cannot populate Claude account usage.
         var quotaLease: UUID?
@@ -575,9 +577,15 @@ final class ClaudeIntegratedAgentModeRunner {
             }
             switch event {
             case let .providerTurnStarted(id):
+                let hasRegisteredHostInput = !session.claudeExpectedTurnIDs.subtracting(session.claudeSupersedingProtectedTurnIDs).isEmpty
                 if session.claudeExpectedTurnIDs.insert(id).inserted, !providerInitiated {
                     session.claudeSupersedingProtectedTurnIDs.insert(id)
                     session.pendingSupersedingTurnCompletions += 1
+                    if hasRegisteredHostInput {
+                        liveSuccessorProviderIDs.insert(id)
+                        hooks.transcript.beginClaudeProviderOutputSegment(session)
+                        session.claudeProviderOutputBoundary = (runAttemptID, session.nextSequenceIndex)
+                    }
                 }
             case let .stream(result):
                 #if DEBUG
@@ -628,11 +636,20 @@ final class ClaudeIntegratedAgentModeRunner {
                 default: preconditionFailure("Expected Claude completion")
                 }
                 let protectedID = ids.last { session.claudeExpectedTurnIDs.contains($0) && session.claudeSupersedingProtectedTurnIDs.contains($0) }
-                guard let settlement = Self.settleCompletedTurnIDsWithProtection(ids, session: session, waitForAllUnprotected: keyed) else {
+                let answersSuccessor = !liveSuccessorProviderIDs.isDisjoint(with: ids)
+                guard let settlement = Self.settleCompletedTurnIDsWithProtection(
+                    ids, session: session, waitForAllUnprotected: keyed,
+                    previouslyAnsweredUnprotected: answeredUnprotected,
+                    liveSuccessorProviderIDs: liveSuccessorProviderIDs
+                ) else {
                     continue eventLoop
                 }
+                liveSuccessorProviderIDs.subtract(ids)
                 if let protectedID { protectedTerminal = (protectedID, turnStatus) }
                 if settlement.answeredUnprotected {
+                    answeredUnprotected = true
+                }
+                if settlement.answeredUnprotected || answersSuccessor {
                     switch (unprotectedTurnStatus, turnStatus) {
                     case (.failed, _), (_, .failed): unprotectedTurnStatus = .failed
                     case (.cancelled, _), (_, .cancelled): unprotectedTurnStatus = .cancelled
@@ -692,7 +709,11 @@ final class ClaudeIntegratedAgentModeRunner {
         settleCompletedTurnIDsWithProtection(ids, session: session, waitForAllUnprotected: waitForAllUnprotected)?.terminal
     }
 
-    private static func settleCompletedTurnIDsWithProtection(_ ids: [UUID], session: AgentTabSession, waitForAllUnprotected: Bool) -> (terminal: Bool, answeredUnprotected: Bool)? {
+    private static func settleCompletedTurnIDsWithProtection(
+        _ ids: [UUID], session: AgentTabSession, waitForAllUnprotected: Bool,
+        previouslyAnsweredUnprotected: Bool = false,
+        liveSuccessorProviderIDs: Set<UUID> = []
+    ) -> (terminal: Bool, answeredUnprotected: Bool)? {
         let matched = Set(ids).intersection(session.claudeExpectedTurnIDs)
         guard !matched.isEmpty else { return nil }
         let explicitlyProtected = matched.intersection(session.claudeSupersedingProtectedTurnIDs)
@@ -705,7 +726,13 @@ final class ClaudeIntegratedAgentModeRunner {
         )
         let answeredUnprotected = matched.count > explicitlyProtected.count + legacyProtectedCount
         let otherUnprotected = session.claudeExpectedTurnIDs.subtracting(session.claudeSupersedingProtectedTurnIDs)
-        guard answeredUnprotected, !waitForAllUnprotected || otherUnprotected.isEmpty else {
+        // A later provider execution is already in this inbox. Keep its owner until
+        // its result; an unread-tail handback cannot recover a consumed start event.
+        // Pre-send predecessors remain protected but do not hold up the host answer.
+        guard answeredUnprotected || previouslyAnsweredUnprotected,
+              liveSuccessorProviderIDs.isDisjoint(with: session.claudeExpectedTurnIDs),
+              !waitForAllUnprotected || otherUnprotected.isEmpty
+        else {
             return (false, answeredUnprotected)
         }
         session.pendingSupersedingTurnCompletions = 0

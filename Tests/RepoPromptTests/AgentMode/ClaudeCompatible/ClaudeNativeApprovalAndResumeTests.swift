@@ -1772,6 +1772,52 @@ final class ClaudeNativeTurnCorrelationTests: XCTestCase {
         }
     }
 
+    func testProviderStartPrecedesDeferredHostCompletionOnIdleAndFallback() async throws {
+        for useIdle in [true, false] {
+            let controller = await controller(fallback: useIdle ? 10 : 0.01)
+            let stream = await controller.events
+            try await feed(initFrame, to: controller)
+            let host = try await controller.sendUserMessage("host A")
+            let completed = expectation(description: "A completes after U starts")
+            let reader = Task {
+                var events: [ClaudeNativeProcessSessionController.Event] = []
+                for await event in stream {
+                    events.append(event)
+                    switch event {
+                    case let .turnsCompleted(ids, _) where ids == [host]: completed.fulfill()
+                    case let .turnCompleted(id, _) where id == host: completed.fulfill()
+                    default: break
+                    }
+                }
+                return events
+            }
+            try await feed(["type": "system", "subtype": "session_state_changed", "state": "busy"], to: controller)
+            try await feed(result([host], text: "host answer"), to: controller)
+            let provider = UUID()
+            try await feed(["type": "command_lifecycle", "state": "started", "command_uuid": provider.uuidString], to: controller)
+            if useIdle {
+                try await feed(["type": "system", "subtype": "session_state_changed", "state": "idle"], to: controller)
+            } else {
+                try await Task.sleep(for: .milliseconds(30))
+            }
+            await fulfillment(of: [completed], timeout: 2)
+            await controller.shutdown()
+            let events = await reader.value
+            let startIndex = try XCTUnwrap(events.firstIndex { event in
+                if case .providerTurnStarted = event { return true }
+                return false
+            })
+            let completionIndex = try XCTUnwrap(events.firstIndex { event in
+                switch event {
+                case let .turnsCompleted(ids, _): ids == [host]
+                case let .turnCompleted(id, _): id == host
+                default: false
+                }
+            })
+            XCTAssertLessThan(startIndex, completionIndex)
+        }
+    }
+
     func testUnsupportedVersionRetainsLegacySettlement() async throws {
         let controller = await controller()
         var old = initFrame
@@ -2272,6 +2318,28 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         await cleanup(f)
     }
 
+    func testFinalOnlyProviderReplyDoesNotReplaceCompletedAssistant() async throws {
+        let f = try await fixture()
+        f.session.appendItem(.user("earlier question", sequenceIndex: f.session.nextSequenceIndex))
+        let previous = AgentChatItem.assistant("earlier answer", sequenceIndex: f.session.nextSequenceIndex)
+        f.session.appendItem(previous)
+        let providerInput = UUID()
+        try await feed(["type": "command_lifecycle", "state": "started", "command_uuid": providerInput.uuidString], f.controller)
+        await until("provider turn is adopted") { f.session.runState == .running }
+        try await feed([
+            "type": "result", "subtype": "success", "result": "new provider answer",
+            "user_message_uuid": providerInput.uuidString
+        ], f.controller)
+        await until("provider attempt completes") { f.session.runState == .completed && f.session.agentTask == nil }
+        XCTAssertEqual(f.session.items.first(where: { $0.id == previous.id })?.text, previous.text)
+        XCTAssertEqual(f.session.items.count(where: { $0.kind == .user }), 1)
+        let answers = f.session.items.filter { $0.kind == .assistant }
+        XCTAssertEqual(answers.count, 2)
+        XCTAssertNotEqual(answers.last?.id, previous.id)
+        XCTAssertEqual(answers.last?.text, "new provider answer")
+        await cleanup(f)
+    }
+
     func testApprovalFirstAdoptsBeforePermissionAndStopRetiresListener() async throws {
         let f = try await fixture()
         try await feed(["type": "control_request", "request_id": "permission-first", "request": ["subtype": "can_use_tool", "tool_name": "Bash", "input": ["command": "echo fixture"]]], f.controller)
@@ -2328,6 +2396,93 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         XCTAssertTrue(f.session.items.contains { $0.text.contains("two") })
         XCTAssertNil(f.listener.subscription)
         await cleanup(f)
+    }
+
+    func testConsumedProviderStartKeepsHostAttemptAliveThroughDeferredCompletion() async throws {
+        let (h, session, controller, listener) = try await spyFixture()
+        let row = AgentChatItem.user("host A", sequenceIndex: session.nextSequenceIndex)
+        session.appendItem(row)
+        let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
+        await service.startRun(
+            tabID: session.tabID, session: session, initialUserMessage: row.text,
+            initialMessageForRun: row.text, attachments: [], initialUserItemID: row.id
+        )
+        await until("host input is registered") { !session.claudeExpectedTurnIDs.isEmpty }
+        let hostID = try XCTUnwrap(session.claudeExpectedTurnIDs.first)
+        let providerID = UUID()
+        var deliveredStart = false
+        listener.test_onDelivery = { event in
+            if case .providerTurnStarted = event { deliveredStart = true }
+        }
+        // The controller has already resolved A, but its completion is deferred until idle/fallback.
+        await controller.emit(.stream(.init(type: "final_content", text: "host answer")))
+        await controller.emit(.providerTurnStarted(turnID: providerID))
+        await until("U's start was consumed by A's inbox") { deliveredStart }
+        await controller.emit(.turnsCompleted(turnIDs: [hostID], status: .completed))
+        await until("A's completion is consumed") { !session.claudeExpectedTurnIDs.contains(hostID) }
+        XCTAssertTrue(session.runState.isActive, "U must retain an owner after A completes")
+        await controller.emit(.approvalRequest(.init(
+            requestID: .claudeControl("provider-approval"), method: "control/can_use_tool",
+            kind: .commandExecution, threadID: "fixture", turnID: providerID.uuidString, itemID: "tool"
+        )))
+        await until("U's approval is presented") { session.runState == .waitingForApproval }
+        XCTAssertEqual(session.pendingApproval?.requestID, .claudeControl("provider-approval"))
+        await controller.emit(.stream(.init(type: "final_content", text: "provider output")))
+        await controller.emit(.turnsCompleted(turnIDs: [providerID], status: .completed))
+        await until("provider work settles once") { session.runState == .completed && session.agentTask == nil }
+        XCTAssertTrue(session.items.contains { $0.kind == .assistant && $0.text == "host answer" })
+        XCTAssertEqual(session.items.count(where: { $0.text.contains("provider output") }), 1)
+        XCTAssertEqual(session.items.count(where: { $0.kind == .assistant }), 2)
+        await h.host.claudeCoordinator.shutdownClaudeSession(session)
+    }
+
+    func testLaterProviderFailureOrCancellationOutranksDeferredHostSuccess() async throws {
+        for status: NativeAgentRuntimeTurnStatus in [.failed, .cancelled] {
+            let (h, session, controller, _) = try await spyFixture()
+            let row = AgentChatItem.user("host A", sequenceIndex: session.nextSequenceIndex)
+            session.appendItem(row)
+            let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
+            await service.startRun(
+                tabID: session.tabID, session: session, initialUserMessage: row.text,
+                initialMessageForRun: row.text, attachments: [], initialUserItemID: row.id
+            )
+            await until("host input is registered") { !session.claudeExpectedTurnIDs.isEmpty }
+            let hostID = try XCTUnwrap(session.claudeExpectedTurnIDs.first)
+            let providerID = UUID()
+            await controller.emit(.stream(.init(type: "final_content", text: "host answer")))
+            await controller.emit(.providerTurnStarted(turnID: providerID))
+            await controller.emit(.turnsCompleted(turnIDs: [hostID], status: .completed))
+            await until("host result is retained for later provider work") { !session.claudeExpectedTurnIDs.contains(hostID) }
+            XCTAssertTrue(session.runState.isActive)
+            await controller.emit(.turnsCompleted(turnIDs: [providerID], status: status))
+            await until("later provider result publishes") { session.agentTask == nil }
+            XCTAssertEqual(session.runState, status == .failed ? .failed : .cancelled)
+            await h.host.claudeCoordinator.shutdownClaudeSession(session)
+        }
+    }
+
+    func testDeferredEmptyHostResultSeparatesLaterProviderDelta() async throws {
+        let (h, session, controller, _) = try await spyFixture()
+        let row = AgentChatItem.user("host A", sequenceIndex: session.nextSequenceIndex)
+        session.appendItem(row)
+        let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
+        await service.startRun(
+            tabID: session.tabID, session: session, initialUserMessage: row.text,
+            initialMessageForRun: row.text, attachments: [], initialUserItemID: row.id
+        )
+        await until("host input is registered") { !session.claudeExpectedTurnIDs.isEmpty }
+        let hostID = try XCTUnwrap(session.claudeExpectedTurnIDs.first)
+        let providerID = UUID()
+        await controller.emit(.stream(.init(type: "content", text: "host partial")))
+        await controller.emit(.providerTurnStarted(turnID: providerID))
+        await controller.emit(.turnsCompleted(turnIDs: [hostID], status: .completed))
+        await until("deferred A is consumed") { !session.claudeExpectedTurnIDs.contains(hostID) }
+        await controller.emit(.stream(.init(type: "content", text: "provider continuation")))
+        await controller.emit(.turnsCompleted(turnIDs: [providerID], status: .completed))
+        await until("later provider settles") { session.agentTask == nil }
+        let answers = session.items.filter { $0.kind == .assistant }
+        XCTAssertEqual(answers.map(\.text), ["host partial", "provider continuation"])
+        await h.host.claudeCoordinator.shutdownClaudeSession(session)
     }
 
     func testRefusedEpochDeniesPendingApprovalAndRecordsOnce() async throws {
