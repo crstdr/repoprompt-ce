@@ -2126,6 +2126,12 @@ final class ClaudeAgentModeCoordinator {
         var permissionIDs = controllerListeners[session.tabID]?.pendingApprovalIDs ?? []
         if let approval = session.pendingApproval, case let .claudeControl(id) = approval.requestID {
             session.pendingApproval = nil
+            if session.runState == .waitingForApproval {
+                session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
+                session.setRunningStatus("Thinking…", source: .transport)
+                session.runState = .running
+                hostCapabilities.requestUIRefresh(session, true)
+            }
             if !permissionIDs.contains(id) { permissionIDs.append(id) }
         }
         for id in permissionIDs {

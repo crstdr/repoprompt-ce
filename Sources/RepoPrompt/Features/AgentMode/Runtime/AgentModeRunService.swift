@@ -1046,10 +1046,11 @@ final class AgentModeRunService {
         }
 
         let claimableTurnIDs = session.claudeExpectedTurnIDs.subtracting(session.claudeSupersedingProtectedTurnIDs)
-        guard !claimableTurnIDs.isEmpty else { return }
+        let liveSuccessorIDs = session.claudeLiveSuccessorTurnIDs.intersection(session.claudeExpectedTurnIDs)
+        guard !claimableTurnIDs.isEmpty || !liveSuccessorIDs.isEmpty else { return }
 
         session.claudeSupersedingProtectedTurnIDs.formUnion(claimableTurnIDs)
-        session.pendingClaudeSteeringInstructions[steeringIndex].supersedingProtectedTurnIDs.formUnion(claimableTurnIDs)
+        session.pendingClaudeSteeringInstructions[steeringIndex].supersedingProtectedTurnIDs.formUnion(claimableTurnIDs.union(liveSuccessorIDs))
         session.pendingSupersedingTurnCompletions += claimableTurnIDs.count
     }
 
@@ -1057,7 +1058,13 @@ final class AgentModeRunService {
         for instructions: [AgentTabSession.ClaudeSteeringInstruction],
         session: AgentTabSession
     ) {
-        let protectedTurnIDs = Set(instructions.filter { $0.targetRunAttemptID == session.activeRunAttemptID }.flatMap(\.supersedingProtectedTurnIDs))
+        let relevantInstructions = instructions.filter { $0.targetRunAttemptID == session.activeRunAttemptID }
+        guard !relevantInstructions.isEmpty else { return }
+        let claimedTurnIDs = Set(relevantInstructions.flatMap(\.supersedingProtectedTurnIDs))
+        let laterProviderIDs = session.claudeLiveSuccessorTurnIDs
+            .intersection(session.claudeExpectedTurnIDs)
+            .intersection(session.claudeSupersedingProtectedTurnIDs)
+        let protectedTurnIDs = claimedTurnIDs.union(laterProviderIDs)
         guard !protectedTurnIDs.isEmpty else { return }
         let unconsumedTurnIDs = protectedTurnIDs
             .intersection(session.claudeExpectedTurnIDs)
