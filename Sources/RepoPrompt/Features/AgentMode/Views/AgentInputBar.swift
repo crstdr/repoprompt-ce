@@ -146,8 +146,13 @@ struct AgentInputBar: View {
             cancelRun: { target in _ = await agentModeVM.cancelAgentRun(target: target) },
             cancelRouting: { tabID in await agentModeVM.cancelFreshTaskRouting(tabID: tabID) },
             attachFiles: { tabID, urls in
+                guard attachmentAdmission(tabID) else { return }
+                if let reason = agentModeVM.imageAttachmentBlockReason(tabID: tabID) {
+                    agentModeVM.reportImageAttachmentBlocked(reason, tabID: tabID)
+                    return
+                }
                 await agentModeVM.attachFiles(tabID: tabID, urls: urls, admission: {
-                    attachmentAdmission(tabID)
+                    attachmentAdmission(tabID) && agentModeVM.imageAttachmentBlockReason(tabID: tabID) == nil
                 }).value
             },
             reportAttachmentFailures: { tabID, failures in
@@ -346,6 +351,7 @@ struct AgentComposerView: View, Equatable {
 
     @ObservedObject private var fontScale = FontScaleManager.shared
     @ObservedObject private var globalSettings = GlobalSettingsStore.shared
+    @Environment(\.agentImageDropController) private var imageDropController
     private var fontPreset: FontScalePreset {
         fontScale.preset
     }
@@ -428,7 +434,9 @@ struct AgentComposerView: View, Equatable {
     }
 
     private var repromptEditTransaction: TextFieldExternalEditTransaction? {
-        if let presentation = repromptPresentation { return .init(id: presentation.id, isComplete: presentation.phase == .completed) }
+        if let presentation = repromptPresentation {
+            return .init(id: presentation.id, isComplete: presentation.phase == .completed)
+        }
         return repromptUndoRecovery.map { .init(id: $0.id, isComplete: true) }
     }
 
@@ -601,7 +609,9 @@ struct AgentComposerView: View, Equatable {
         }
         .onDisappear {
             // Store draft when leaving
-            if let tabID = currentTabID { flushDraftOnDeparture(tabID: tabID) }
+            if let tabID = currentTabID {
+                flushDraftOnDeparture(tabID: tabID)
+            }
             steeringUnsupportedDismissTask?.cancel()
             steeringUnsupportedDismissTask = nil
             modelMenuSnapshotReleaseTask?.cancel()
@@ -611,7 +621,9 @@ struct AgentComposerView: View, Equatable {
         .onChange(of: currentTabID) { oldTabID, newTabID in
             composerFocusRestoreRequest = nil
             // Switch drafts when tab changes
-            if let oldTabID { flushDraftOnDeparture(tabID: oldTabID) }
+            if let oldTabID {
+                flushDraftOnDeparture(tabID: oldTabID)
+            }
             if let newTabID {
                 loadDraftFromSession(for: newTabID)
             }
@@ -692,6 +704,10 @@ struct AgentComposerView: View, Equatable {
                 showSteeringUnsupportedNotice(event.message)
             }
         }
+        .onChange(of: props.imageAttachmentNotice) { _, notice in
+            guard let notice, notice.tabID == currentTabID else { return }
+            showSteeringUnsupportedNotice(notice.message)
+        }
         .onDrop(of: Self.attachmentDropTypes, isTargeted: $isAttachmentDropTargeted, perform: handleAttachmentDrop(providers:))
         .overlay(attachmentDropOutline)
     }
@@ -769,6 +785,9 @@ struct AgentComposerView: View, Equatable {
                 onReturn: sendMessage,
                 resetTrigger: $resetTextFieldTrigger,
                 onAttachmentPaste: handleAttachmentPaste(pasteboard:),
+                onImageDragHoverChange: { [weak imageDropController] isActive in
+                    imageDropController?.setTextViewImageDragActive(isActive)
+                },
                 features: .agentInputBar(
                     fileTagStore: promptManager.fileManager.workspaceFileContextStore,
                     fileTagSearchService: workspaceSearchService,
@@ -786,8 +805,9 @@ struct AgentComposerView: View, Equatable {
                 externalUpdateTick: externalTextUpdateTick,
                 externalEditTransaction: repromptEditTransaction,
                 onUndoExternalEdit: { [id = repromptPresentation?.id, recoveryID = repromptUndoRecovery?.id, tabID = currentTabID] in
-                    if let id { undoRepromptDraft(expectedID: id) }
-                    else if let tabID, let recoveryID, repromptStore.recoveries[tabID]?.id == recoveryID {
+                    if let id {
+                        undoRepromptDraft(expectedID: id)
+                    } else if let tabID, let recoveryID, repromptStore.recoveries[tabID]?.id == recoveryID {
                         _ = repromptViewModel?.restoreRepromptRecovery(tabID: tabID, confirmedReplacement: false)
                     }
                 },
@@ -801,8 +821,11 @@ struct AgentComposerView: View, Equatable {
                 },
                 onEscape: repromptPresentation == nil ? nil : { [id = repromptPresentation?.id] in
                     guard let id, let operation = repromptViewModel?.repromptOperation, operation.id == id else { return }
-                    if operation.phase == .completed { undoRepromptDraft(expectedID: id) }
-                    else { operation.cancel() }
+                    if operation.phase == .completed {
+                        undoRepromptDraft(expectedID: id)
+                    } else {
+                        operation.cancel()
+                    }
                 },
                 onCommandReturn: repromptViewModel == nil ? nil : repromptAgain,
                 commandReturnMatcher: { LocalKeyboardShortcut.matches($0, .repromptDraft) },
@@ -1853,7 +1876,9 @@ struct AgentComposerView: View, Equatable {
         }
         setLocalInputText(rawDraftSnapshot)
         actions.storeDraft(submitTarget.tabID, rawDraftSnapshot, acknowledgedDraftRestorationSequenceByTab[submitTarget.tabID] ?? 0)
-        if actions.prepareReprompt(submitTarget, rawDraftSnapshot) { return }
+        if actions.prepareReprompt(submitTarget, rawDraftSnapshot) {
+            return
+        }
         guard let attempt = submissionLatch.begin(
             target: submitTarget,
             rawDraftSnapshot: rawDraftSnapshot
