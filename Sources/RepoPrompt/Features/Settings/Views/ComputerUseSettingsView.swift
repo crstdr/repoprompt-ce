@@ -79,7 +79,7 @@ struct ComputerUseSettingsView: View {
                     VStack(alignment: .leading) { ForEach(availability.messages, id: \.self) { Text($0) } }
                 }
                 Picker("Model", selection: Binding(get: { model }, set: { value in
-                    settings.updateAgentModeScalar(commit: true) { $0.computerUseModel = value }
+                    settings.setComputerUseModel(value)
                 })) {
                     Text("GPT-6.1 Terra High").tag("codexExec:gpt-6.1-terra-high").disabled(!availability.terraAvailable)
                     Text("GPT-6.1 Sol High").tag("codexExec:gpt-6.1-sol-high")
@@ -97,7 +97,7 @@ struct ComputerUseSettingsView: View {
                 ))
                 Toggle("Other chats (Claude, Devin, …) — through a \"Computer Use\" subagent", isOn: Binding(
                     get: { preferences?.computerUseSubagentEnabled ?? false },
-                    set: { value in settings.updateAgentModeScalar(commit: true) { $0.computerUseSubagentEnabled = value } }
+                    set: { settings.setComputerUseSubagentEnabled($0) }
                 ))
             }
             .disabled(!settings.computerUseMasterEnabled)

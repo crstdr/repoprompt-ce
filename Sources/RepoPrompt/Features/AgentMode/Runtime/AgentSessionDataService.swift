@@ -145,6 +145,7 @@ actor AgentSessionDataService {
         let codexLastTotalTokens: Int?
         let codexTotalTotalTokens: Int?
         let codexMcpSessionKey: String?
+        let purpose: String?
         let parentSessionID: UUID?
         let createdByOverseerSessionID: UUID?
         let organizationalParentID: UUID?
@@ -1032,6 +1033,11 @@ actor AgentSessionDataService {
         }
     }
 
+    func computerUseChildIDs(for parent: UUID, workspace: WorkspaceModel) async throws -> Set<UUID>? {
+        guard let index = try await metadataIndex(for: workspace, mode: .fast) else { return nil }
+        return index.purposeChildIDsByParent[parent] ?? []
+    }
+
     func fastMetadataRecordsIfAvailable(for workspace: WorkspaceModel) async throws -> FastMetadataRecordsResult? {
         let folder = try ensureAgentSessionsFolder(for: workspace)
         let key = canonicalMetadataFolderKey(folder)
@@ -1416,6 +1422,7 @@ actor AgentSessionDataService {
                 codexLastTotalTokens: header.codexLastTotalTokens,
                 codexTotalTotalTokens: header.codexTotalTotalTokens,
                 codexMcpSessionKey: header.codexMcpSessionKey,
+                purpose: header.purpose,
                 parentSessionID: header.parentSessionID,
                 createdByOverseerSessionID: header.createdByOverseerSessionID,
                 organizationalParentID: header.organizationalParentID,
@@ -1481,6 +1488,7 @@ actor AgentSessionDataService {
                         agentModel: session.agentModel,
                         lastRunState: session.lastRunState,
                         acpModelParameterSelections: session.acpModelParameterSelections,
+                        purpose: session.purpose,
                         parentSessionID: session.parentSessionID,
                         createdByOverseerSessionID: session.createdByOverseerSessionID,
                         isMCPOriginated: session.isMCPOriginated,
@@ -1537,6 +1545,7 @@ actor AgentSessionDataService {
                             agentModel: session.agentModel,
                             lastRunState: session.lastRunState,
                             acpModelParameterSelections: session.acpModelParameterSelections,
+                            purpose: session.purpose,
                             parentSessionID: session.parentSessionID,
                             createdByOverseerSessionID: session.createdByOverseerSessionID,
                             isMCPOriginated: session.isMCPOriginated,

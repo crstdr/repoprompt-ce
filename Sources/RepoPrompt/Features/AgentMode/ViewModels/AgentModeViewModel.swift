@@ -2627,18 +2627,27 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let providerBindingService = AgentModeProviderBindingService()
         let codexControllerFactory: CodexAgentModeCoordinator.CodexControllerFactory = { runID, tabID, windowID, workspacePaths, permissionProfile, _, computerUseEnabled, capabilities in
             let client = CodexAppServerClient(provisionsRepoPromptMCPOnStart: false)
-            let options = CodexNativeSessionController.Options.agentModeDefault(
+            var options = CodexNativeSessionController.Options.agentModeDefault(
                 approvalPolicyProvider: { permissionProfile.codexApprovalPolicy },
                 sandboxModeProvider: { permissionProfile.codexSandboxMode },
                 approvalReviewerProvider: { permissionProfile.codexApprovalReviewer },
                 shellToolEnabled: permissionProfile.codexBashToolEnabled(),
                 suppressThirdPartyMCPServers: permissionProfile.codexSuppressesThirdPartyMCPServers,
                 capabilitiesProvider: { capabilities },
-                goalSupportEnabledProvider: { CodexGoalSupport.isEnabled },
+                goalSupportEnabledProvider: { permissionProfile != .computerUseChild && CodexGoalSupport.isEnabled },
                 reasoningSummariesEnabledProvider: { CodexReasoningSummaries.isEnabled },
-                memoriesEnabledProvider: { CodexMemories.isEnabled },
+                memoriesEnabledProvider: { permissionProfile != .computerUseChild && CodexMemories.isEnabled },
                 computerUseEnabledProvider: { computerUseEnabled }
             )
+            if permissionProfile == .computerUseChild {
+                options.computerUseHumanOnly = true
+                let base = options.configOverridesProvider
+                options.configOverridesProvider = {
+                    var overrides = await base()
+                    overrides["web_search"] = "disabled"
+                    return overrides
+                }
+            }
             return CodexNativeSessionController(
                 client: client,
                 runID: runID,
@@ -3901,7 +3910,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     func toggleComputerUse(tabID: UUID, expectedSessionIdentity: ObjectIdentifier) async {
         guard let session = sessions[tabID], ObjectIdentifier(session) == expectedSessionIdentity,
               currentTabID == tabID, computerUseComposerProps(session: session).isVisible else { return }
-        if session.isCodexComputerUseArmed {
+        if session.selectedAgent != .codexExec, session.computerUseParentGrant != nil {
+            session.computerUseParentGrant = nil
+            if let holder = ComputerUseChildProof.holder, holder.parent === session { holder.retire() }
+        } else if session.isCodexComputerUseArmed {
             await codexCoordinator.revokeCodexComputerUse(session: session, reason: "user-off")
         } else if let message = await armComputerUseForLocalUser(session: session), !message.isEmpty {
             guard sessions[tabID] === session else { return }
@@ -3915,16 +3927,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session: TabSession,
         confirmOptIn: (() async -> Bool)? = nil
     ) async -> String? {
+        let parentGrant = session.selectedAgent != .codexExec
         guard sessions[session.tabID] === session, currentTabID == session.tabID,
               computerUseComposerProps(session: session).isVisible else { return CodexComputerUseWorkflow.ineligibleMessage }
-        guard GlobalSettingsStore.shared.computerUseMasterEnabled else {
+        guard GlobalSettingsStore.shared.computerUseMasterEnabled, !parentGrant || ComputerUseChildProof.enabled else {
             NotificationCenter.default.post(name: .showComputerUseSettingsTab, object: nil, userInfo: ["windowID": windowID])
-            return CodexComputerUseWorkflow.disabledMessage
+            return parentGrant ? ComputerUseChildProof.denied : CodexComputerUseWorkflow.disabledMessage
         }
         if session.isCodexComputerUseArmed {
             return nil
         }
-        guard session.codexComputerUseArmingRequestID == nil, !session.runState.isActive else {
+        guard session.codexComputerUseArmingRequestID == nil, parentGrant || !session.runState.isActive else {
             return "Wait for the current Codex operation to finish before enabling Computer Use."
         }
         let requestID = UUID()
@@ -3941,22 +3954,22 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         func stillCurrent() -> Bool {
             !Task.isCancelled && sessions[session.tabID] === session && currentTabID == session.tabID
                 && session.codexComputerUseArmingRequestID == requestID
-                && GlobalSettingsStore.shared.computerUseMasterEnabled
+                && GlobalSettingsStore.shared.computerUseMasterEnabled && (!parentGrant || ComputerUseChildProof.enabled)
                 && session.persistentSessionBindingIdentity == binding && session.bindingTransitionGeneration == generation
                 && computerUseComposerProps(session: session).isVisible
         }
         let runtimeMessage = await codexCoordinator.computerUseRuntimeRequirementMessage()
         guard stillCurrent() else { return CodexComputerUseWorkflow.ineligibleMessage }
         if let runtimeMessage { return runtimeMessage }
-        if !CodexComputerUseWorkflow.isEnabled {
+        if parentGrant || !CodexComputerUseWorkflow.isEnabled {
             let accepted: Bool = if let confirmOptIn {
                 await confirmOptIn()
             } else {
-                await presentComputerUseOptIn()
+                await presentComputerUseOptIn(parentGrant: parentGrant)
             }
             guard accepted else { return "" }
             guard stillCurrent() else { return CodexComputerUseWorkflow.ineligibleMessage }
-            GlobalSettingsStore.shared.setCodexComputerUseEnabled(true)
+            if !parentGrant { GlobalSettingsStore.shared.setCodexComputerUseEnabled(true) }
         }
         guard stillCurrent() else { return CodexComputerUseWorkflow.ineligibleMessage }
         let hydrated = await ensureSessionReady(tabID: session.tabID)
@@ -3976,18 +3989,25 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
               session.codexComputerUseArmingRequestID == requestID,
               session.currentRestorationBindingToken == armedBindingToken,
               session.operationAdmissionFailureMessage == nil else { return CodexComputerUseWorkflow.ineligibleMessage }
+        if parentGrant {
+            guard ComputerUseChildProof.enabled else { return ComputerUseChildProof.denied }
+            session.computerUseParentGrant = UUID()
+            return nil
+        }
         do {
             try await codexCoordinator.armCodexComputerUse(session: session, requestID: requestID)
             return nil
         } catch { return error.localizedDescription }
     }
 
-    private func presentComputerUseOptIn() async -> Bool {
+    private func presentComputerUseOptIn(parentGrant: Bool = false) async -> Bool {
         guard let window = WindowStatesManager.shared.window(withID: windowID)?.nsWindow,
               window.attachedSheet == nil else { return false }
         let alert = NSAlert()
         alert.messageText = "Turn on Computer Use?"
-        alert.informativeText = "Codex can control apps on your Mac in this chat when you ask. macOS may ask you to allow RepoPrompt CE to use Apple Events."
+        alert.informativeText = parentGrant
+            ? "This chat’s designated Codex child may observe and control your desktop, including tasks from managed or automated turns. Answer approvals in the child chat. Provider storage remains shared and actions may persist after Stop."
+            : "Codex can control apps on your Mac in this chat when you ask. macOS may ask you to allow RepoPrompt CE to use Apple Events."
         alert.addButton(withTitle: "Turn On")
         alert.addButton(withTitle: "Cancel")
         return await withCheckedContinuation { continuation in
@@ -4003,12 +4023,28 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             .store(in: &cancellables)
         // This notification is emitted synchronously by the MainActor settings setters. Take
         // admission holds now, so a rapid off/on cannot re-arm while teardown is suspended.
+        var previousModel = GlobalSettingsStore.shared.scalarPreferences.agentMode?.computerUseModel
         NotificationCenter.default.publisher(for: .codexComputerUseDidChange)
             .sink { [weak self] _ in
-                guard let self, !CodexComputerUseWorkflow.isEnabled else { return }
-                for session in sessions.values where session.isCodexComputerUseArmed || session.codexComputerUseArmingRequestID != nil
-                    || session.codexControllerFeatureState?.computerUseEnabled == true
+                guard let self else { return }
+                let settings = GlobalSettingsStore.shared
+                let policy = settings.computerUsePolicy
+                let model = settings.scalarPreferences.agentMode?.computerUseModel
+                let revokeChildren = !policy.subagent || previousModel != model
+                previousModel = model
+                if revokeChildren {
+                    for session in sessions.values {
+                        session.computerUseParentGrant = nil
+                    }
+                    if ComputerUseChildProof.holder?.owner === self { ComputerUseChildProof.holder?.retire() }
+                }
+                for session in sessions.values where
+                    (session.isComputerUseChild ? revokeChildren : !policy.direct)
+                    && (session.isCodexComputerUseArmed || session.codexComputerUseArmingRequestID != nil || session.codexControllerFeatureState?.computerUseEnabled == true)
                 {
+                    if let proof = session.computerUseChildProof { proof.retire()
+                        continue
+                    }
                     session.codexController?.revokeComputerUseAutoApproval()
                     session.codexComputerUseArmingRequestID = nil
                     let releaseAdmission = session.holdCodexComputerUseAdmission()
@@ -5047,6 +5083,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func prepareSessionForWindowClose(_ session: TabSession) async {
+        session.computerUseParentGrant = nil
+        if let holder = ComputerUseChildProof.holder, holder.parent === session || holder.child === session { holder.retire() }
         removePendingUIRefresh(for: session.tabID)
         cancelPersistedLoad(for: session)
         // cancelEphemeralRuntimeState() cancels and nils agentTask before the
@@ -5677,6 +5715,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session.hasLoadedPersistedState = true
         session.lastActivityAt = Date()
         session.lastUserMessageAt = nil
+        session.purpose = nil
+        session.computerUseParentGrant = nil
+        session.computerUseChildProof = nil
         session.parentSessionID = nil
         session.createdByOverseerSessionID = nil
         session.organizationalParentID = nil
@@ -7479,6 +7520,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
         repairRetainedAttachmentPathsAfterHydration(session, sessionID: payload.sessionID)
         session.hasSentFirstMessage = payload.transcript.turns.contains { $0.request != nil }
+        session.purpose = agentSession.purpose
         session.parentSessionID = agentSession.parentSessionID
         session.createdByOverseerSessionID = agentSession.createdByOverseerSessionID
         // Placement written while the file was being read lands in the index first; prefer it so a
@@ -7932,6 +7974,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private func prepareSessionForRouteActivation(_ session: TabSession) {
         cancelPersistedLoad(for: session)
         session.hasLoadedPersistedState = false
+        session.purpose = nil
+        session.computerUseParentGrant = nil
+        session.computerUseChildProof = nil
         session.parentSessionID = nil
         session.createdByOverseerSessionID = nil
         session.organizationalParentID = nil
@@ -11368,6 +11413,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let expectedSessionID = session.activeAgentSessionID
         let configurationBindingToken = session.currentRestorationBindingToken
         func requireConfigurationAdmission() throws {
+            if session.isComputerUseChild {
+                guard creationHandle != nil, session.computerUseChildProof?.permits(session) == true else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+            }
             try requireSessionConfigurationAdmission(session, creationHandle: creationHandle)
             guard sessions[tabID] === session,
                   session.currentRestorationBindingToken == configurationBindingToken
@@ -11708,7 +11756,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         startPending: Bool = false,
         markSessionAsMCPOriginated: Bool = true,
         requireInactiveRunState: Bool = false,
-        creationHandle: AgentSessionCreationHandle? = nil
+        creationHandle: AgentSessionCreationHandle? = nil,
+        computerUseProof: ComputerUseChildProof? = nil
     ) async throws -> AgentMCPControlContext {
         let admittedWindow = WindowStatesManager.shared.window(withID: windowID)
         var residentActivationTarget: MCPResidentTarget? = nil
@@ -11721,6 +11770,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
               !session.bindingTransitionInProgress
         else {
             throw MCPError.invalidParams("The requested agent session binding changed before MCP control activation.")
+        }
+        if session.isComputerUseChild {
+            guard creationHandle != nil, computerUseProof === session.computerUseChildProof,
+                  computerUseProof?.permits(session) == true else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
         }
         try requireSessionConfigurationAdmission(session, creationHandle: creationHandle)
         if requireInactiveRunState, session.runState.isActive {
@@ -11740,6 +11793,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let activationBindingToken = session.currentRestorationBindingToken
         var activationOwnership: MCPActivationOwnership = .resident
         func requireActivationOwner() throws {
+            if session.isComputerUseChild, computerUseProof?.permits(session) != true { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
             guard sessions[tabID] === session,
                   session.currentRestorationBindingToken == activationBindingToken
             else {
@@ -13038,13 +13092,18 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         workflow: AgentWorkflowDefinition? = nil,
         nativePreparedTurn: NativeSlashPreparedUserTurn? = nil,
         preserveRoutedInitialEffort: Bool = false,
-        validateInitialStart: (@MainActor () throws -> Void)? = nil
+        validateInitialStart: (@MainActor () throws -> Void)? = nil,
+        computerUseProof: ComputerUseChildProof? = nil
     ) async throws -> MCPInstructionDispatch {
         guard let session = mcpControlledSession(sessionID: sessionID) else {
             throw MCPError.invalidParams("The requested agent run is no longer active.")
         }
         if let message = session.operationAdmissionFailureMessage {
             throw MCPError.invalidParams(message)
+        }
+        if session.isComputerUseChild {
+            guard computerUseProof === session.computerUseChildProof, computerUseProof?.permits(session) == true,
+                  nativePreparedTurn == nil, !session.runState.isActive else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
         }
         try validateInitialStart?()
         let dispatchBindingToken = session.currentRestorationBindingToken
@@ -13066,7 +13125,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         // Preserve Model Router's effort on a router-owned first start. Auto effort may
         // judge other first starts and settled follow-ups; active steering keeps its effort.
-        let judgesUserTurn = AutoEffortModelPolicy.shouldJudgeMCPUserTurn(
+        let judgesUserTurn = !session.isComputerUseChild && AutoEffortModelPolicy.shouldJudgeMCPUserTurn(
             isEnabled: modelRouterSettingsStore.autoEffortEnabled(),
             startsNewRun: allowStartingRun && !session.runState.isActive
                 && !(session.runState == .waitingForUser && session.instructionContinuation != nil),
@@ -13156,7 +13215,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     codexAttemptID: codexAttemptID,
                     autoEffortSelection: submittedAutoEffortSelection,
                     autoEffortAudit: submittedAutoEffortAudit,
-                    isLocalComposerInput: false
+                    isLocalComposerInput: false,
+                    computerUseProof: computerUseProof
                 )
             }
             switch submission {
@@ -13238,6 +13298,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             throw MCPError.invalidParams("The requested agent run is no longer active.")
         }
 
+        guard !session.isComputerUseChild else { throw MCPError.invalidParams(ComputerUseChildProof.humanOnly) }
         // Infer the interaction kind from the live pending interaction
         guard let currentInteraction = mcpPendingInteraction(for: session) else {
             throw MCPError.invalidParams("No pending interaction found for the active run.")
@@ -13394,6 +13455,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         interactionID: UUID,
         payload: MCPInteractionResponsePayload
     ) throws -> PendingInteractionResolution {
+        guard !session.isComputerUseChild else { throw MCPError.invalidParams(ComputerUseChildProof.humanOnly) }
         switch kind {
         case .question:
             guard let pendingAskUser = session.pendingAskUser,
@@ -13587,6 +13649,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         _ resolution: PendingInteractionResolution,
         to session: TabSession
     ) throws {
+        guard !session.isComputerUseChild else { throw MCPError.invalidParams(ComputerUseChildProof.humanOnly) }
         switch resolution {
         case let .askUserSkip(interactionID):
             skipAskUser(tabID: session.tabID, interactionID: interactionID)
@@ -13599,13 +13662,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 throw MCPError.invalidParams(error.localizedDescription)
             }
         case let .mcpElicitation(request, response):
-            codexCoordinator.submitMCPElicitationResponse(session: session, request: request, response: response)
+            codexCoordinator.submitMCPElicitationResponse(session: session, request: request, response: response, origin: .machine)
         case let .userInput(request, response):
             submitUserInputResponse(tabID: session.tabID, requestID: request.requestID, response: response)
         case let .worktreeMerge(reviewID, decision):
             submitWorktreeMergeReviewDecision(tabID: session.tabID, reviewID: reviewID, decision: decision)
         case let .permissions(request, decision):
-            codexCoordinator.submitPermissionsDecision(session: session, request: request, decision: decision)
+            codexCoordinator.submitPermissionsDecision(session: session, request: request, decision: decision, origin: .machine)
         case let .approval(request, decision):
             guard submitApprovalDecision(tabID: session.tabID, requestID: request.id, decision: decision) else {
                 let current = session.pendingApproval ?? request
@@ -18126,6 +18189,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             periodicIdleWakeIntervalSeconds: session.oversight.periodicIdleWakeIntervalSeconds,
             providerTokenUsageByTurn: session.providerTokenUsageByTurn,
             automationTurnAudit: session.automationTurnAudit,
+            purpose: session.purpose,
             parentSessionID: session.parentSessionID,
             createdByOverseerSessionID: session.createdByOverseerSessionID,
             organizationalParentID: session.organizationalParentID,
@@ -19120,10 +19184,32 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         routerAudit: AgentAutomationTurnAudit.Feature? = nil,
         repromptedText: String? = nil,
         repromptAudit: AgentAutomationTurnAudit.Reprompt? = nil,
-        isLocalComposerInput: Bool = true
+        isLocalComposerInput: Bool = true,
+        computerUseProof: ComputerUseChildProof? = nil
     ) -> UserTurnSubmissionResult {
         let session = session(for: tabID)
+        if session.isComputerUseChild, isLocalComposerInput, text.trimmingCharacters(in: .whitespacesAndNewlines) == "/computer-use off" {
+            turnOffComputerUseChild(session)
+            return .submitted
+        }
+        if session.isComputerUseChild {
+            guard !isLocalComposerInput, computerUseProof === session.computerUseChildProof,
+                  computerUseProof?.permits(session) == true, session.hasLoadedPersistedState,
+                  !session.runState.isActive else { return .blocked(message: ComputerUseChildProof.denied) }
+        }
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if session.selectedAgent != .codexExec, ["/computer-use", "/computer-use off"].contains(trimmedText) {
+            guard isLocalComposerInput, session.parentSessionID == nil else { return .blocked(message: ComputerUseChildProof.denied) }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if trimmedText.hasSuffix(" off"), session.computerUseParentGrant == nil { return }
+                if !ComputerUseChildProof.enabled { NotificationCenter.default.post(name: .showComputerUseSettingsTab, object: nil, userInfo: ["windowID": windowID])
+                    return
+                }
+                await toggleComputerUse(tabID: tabID, expectedSessionIdentity: ObjectIdentifier(session))
+            }
+            return .submitted
+        }
         guard repromptedText == nil || isLocalComposerInput else { return .blocked(message: "Re-prompt is local composer input only.") }
         let attachmentsToSend = session.pendingFileAttachments
         let taggedFilesToSend = session.pendingTaggedFileAttachments
@@ -19312,7 +19398,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             repromptAudit: repromptAudit,
             restorationSelectedWorkflow: activeWorkflow,
             restorationSelectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
-            isLocalComposerInput: isLocalComposerInput
+            isLocalComposerInput: isLocalComposerInput,
+            computerUseProof: computerUseProof
         )
     }
 
@@ -20017,8 +20104,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         restorationSelectedWorkflowMutationGeneration: UInt64? = nil,
         managedTurn: AgentNoncomposerTurn? = nil,
         stopFence: AgentRunStartStopFence? = nil,
-        isLocalComposerInput: Bool = true
+        isLocalComposerInput: Bool = true,
+        computerUseProof: ComputerUseChildProof? = nil
     ) -> UserTurnSubmissionResult {
+        if session.isComputerUseChild {
+            guard !isLocalComposerInput, managedTurn == nil, nativePreparedTurn == nil,
+                  computerUseProof === session.computerUseChildProof,
+                  computerUseProof?.permits(session) == true else { return .blocked(message: ComputerUseChildProof.denied) }
+        }
         guard repromptedText == nil || (isLocalComposerInput && managedTurn == nil) else { return .blocked(message: "Re-prompt is local composer input only.") }
         let trimmedText = repromptedText ?? originalText
         if let message = session.operationAdmissionFailureMessage {
@@ -20069,7 +20162,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // target user's interview preference.
         var effectiveUserText = managedTurn?.providerText ?? nativePreparedTurn?.providerText ?? repromptedText ?? originalText
         if nativePreparedTurn == nil, session.isCodexComputerUseArmed {
-            effectiveUserText = CodexComputerUseWorkflow.renderProviderPrompt(userInstructions: effectiveUserText)
+            effectiveUserText = CodexComputerUseWorkflow.renderProviderPrompt(userInstructions: effectiveUserText, parentAgentTask: session.isComputerUseChild)
         }
         if managedTurn == nil,
            interviewFirst,
@@ -20324,7 +20417,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         taggedFileAttachments: taggedFilesToSend,
                         codexFallbackContext: fallbackContext,
                         autoEffortSelection: autoEffortSelection,
-                        directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: repromptedText != nil, stopFence: producerStopFence)
+                        directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: repromptedText != nil, stopFence: producerStopFence, computerUseProof: computerUseProof)
                     )
                 } else {
                     .preDispatchRejected(
@@ -20468,7 +20561,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         attachments: attachmentsToSend,
                         taggedFileAttachments: taggedFilesToSend,
                         autoEffortSelection: autoEffortSelection,
-                        directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: repromptedText != nil, stopFence: resumedFence, localComposerCandidate: localComposerCandidate, initialUserItemID: userItem.id)
+                        directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: repromptedText != nil, stopFence: resumedFence, localComposerCandidate: localComposerCandidate, initialUserItemID: userItem.id, computerUseProof: computerUseProof)
                     )
                 }
                 return UserTurnSubmissionResult.submitted
@@ -20523,7 +20616,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     attachments: attachmentsToSend,
                     taggedFileAttachments: taggedFilesToSend,
                     autoEffortSelection: autoEffortSelection,
-                    directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: repromptedText != nil, stopFence: producerStopFence, localComposerCandidate: localComposerCandidate, initialUserItemID: userItem.id)
+                    directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: repromptedText != nil, stopFence: producerStopFence, localComposerCandidate: localComposerCandidate, initialUserItemID: userItem.id, computerUseProof: computerUseProof)
                 )
             }
         } else if let route = activeProviderSteeringRoute(for: session, attachments: attachmentsToSend) {
@@ -21892,6 +21985,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         } else {
             session = self.session(for: tabID)
         }
+        if session.isComputerUseChild {
+            guard directStartOptions.computerUseProof === session.computerUseChildProof,
+                  directStartOptions.computerUseProof?.permits(session) == true
+            else {
+                startOutcome?.recordStartFailure(message: ComputerUseChildProof.denied)
+                return .failed(message: ComputerUseChildProof.denied)
+            }
+        }
         var candidateTransferred = false
         defer {
             // Run preparation has no rollback for ordinary non-Codex rows. An explicit retained
@@ -21924,6 +22025,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
               session.currentRestorationBindingToken == originalBindingToken,
               workspaceManager?.activeWorkspaceID == originalWorkspaceID,
               originalStopFence.permitsStart(of: session) else { return nil }
+        if session.isComputerUseChild, directStartOptions.computerUseProof?.permits(session) != true { return .failed(message: ComputerUseChildProof.denied) }
         if let message = session.operationAdmissionFailureMessage {
             startOutcome?.recordStartFailure(message: message)
             return .failed(message: message)
@@ -23964,7 +24066,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         else {
             return
         }
-        guard codexCoordinator.submitUserInputResponse(session: session, requestID: requestID, response: response) else { return }
+        guard codexCoordinator.submitUserInputResponse(session: session, requestID: requestID, response: response, origin: .humanCard) else { return }
+        settleUserInputResponse(session: session)
+    }
+
+    func settleUserInputResponse(session: TabSession) {
+        let tabID = session.tabID
         session.pendingUserInputRequest = nil
         if !session.queuedUserInputRequests.isEmpty {
             session.pendingUserInputRequest = session.queuedUserInputRequests.removeFirst()
@@ -24059,11 +24166,70 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         scheduleSave(for: session.tabID)
     }
 
+    func turnOffComputerUseChild(_ session: TabSession) {
+        guard sessions[session.tabID] === session, session.isComputerUseChild else { return }
+        let owners = WindowStatesManager.shared.allWindows.map(\.agentModeViewModel) + [self]
+        for owner in owners {
+            for parent in owner.sessions.values where session.parentSessionID != nil && parent.activeAgentSessionID == session.parentSessionID {
+                parent.computerUseParentGrant = nil
+            }
+        }
+        if let proof = session.computerUseChildProof {
+            proof.parent.computerUseParentGrant = nil
+            proof.retire()
+        } else {
+            Task { @MainActor [self] in await codexCoordinator.revokeCodexComputerUse(session: session, reason: "child-off") }
+        }
+        requestUIRefresh(tabID: session.tabID, urgent: true)
+    }
+
+    var computerUseControllerOrRetirementExists: Bool {
+        codexCoordinator.computerUseControllerOrRetirementExists
+    }
+
+    func armComputerUseChild(session: TabSession, proof: ComputerUseChildProof) async throws {
+        try await codexCoordinator.armComputerUseChild(session: session, proof: proof)
+    }
+
+    func captureComputerUseChildRetirement(_ session: TabSession) -> @MainActor () async -> Bool {
+        let binding = session.currentRestorationBindingToken
+        let attemptID = session.activeRunAttemptID
+        let runID = session.runID
+        let controllerGeneration = session.codexControllerGeneration
+        let target = codexCoordinator.captureCodexCancellationTarget(session, expectedRunID: runID)
+        let producer = session.agentTask
+        func isOriginalOperation() -> Bool {
+            sessions[session.tabID] === session && session.currentRestorationBindingToken == binding
+                && session.activeRunAttemptID == attemptID && session.runID == runID
+                && session.codexControllerGeneration == controllerGeneration
+                && session.codexController.map(ObjectIdentifier.init) == target.map { ObjectIdentifier($0.controller) }
+        }
+        session.stopState.invalidateScheduledStarts()
+        session.codexComputerUseArmingRequestID = nil
+        session.pendingCodexComputerUseActivation = nil
+        target?.controller.revokeComputerUseAutoApproval()
+        producer?.cancel()
+        return { [self] in
+            if isOriginalOperation() {
+                await runService.cancelRun(tabID: session.tabID, session: session, completion: .terminalTeardownCompleted)
+            }
+            // Cancellation may have suspended across a rebind. Never sample a replacement
+            // controller for teardown, nor retire an original instance reused by a successor.
+            if let target {
+                if !isOriginalOperation(), session.codexController.map(ObjectIdentifier.init) == ObjectIdentifier(target.controller) { return false }
+                await codexCoordinator.retireCapturedComputerUseController(target, tabID: session.tabID, currentSession: isOriginalOperation() ? session : nil)
+            }
+            await producer?.value
+            return true
+        }
+    }
+
     func prepareAgentRunCancellation(
         session: TabSession,
         intent: DomainAgentRunCancellationIntent,
         origin: AgentModeRunService.CancellationOrigin
     ) {
+        if let proof = ComputerUseChildProof.holder, proof.parent === session || proof.child === session { proof.retire() }
         cancelPendingInstruction(for: session)
         // Every cancellation fences this session's own deferred starts.
         session.stopState.invalidateScheduledStarts()

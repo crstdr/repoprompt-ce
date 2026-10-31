@@ -159,7 +159,8 @@ enum AgentExternalMCPRunStarter {
                 originatingConnectionID: metadata.connectionID,
                 taskLabelKind: taskLabelKind,
                 startPending: true,
-                creationHandle: target.creationHandle
+                creationHandle: target.creationHandle,
+                computerUseProof: agentModeVM.session(for: target.tabID, createIfNeeded: false)?.computerUseChildProof
             )
         } catch {
             // Activation owns rollback of its registration. Do not tear down a different
@@ -182,11 +183,13 @@ enum AgentExternalMCPRunStarter {
                 throw MCPError.invalidParams("The pending agent start was withdrawn or replaced during activation.")
             }
             let pendingStartFence = AgentRunStartStopFence(session: activatedSession)
+            let computerUseProof = activatedSession.computerUseChildProof
             func requirePendingStart() throws {
                 guard agentModeVM.session(for: target.tabID, createIfNeeded: false) === activatedSession,
                       activatedSession.activeAgentSessionID == sessionID,
                       activatedSession.mcpControlContext == ownedActivation,
-                      pendingStartFence.permitsStart(of: activatedSession)
+                      pendingStartFence.permitsStart(of: activatedSession),
+                      !activatedSession.isComputerUseChild || computerUseProof?.permits(activatedSession) == true
                 else {
                     throw MCPError.invalidParams("The pending agent start was withdrawn or replaced before dispatch.")
                 }
@@ -206,6 +209,12 @@ enum AgentExternalMCPRunStarter {
                 reasoningEffortRaw: resolvedEffort,
                 creationHandle: target.creationHandle
             )
+            if activatedSession.isComputerUseChild {
+                try requirePendingStart()
+                guard let computerUseProof else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+                try await agentModeVM.armComputerUseChild(session: activatedSession, proof: computerUseProof)
+                try requirePendingStart()
+            }
             switch bindingDisposition {
             case .preserveCallerBinding:
                 #if DEBUG
@@ -243,7 +252,8 @@ enum AgentExternalMCPRunStarter {
                     allowStartingRun: true,
                     workflow: workflow,
                     preserveRoutedInitialEffort: preserveRoutedInitialEffort,
-                    validateInitialStart: requirePendingStart
+                    validateInitialStart: requirePendingStart,
+                    computerUseProof: computerUseProof
                 )
             }
 

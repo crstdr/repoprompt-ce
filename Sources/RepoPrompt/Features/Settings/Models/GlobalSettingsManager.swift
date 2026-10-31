@@ -3,17 +3,18 @@ import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 import RepoPromptShared
 
-/// Effective gates only; stored subagent/model choices cannot enable execution in slice 1.
+/// One effective policy for direct admission, designated-child admission, and native runtime availability.
 struct ComputerUsePolicy: Equatable {
     static let masterDefaultsKey = "computerUseMasterEnabled"
     let direct: Bool
-    let subagent = false
+    let subagent: Bool
     var runtime: Bool {
         direct || subagent
     }
 
-    init(master: Bool?, legacyDirect: Bool) {
+    init(master: Bool?, legacyDirect: Bool, subagent: Bool? = nil) {
         direct = (master ?? true) && legacyDirect
+        self.subagent = (master ?? true) && (subagent ?? false)
     }
 }
 
@@ -175,11 +176,32 @@ extension GlobalSettingsStore {
         CodexGoalSupport.postDidChangeIfNeeded(previousValue: oldValue, currentValue: codexGoalSupportEnabled())
     }
 
-    func codexComputerUseEnabled() -> Bool {
-        CodexComputerUseWorkflow.isEnabled(
-            persistedValue: scalarPreferences.agentMode?.codexComputerUseEnabled,
-            master: scalarPreferences.agentMode?.computerUseMasterEnabled
+    var computerUsePolicy: ComputerUsePolicy {
+        ComputerUsePolicy(
+            master: scalarPreferences.agentMode?.computerUseMasterEnabled,
+            legacyDirect: CodexComputerUseWorkflow.isEnabled(persistedValue: scalarPreferences.agentMode?.codexComputerUseEnabled, master: nil),
+            subagent: scalarPreferences.agentMode?.computerUseSubagentEnabled
         )
+    }
+
+    func codexComputerUseEnabled() -> Bool {
+        computerUsePolicy.direct
+    }
+
+    func setComputerUseSubagentEnabled(_ enabled: Bool) {
+        let previous = computerUsePolicy
+        updateAgentModeScalar(commit: true) { $0.computerUseSubagentEnabled = enabled }
+        notifyComputerUsePolicyChange(previous)
+    }
+
+    func setComputerUseModel(_ model: String) {
+        guard scalarPreferences.agentMode?.computerUseModel != model else { return }
+        updateAgentModeScalar(commit: true) { $0.computerUseModel = model }
+        NotificationCenter.default.post(name: .codexComputerUseDidChange, object: nil)
+    }
+
+    private func notifyComputerUsePolicyChange(_ previous: ComputerUsePolicy) {
+        if previous != computerUsePolicy { NotificationCenter.default.post(name: .codexComputerUseDidChange, object: nil) }
     }
 
     var computerUseMasterEnabled: Bool {
@@ -187,17 +209,17 @@ extension GlobalSettingsStore {
     }
 
     func setComputerUseMasterEnabled(_ enabled: Bool, commit: Bool = true) {
-        let oldValue = codexComputerUseEnabled()
+        let previous = computerUsePolicy
         updateAgentModeScalar(commit: commit) { $0.computerUseMasterEnabled = enabled }
-        CodexComputerUseWorkflow.postDidChangeIfNeeded(previousValue: oldValue, currentValue: codexComputerUseEnabled())
+        notifyComputerUsePolicyChange(previous)
     }
 
     func setCodexComputerUseEnabled(_ enabled: Bool, commit: Bool = true) {
-        let oldValue = codexComputerUseEnabled()
+        let previous = computerUsePolicy
         updateAgentModeScalar(commit: commit) { settings in
             settings.codexComputerUseEnabled = enabled
         }
-        CodexComputerUseWorkflow.postDidChangeIfNeeded(previousValue: oldValue, currentValue: codexComputerUseEnabled())
+        notifyComputerUsePolicyChange(previous)
     }
 
     func codexReasoningSummariesEnabled() -> Bool {

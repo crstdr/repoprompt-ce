@@ -38,6 +38,7 @@ extension AgentModeViewModel {
         authorize: @escaping @MainActor @Sendable () async -> Bool
     ) async -> AgentSessionLinkInteractionResponseOutcome {
         guard let session = agentSessionLinkLiveSession(matching: candidate) else { return .unavailable }
+        guard !session.isComputerUseChild else { return .invalid(ComputerUseChildProof.humanOnly) }
         guard let interaction = mcpPendingInteraction(for: session) else { return .noPendingInteraction }
         guard interaction.id == request.interactionID else {
             return .interactionMismatch(currentInteractionID: interaction.id)
@@ -105,6 +106,7 @@ extension AgentModeViewModel {
 
         guard await authorize() else { return .unavailable }
         // Final compare-and-set. No suspension between here and submission.
+        guard !session.isComputerUseChild else { return .invalid(ComputerUseChildProof.humanOnly) }
         guard sessions[session.tabID] === session,
               agentSessionLinkLiveSession(matching: candidate) === session
         else { return .unavailable }
@@ -134,6 +136,7 @@ extension AgentModeViewModel {
         for interaction: AgentRunMCPSnapshot.Interaction,
         session: TabSession
     ) -> AgentSessionLinkInteractionManualOnlyReason? {
+        if session.isComputerUseChild { return .computerUseHumanOnly }
         switch interaction.kind {
         case .instruction:
             return .instructionPrompt

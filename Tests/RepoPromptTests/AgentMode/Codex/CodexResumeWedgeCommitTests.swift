@@ -999,9 +999,9 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         await coordinator.test_handleCodexNativeEvent(.approvalRequest(permission), session: session, sourceController: controller)
         XCTAssertEqual(session.pendingApproval?.id, permission.id)
         XCTAssertEqual(controller.qaResponseCount, 0)
-        coordinator.submitApprovalDecision(session: session, decision: .acceptForSession)
+        coordinator.submitApprovalDecision(session: session, decision: .acceptForSession, origin: .humanCard)
         XCTAssertEqual(session.pendingApproval?.id, permission.id, "Remembered permission must remain rejected")
-        coordinator.submitApprovalDecision(session: session, decision: .accept)
+        coordinator.submitApprovalDecision(session: session, decision: .accept, origin: .humanCard)
         try await AsyncTestWait.waitUntil("one explicit permission response", timeout: 4) { controller.qaResponseCount == 1 }
         XCTAssertNil(session.pendingApproval)
         let followUp = await coordinator.sendCodexNativeMessage(session: session, text: "continue locally", attachments: [], fallbackContext: context(true))
@@ -2420,7 +2420,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
     }
 }
 
-private final class WedgeControllerFactory {
+final class WedgeControllerFactory {
     private var plans: [[WedgeFakeCodexController.Response]]
     private(set) var controllers: [WedgeFakeCodexController] = []
     private(set) var computerUseEnabledFlags: [Bool] = []
