@@ -3706,7 +3706,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 return false
             }
         }
-
         let acquiredPhysicalDispatch = viewModel?.agentSessionLinkAcquirePhysicalDispatch(
             for: session,
             dispatchID: promptDispatchID
@@ -5485,10 +5484,19 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 return .unrecoverable(recoveryFailureMessage(for: trigger))
             }
             do {
-                let snapshot = try await probeController.readThreadSnapshot(
-                    includeTurns: true,
-                    timeout: codexRecoveryProbeTimeout
-                )
+                let snapshot: CodexNativeSessionController.ThreadSnapshot = if hasSoftLocalToolLiveness(for: session),
+                                                                               let toolTurnID = currentAuthoritativeNativeToolTurnID(for: session)
+                {
+                    try await probeController.readNativeToolProbeSnapshot(
+                        expectedTurnID: toolTurnID,
+                        timeout: codexRecoveryProbeTimeout
+                    )
+                } else {
+                    try await probeController.readThreadSnapshot(
+                        includeTurns: true,
+                        timeout: codexRecoveryProbeTimeout
+                    )
+                }
                 guard codexWatchdogAttemptRemainsCurrent(
                     session: session,
                     controller: probeController,
@@ -7540,17 +7548,17 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 await ensureCodexToolTrackingForReadySessionIfNeeded(for: session, runID: runID)
             }
         } catch {
-            if computerUseActivationID != nil {
-                guard session.pendingCodexComputerUseActivation?.id == computerUseActivationID,
-                      session.runID == runID, session.activeRunAttemptID == runAttemptIDAtEntry,
-                      session.codexController.map(ObjectIdentifier.init) == ObjectIdentifier(startController) else { return }
-            }
             if forIdleNativeCompact {
                 guard session.runID == runID,
                       session.activeRunAttemptID == runAttemptIDAtEntry,
                       session.codexControllerGeneration == controllerGenerationAtStart,
                       session.codexController.map({ Self.sameCodexControllerInstance($0, startController) }) == true
                 else { return }
+            }
+            if computerUseActivationID != nil {
+                guard session.pendingCodexComputerUseActivation?.id == computerUseActivationID,
+                      session.runID == runID, session.activeRunAttemptID == runAttemptIDAtEntry,
+                      session.codexController.map(ObjectIdentifier.init) == ObjectIdentifier(startController) else { return }
             }
             var effectiveError: Error = error
             if session.runState.isActive,
@@ -8140,7 +8148,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         // Auth replay only reattaches an acknowledged auto-wake claim; it never accepts it again.
         defer { withExtendedLifetime(monitoring?.quietMarkerProducerLifetime) {} }
         var releasedMonitoringClaim: AgentSessionLinkOutboundPromptClaim?
-
         var acquiredAgentSessionLinkPhysicalDispatch = false
         let prepareAgentSessionLinkPhysicalDispatch: () async -> NativeSendOutcome? = {
             if isSelfNote {
