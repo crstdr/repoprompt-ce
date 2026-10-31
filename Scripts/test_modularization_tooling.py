@@ -269,6 +269,7 @@ class CatalogTests(unittest.TestCase):
                 }))
 
             with mock.patch.object(ci_build, 'ROOT', root), mock.patch.object(ci_build, 'BASELINE', baseline), \
+                    mock.patch('ci_app_test_runner.read_inherited_storage_preference', return_value=None), \
                     mock.patch.object(ci_build.subprocess, 'run', side_effect=run_command) as run, \
                     mock.patch.object(ci_build.subprocess, 'Popen', return_value=BuildProcess()), \
                     mock.patch.object(ci_build, 'sources_import_module', return_value=False), \
@@ -294,6 +295,7 @@ class CatalogTests(unittest.TestCase):
             baseline.write_text(json.dumps({'typecheck': {'function_bodies_1000ms': 0,
                                                           'expressions_500ms': 0}}))
             with mock.patch.object(ci_build, 'ROOT', root), mock.patch.object(ci_build, 'BASELINE', baseline), \
+                    mock.patch('ci_app_test_runner.read_inherited_storage_preference', return_value=None), \
                     mock.patch.object(ci_build.subprocess, 'run', side_effect=[listing, subprocess.CompletedProcess([], 0, stdout=json.dumps({'targets': [{'type': 'test', 'name': 'RepoPromptTests'}]}))]) as run, \
                     mock.patch.object(ci_build.subprocess, 'Popen', return_value=BuildProcess()), \
                     mock.patch.object(ci_build, 'sources_import_module', return_value=False), \
@@ -352,19 +354,39 @@ class CatalogTests(unittest.TestCase):
         self.assertNotIn('compression-level:', cache_save)
         self.assertNotIn('if-no-files-found:', cache_save)
 
-    def test_required_style_is_final_and_mac_job_budget_is_five(self) -> None:
+    def test_required_style_is_final_and_mac_job_budget_is_seven(self) -> None:
         ci = (SCRIPT_DIR.parent / '.github/workflows/ci.yml').read_text()
         final = ci.split('  style:', 1)[1].split('  secret-scan:', 1)[0]
         self.assertIn('name: Style', final)
-        self.assertIn('needs: [build-test-bundles, build-and-test, secret-scan]', final)
+        self.assertIn('needs: [candidate, build-test-bundles, build-and-test, secret-scan, integration-products]', final)
         self.assertIn('if: always()', final)
         self.assertIn('ci_test_coverage.py', final)
-        self.assertEqual(ci.count('runs-on: macos-26'), 2)  # one shared job + 4 matrix children
+        self.assertEqual(ci.count('runs-on: macos-26'), 2)  # shared root build + 4 matrix children
+        products = (SCRIPT_DIR.parent / '.github/workflows/ci-integration-products.yml').read_text()
+        self.assertEqual(products.count('runs-on: macos-26'), 2)  # Sentry/privacy + release package/smoke
+        self.assertNotIn('continue-on-error', products)
         self.assertIn('shard: [1, 2, 3, 4]', ci)
         self.assertNotIn('continue-on-error', ci)
         for line in ci.splitlines():
             if line.startswith('    name:'):
                 self.assertNotIn('${{', line)
+
+    def test_style_shell_rejects_each_failed_cancelled_or_skipped_obligation(self) -> None:
+        import os
+        import textwrap
+        ci = (SCRIPT_DIR.parent / '.github/workflows/ci.yml').read_text()
+        gate = ci.split('      - name: Fail if a prerequisite failed or was skipped', 1)[1]
+        script = textwrap.dedent(gate.split('        run: |\n', 1)[1].split('\n      - name:', 1)[0])
+        keys = ('CANDIDATE_RESULT', 'PRODUCTS_RESULT', 'BUILD_RESULT', 'SHARD_RESULT', 'SECRET_RESULT')
+        with tempfile.TemporaryDirectory() as directory:
+            env = {**os.environ, **dict.fromkeys(keys, 'success'), 'GITHUB_STEP_SUMMARY': directory + '/summary'}
+            self.assertEqual(subprocess.run(['bash', '-c', script], env=env, capture_output=True).returncode, 0)
+            for key in keys:
+                for result in ('failure', 'cancelled', 'skipped'):
+                    with self.subTest(obligation=key, result=result):
+                        run = subprocess.run(['bash', '-c', script], env={**env, key: result}, capture_output=True)
+                        self.assertNotEqual(run.returncode, 0)
+                        self.assertIn(b'Style is the aggregate gate', run.stdout)
 
     def test_ci_typecheck_warning_classification(self) -> None:
         warning = '/checkout/Sources/RepoPrompt/App/X.swift:3:4: warning: expression took 502ms to type-check'
