@@ -7401,7 +7401,9 @@ extension PromptViewModel {
             symbolicBase
         }
         let gitVM = gitViewModel
-        let coordinator = AutomaticReviewGitDiffCoordinator()
+        let coordinator = AutomaticReviewGitDiffCoordinator(
+            dependencies: .live(store: workspaceFileContextStore)
+        )
         #if DEBUG
             let automaticReviewGitDiffProviderOverrideForTesting = automaticReviewGitDiffProviderOverrideForTesting
         #endif
