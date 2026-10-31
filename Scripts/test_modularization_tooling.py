@@ -269,6 +269,7 @@ class CatalogTests(unittest.TestCase):
                 }))
 
             with mock.patch.object(ci_build, 'ROOT', root), mock.patch.object(ci_build, 'BASELINE', baseline), \
+                    mock.patch('ci_app_test_runner.read_inherited_storage_preference', return_value=None), \
                     mock.patch.object(ci_build.subprocess, 'run', side_effect=run_command) as run, \
                     mock.patch.object(ci_build.subprocess, 'Popen', return_value=BuildProcess()), \
                     mock.patch.object(ci_build, 'sources_import_module', return_value=False), \
@@ -294,6 +295,7 @@ class CatalogTests(unittest.TestCase):
             baseline.write_text(json.dumps({'typecheck': {'function_bodies_1000ms': 0,
                                                           'expressions_500ms': 0}}))
             with mock.patch.object(ci_build, 'ROOT', root), mock.patch.object(ci_build, 'BASELINE', baseline), \
+                    mock.patch('ci_app_test_runner.read_inherited_storage_preference', return_value=None), \
                     mock.patch.object(ci_build.subprocess, 'run', side_effect=[listing, subprocess.CompletedProcess([], 0, stdout=json.dumps({'targets': [{'type': 'test', 'name': 'RepoPromptTests'}]}))]) as run, \
                     mock.patch.object(ci_build.subprocess, 'Popen', return_value=BuildProcess()), \
                     mock.patch.object(ci_build, 'sources_import_module', return_value=False), \
