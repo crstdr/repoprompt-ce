@@ -1804,6 +1804,11 @@ final class ClaudeNativeTurnCorrelationTests: XCTestCase {
                 try await Task.sleep(for: .milliseconds(30))
             }
             await fulfillment(of: [completed], timeout: 2)
+            try await feed(assistant(provider, text: "provider output"), to: controller)
+            try await feed([
+                "type": "control_request", "request_id": "provider-approval",
+                "request": ["subtype": "can_use_tool", "tool_name": "Bash", "input": ["command": "echo fixture"]]
+            ], to: controller)
             await controller.shutdown()
             let events = await reader.value
             let startIndex = try XCTUnwrap(events.firstIndex { event in
@@ -1818,6 +1823,19 @@ final class ClaudeNativeTurnCorrelationTests: XCTestCase {
                 }
             })
             XCTAssertLessThan(startIndex, completionIndex)
+            let hostAnswerIndex = try XCTUnwrap(events.firstIndex { event in
+                if case let .stream(value) = event { return value.text == "host answer" }
+                return false
+            })
+            XCTAssertLessThan(hostAnswerIndex, startIndex, "Host final text precedes U's start, even when A's completion is deferred")
+            XCTAssertEqual(events.count { event in
+                if case let .stream(value) = event { return value.text == "provider output" }
+                return false
+            }, 1)
+            XCTAssertEqual(events.count { event in
+                if case let .approvalRequest(request) = event { return request.requestID == .claudeControl("provider-approval") }
+                return false
+            }, 1)
         }
     }
 
@@ -2511,6 +2529,121 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
             XCTAssertEqual(session.lastTerminalCommitRevision?.terminalState, .completed)
             await h.host.claudeCoordinator.shutdownClaudeSession(session)
         }
+    }
+
+    func testAcceptedReplacementSurvivesQueuedNoWriteSteerAfterProviderCancellation() async throws {
+        let (h, session, controller, _) = try await spyFixture()
+        let row = AgentChatItem.user("host A", sequenceIndex: session.nextSequenceIndex)
+        session.appendItem(row)
+        let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
+        await service.startRun(
+            tabID: session.tabID, session: session, initialUserMessage: row.text,
+            initialMessageForRun: row.text, attachments: [], initialUserItemID: row.id
+        )
+        await until("A registers") { !session.claudeExpectedTurnIDs.isEmpty }
+        let hostID = try XCTUnwrap(session.claudeExpectedTurnIDs.first)
+        let providerID = UUID()
+        await controller.emit(.providerTurnStarted(turnID: providerID))
+        await until("U starts inside A's inbox") { session.claudeExpectedTurnIDs.contains(providerID) }
+        await controller.emit(.turnsCompleted(turnIDs: [hostID], status: .completed))
+        await until("A completes while U remains") { !session.claudeExpectedTurnIDs.contains(hostID) }
+        XCTAssertTrue(session.runState.isActive)
+        XCTAssertTrue(session.claudeExpectedTurnIDs.contains(providerID))
+        await controller.setTurnInFlight(true)
+        await controller.setInterruptedTurnID(providerID)
+        try queueSteer("replacement B", in: session, service: h.service)
+        let acceptedB = await h.service.submitQueuedClaudeSteeringIfSupported(session: session)
+        XCTAssertTrue(acceptedB)
+        await until("B registers") { !session.claudeExpectedTurnIDs.subtracting([providerID]).isEmpty }
+        let replacementID = try XCTUnwrap(session.claudeExpectedTurnIDs.subtracting([providerID]).first)
+        let gate = Gate()
+        h.host.claudeCoordinator.installHostCapabilities(.init(
+            isSessionCurrent: { $0 === session }, requestUIRefresh: { _, _ in }, scheduleSave: { _ in },
+            stageClaudeResumeRecoveryHandoff: { _ in }, prependPendingHandoff: { text, _ in text },
+            qualifyAgentSessionLinkProviderInputRoute: { _, _ in await gate.wait()
+                return .unavailable
+            },
+            hasCurrentAgentSessionLinkProviderInputRoute: { _, _ in false },
+            decorateAgentSessionLinkPrompt: { text, _, _ in .init(text: text, claim: nil, mustAbortDispatch: false) },
+            acquireAgentSessionLinkPhysicalDispatch: { _, _ in true }, recordAgentSessionLinkPhysicalDispatchNotAttempted: { _, _ in },
+            recordAgentSessionLinkPhysicalDispatchFailure: { _, _ in }, acceptAgentSessionLinkPromptClaim: { _, _, _ in }
+        ), providerBindingService: h.host.providerBindingService)
+        try queueSteer("refused C", in: session, service: h.service)
+        let acceptedC = await h.service.submitQueuedClaudeSteeringIfSupported(session: session)
+        XCTAssertTrue(acceptedC)
+        await until("C protects B while waiting on route") {
+            gate.isWaiting && session.claudeSupersedingProtectedTurnIDs.contains(replacementID)
+        }
+        await controller.emit(.turnsCompleted(turnIDs: [providerID], status: .cancelled))
+        await controller.emit(.turnsCompleted(turnIDs: [replacementID], status: .completed))
+        await until("B result is consumed") { !session.claudeExpectedTurnIDs.contains(replacementID) }
+        XCTAssertTrue(session.runState.isActive)
+        gate.open()
+        await until("refused C releases B") { session.runState == .completed && session.agentTask == nil }
+        XCTAssertEqual(session.lastTerminalCommitRevision?.terminalState, .completed)
+        let sentCount = await controller.sentCount
+        XCTAssertEqual(sentCount, 2, "Only A and B were written")
+        await h.host.claudeCoordinator.shutdownClaudeSession(session)
+    }
+
+    func testQueuedSteerBeforeReplacementRegistrationCannotRestoreProviderCancellation() async throws {
+        let (h, session, controller, _) = try await spyFixture()
+        let row = AgentChatItem.user("host A", sequenceIndex: session.nextSequenceIndex)
+        session.appendItem(row)
+        let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
+        await service.startRun(
+            tabID: session.tabID, session: session, initialUserMessage: row.text,
+            initialMessageForRun: row.text, attachments: [], initialUserItemID: row.id
+        )
+        await until("A registers") { !session.claudeExpectedTurnIDs.isEmpty }
+        let hostID = try XCTUnwrap(session.claudeExpectedTurnIDs.first)
+        let providerID = UUID()
+        await controller.emit(.providerTurnStarted(turnID: providerID))
+        await until("U starts inside A's inbox") { session.claudeExpectedTurnIDs.contains(providerID) }
+        await controller.emit(.turnsCompleted(turnIDs: [hostID], status: .completed))
+        await until("A completes while U remains") { !session.claudeExpectedTurnIDs.contains(hostID) }
+        await controller.setTurnInFlight(true)
+        let sendGate = Gate()
+        await controller.setSendSuspension { await sendGate.wait() }
+        try queueSteer("replacement B", in: session, service: service)
+        let acceptedB = await service.submitQueuedClaudeSteeringIfSupported(session: session)
+        XCTAssertTrue(acceptedB)
+        await until("B send is held before registration") { sendGate.isWaiting }
+        let preparationGate = Gate()
+        h.host.test_beforeACPToolIdleWait = { await preparationGate.wait() }
+        defer { h.host.test_beforeACPToolIdleWait = nil }
+        h.host.claudeCoordinator.installHostCapabilities(.init(
+            isSessionCurrent: { $0 === session }, requestUIRefresh: { _, _ in }, scheduleSave: { _ in },
+            stageClaudeResumeRecoveryHandoff: { _ in }, prependPendingHandoff: { text, _ in text },
+            qualifyAgentSessionLinkProviderInputRoute: { _, _ in .unavailable },
+            hasCurrentAgentSessionLinkProviderInputRoute: { _, _ in false },
+            decorateAgentSessionLinkPrompt: { text, _, _ in .init(text: text, claim: nil, mustAbortDispatch: false) },
+            acquireAgentSessionLinkPhysicalDispatch: { _, _ in true }, recordAgentSessionLinkPhysicalDispatchNotAttempted: { _, _ in },
+            recordAgentSessionLinkPhysicalDispatchFailure: { _, _ in }, acceptAgentSessionLinkPromptClaim: { _, _, _ in }
+        ), providerBindingService: h.host.providerBindingService)
+        try queueSteer("refused C", in: session, service: service)
+        let acceptedC = await service.submitQueuedClaudeSteeringIfSupported(session: session)
+        XCTAssertTrue(acceptedC)
+        XCTAssertTrue(
+            session.pendingClaudeSteeringInstructions.last?.supersedingProtectedTurnIDs.contains(providerID) == true,
+            "C claims U before B is accepted"
+        )
+        sendGate.open()
+        await until("B registers and C waits before interrupt") {
+            preparationGate.isWaiting && !session.claudeExpectedTurnIDs.subtracting([providerID]).isEmpty
+        }
+        let replacementID = try XCTUnwrap(session.claudeExpectedTurnIDs.subtracting([providerID]).first)
+        XCTAssertTrue(session.claudeSupersedingProtectedTurnIDs.contains(replacementID))
+        await controller.emit(.turnsCompleted(turnIDs: [providerID], status: .cancelled))
+        await controller.emit(.turnsCompleted(turnIDs: [replacementID], status: .completed))
+        await until("U and B results are consumed") { session.claudeExpectedTurnIDs.isEmpty }
+        await controller.setTurnInFlight(false)
+        preparationGate.open()
+        await until("refused C releases only B") { session.runState == .completed && session.agentTask == nil }
+        XCTAssertEqual(session.lastTerminalCommitRevision?.terminalState, .completed)
+        let sentCount = await controller.sentCount
+        XCTAssertEqual(sentCount, 2, "Only A and B were written")
+        await h.host.claudeCoordinator.shutdownClaudeSession(session)
     }
 
     func testProviderStartAfterReplacementWriteSurvivesDeferredCompletion() async throws {

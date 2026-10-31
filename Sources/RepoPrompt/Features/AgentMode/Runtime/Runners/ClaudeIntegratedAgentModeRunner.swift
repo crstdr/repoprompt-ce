@@ -537,7 +537,14 @@ final class ClaudeIntegratedAgentModeRunner {
             }
         }
 
-        var completedProtectedIDs: Set<UUID> = []
+        func strongest(_ current: ClaudeNativeProcessSessionController.TurnStatus, _ next: ClaudeNativeProcessSessionController.TurnStatus) -> ClaudeNativeProcessSessionController.TurnStatus {
+            switch (current, next) {
+            case (.failed, _), (_, .failed): .failed
+            case (.cancelled, _), (_, .cancelled): .cancelled
+            default: .completed
+            }
+        }
+        var completedProtectedStatuses: [UUID: ClaudeNativeProcessSessionController.TurnStatus] = [:]
         var abandonedProtectedIDs: Set<UUID> = []
         eventLoop: while let item = await next() {
             guard session.runID == runID,
@@ -559,9 +566,14 @@ final class ClaudeIntegratedAgentModeRunner {
             case let .steeringReleased(ids, inputWasAttempted):
                 if inputWasAttempted { return .failed(errorText: nil, shouldShutdownSession: true) }
                 abandonedProtectedIDs.formUnion(ids)
+                for id in ids {
+                    if let status = completedProtectedStatuses[id] {
+                        unprotectedTurnStatus = strongest(unprotectedTurnStatus, status)
+                    }
+                }
                 fallthrough
             case .settlementRecheck:
-                if !completedProtectedIDs.isDisjoint(with: abandonedProtectedIDs),
+                if abandonedProtectedIDs.contains(where: { completedProtectedStatuses[$0] != nil }),
                    session.claudeExpectedTurnIDs.isEmpty, session.pendingClaudeSteeringInstructions.isEmpty,
                    session.claudeSteeringFlushTask == nil
                 {
@@ -574,16 +586,14 @@ final class ClaudeIntegratedAgentModeRunner {
                 continue eventLoop
             }
             if let knownHostIDs = hostIDsAtFirstSuccessor {
-                let activeHostIDs = session.claudeExpectedTurnIDs
-                    .subtracting(session.claudeSupersedingProtectedTurnIDs)
-                    .subtracting(session.claudeLiveSuccessorTurnIDs)
+                let activeHostIDs = session.claudeAcceptedHostTurnIDs
                 if !activeHostIDs.subtracting(knownHostIDs).isEmpty {
                     // A newly registered host input supersedes earlier provider work, not later starts.
                     session.claudeLiveSuccessorTurnIDs.removeAll()
                     hostIDsAtFirstSuccessor = activeHostIDs
                     answeredUnprotected = false
                     unprotectedTurnStatus = .completed
-                    completedProtectedIDs.removeAll()
+                    completedProtectedStatuses.removeAll()
                     abandonedProtectedIDs.removeAll()
                 }
             }
@@ -597,7 +607,7 @@ final class ClaudeIntegratedAgentModeRunner {
                     session.pendingSupersedingTurnCompletions += 1
                     if hasLivePredecessor {
                         if hostIDsAtFirstSuccessor == nil {
-                            hostIDsAtFirstSuccessor = session.claudeExpectedTurnIDs.subtracting(session.claudeSupersedingProtectedTurnIDs)
+                            hostIDsAtFirstSuccessor = session.claudeAcceptedHostTurnIDs
                         }
                         session.claudeLiveSuccessorTurnIDs.insert(id)
                     }
@@ -652,7 +662,6 @@ final class ClaudeIntegratedAgentModeRunner {
                 case let .turnsCompleted(group, status): (ids, turnStatus, keyed) = (group, status, true)
                 default: preconditionFailure("Expected Claude completion")
                 }
-                let hasOutstandingHostInput = !session.claudeExpectedTurnIDs.subtracting(session.claudeSupersedingProtectedTurnIDs).isEmpty
                 let protectedIDs = Set(ids).intersection(session.claudeExpectedTurnIDs).intersection(session.claudeSupersedingProtectedTurnIDs)
                 let answersSuccessor = !session.claudeLiveSuccessorTurnIDs.isDisjoint(with: ids)
                 guard let settlement = Self.settleCompletedTurnIDsWithProtection(
@@ -663,26 +672,17 @@ final class ClaudeIntegratedAgentModeRunner {
                     continue eventLoop
                 }
                 session.claudeLiveSuccessorTurnIDs.subtract(ids)
-                completedProtectedIDs.formUnion(protectedIDs)
+                for id in protectedIDs {
+                    completedProtectedStatuses[id] = turnStatus
+                }
                 if settlement.answeredUnprotected {
                     answeredUnprotected = true
                 }
-                if settlement.answeredUnprotected || answersSuccessor
-                    || (
-                        !protectedIDs.isEmpty && !hasOutstandingHostInput
-                            && (!session.pendingClaudeSteeringInstructions.isEmpty || session.claudeSteeringFlushTask != nil)
-                    )
-                {
+                if settlement.answeredUnprotected || answersSuccessor {
                     if hostIDsAtFirstSuccessor == nil, !protectedIDs.isEmpty {
-                        hostIDsAtFirstSuccessor = session.claudeExpectedTurnIDs
-                            .subtracting(session.claudeSupersedingProtectedTurnIDs)
-                            .subtracting(session.claudeLiveSuccessorTurnIDs)
+                        hostIDsAtFirstSuccessor = session.claudeAcceptedHostTurnIDs
                     }
-                    switch (unprotectedTurnStatus, turnStatus) {
-                    case (.failed, _), (_, .failed): unprotectedTurnStatus = .failed
-                    case (.cancelled, _), (_, .cancelled): unprotectedTurnStatus = .cancelled
-                    default: unprotectedTurnStatus = .completed
-                    }
+                    unprotectedTurnStatus = strongest(unprotectedTurnStatus, turnStatus)
                 }
                 if !settlement.terminal {
                     if !session.runState.isActive { session.runState = .running }

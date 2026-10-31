@@ -1780,7 +1780,7 @@ final class ClaudeAgentModeCoordinator {
                         }
                         return .superseded
                     }
-                    session.claudeExpectedTurnIDs.insert(turnID)
+                    session.acceptClaudeHostTurn(turnID)
                     return .sent
                 } catch {
                     guard intentIsCurrent(intent, for: session),
@@ -1827,7 +1827,7 @@ final class ClaudeAgentModeCoordinator {
                     guard intentIsCurrent(intent, for: session),
                           sessionOwnsClaudeController(controller, for: session)
                     else { return .superseded }
-                    session.claudeExpectedTurnIDs.insert(turnID)
+                    session.acceptClaudeHostTurn(turnID)
                     return .sent
                 } catch {
                     state = session.selfCompactState
@@ -1948,7 +1948,7 @@ final class ClaudeAgentModeCoordinator {
                     }
                     return .superseded
                 }
-                session.claudeExpectedTurnIDs.insert(turnID)
+                session.acceptClaudeHostTurn(turnID)
                 return .sent
             } catch NativeAgentRuntimeControllerError.configurationNotCurrent,
                 NativeAgentRuntimeControllerError.cancelledBeforeWrite
