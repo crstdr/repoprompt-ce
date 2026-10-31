@@ -3204,8 +3204,11 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         await h.host.claudeCoordinator.shutdownClaudeSession(session)
     }
 
-    func testNoWriteSteerReleasesChainedProviderWorkWithoutHidingHostFailure() async throws {
-        for secondCompletesBeforeRefusal in [true, false] {
+    func testNoWriteSteerReleasesChainedProviderWorkWithHostOutcome() async throws {
+        let cases: [(ClaudeNativeProcessSessionController.TurnStatus, Bool)] = [
+            (.failed, true), (.failed, false), (.completed, true), (.completed, false)
+        ]
+        for (hostStatus, secondCompletesBeforeRefusal) in cases {
             let (h, session, controller, _) = try await spyFixture()
             let row = AgentChatItem.user("host A", sequenceIndex: session.nextSequenceIndex)
             session.appendItem(row)
@@ -3219,8 +3222,8 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
             let firstProviderID = UUID()
             let secondProviderID = UUID()
             await controller.emit(.providerTurnStarted(turnID: firstProviderID))
-            await controller.emit(.turnsCompleted(turnIDs: [hostID], status: .failed))
-            await until("failed host answer is retained") { !session.claudeExpectedTurnIDs.contains(hostID) }
+            await controller.emit(.turnsCompleted(turnIDs: [hostID], status: hostStatus))
+            await until("host answer is retained") { !session.claudeExpectedTurnIDs.contains(hostID) }
             XCTAssertTrue(session.runState.isActive)
             let gate = Gate()
             h.host.claudeCoordinator.installHostCapabilities(.init(
@@ -3253,7 +3256,8 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
                 }
                 await controller.emit(.turnsCompleted(turnIDs: [secondProviderID], status: .completed))
             }
-            await until("host failure remains authoritative") { session.runState == .failed && session.agentTask == nil }
+            let expectedState: AgentSessionRunState = hostStatus == .failed ? .failed : .completed
+            await until("host outcome remains authoritative") { session.runState == expectedState && session.agentTask == nil }
             let sentCount = await controller.sentCount
             XCTAssertEqual(sentCount, 1, "Only the original host input reached the controller")
             await h.host.claudeCoordinator.shutdownClaudeSession(session)
