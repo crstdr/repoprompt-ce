@@ -81,13 +81,14 @@ actor DirectHeadlessOracleAdapter {
     }
 
     private enum Route {
-        case direct(modelID: String, implicitConversationID: UUID?)
+        case direct(modelID: String, conversationID: UUID?)
         case startGroup(group: OracleGroupDescriptor, roster: OracleRoster, members: [OracleGroupMember])
         case continueGroup(groupID: OracleGroupID, expectedRevision: UInt64, roster: OracleRoster)
     }
 
     enum PreparedRoute {
-        case direct(modelID: String, implicitConversationID: UUID?)
+        /// A nil ID starts a chat; otherwise continue the direct conversation selected during preparation.
+        case direct(modelID: String, conversationID: UUID?)
         case group
     }
 
@@ -147,10 +148,10 @@ actor DirectHeadlessOracleAdapter {
         }
         guard plan.claimID != nil else {
             plansByInvocationID.removeValue(forKey: invocationID)
-            guard case let .direct(modelID, implicitConversationID) = plan.route else {
+            guard case let .direct(modelID, conversationID) = plan.route else {
                 throw AdapterError.missingPreparedInvocation
             }
-            return .direct(modelID: modelID, implicitConversationID: implicitConversationID)
+            return .direct(modelID: modelID, conversationID: conversationID)
         }
         return .group
     }
@@ -339,7 +340,7 @@ actor DirectHeadlessOracleAdapter {
                     runID: runID,
                     claimID: nil,
                     input: input,
-                    route: .direct(modelID: roster.primary.modelID, implicitConversationID: nil),
+                    route: .direct(modelID: roster.primary.modelID, conversationID: nil),
                     childLaunchPlan: childPlan
                 )
             }
@@ -376,6 +377,11 @@ actor DirectHeadlessOracleAdapter {
                     input: input
                 )
             }
+            guard let conversationID = UUID(uuidString: chatID),
+                  await provider.conversationReference(id: conversationID) != nil
+            else {
+                throw MCPError.invalidParams("Unknown direct Oracle chat_id. Use a direct-conversation chat_id or set new_chat=true.")
+            }
             let configured = try await rosterResolver.resolveRoster(for: OracleRosterResolutionRequest(newChat: false))
             let directRoster = try OracleRoster(primary: configured.primary)
             try await provider.validateOracleRoster(directRoster)
@@ -385,7 +391,7 @@ actor DirectHeadlessOracleAdapter {
                 runID: runID,
                 claimID: nil,
                 input: input,
-                route: .direct(modelID: directRoster.primary.modelID, implicitConversationID: nil),
+                route: .direct(modelID: directRoster.primary.modelID, conversationID: conversationID),
                 childLaunchPlan: childPlan
             )
 
@@ -411,7 +417,7 @@ actor DirectHeadlessOracleAdapter {
                 input: input,
                 route: .direct(
                     modelID: directRoster.primary.modelID,
-                    implicitConversationID: latestDirect?.id
+                    conversationID: latestDirect?.id
                 ),
                 childLaunchPlan: Self.childPlan(runID: runID, roster: directRoster)
             )

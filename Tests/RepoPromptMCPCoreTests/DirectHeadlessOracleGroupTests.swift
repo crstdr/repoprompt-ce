@@ -152,6 +152,64 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
         XCTAssertEqual(context["response"] as? String, "response-0-default")
     }
 
+    func testAskOracleDirectChatIDContinuesHistoryAndRejectsUnknownIDs() async throws {
+        let fixture = try Fixture(name: "ask-direct-continuation")
+        defer { fixture.cleanup() }
+        let service = fixture.service()
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        let backend = DirectHeadlessConversationBackend(
+            providerCoordinator: prepared.providerCoordinator,
+            oracleAdapter: prepared.oracleAdapter
+        )
+        let started = try await invoke(
+            prepared: prepared, backend: backend, toolName: "ask_oracle",
+            arguments: ["message": .string("first turn"), "additional_oracles": .array([])]
+        )
+        let chatID = try XCTUnwrap(started["chat_id"] as? String)
+        let id = try XCTUnwrap(UUID(uuidString: chatID))
+        let continued = try await invoke(
+            prepared: prepared, backend: backend, toolName: "ask_oracle",
+            arguments: ["message": .string("second turn"), "chat_id": .string(" \(chatID) ")]
+        )
+        XCTAssertEqual(continued["chat_id"] as? String, chatID)
+        let log = try await Self.object(prepared.providerCoordinator.conversationLog(id: id, limit: 8))
+        let messages = try XCTUnwrap(log["messages"] as? [[String: Any]])
+        XCTAssertEqual(messages.compactMap { $0["text"] as? String }, [
+            "first turn", "response-0-default", "second turn", "response-0-default"
+        ])
+        let latest = await prepared.providerCoordinator.latestConversationReference()
+        XCTAssertEqual(latest?.id, id)
+        XCTAssertEqual(try fixture.calls().count, 2)
+        for invalidID in ["not-a-uuid", UUID().uuidString] {
+            do {
+                _ = try await invoke(
+                    prepared: prepared, backend: backend, toolName: "ask_oracle",
+                    arguments: ["message": .string("must not dispatch"), "chat_id": .string(invalidID)]
+                )
+                XCTFail("Expected unknown direct conversation refusal")
+            } catch {
+                guard case let MCPError.invalidParams(message) = error else {
+                    return XCTFail("Unexpected error: \(error)")
+                }
+                XCTAssertEqual(message, "Unknown direct Oracle chat_id. Use a direct-conversation chat_id or set new_chat=true.")
+            }
+        }
+        XCTAssertEqual(try fixture.calls().count, 2)
+        let forced = try await invoke(
+            prepared: prepared, backend: backend, toolName: "ask_oracle",
+            arguments: ["message": .string("forced start"), "chat_id": .string(chatID), "new_chat": .bool(true)]
+        )
+        XCTAssertNotEqual(forced["chat_id"] as? String, chatID)
+        let fresh = try await invoke(
+            prepared: prepared, backend: backend, toolName: "ask_oracle",
+            arguments: ["message": .string("message-only start")]
+        )
+        XCTAssertNotEqual(fresh["chat_id"] as? String, forced["chat_id"] as? String)
+        XCTAssertNotEqual(fresh["chat_id"] as? String, chatID)
+        XCTAssertEqual(try fixture.calls().count, 4)
+    }
+
     func testContextBuilderRejectsOraclePresetBeforeProviderWork() async throws {
         let fixture = try Fixture(name: "app-only-oracle-preset")
         defer { fixture.cleanup() }
