@@ -3306,8 +3306,8 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
     }
 
     func testLargeSavedTranscriptDoesNotMultiplyLiveRoutingWork() async throws {
-        // Untimed setup follows a growing live session: compact each bounded batch using
-        // the real compactor, retaining its durable prefix and small working suffix.
+        // Seed the retention tiers left by live compaction, then let the real compactor
+        // trim and normalize once. Replaying every intermediate compaction is quadratic.
         let setupStarted = ContinuousClock.now
         var history = AgentTranscript.empty
         for index in stride(from: 0, to: 20000, by: 2) {
@@ -3317,14 +3317,19 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
                 policy: .liveSession(hidePendingQuestionToolCall: false)
             ).turns
             history.nextSequenceIndex = index + 2
-            if (index + 2).isMultiple(of: 64) || index == 19998 {
-                history = AgentTranscriptCompactor.compact(history, mode: .recomputeAll)
-            }
         }
+        // Keep 34 summary turns plus the final full turn, matching the measured live
+        // fixture's 9,999 frozen turns, 2 working rows, and 70 working units.
+        for index in history.turns.indices.dropLast() {
+            history.turns[index].retentionTier = index < 9965 ? .archived : .summary
+        }
+        history = AgentTranscriptCompactor.compact(history, mode: .recomputeAll)
         XCTAssertEqual(history.nextSequenceIndex, 20000)
-        XCTAssertLessThanOrEqual(AgentTranscriptCompactor.estimatedWorkingUnitCount(for: history), AgentTranscriptCompactor.hardMaxWorkingUnitCount)
-        XCTAssertGreaterThan(history.compactionFrontier?.frozenPrefixTurnCount ?? 0, 0)
-        print("C2 compacted setup=\(setupStarted.duration(to: .now)) seededItems=20000 turns=\(history.turns.count) workingRows=\(AgentTranscriptIO.workingSourceItems(from: history).count)")
+        XCTAssertEqual(history.turns.count, 10000)
+        XCTAssertEqual(AgentTranscriptIO.workingSourceItems(from: history).count, 2)
+        XCTAssertEqual(history.compactionFrontier?.frozenPrefixTurnCount, 9999)
+        XCTAssertEqual(AgentTranscriptCompactor.estimatedWorkingUnitCount(for: history), 70)
+        print("C2 compacted setup=\(setupStarted.duration(to: .now)) seededItems=20000 turns=\(history.turns.count) workingRows=\(AgentTranscriptIO.workingSourceItems(from: history).count) frozenPrefix=\(history.compactionFrontier?.frozenPrefixTurnCount ?? 0) workingUnits=\(AgentTranscriptCompactor.estimatedWorkingUnitCount(for: history))")
         AgentTranscriptDebugInstrumentation.configure(.init(refreshAttemptHandler: { metrics in
             print("C2 refresh tab=\(metrics.tabID) state=\(metrics.runState) path=\(metrics.incrementalPath)")
         }))
