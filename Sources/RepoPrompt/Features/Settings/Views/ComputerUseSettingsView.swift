@@ -90,12 +90,12 @@ struct ComputerUseSettingsView: View {
                 Text("Terra High recommended; Sol High for tasks that need deeper reasoning")
             }
             Section("Where it can run") {
-                Toggle("Codex chats — directly, after /computer-use in the chat", isOn: Binding(
+                Toggle("Codex chats", isOn: Binding(
                     // Display the remembered legacy/environment row even while the master vetoes execution.
                     get: { CodexComputerUseWorkflow.isEnabled(persistedValue: preferences?.codexComputerUseEnabled, master: nil) },
                     set: onDirectChange
                 ))
-                Toggle("Other chats (Claude, Devin, …) — through a \"Computer Use\" subagent, after \"Allow Computer Use\" in that chat", isOn: Binding(
+                Toggle("Other chats (Claude, Devin, …) — through a \"Computer Use\" subagent", isOn: Binding(
                     get: { preferences?.computerUseSubagentEnabled ?? false },
                     set: { value in settings.updateAgentModeScalar(commit: true) { $0.computerUseSubagentEnabled = value } }
                 ))
@@ -103,6 +103,16 @@ struct ComputerUseSettingsView: View {
             .disabled(!settings.computerUseMasterEnabled)
         }
         .formStyle(.grouped)
+        .safeAreaInset(edge: .bottom, alignment: .leading) {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "info.circle")
+                Text("Computer Use needs to be enabled for each chat by typing /computer-use or clicking the \(Image(systemName: "desktopcomputer")) icon.")
+            }
+            .font(.footnote)
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 20)
+            .padding(.vertical, 12)
+        }
         .task {
             let selection = CodexRuntimePreferences.activeSelection
             await availability.refresh {
