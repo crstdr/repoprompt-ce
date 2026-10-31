@@ -3663,6 +3663,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 flushPendingAssistantDelta: { [weak self] session in
                     self?.flushPendingAssistantDelta(session)
                 },
+                beginClaudeProviderOutputSegment: { [weak self] session in
+                    self?.flushPendingAssistantDelta(session)
+                    self?.endActiveAssistantSegment(session)
+                },
                 clearPendingAssistantDelta: { [weak self] session in
                     self?.clearPendingAssistantDelta(session)
                 }
@@ -22896,14 +22900,19 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 // very last item if system events (e.g. rate-limit telemetry) were
                 // interleaved, which can prematurely finalize the streaming segment.
                 // Walk past system items but stop at tool calls, user messages, etc.
+                let attemptStartKey = session.quietLedger.startKey(owner: owner) ?? session.nextSequenceIndex
+                let providerStartKey = session.claudeProviderOutputBoundary.flatMap { $0.attemptID == owner.attemptID ? $0.startSequenceIndex : nil }
+                let outputStartKey = max(attemptStartKey, providerStartKey ?? attemptStartKey)
                 let tailAssistantIndex: Int? = {
-                    if let streamingAssistantIndex = self.resumableStreamingAssistantIndexAcrossTrailingUserInterjections(in: session) {
+                    if let streamingAssistantIndex = self.resumableStreamingAssistantIndexAcrossTrailingUserInterjections(in: session),
+                       session.items[streamingAssistantIndex].sequenceIndex >= outputStartKey
+                    {
                         return streamingAssistantIndex
                     }
                     for i in session.items.indices.reversed() {
                         switch session.items[i].kind {
                         case .assistant:
-                            return i
+                            return session.items[i].sequenceIndex >= outputStartKey ? i : nil
                         case .system:
                             continue
                         default:

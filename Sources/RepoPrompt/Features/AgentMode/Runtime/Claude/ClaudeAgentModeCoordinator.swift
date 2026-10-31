@@ -1806,7 +1806,7 @@ final class ClaudeAgentModeCoordinator {
                         }
                         return .supersededAfterWriteAttempt
                     }
-                    session.claudeExpectedTurnIDs.insert(turnID)
+                    session.acceptClaudeHostTurn(turnID)
                     return .sent
                 } catch {
                     guard intentIsCurrent(intent, for: session),
@@ -1854,7 +1854,7 @@ final class ClaudeAgentModeCoordinator {
                     guard intentIsCurrent(intent, for: session),
                           sessionOwnsClaudeController(controller, for: session)
                     else { return .supersededAfterWriteAttempt }
-                    session.claudeExpectedTurnIDs.insert(turnID)
+                    session.acceptClaudeHostTurn(turnID)
                     return .sent
                 } catch {
                     state = session.selfCompactState
@@ -1976,7 +1976,7 @@ final class ClaudeAgentModeCoordinator {
                     }
                     return .supersededAfterWriteAttempt
                 }
-                session.claudeExpectedTurnIDs.insert(turnID)
+                session.acceptClaudeHostTurn(turnID)
                 return .sent
             } catch NativeAgentRuntimeControllerError.configurationNotCurrent,
                 NativeAgentRuntimeControllerError.cancelledBeforeWrite
@@ -2126,6 +2126,12 @@ final class ClaudeAgentModeCoordinator {
         var permissionIDs = controllerListeners[session.tabID]?.pendingApprovalIDs ?? []
         if let approval = session.pendingApproval, case let .claudeControl(id) = approval.requestID {
             session.pendingApproval = nil
+            if session.runState == .waitingForApproval {
+                session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
+                session.setRunningStatus("Thinking…", source: .transport)
+                session.runState = .running
+                hostCapabilities.requestUIRefresh(session, true)
+            }
             if !permissionIDs.contains(id) { permissionIDs.append(id) }
         }
         for id in permissionIDs {

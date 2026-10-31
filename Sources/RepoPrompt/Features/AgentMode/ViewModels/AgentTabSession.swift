@@ -276,6 +276,25 @@ final class AgentTabSession: ObservableObject {
     }
 
     var claudeTerminalAnchor: (AgentRunOwnership, AgentRunTerminalCommitBarrier.TerminalAnchor)?
+    /// A provider execution that starts after host input owns a fresh assistant segment,
+    /// even when its deferred predecessor keeps the same run attempt alive.
+    var claudeProviderOutputBoundary: (attemptID: UUID, startSequenceIndex: Int)?
+    /// Provider starts already consumed by the current attempt that still need a terminal owner.
+    var claudeLiveSuccessorTurnIDs: Set<UUID> = []
+    /// Host inputs accepted by Claude for this attempt, regardless of later steer protection.
+    var claudeAcceptedHostTurnIDs: Set<UUID> = []
+
+    func acceptClaudeHostTurn(_ turnID: UUID) {
+        claudeExpectedTurnIDs.insert(turnID)
+        claudeAcceptedHostTurnIDs.insert(turnID)
+        let supersededProviderIDs = claudeLiveSuccessorTurnIDs
+        for index in pendingClaudeSteeringInstructions.indices
+            where pendingClaudeSteeringInstructions[index].targetRunAttemptID == activeRunAttemptID
+        {
+            pendingClaudeSteeringInstructions[index].supersedingProtectedTurnIDs.subtract(supersededProviderIDs)
+        }
+        claudeLiveSuccessorTurnIDs.removeAll()
+    }
 
     func terminalAnchor(for ownership: AgentRunOwnership) -> AgentRunTerminalCommitBarrier.TerminalAnchor {
         claudeTerminalAnchor.flatMap { $0.0 == ownership ? $0.1 : nil } ?? .automatic
@@ -2139,6 +2158,9 @@ final class AgentTabSession: ObservableObject {
 
     @discardableResult
     func beginRunAttempt(source: String, attemptID: UUID = UUID()) -> AgentRunOwnership {
+        claudeProviderOutputBoundary = nil
+        claudeLiveSuccessorTurnIDs.removeAll()
+        claudeAcceptedHostTurnIDs.removeAll()
         let baseline = currentQuietBaseline()
         // Host-specific responsibilities stay here: Codex routing resets and
         // exactly-once MCP prepared-epoch consumption. The neutral attempt

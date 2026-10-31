@@ -200,6 +200,15 @@ final class AgentSessionLinkRunnerHarness {
                     if let host = harnessBox?.nativeTranscriptHost { host.flushPendingAssistantDelta(session) }
                     else if replayTranscript { harnessBox?.host.flushPendingAssistantDelta(session) }
                 },
+                beginClaudeProviderOutputSegment: { session in
+                    if let host = harnessBox?.nativeTranscriptHost {
+                        host.flushPendingAssistantDelta(session)
+                        host.endActiveAssistantSegment(session)
+                    } else if replayTranscript {
+                        harnessBox?.host.flushPendingAssistantDelta(session)
+                        harnessBox?.host.endActiveAssistantSegment(session)
+                    }
+                },
                 clearPendingAssistantDelta: { _ in }
             ),
             providerInput: .init(
