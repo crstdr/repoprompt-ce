@@ -276,6 +276,9 @@ final class AgentTabSession: ObservableObject {
     }
 
     var claudeTerminalAnchor: (AgentRunOwnership, AgentRunTerminalCommitBarrier.TerminalAnchor)?
+    /// A provider execution that starts after host input owns a fresh assistant segment,
+    /// even when its deferred predecessor keeps the same run attempt alive.
+    var claudeProviderOutputBoundary: (attemptID: UUID, startSequenceIndex: Int)?
 
     func terminalAnchor(for ownership: AgentRunOwnership) -> AgentRunTerminalCommitBarrier.TerminalAnchor {
         claudeTerminalAnchor.flatMap { $0.0 == ownership ? $0.1 : nil } ?? .automatic
@@ -2139,6 +2142,7 @@ final class AgentTabSession: ObservableObject {
 
     @discardableResult
     func beginRunAttempt(source: String, attemptID: UUID = UUID()) -> AgentRunOwnership {
+        claudeProviderOutputBoundary = nil
         let baseline = currentQuietBaseline()
         // Host-specific responsibilities stay here: Codex routing resets and
         // exactly-once MCP prepared-epoch consumption. The neutral attempt
