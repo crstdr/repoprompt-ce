@@ -245,7 +245,7 @@ struct SettingsView: View {
             // Overview (formerly "Behavior") is the top-level entry point that
             // deep-links into each of the other Agent Mode settings surfaces, so
             // it sits first in the sidebar.
-            [.agentMode, .cliProviders, .agentModels, .agentPermissions, .agentWorkflows, .modelRouter, .contextBuilder]
+            [.agentMode, .cliProviders, .agentModels, .agentPermissions, .computerUse, .agentWorkflows, .modelRouter, .contextBuilder]
         case .mcp:
             [.mcp, .mcpTools, .permissions, .modelPresets]
         case .api:
@@ -290,6 +290,9 @@ struct SettingsView: View {
     @ViewBuilder
     private var contentView: some View {
         switch selectedTab {
+        case .computerUse:
+            let provider = makeAgentProviderPermissionsSettingsViewModel()
+            ComputerUseSettingsView(onDirectChange: { provider.applyCodexToolSettingMutation(.computerUse(enabled: $0)) })
         case .appearance:
             AppearanceSettingsView(promptViewModel: promptViewModel)
                 .transition(.opacity.animation(.easeInOut(duration: 0.15)))
@@ -565,6 +568,7 @@ enum TabSection: String, Identifiable {
 }
 
 enum SettingsTab: String, CaseIterable {
+    case computerUse
     case appearance
     case licenseUpdates
     case mcp
@@ -596,6 +600,7 @@ enum SettingsTab: String, CaseIterable {
 
     var title: String {
         switch self {
+        case .computerUse: "Computer Use"
         case .appearance: "Appearance"
         case .licenseUpdates: "Updates"
         case .mcp: "MCP Server"
@@ -629,6 +634,7 @@ enum SettingsTab: String, CaseIterable {
 
     var iconName: String {
         switch self {
+        case .computerUse: "desktopcomputer"
         case .appearance: "paintbrush"
         case .licenseUpdates: "arrow.down.circle"
         case .mcp: "server.rack"
@@ -663,7 +669,7 @@ enum SettingsTab: String, CaseIterable {
     var section: TabSection? {
         switch self {
         // Agent Mode — agent-first section
-        case .cliProviders,
+        case .computerUse, .cliProviders,
              .agentModels,
              .agentPermissions,
              .agentWorkflows,
@@ -696,6 +702,7 @@ enum SettingsTab: String, CaseIterable {
 
     var searchTags: [String] {
         switch self {
+        case .computerUse: ["desktop", "Codex", "companion", "computer use"]
         case .appearance:
             [
                 "appearance",

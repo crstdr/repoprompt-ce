@@ -55,13 +55,13 @@ private enum CodexNativeFeatureGate: Hashable {
         isEnabled(persistedValue: Optional(persistedValue))
     }
 
-    func isEnabled(persistedValue: Bool?) -> Bool {
+    func isEnabled(persistedValue: Bool?, environment: [String: String] = ProcessInfo.processInfo.environment) -> Bool {
         #if DEBUG
             if let override = testingOverride {
                 return override
             }
         #endif
-        return (persistedValue ?? defaultPersistedValue) || environmentFlagEnabled
+        return (persistedValue ?? defaultPersistedValue) || environmentFlagEnabled(environment)
     }
 
     func setEnabled(_ value: Bool, defaults: UserDefaults) {
@@ -86,8 +86,8 @@ private enum CodexNativeFeatureGate: Hashable {
         }
     #endif
 
-    private var environmentFlagEnabled: Bool {
-        let rawValue = ProcessInfo.processInfo.environment[environmentKey]?
+    private func environmentFlagEnabled(_ environment: [String: String]) -> Bool {
+        let rawValue = environment[environmentKey]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
         return rawValue.map { Self.enabledEnvironmentValues.contains($0) } ?? false
@@ -236,15 +236,27 @@ enum CodexComputerUseWorkflow {
         GlobalSettingsStore.shared.codexComputerUseEnabled()
     }
 
+    @MainActor
     static func isEnabled(defaults: UserDefaults) -> Bool {
-        CodexNativeFeatureGate.computerUse.isEnabled(defaults: defaults)
+        if defaults === UserDefaults.standard {
+            return isEnabled
+        }
+        return isEnabled(
+            persistedValue: defaults.object(forKey: "enableCodexComputerUse") as? Bool,
+            master: defaults.object(forKey: ComputerUsePolicy.masterDefaultsKey) as? Bool
+        )
     }
 
-    static func isEnabled(persistedValue: Bool?) -> Bool {
-        CodexNativeFeatureGate.computerUse.isEnabled(persistedValue: persistedValue)
+    static func isEnabled(persistedValue: Bool?, master: Bool?, environment: [String: String] = ProcessInfo.processInfo.environment) -> Bool {
+        ComputerUsePolicy(master: master, legacyDirect: CodexNativeFeatureGate.computerUse.isEnabled(persistedValue: persistedValue, environment: environment)).direct
     }
 
+    @MainActor
     static func setEnabled(_ value: Bool, defaults: UserDefaults = .standard) {
+        if defaults === UserDefaults.standard {
+            GlobalSettingsStore.shared.setCodexComputerUseEnabled(value)
+            return
+        }
         let oldValue = isEnabled(defaults: defaults)
         CodexNativeFeatureGate.computerUse.setEnabled(value, defaults: defaults)
         postDidChangeIfNeeded(previousValue: oldValue, currentValue: isEnabled(defaults: defaults))

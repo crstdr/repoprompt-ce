@@ -3917,6 +3917,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ) async -> String? {
         guard sessions[session.tabID] === session, currentTabID == session.tabID,
               computerUseComposerProps(session: session).isVisible else { return CodexComputerUseWorkflow.ineligibleMessage }
+        guard GlobalSettingsStore.shared.computerUseMasterEnabled else {
+            NotificationCenter.default.post(name: .showComputerUseSettingsTab, object: nil, userInfo: ["windowID": windowID])
+            return CodexComputerUseWorkflow.disabledMessage
+        }
         if session.isCodexComputerUseArmed {
             return nil
         }
@@ -3937,6 +3941,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         func stillCurrent() -> Bool {
             !Task.isCancelled && sessions[session.tabID] === session && currentTabID == session.tabID
                 && session.codexComputerUseArmingRequestID == requestID
+                && GlobalSettingsStore.shared.computerUseMasterEnabled
                 && session.persistentSessionBindingIdentity == binding && session.bindingTransitionGeneration == generation
                 && computerUseComposerProps(session: session).isVisible
         }
