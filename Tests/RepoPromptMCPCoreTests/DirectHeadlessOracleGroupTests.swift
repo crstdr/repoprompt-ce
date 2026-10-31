@@ -1080,7 +1080,7 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
         XCTAssertEqual(try fixture.calls().count, 2)
     }
 
-    func testRosterConflictAndRawContextBuilderGateFailBeforeProviderDispatch() async throws {
+    func testFilteredStartPersistsRosterForContinuationAndRawContextBuilderGate() async throws {
         let fixture = try Fixture(name: "gates")
         defer { fixture.cleanup() }
         let service = fixture.service()
@@ -1105,29 +1105,41 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
         }
         XCTAssertEqual(try fixture.calls().count, 0)
 
-        _ = try await invoke(
+        try await Self.setRoster(prepared, primary: "lane-0", additional: ["lane-1", "lane-2"])
+        let started = try await invoke(
             prepared: prepared,
             backend: backend,
             toolName: "ask_oracle",
-            arguments: ["message": .string("start")]
+            arguments: ["message": .string("start"), "additional_oracles": .array([.string("lane-2")])]
         )
-        let callCount = try fixture.calls().count
-        _ = try await prepared.settingsStore.set(
-            key: OracleRosterContract.additionalSettingKey,
-            value: .stringArray(["changed"])
-        )
-        do {
-            _ = try await invoke(
-                prepared: prepared,
-                backend: backend,
-                toolName: "oracle_send",
-                arguments: ["message": .string("implicit conflict")]
-            )
-            XCTFail("Expected roster conflict")
-        } catch {
-            XCTAssertTrue(error.localizedDescription.contains("new_chat=true"), error.localizedDescription)
+        let chatID = try XCTUnwrap(started["chat_id"] as? String)
+        let owner = try OracleConversationOwner(kind: "direct-headless", identifier: fixture.profileName)
+        let stored = try await prepared.oracleStore.load(member: OracleMemberLookup(publicChatID: chatID), owner: owner)
+        XCTAssertEqual(stored?.roster.orderedModels.map(\.modelID), ["lane-0", "lane-2"])
+        for arguments: [String: Value] in [
+            ["message": .string("named follow-up"), "chat_id": .string(chatID)],
+            ["message": .string("implicit follow-up")]
+        ] {
+            let continued = try await invoke(prepared: prepared, backend: backend, toolName: "oracle_send", arguments: arguments)
+            XCTAssertEqual(continued["oracle_group_id"] as? String, started["oracle_group_id"] as? String)
+            XCTAssertEqual(continued["oracle_count"] as? Int, 2)
         }
-        XCTAssertEqual(try fixture.calls().count, callCount)
+        XCTAssertEqual(try fixture.calls().count, 6)
+        let reloaded = try await prepared.oracleStore.load(member: OracleMemberLookup(publicChatID: chatID), owner: owner)
+        XCTAssertEqual(reloaded?.roster, stored?.roster)
+        XCTAssertEqual(reloaded?.turns.count, 3)
+        let single = try await invoke(
+            prepared: prepared,
+            backend: backend,
+            toolName: "ask_oracle",
+            arguments: ["message": .string("primary only"), "additional_oracles": .array([])]
+        )
+        XCTAssertNil(single["oracle_group_id"])
+        XCTAssertEqual(try fixture.calls().count, 7)
+        XCTAssertNil(try fixture.calls().last?.groupID)
+        let singleChatID = try XCTUnwrap(single["chat_id"] as? String)
+        let singleGroup = try await prepared.oracleStore.load(member: OracleMemberLookup(publicChatID: singleChatID), owner: owner)
+        XCTAssertNil(singleGroup)
     }
 
     func testThreeOracleContextBuilderUsesOnePersistedCanonicalFrozenPack() async throws {

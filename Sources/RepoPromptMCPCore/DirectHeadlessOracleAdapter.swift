@@ -249,10 +249,12 @@ actor DirectHeadlessOracleAdapter {
         if OracleAttachmentContract.redactedArgumentKeys.contains(where: { arguments[$0] != nil }) {
             throw AdapterError.unsupportedAttachments
         }
+        let additionalOracles: [String]?
         let route: OracleConversationRoute
         let input: OracleInput
         let resolvedStartRoster: OracleRoster?
         if toolName == "context_builder" {
+            additionalOracles = nil
             let mode = try Self.contextBuilderMode(arguments["response_type"]?.stringValue)
             let roster = try await rosterResolver.resolveRoster(for: OracleRosterResolutionRequest(
                 primaryModelOverride: arguments["model"]?.stringValue,
@@ -303,6 +305,7 @@ actor DirectHeadlessOracleAdapter {
             route = .start(primaryModelOverride: arguments["model"]?.stringValue)
             resolvedStartRoster = roster
         } else {
+            additionalOracles = try OracleAdditionalOraclesContract.parseArguments(arguments)
             guard let message = arguments["message"]?.stringValue else {
                 throw MCPError.invalidParams("\(toolName) requires message")
             }
@@ -311,7 +314,8 @@ actor DirectHeadlessOracleAdapter {
                 chatID: arguments["chat_id"]?.stringValue,
                 newChat: arguments["new_chat"]?.boolValue == true,
                 modelOverride: arguments["model"]?.stringValue,
-                whenMissingChatID: toolName == "oracle_send" ? .continueCurrent : .startNew
+                whenMissingChatID: toolName == "oracle_send" ? .continueCurrent : .startNew,
+                additionalOracles: additionalOracles
             )
             resolvedStartRoster = nil
         }
@@ -323,7 +327,8 @@ actor DirectHeadlessOracleAdapter {
             } else {
                 try await rosterResolver.resolveRoster(for: OracleRosterResolutionRequest(
                     primaryModelOverride: primaryModelOverride,
-                    newChat: true
+                    newChat: true,
+                    additionalOracles: additionalOracles
                 ))
             }
             try await provider.validateOracleRoster(roster)
@@ -363,16 +368,15 @@ actor DirectHeadlessOracleAdapter {
             )
 
         case let .continuation(chatID):
-            let configured = try await rosterResolver.resolveRoster(for: OracleRosterResolutionRequest(newChat: false))
             if let group = try await store.load(member: OracleMemberLookup(publicChatID: chatID), owner: owner) {
                 return try await groupContinuationPlan(
                     group: group,
-                    configuredRoster: configured,
                     invocationID: invocationID,
                     runID: runID,
                     input: input
                 )
             }
+            let configured = try await rosterResolver.resolveRoster(for: OracleRosterResolutionRequest(newChat: false))
             let directRoster = try OracleRoster(primary: configured.primary)
             try await provider.validateOracleRoster(directRoster)
             let childPlan = try Self.childPlan(runID: runID, roster: directRoster)
@@ -386,19 +390,18 @@ actor DirectHeadlessOracleAdapter {
             )
 
         case .implicitContinuation:
-            let configured = try await rosterResolver.resolveRoster(for: OracleRosterResolutionRequest(newChat: false))
             let latestDirect = await provider.latestConversationReference()
             if case let .group(group)? = try await store.loadMostRecentConversation(owner: owner),
                Self.prefersGroup(group, overDirectUpdatedAt: latestDirect?.updatedAt)
             {
                 return try await groupContinuationPlan(
                     group: group,
-                    configuredRoster: configured,
                     invocationID: invocationID,
                     runID: runID,
                     input: input
                 )
             }
+            let configured = try await rosterResolver.resolveRoster(for: OracleRosterResolutionRequest(newChat: false))
             let directRoster = try OracleRoster(primary: configured.primary)
             try await provider.validateOracleRoster(directRoster)
             return try InvocationPlan(
@@ -424,12 +427,10 @@ actor DirectHeadlessOracleAdapter {
 
     private func groupContinuationPlan(
         group: OracleGroupDocument,
-        configuredRoster: OracleRoster,
         invocationID: UUID,
         runID: UUID,
         input: OracleInput
     ) async throws -> InvocationPlan {
-        guard configuredRoster == group.roster else { throw AdapterError.rosterConflict }
         try await provider.validateOracleRoster(group.roster)
         let claimID = UUID()
         let childPlan = try Self.childPlan(
