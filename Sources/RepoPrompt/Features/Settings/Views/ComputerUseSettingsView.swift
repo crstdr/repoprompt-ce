@@ -72,7 +72,6 @@ struct ComputerUseSettingsView: View {
                 Toggle("Enable Computer Use", isOn: Binding(
                     get: { settings.computerUseMasterEnabled }, set: { settings.setComputerUseMasterEnabled($0) }
                 ))
-                Text("Agents can use your desktop: Codex chats directly, other chats through their Computer Use subagent. Approvals are always answered by you.")
             }
             Section {
                 Picker("Provider", selection: .constant("codex")) { Text("Codex").tag("codex") }
