@@ -551,6 +551,17 @@ struct AgentRunMCPToolService {
 
     static func startExpirySnapshot(sessionID: UUID, agentModeVM: AgentModeViewModel) -> AgentRunMCPSnapshot {
         guard let live = agentModeVM.mcpSnapshot(sessionID: sessionID) else { return .expired(sessionID: sessionID) }
+        if let session = agentModeVM.mcpControlledSession(sessionID: sessionID),
+           let epoch = session.mcpControlContext?.currentEpoch
+        {
+            let ownership = session.runState.isActive
+                ? session.activeRunOwnership
+                : session.runLifecycle.lastTerminalCommitRevision?.ownership
+            // Preparation alone leaves prior-run IDs/text visible; only this turn's attempt owns them.
+            if ownership?.turnEpoch == epoch, live.runID != nil || !live.isStartupPendingForMCPWait {
+                return live
+            }
+        }
         return AgentRunMCPSnapshot(
             sessionID: live.sessionID, runID: nil, tabID: live.tabID, sessionName: live.sessionName,
             agentRaw: live.agentRaw, agentDisplayName: live.agentDisplayName, modelRaw: live.modelRaw,
