@@ -1492,7 +1492,7 @@ final class AgentModeRunService {
         admission: AgentRunCancellationAdmission
     ) -> Bool {
         guard admission.scope == .pendingStart, admission.claim(for: session) else { return false }
-        hooks.prepareForCancellation(session, .userStop, .explicitStop)
+        _ = hooks.prepareForCancellation(session, .userStop, .explicitStop)
         withdrawQueuedWorkForManagedStop(tabID: tabID, session: session)
         return true
     }
@@ -1538,7 +1538,7 @@ final class AgentModeRunService {
         }
         let withdrawingProviderAdoption = dependencies.claudeCoordinator.hasPendingProviderAdoption(for: session)
             && session.activeRunOwnership == nil
-        hooks.prepareForCancellation(session, intent, origin)
+        let providerTeardown = hooks.prepareForCancellation(session, intent, origin)
         if withdrawingProviderAdoption {
             if intent == .userStop, origin == .explicitStop {
                 withdrawQueuedWorkForManagedStop(tabID: tabID, session: session)
@@ -1551,6 +1551,7 @@ final class AgentModeRunService {
                     await terminalCommitBarrier.awaitTerminalTeardown(for: revision.ownership, lifecycle: session.runLifecycle)
                 }
             }
+            if completion == .terminalTeardownCompleted { await providerTeardown?() }
             return
         }
         if session.runState.isTerminalForCommit,
