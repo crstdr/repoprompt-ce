@@ -31,6 +31,7 @@ struct ACPModelParameterProbeView: View {
     let onSelect: (_ configID: String, _ valueRaw: String?) -> Void
 
     @State private var snapshot: OpenCodeACPModelParameterSnapshot?
+    @State private var devinParameterSet: ACPModelParameterSet?
     @State private var cursorRegistryRevision = 0
 
     private struct CursorObservationIdentity: Equatable {
@@ -86,6 +87,13 @@ struct ACPModelParameterProbeView: View {
                 providerID: .cursor, selectedModelRaw: modelRaw
             )?.definition(kind: .thinking)
         }
+        if providerID == .devin {
+            guard let devinParameterSet,
+                  ACPModelParameterIdentity.canonicalBaseModelRaw(devinParameterSet.baseModelRaw, providerID: .devin)
+                  == ACPModelParameterIdentity.canonicalBaseModelRaw(modelRaw, providerID: .devin)
+            else { return nil }
+            return devinParameterSet.definition(kind: .thinking)
+        }
         guard let snapshot, snapshot.key == probeKey,
               case let .available(parameterSet) = snapshot.state
         else { return nil }
@@ -133,6 +141,16 @@ struct ACPModelParameterProbeView: View {
                         guard !Task.isCancelled else { return }
                         snapshot = delivered
                     }
+                }
+                .task(id: "\(providerID.rawValue):\(modelRaw)") {
+                    devinParameterSet = nil
+                    guard providerID == .devin else { return }
+                    _ = await DevinModelDiscoveryService.shared.discoverIfNeeded()
+                    guard !Task.isCancelled else { return }
+                    devinParameterSet = ACPModelParameterResolver.parameterSet(
+                        providerID: .devin,
+                        selectedModelRaw: modelRaw
+                    )
                 }
 
             if definition != nil || pinnedValueRaw != nil {

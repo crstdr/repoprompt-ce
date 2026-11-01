@@ -118,7 +118,8 @@ final class ComputerUseChildProof: Equatable {
     }
 
     func acceptCreation() throws {
-        guard !retiring else { throw MCPError.invalidParams(Self.denied) }
+        guard !retiring || nativeAttemptID != nil else { throw MCPError.invalidParams(Self.denied) }
+        if let creationTarget { owner.mcpAcceptSessionTarget(creationTarget) }
         creationTarget = nil
     }
 
@@ -143,6 +144,8 @@ final class ComputerUseChildProof: Equatable {
     func claimNativeAttempt(_ session: AgentTabSession) -> Bool {
         guard permits(session), let attemptID = session.activeRunAttemptID else { return false }
         nativeAttemptID = attemptID
+        // Native admission ends provisional rollback ownership before dispatch can suspend.
+        try? acceptCreation()
         return true
     }
 
@@ -182,8 +185,9 @@ final class ComputerUseChildProof: Equatable {
     }
 
     @discardableResult
-    func producerSettled() -> Task<Void, Never>? {
+    func producerSettled(retireUnacceptedStart: Bool = false) -> Task<Void, Never>? {
         producerActive = false
+        if retireUnacceptedStart { retire() }
         if retiring {
             return finishRetirement()
         } else if child?.runState.isTerminalForCommit == true {

@@ -632,6 +632,21 @@ extension AgentModeViewModel {
             }
             switch route {
             case .idleFollowUp:
+                let switchPreparation: ProviderSwitchSendPreparation?
+                switch await providerSwitchSendAdmission(
+                    session: session, input: "", skipsAugmentation: true,
+                    supplementalInput: reservedClaim.fragment, autoWakeID: wakeID,
+                    isCurrent: { self.agentSessionLinkAutoWakeSession(for: endpoint) === session
+                        && session.oversight.pendingAutoWake?.wakeID == wakeID
+                        && self.agentSessionLinkAutoWakeRoute(session) == .idleFollowUp
+                    }
+                ) {
+                case let .success(preparation): switchPreparation = preparation
+                case .failure:
+                    abandonAgentSessionLinkPromptClaim(reservedClaim)
+                    cancelAgentSessionLinkAutoWake(for: endpoint, reason: .requiredClaimUnavailable)
+                    return
+                }
                 #if DEBUG
                     if test_beforeRoutineIdleFollowUpStart?(session, wakeID) == false {
                         agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: dispatchID)
@@ -642,7 +657,8 @@ extension AgentModeViewModel {
                 let startOutcome = await startAgentRun(
                     tabID: endpoint.tabID,
                     initialMessage: "",
-                    directStartOptions: startOptions
+                    directStartOptions: startOptions,
+                    providerSwitchPreparation: switchPreparation
                 )
                 if case .some(.queuedFallback) = startOutcome {
                     // Codex owns a durable queued submission. Keep the wake identity attached until
@@ -766,7 +782,7 @@ extension AgentModeViewModel {
     /// would otherwise take the ordinary-dispatch early return and turn a fenced lane update into an
     /// unfenced provider call with no claim, no provenance row, and no snooze/selection check.
     @discardableResult
-    func agentSessionLinkAcquirePhysicalDispatch(
+    func agentSessionLinkAcquireAutoWakePhysicalDispatch(
         for session: TabSession,
         dispatchID: AgentSessionLinkPromptDispatchID
     ) -> Bool {
@@ -1317,6 +1333,23 @@ extension AgentModeViewModel {
                 cancelAgentSessionLinkAutoWake(for: endpoint, reason: .eligibilityLost)
                 return
             }
+        }
+        // A .sending marker already owned by this live run means the handover is in flight on the
+        // very turn this continuation resumes; refusing here would deadlock the wake's own turn.
+        let switchInFlightOnActiveRun = session.pendingHandoff.providerSwitchDelivery == .sending
+            && session.runState.isActive && Self.providerSwitchHasOwnedCarryingAttempt(session)
+            && session.pendingHandoff.providerSwitchDispatch?.dispatchID != nil
+        if !switchInFlightOnActiveRun, case .failure = await providerSwitchSendAdmission(
+            session: session, input: claim.fragment, skipsAugmentation: true,
+            inputAlreadyIncludesSupplement: true,
+            isCurrent: { self.agentSessionLinkAutoWakeSession(for: endpoint) === session
+                && session.oversight.pendingAutoWake?.wakeID == wakeID
+                && self.agentSessionLinkAutoWakeRoute(session) == .waitingContinuation
+            }
+        ) {
+            abandonAgentSessionLinkPromptClaim(claim)
+            cancelAgentSessionLinkAutoWake(for: endpoint, reason: .requiredClaimUnavailable)
+            return
         }
         guard agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: claim.dispatchID) else {
             return
@@ -1881,7 +1914,10 @@ extension AgentModeViewModel {
         if let predicate = agentSessionLinkAutoWakeRouteRefusal(session) {
             if let refusalPhase {
                 // Closed predicate vocabulary and the existing phase only: no endpoint or content.
-                AgentSessionLinkAutoWakeDiagnostics.routeRefused(predicate: predicate, phase: refusalPhase)
+                AgentSessionLinkAutoWakeDiagnostics.routeRefused(observer: session.oversight.wakeDiagnosticObserver, predicate: predicate, phase: refusalPhase)
+                if predicate == .runStateIsActive {
+                    requestClaudeStaleActiveProbe(for: session)
+                }
             }
             return nil
         }

@@ -191,6 +191,7 @@ class TimingProtocolTests(unittest.TestCase):
                 (root / 'Package.swift').write_text('// fixture')
                 with mock.patch.object(ci_build, 'ROOT', root), \
                         mock.patch.object(ci_build, 'BASELINE', baseline), \
+                        mock.patch('ci_app_test_runner.read_inherited_storage_preference', return_value=None), \
                         mock.patch.dict('os.environ', {'TYPECHECK_RATCHET_ENFORCE': '1'}), \
                         mock.patch.object(ci_build.subprocess, 'Popen', return_value=process), \
                         mock.patch.object(ci_build.subprocess, 'run', side_effect=[

@@ -45,6 +45,7 @@ final class TaskLocalPayloadLayoutGuardTests: XCTestCase {
         "Sources/RepoPromptFileSystem/FileSystemRuntimeHooks.swift#currentContext":
             "struct of closures and an existential only; no Foundation or resilient fields",
         "Sources/RepoPromptDomainRuntime/MCPDomainProtectedMutationToolProvider.swift#observer": "closure",
+        "Sources/RepoPromptDomainRuntime/MCPDomainAgentRunStartExecutionScope.swift#current": "final class",
         "Sources/RepoPromptShared/ProviderProcessLaunchPolicy.swift#allowsLaunchForTesting": "Bool"
     ]
 

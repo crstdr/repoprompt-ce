@@ -54,7 +54,7 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
                 "ACP_BOOTSTRAP_UPDATE_PROBE": "1"
             ]
         )
-        let request = makeRunRequest(agentKind: .devin, workspacePath: workspace.path, resumeSessionID: resumeID)
+        let request = makeRunRequest(agentKind: .devin, workspacePath: workspace.path, resumeSessionID: resumeID, sessionModeID: "smart")
         let controller = try ACPAgentSessionController(
             provider: provider, runRequest: request,
             requestTimeouts: .init(bootstrapSeconds: 5, operationalSeconds: 5),
@@ -65,6 +65,7 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
             let bootstrap = try await controller.bootstrap()
             XCTAssertEqual(bootstrap.sessionID, "bootstrap-session-id")
             XCTAssertEqual(bootstrap.providerSessionIdentity.runtimeSessionID, "bootstrap-session-id")
+            try await controller.setSessionMode("smart")
             // This real prompt request can only run after bootstrap has installed sessionID.
             // Its fake response is preceded by foreign then current tagged known-kind updates.
             try await controller.prompt(AgentMessage(userMessage: "probe after bootstrap"), request: request)
@@ -397,7 +398,8 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
     private func makeRunRequest(
         agentKind: AgentProviderKind,
         workspacePath: String,
-        resumeSessionID: String? = nil
+        resumeSessionID: String? = nil,
+        sessionModeID: String? = nil
     ) -> ACPRunRequest {
         ACPRunRequest(
             agentKind: agentKind,
@@ -405,7 +407,8 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
             workspacePath: workspacePath,
             resumeSessionID: resumeSessionID,
             attachments: [],
-            taskLabelKind: nil
+            taskLabelKind: nil,
+            sessionModeID: sessionModeID
         )
     }
 
@@ -433,6 +436,13 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
                 return
             with open(record_path, "a", encoding="utf-8") as handle:
                 handle.write(json.dumps({"method": method, "params": params}) + "\n")
+
+        def session_result(session_id):
+            result = {"sessionId": session_id}
+            if os.environ.get("ACP_BOOTSTRAP_UPDATE_PROBE") == "1":
+                result["configOptions"] = [{"id": "mode", "category": "mode", "type": "select", "currentValue": "smart",
+                                            "options": [{"value": "smart", "name": "Smart"}]}]
+            return result
 
         def probe_update(session_id, text):
             print(json.dumps({"jsonrpc":"2.0", "method":"session/update", "params":{"sessionId":session_id, "update":{"sessionUpdate":"agent_message_chunk", "content":{"type":"text", "text":text}}}}), flush=True)
@@ -462,7 +472,7 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
                     probe_update(runtime_session_id, "before-new-reply")
                 if os.environ.get("ACP_COMMAND"):
                     print(json.dumps({"jsonrpc":"2.0", "method":"session/update", "params":{"sessionId":runtime_session_id, "update":{"sessionUpdate":"available_commands_update", "availableCommands":[{"name":os.environ["ACP_COMMAND"], "description":"command"}]}}}), flush=True)
-                respond(request.get("id"), {"sessionId": runtime_session_id})
+                respond(request.get("id"), session_result(runtime_session_id))
             elif method == "session/load":
                 session_id = params.get("sessionId")
                 if os.environ.get("ACP_BOOTSTRAP_UPDATE_PROBE") == "1":
@@ -471,7 +481,7 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
                     message = load_error_message or ("session not found: " + str(session_id))
                     respond(request.get("id"), error={"code": load_error_code, "message": message})
                 else:
-                    respond(request.get("id"), {"sessionId": session_id})
+                    respond(request.get("id"), session_result(session_id))
             elif method == "session/prompt":
                 if os.environ.get("ACP_BOOTSTRAP_UPDATE_PROBE") == "1":
                     probe_update("foreign-session-id", "foreign-after-open")

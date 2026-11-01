@@ -139,6 +139,7 @@
         "RepoPromptDomainRuntime",
         "RepoPromptMCPCore",
         "RepoPromptShared",
+        "RepoPromptTestSandboxPreflight",
         "RepoPromptTestSupport",
         "RepoPromptVCS"
       ]
@@ -246,6 +247,10 @@
       "source_root": "Sources/RepoPromptShared",
       "allowed_dependencies": []
     },
+    "RepoPromptTestSandboxPreflight": {
+      "source_root": "Tests/RepoPromptTestSandboxPreflight",
+      "allowed_dependencies": []
+    },
     "RepoPromptTestSupport": {
       "source_root": "Tests/RepoPromptTestSupport",
       "allowed_dependencies": []
@@ -267,6 +272,7 @@
         "RepoPromptSettingsCore",
         "RepoPromptProviderQuota",
         "RepoPromptShared",
+        "RepoPromptTestSandboxPreflight",
         "RepoPromptTestSupport",
         "RepoPromptWorkspaceCore"
       ]

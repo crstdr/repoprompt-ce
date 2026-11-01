@@ -37,6 +37,9 @@ final class AgentSessionLinkRunnerHarness {
     /// that suspension.
     var onTurnComplete: (() -> Void)?
     var onAttachmentsConsumed: (@MainActor () -> Void)?
+    var nativeTranscriptHost: AgentModeViewModel?
+    var onTerminalPublication: (@MainActor (AgentRunTerminalCommitRevision, AgentTabSession) -> Void)?
+    var onNativeStreamResult: (@MainActor (AIStreamResult, AgentTabSession, UUID, UUID) async -> Void)?
 
     /// Runs while the message is being built, i.e. the last synchronous MainActor point before the
     /// headless runner's lease `providerInitializationStarted` hop. A test uses it to enqueue a
@@ -86,6 +89,7 @@ final class AgentSessionLinkRunnerHarness {
         acpProviderFactory: @escaping AgentModeViewModel.ACPProviderFactory = { _, _ in nil },
         workspacePath: String = FileManager.default.currentDirectoryPath,
         sessionLinkHost: AgentModeViewModel? = nil,
+        awaitNoActiveMCPTools: @escaping (UUID) async throws -> Void = { _ in },
         replayTranscript: Bool = false,
         codexController: (any CodexSessionControlling)? = nil,
         claudeControllerFactory: ClaudeAgentModeCoordinator.ClaudeControllerFactory? = nil,
@@ -143,7 +147,7 @@ final class AgentSessionLinkRunnerHarness {
             },
             bindPendingOracleReviewContext: { _, _ in },
             cancelMCPToolsForRun: { _, _ in },
-            awaitNoActiveMCPTools: { _ in },
+            awaitNoActiveMCPTools: awaitNoActiveMCPTools,
             activeAgentRunWaitQuery: { _ in false },
             childAgentRunWaitDrainTimeoutSeconds: 0.01
         )
@@ -183,12 +187,28 @@ final class AgentSessionLinkRunnerHarness {
             ),
             transcript: .init(
                 handleHeadlessStreamResult: { result, session, runID, attemptID in
+                    await harnessBox?.onNativeStreamResult?(result, session, runID, attemptID)
                     if replayTranscript { await harnessBox?.host.test_handleStreamResult(result, session: session, runID: runID, runAttemptID: attemptID) }
                 },
-                finalizeStreamingItems: { session in if replayTranscript { harnessBox?.host.finalizeStreamingItems(in: session) } },
+                finalizeStreamingItems: { session in
+                    if let host = harnessBox?.nativeTranscriptHost { host.finalizeStreamingItems(in: session) }
+                    else if replayTranscript { harnessBox?.host.finalizeStreamingItems(in: session) }
+                },
                 finalizePendingToolCalls: { _, _ in },
                 finalizePendingToolCallsWithUpperBound: { _, _, _ in },
-                flushPendingAssistantDelta: { session in if replayTranscript { harnessBox?.host.flushPendingAssistantDelta(session) } },
+                flushPendingAssistantDelta: { session in
+                    if let host = harnessBox?.nativeTranscriptHost { host.flushPendingAssistantDelta(session) }
+                    else if replayTranscript { harnessBox?.host.flushPendingAssistantDelta(session) }
+                },
+                beginClaudeProviderOutputSegment: { session in
+                    if let host = harnessBox?.nativeTranscriptHost {
+                        host.flushPendingAssistantDelta(session)
+                        host.endActiveAssistantSegment(session)
+                    } else if replayTranscript {
+                        harnessBox?.host.flushPendingAssistantDelta(session)
+                        harnessBox?.host.endActiveAssistantSegment(session)
+                    }
+                },
                 clearPendingAssistantDelta: { _ in }
             ),
             providerInput: .init(
@@ -288,7 +308,10 @@ final class AgentSessionLinkRunnerHarness {
             terminalSettlement: .init(
                 prepareTerminalPublication: { _ in },
                 makeTerminalPublicationEnvelope: { _, _, _, _, _ in nil },
-                publishTerminalCommit: { _, _, _ in .accepted(successorEpoch: nil) }
+                publishTerminalCommit: { session, revision, _ in
+                    harnessBox?.onTerminalPublication?(revision, session)
+                    return .accepted(successorEpoch: nil)
+                }
             ),
             continuation: .init(
                 startFollowUpRun: { _, _ in },
@@ -366,10 +389,16 @@ final class AgentSessionLinkRunnerHarness {
         let session = host.session(for: tabID)
         session.selectedAgent = agent
         session.hasLoadedPersistedState = true
+        // This harness supplies an existing payload; allocation alone owns unfinished creation.
+        let sessionID = UUID()
         _ = try XCTUnwrap(host.test_installPersistentSessionBinding(
-            sessionID: UUID(), on: session, updateWorkspaceMetadata: true
+            sessionID: sessionID, on: session, updateWorkspaceMetadata: true
         ))
         session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        _ = try XCTUnwrap(
+            session.permitsBoundOperationAndSave ? session.currentRestorationBindingToken : nil,
+            "The bound transport fixture must be restored before provider dispatch."
+        )
         return session
     }
 

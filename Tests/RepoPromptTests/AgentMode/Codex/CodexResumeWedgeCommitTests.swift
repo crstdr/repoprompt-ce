@@ -2256,6 +2256,174 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         XCTAssertEqual(fixture.factory.controllers[0].startedTurnCount, 0)
     }
 
+    private func selfCompactOwner(
+        for fixture: Fixture
+    ) throws -> AgentSelfCompactOwner {
+        let session = fixture.session
+        _ = try installRestoredBinding(fixture)
+        if session.runID == nil { session.installRunID(UUID()) }
+        let binding = try XCTUnwrap(session.persistentSessionBindingIdentity)
+        return try AgentSelfCompactOwner(
+            windowID: 1,
+            workspaceID: XCTUnwrap(fixture.workspaceManager.activeWorkspace?.id),
+            tabID: session.tabID,
+            sessionID: binding.sessionID,
+            persistentBindingGeneration: binding.generation,
+            bindingTransitionGeneration: session.bindingTransitionGeneration,
+            runID: XCTUnwrap(session.runID),
+            runAttemptID: XCTUnwrap(session.activeRunAttemptID)
+        )
+    }
+
+    private func armSelfCompact(
+        for fixture: Fixture,
+        phase: AgentSelfCompactAttempt.Phase
+    ) throws -> UUID {
+        var state = AgentSelfCompactState()
+        _ = try state.reserve(
+            note: "continue on the original thread",
+            idempotencyKey: "codex-wedge-self-compact",
+            maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes,
+            owner: selfCompactOwner(for: fixture)
+        )
+        state.active?.admittedSupport = .codex
+        state.active?.phase = phase
+        state.active?.compactProviderConversation = Self.oldThreadID
+        fixture.session.selfCompactState = state
+        return try XCTUnwrap(state.active?.id)
+    }
+
+    func testSelfCompactMissingRolloutDoesNotStartFreshThreadOrStrandAttempt() async throws {
+        let fixture = makeFixture([[.missingRollout, .success("forbidden-fresh-thread")]])
+        fixture.session.runState = .idle
+        let requestID = try armSelfCompact(for: fixture, phase: .scheduled)
+        let owner = try XCTUnwrap(fixture.session.selfCompactState.active?.owner)
+        let scheduler = AgentSelfCompactTerminalScheduler(
+            load: { fixture.session.selfCompactState },
+            store: { fixture.session.selfCompactState = $0 },
+            isCurrentOwner: { _ in true },
+            hasActiveTools: { _ in false },
+            support: { .codex },
+            dispatch: { id, _, admissible in
+                let result = await fixture.coordinator.startOversightCompaction(
+                    session: fixture.session,
+                    expectedThreadID: Self.oldThreadID,
+                    selfCompactDispatchID: .init(requestID: id, stage: .compact),
+                    isStillAdmissible: admissible
+                )
+                return result == .started ? .started : .refused(.nativeNotStarted)
+            }
+        )
+        scheduler.terminalSettled(
+            runID: owner.runID,
+            runAttemptID: owner.runAttemptID,
+            terminalState: .completed,
+            publication: .accepted(successorEpoch: nil),
+            successorClaimed: false,
+            teardownSettled: { true }
+        )
+        try await AsyncTestWait.waitUntil("self-compact resume failure settled", timeout: 4) {
+            fixture.session.selfCompactState.latest?.requestID == requestID
+        }
+        XCTAssertNil(fixture.session.selfCompactState.active)
+        XCTAssertEqual(fixture.session.selfCompactState.latest?.outcome, .failed)
+        XCTAssertEqual(fixture.factory.controllers.count, 1)
+        XCTAssertEqual(fixture.factory.controllers[0].receivedExistingIDs, [Self.oldThreadID])
+        XCTAssertEqual(fixture.factory.controllers[0].startedTurnCount, 0)
+        assertOldTuple(fixture.session)
+        XCTAssertFalse(fixture.session.items.contains { $0.text.contains("Started a fresh thread") })
+    }
+
+    func testContinuationNoteMissingRolloutParksWithoutFreshThreadFallback() async throws {
+        let fixture = makeFixture([[.missingRollout, .success("forbidden-fresh-thread")]])
+        fixture.session.runState = .idle
+        let requestID = try armSelfCompact(for: fixture, phase: .dispatchingCompact)
+        let owner = try XCTUnwrap(fixture.session.selfCompactState.active?.owner)
+        fixture.session.selfCompactState.active?.compactTurnSucceeded = true
+        let completion = AgentSelfCompactNativeCompletionCoordinator(
+            load: { fixture.session.selfCompactState },
+            store: { fixture.session.selfCompactState = $0 },
+            isCurrentOwner: { _ in true },
+            dispatchNote: { id, admissible in
+                guard admissible() else { return false }
+                fixture.session.selfCompactState.active?.phase = .dispatchingNote
+                let outcome = await fixture.coordinator.sendCodexNativeMessage(
+                    session: fixture.session,
+                    text: AgentSelfCompactNoteEnvelope.frame("continue on the original thread"),
+                    attachments: [],
+                    selfCompactDispatchID: .init(requestID: id, stage: .note)
+                )
+                return outcome.didSend
+            }
+        )
+        defer { completion.cancelRuntimeWork() }
+        XCTAssertTrue(completion.bindCompact(
+            .init(requestID: requestID, stage: .compact),
+            runID: owner.runID,
+            runAttemptID: owner.runAttemptID
+        ))
+        completion.compactTurnSettled(
+            revision: AgentRunTerminalCommitRevision(
+                commitID: UUID(),
+                ownership: AgentRunOwnership(
+                    attemptID: owner.runAttemptID,
+                    binding: AgentRunBindingIdentity(tabID: owner.tabID, persistentSessionID: owner.sessionID)
+                ),
+                terminalState: .completed,
+                failureReason: nil,
+                expectedRunID: owner.runID,
+                sourceItemsRevision: 0,
+                assistantDeltaFlushGeneration: 0,
+                providerDrainGeneration: 0,
+                mcpPublicationEnvelope: nil,
+                successorKind: nil,
+                providerSuccessorID: nil
+            ),
+            publication: .accepted(successorEpoch: nil),
+            teardownSettled: { true }
+        )
+        try await AsyncTestWait.waitUntil("continuation note parked after resume failure", timeout: 4) {
+            fixture.session.selfCompactState.active?.phase == .parked
+        }
+        XCTAssertEqual(
+            fixture.session.selfCompactState.parkedNote?.frame,
+            AgentSelfCompactNoteEnvelope.frame("continue on the original thread")
+        )
+        XCTAssertEqual(fixture.factory.controllers.count, 1)
+        XCTAssertEqual(fixture.factory.controllers[0].receivedExistingIDs, [Self.oldThreadID])
+        XCTAssertEqual(fixture.factory.controllers[0].startedTurnCount, 0)
+        assertOldTuple(fixture.session)
+        XCTAssertFalse(fixture.session.items.contains { $0.text.contains("Started a fresh thread") })
+    }
+
+    func testContinuationNoteWaitsForRoutedResumeThenStartsOnOriginalThread() async throws {
+        let fixture = makeFixture([[.success(Self.oldThreadID)]])
+        fixture.session.runState = .idle
+        let requestID = try armSelfCompact(for: fixture, phase: .dispatchingNote)
+        let note = AgentSelfCompactNoteEnvelope.frame("continue on the original thread")
+        let send = Task {
+            await fixture.coordinator.sendCodexNativeMessage(
+                session: fixture.session,
+                text: note,
+                attachments: [],
+                selfCompactDispatchID: .init(requestID: requestID, stage: .note)
+            )
+        }
+        defer { send.cancel() }
+        try await waitForPendingStart(fixture)
+        XCTAssertEqual(fixture.factory.controllers[0].startedTurnCount, 0)
+        assertOldTuple(fixture.session)
+        try await MCPRoutingWaiter.shared.notifyRouted(runID: XCTUnwrap(fixture.session.runID))
+        let outcome = await send.value
+        XCTAssertEqual(outcome, .sent)
+        XCTAssertEqual(fixture.factory.controllers.count, 1)
+        XCTAssertEqual(fixture.factory.controllers[0].receivedExistingIDs, [Self.oldThreadID])
+        XCTAssertEqual(fixture.factory.controllers[0].startedTurnCount, 1)
+        XCTAssertEqual(fixture.session.selfCompactState.latest?.outcome, .noteAccepted)
+        XCTAssertEqual(fixture.session.codexConversationID, Self.oldThreadID)
+        XCTAssertFalse(fixture.session.items.contains { $0.text.contains("Started a fresh thread") })
+    }
+
     private func hasPendingPolicy(for runID: UUID) async -> Bool {
         guard let clientName = AgentProviderKind.codexExec.mcpClientNameHint else { return false }
         let policies = await ServerNetworkManager.shared.debugPendingPolicySnapshot(for: clientName)
@@ -4030,7 +4198,7 @@ extension CodexResumeWedgeCommitTests {
             ])], false),
             ("settings-before-close", "thread/settings/updated", settings, false),
             ("malformed-settings", "thread/settings/updated", ["threadSettings": .array([])], true),
-            ("partial-settings", "thread/settings/updated", ["threadSettings": .object([:])], true),
+            ("opaque-settings", "thread/settings/updated", ["threadSettings": .object([:])], false),
             ("missing-moderation-metadata", "turn/moderationMetadata", [:], true),
             ("metadata-field-is-not-output-proof", "rawResponseItem/completed", ["metadata": .object([:])], true),
             ("future-metadata-method", "thread/futureMetadata/updated", ["metadata": .object([:])], true),
@@ -4112,6 +4280,37 @@ extension CodexResumeWedgeCommitTests {
             XCTAssertTrue(f.session.quietLedger.hiddenSourceIDs.isEmpty, label)
             print("W0E_REPAIRED_CODEX \(label) warning=\(warnings) ordinary=\(ordinary)")
         }
+    }
+}
+
+extension CodexResumeWedgeCommitTests {
+    func testForkMetadataBeforeTurnStartedPreservesEnvelopeEvidence() async {
+        let controller = CodexNativeSessionController(client: CodexAppServerClient(), runID: UUID(), tabID: UUID(), windowID: -1, workspacePaths: .uniform(nil))
+        await controller.test_installThreadState(threadID: Self.oldThreadID, authoritativeTurnID: nil, routingTurnID: nil)
+        let events = controller.events
+        let thread = CodexJSONValue.string(Self.oldThreadID)
+        let frames: [(String, [String: CodexJSONValue])] = [
+            ("thread/name/updated", ["threadId": thread, "threadName": .string("renamed")]),
+            ("thread/name/updated", ["threadId": thread, "threadName": .null]),
+            ("thread/name/updated", ["threadId": thread]),
+            ("thread/settings/updated", ["threadId": thread, "threadSettings": .object([:])]),
+            ("thread/name/updated", ["threadId": thread, "threadName": .number(7)]),
+            ("thread/settings/updated", ["threadId": thread, "threadSettings": .null])
+        ]
+        for (method, params) in frames {
+            await controller.test_handleNotification(method: method, params: params)
+        }
+        await controller.shutdown()
+        var metadata: [String] = []
+        var warnings: [String] = []
+        for await event in events {
+            if case let .livenessActivity(activity) = event {
+                if activity.kind == .protocolMetadata { metadata.append(activity.method) }
+                if activity.kind == .warning { warnings.append(activity.method) }
+            }
+        }
+        XCTAssertEqual(metadata, ["thread/name/updated", "thread/name/updated", "thread/name/updated", "thread/settings/updated"])
+        XCTAssertEqual(warnings, ["thread/name/updated", "thread/settings/updated"])
     }
 }
 

@@ -195,9 +195,35 @@ final class ComputerUseChildSafetyTests: XCTestCase {
     }
 
     func testExactParentProofAndOnlyApprovedNativeSubmission() async throws {
-        for stop in [false, true] {
-            let f = try fixture()
-            try f.proof.reserve()
+        for mode in ["stop", "complete", "unknown", "quick"] {
+            let stop = mode == "stop"
+            var f = try fixture()
+            if mode == "unknown" || mode == "quick" {
+                f.vm.promptManager = f.manager.promptViewModel
+                f.manager.promptViewModel.attachWorkspaceManager(f.manager)
+                try f.manager.setWorkspacePersistenceOutcomeOverrideForTesting(.notRequired(workspaceID: XCTUnwrap(f.manager.activeWorkspaceID)))
+                f.child.computerUseChildProof = nil
+                let target = try await f.vm.mcpResolveOrCreateSessionTarget(tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "native admitted", parentSessionID: f.parent.activeAgentSessionID, inheritWorktreeBindings: false, expectedWorkspaceID: f.manager.activeWorkspaceID)
+                let child = f.vm.session(for: target.tabID)
+                child.selectedAgent = .codexExec
+                child.selectedModelRaw = "gpt-6.1-sol"
+                child.selectedReasoningEffortRaw = "high"
+                child.purpose = "computerUse"
+                child.computerUseChildProof = f.proof
+                f.proof.child = child
+                f.proof.creationTarget = target
+                try f.proof.claimCreation()
+                try f.proof.reserve()
+                try await f.vm.mcpConfigureSession(tabID: child.tabID, agentRaw: child.selectedAgent.rawValue, modelRaw: "gpt-6.1-sol", reasoningEffortRaw: "high", creationHandle: target.creationHandle)
+                // Persist configuration without accepting the recovery claim, as an interrupted start can leave it.
+                let durable = try await f.vm.commitConfiguredSessionCreation(handle: XCTUnwrap(target.creationHandle))
+                XCTAssertTrue(durable)
+                child.hasLoadedPersistedState = true
+                XCTAssertEqual(f.vm.test_outstandingProvisionalMCPSessionTargetCount, 1)
+                f = Fixture(vm: f.vm, manager: f.manager, parent: f.parent, child: child, proof: f.proof, factory: f.factory)
+            } else {
+                try f.proof.reserve()
+            }
             XCTAssertTrue(f.proof.permits(f.child))
             XCTAssertThrowsError(try ComputerUseChildProof.capture(owner: f.vm)) // No network/source-tab witness.
             let ordinary = f.vm.session(for: UUID())
@@ -208,27 +234,70 @@ final class ComputerUseChildSafetyTests: XCTestCase {
             f.child.purpose = "computerUse"
             let blocked = f.vm.submitUserTurn(text: "confirmed", tabID: f.child.tabID)
             guard case .blocked = blocked else { return XCTFail("Child composer must not create a task") }
+            let composed = f.vm.composeOrdinaryUserTurnText("Inspect <TextEdit> only", computerUseArmed: true, includesInterview: false, workflow: nil, includeBuiltInCleanupGuidance: false, parentAgentTask: true)
+            XCTAssertEqual(composed, CodexComputerUseWorkflow.renderProviderPrompt(userInstructions: "Inspect <TextEdit> only", parentAgentTask: true))
+            for delivery in [AgentProviderSwitchDelivery.ready, .sending] {
+                f.child.pendingHandoff.providerSwitchDelivery = delivery
+                let refused = f.vm.submitUserTurn(text: "handover must not bypass child origin", tabID: f.child.tabID, isLocalComposerInput: false, scheduledProviderSwitchSubmission: { _ in XCTFail("Child must not schedule a provider switch") }, computerUseProof: f.proof)
+                guard case .blocked = refused else { return XCTFail("Child handover was admitted") }
+                XCTAssertTrue(f.factory.controllers.isEmpty)
+            }
+            f.child.pendingHandoff.providerSwitchDelivery = nil
             try await f.vm.armComputerUseChild(session: f.child, proof: f.proof)
+            f.vm.promptManager?.apiSettingsViewModel?.isCodexConnected = true // Fake controller availability after configuration probes.
+            let clock = MCPExportWatchdogManualClock()
+            let scope = MCPAgentRunStartExecutionScope(connectionID: UUID(), environment: clock.environment)
+            try scope.beginDispatch()
             let submitted = f.vm.submitUserTurn(text: "Inspect <TextEdit> only", tabID: f.child.tabID, isLocalComposerInput: false, computerUseProof: f.proof)
-            guard case .submitted = submitted else { return XCTFail("Exact parent proof must admit the task") }
+            guard case .submitted = submitted else { return XCTFail("Exact parent proof must admit the task (\(mode)): \(submitted)") }
             try await AsyncTestWait.waitUntil("designated fake native turn", timeout: 8) { f.factory.controllers.first?.startedTurnCount == 1 }
             XCTAssertEqual(f.factory.computerUseEnabledFlags, [true])
             XCTAssertTrue(f.factory.controllers[0].startedTexts[0].contains("<parent_agent_task>"))
             XCTAssertTrue(f.factory.controllers[0].startedTexts[0].contains("&lt;TextEdit&gt;"))
             let controller = f.factory.controllers[0]
-            f.proof.producerSettled() // The detached parent start has returned; no waiter owns cleanup.
+            if mode == "unknown" {
+                scope.close()
+                XCTAssertFalse(scope.allowsFailureCleanup)
+                f.proof.producerSettled(retireUnacceptedStart: scope.allowsFailureCleanup)
+            } else if mode != "quick" {
+                f.proof.producerSettled() // Detached start returned; no waiter owns cleanup.
+            }
             await f.coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "child-turn"), session: f.child, sourceController: controller)
             if stop {
                 f.vm.prepareAgentRunCancellation(session: f.child, intent: .userStop, origin: .explicitStop)
             } else {
-                f.child.items.append(AgentChatItem(kind: .assistant, text: "final report"))
+                f.child.appendItem(AgentChatItem(kind: .assistant, text: "final report"))
                 await f.coordinator.test_handleCodexNativeEvent(.turnCompleted(turnID: "child-turn", status: .completed), session: f.child, sourceController: controller)
+            }
+            if mode == "quick" {
+                // A native task can finish while the starter resolves its initial snapshot, before outer acceptance.
+                try await AsyncTestWait.waitUntil("post-commit retirement began", timeout: 4) { f.proof.retiring }
+                XCTAssertNoThrow(try f.proof.acceptCreation())
+                f.proof.producerSettled()
             }
             try await AsyncTestWait.waitUntil("completed child releases only after retirement", timeout: 4) {
                 ComputerUseChildProof.holder == nil && controller.shutdownCount == 1
             }
             XCTAssertEqual(f.child.runState, stop ? .cancelled : .completed)
             if !stop { XCTAssertTrue(f.child.items.contains { $0.kind == .assistant && $0.text == "final report" }) }
+            if mode == "unknown" || mode == "quick" {
+                XCTAssertTrue(f.vm.sessions[f.child.tabID] === f.child)
+                XCTAssertTrue(f.manager.activeWorkspace?.composeTabs.contains { $0.id == f.child.tabID } == true)
+                XCTAssertNotNil(f.child.activeAgentSessionID)
+                XCTAssertEqual(f.vm.test_outstandingProvisionalMCPSessionTargetCount, 0)
+                XCTAssertEqual(f.vm.test_pendingMCPSessionTargetDiscardCount, 0)
+                XCTAssertEqual(f.vm.test_provisionalRuntimeTargetIdentityCount, 0)
+                XCTAssertNil(f.proof.creationTarget)
+                let childID = try XCTUnwrap(f.child.activeAgentSessionID)
+                let workspace = try XCTUnwrap(f.manager.activeWorkspace)
+                try await AsyncTestWait.waitUntil("terminal report persisted", timeout: 4) {
+                    let stored = try? await AgentSessionDataService.shared.loadAgentSession(id: childID, for: workspace)
+                    return stored?.items.contains { $0.kind == .assistant && $0.text == "final report" } == true
+                }
+                let stored = try await AgentSessionDataService.shared.loadAgentSession(id: childID, for: workspace)
+                XCTAssertEqual(stored?.purpose, "computerUse")
+                XCTAssertTrue(stored?.items.contains { $0.kind == .assistant && $0.text == "final report" } == true)
+            }
             let fresh = try ComputerUseChildProof(owner: f.vm, parent: f.parent, configuration: { .init(enabled: true, modelID: "codexExec:gpt-6.1-sol-high", modelAvailable: true) })
             try fresh.reserve()
             fresh.producerSettled()
@@ -266,6 +335,24 @@ final class ComputerUseChildSafetyTests: XCTestCase {
         f.vm.turnOffComputerUseChild(f.child)
         XCTAssertNil(f.parent.computerUseParentGrant)
         XCTAssertThrowsError(try ComputerUseChildProof(owner: f.vm, parent: f.parent))
+        for accepted in [nil, false, true] as [Bool?] {
+            let request = try fixture()
+            try request.proof.reserve()
+            let clock = MCPExportWatchdogManualClock()
+            let scope = MCPAgentRunStartExecutionScope(connectionID: UUID(), environment: clock.environment)
+            try scope.beginDispatch()
+            if let accepted { scope.recordDispatch(accepted: accepted) }
+            scope.close()
+            XCTAssertThrowsError(try scope.checkAdmission())
+            await request.proof.producerSettled(retireUnacceptedStart: scope.allowsFailureCleanup)?.value
+            if accepted == false {
+                XCTAssertNil(ComputerUseChildProof.holder)
+            } else {
+                XCTAssertFalse(request.proof.retiring)
+                XCTAssertTrue(ComputerUseChildProof.holder === request.proof)
+            }
+            await request.finish()
+        }
     }
 
     func testTwoWindowsHoldSlotUntilRetirementAndRejectStaleRelease() async throws {

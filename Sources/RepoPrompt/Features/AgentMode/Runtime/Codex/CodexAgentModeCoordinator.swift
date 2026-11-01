@@ -2749,6 +2749,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         guard isStillAdmissible(),
               session.codexConversationID == expectedThreadID,
               nativeSlashCommandAvailabilityMessage(.compact, session: session) == nil,
+              !hasCodexStartupClaim(for: session),
               let controller = session.codexController,
               controller.hasActiveThread
         else {
@@ -6175,8 +6176,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     replayTurn.text
                 }
             }
-            // Ordinary auth replay may compose against an existing dispatching wake. Its local
-            // wrapper must retain that cohort through acceptance just like the native send path.
+            // Capture this replay's exact dispatch before transport, independently of whether
+            // supplement monitoring exists. Never reconstruct it from a later pending slot.
+            let replayDispatchContext = replayTurn.monitoringDispatchContext
+                ?? AgentSessionLinkDispatchContext(session: session, dispatchID: replayDispatchID)
+            // Recovery retains only its accepted wrapper; it never adopts a fresh wake claim.
             defer { withExtendedLifetime(monitoring?.quietMarkerProducerLifetime) {} }
             let acquiredPhysicalDispatch = viewModel?.agentSessionLinkAcquirePhysicalDispatch(
                 for: session,
@@ -6229,7 +6233,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 return receipt
             }
             dispatched = true
-            viewModel?.acceptAgentSessionLinkDispatch(session: session, context: monitoring?.dispatchContext, claim: nil)
+            viewModel?.acceptAgentSessionLinkDispatch(session: session, context: monitoring?.dispatchContext ?? replayDispatchContext, claim: nil)
             await applySuccessfulCodexNativeSend(
                 for: session,
                 runID: runID,
@@ -8377,6 +8381,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                                   isSelfNote || viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) == true
                             else { throw CancellationError() }
                         }
+                        // Read proof may suspend. Assert the same frozen switch evidence at this
+                        // final synchronous release fence, never re-fit it.
+                        guard viewModel?.providerSwitchAcquirePhysicalDispatch(session: session, dispatchID: promptDispatchID)
+                            ?? (session.pendingHandoff.providerSwitchDelivery == nil)
+                        else { throw CancellationError() }
                         guard acquireFinalizedAgentSessionLinkDispatch() else { throw CancellationError() }
                         // A parked note remains unattempted throughout optional Read proof.
                         // Claim it before synchronous frontier consumption, with no intervening await.

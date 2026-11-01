@@ -64,7 +64,15 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
         }
     }
 
-    private enum SurfaceTransition { case activation, upgrade, orchestrator, delegation, toolbar, delegationGrant, delegationRevocation }
+    func testLateFirstOutboundLinkDoesNotRepairSelfNoopOnlyCatalogChange() async throws {
+        try await assertRestoredGrantRepairsCatalog(outbound: true, surfaceTransition: .selfNoop)
+    }
+
+    func testLastOutboundLinkRemovalDoesNotRepairSelfNoopOnlyCatalogChange() async throws {
+        try await assertRestoredGrantRepairsCatalog(outbound: false, surfaceTransition: .selfNoop)
+    }
+
+    private enum SurfaceTransition { case activation, upgrade, orchestrator, delegation, toolbar, delegationGrant, delegationRevocation, selfNoop }
 
     private func assertRestoredGrantRepairsCatalog(
         outbound: Bool, surfaceTransition: SurfaceTransition? = nil, oversightEnabled: Bool = true
@@ -126,6 +134,14 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 tabID: tabID
             )
             let isScopeRepair = surfaceTransition == .delegationGrant || surfaceTransition == .delegationRevocation
+            let isNoopRepair = surfaceTransition == .selfNoop
+            let initiallyOutbound = isNoopRepair && !outbound
+            let initiallyOffersLink = surfaceTransition == .upgrade || isNoopRepair
+            if isNoopRepair {
+                // Keep the other family definitions stable: only the outbound no-op grant changes.
+                let state = try XCTUnwrap(window.agentModeViewModel.agentSessionLinkBootstrapState(for: endpoint))
+                XCTAssertTrue(window.agentModeViewModel.agentSessionLinkActivateOverseer(for: endpoint, expected: state))
+            }
             let scopes = AgentSessionLinkRuntimeBridge.shared.delegationScopes
             let scopeSessionID = try XCTUnwrap(session.activeAgentSessionID)
             func grantScope() throws -> UUID {
@@ -152,7 +168,10 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 }
                 if surfaceTransition == .delegationRevocation { scopeToRevoke = try grantScope() }
             }
-            await manager.debugSetSessionLinkCatalogEndpointsForTesting(anyActive: surfaceTransition == .upgrade ? [endpoint] : [], outbound: [])
+            await manager.debugSetSessionLinkCatalogEndpointsForTesting(
+                anyActive: surfaceTransition == .upgrade || initiallyOutbound ? [endpoint] : [],
+                outbound: initiallyOutbound ? [endpoint] : []
+            )
             if surfaceTransition != nil { session.runState = .running }
             await installAuthoritativePolicy(
                 manager: manager,
@@ -180,11 +199,11 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             XCTAssertEqual(applied.outcome, "applied")
 
             let names = try await manager.debugListToolNames(for: connectionID)
-            XCTAssertEqual(names.contains(MCPWindowToolName.agentSessionLink), surfaceTransition == .upgrade)
+            XCTAssertEqual(names.contains(MCPWindowToolName.agentSessionLink), initiallyOffersLink)
             let unlinkedProjection = await manager.debugRunCatalogProjection(for: runID)
             let unlinked = try XCTUnwrap(unlinkedProjection)
-            XCTAssertEqual(unlinked.hasAgentSessionLink, surfaceTransition == .upgrade)
-            XCTAssertEqual(unlinked.hasActiveOutboundLink, false)
+            XCTAssertEqual(unlinked.hasAgentSessionLink, initiallyOffersLink)
+            XCTAssertEqual(unlinked.hasActiveOutboundLink, initiallyOutbound)
             XCTAssertNil(session.codexSessionLinkCatalogRepairCycle?.observedControllerGeneration)
             XCTAssertNotNil(session.codexController)
 
@@ -295,12 +314,15 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 let inboundNames = try await manager.debugListToolNames(for: connectionID)
                 XCTAssertTrue(inboundNames.contains(MCPWindowToolName.agentSessionLink))
                 XCTAssertTrue(inboundNames.contains(MCPWindowToolName.sessionAdmin))
+                XCTAssertFalse(inboundNames.contains(MCPWindowToolName.selfNoop))
                 await manager.debugSetSessionLinkCatalogEndpointsForTesting(anyActive: [endpoint], outbound: [endpoint])
                 let outboundNames = try await manager.debugListToolNames(for: connectionID)
                 XCTAssertTrue(outboundNames.contains(MCPWindowToolName.sessionAdmin))
+                XCTAssertTrue(outboundNames.contains(MCPWindowToolName.selfNoop))
                 await manager.debugSetSessionLinkCatalogEndpointsForTesting(anyActive: [], outbound: [])
                 let noLinkNames = try await manager.debugListToolNames(for: connectionID)
                 XCTAssertTrue(noLinkNames.contains(MCPWindowToolName.sessionAdmin))
+                XCTAssertFalse(noLinkNames.contains(MCPWindowToolName.selfNoop))
 
                 let scopes = AgentSessionLinkRuntimeBridge.shared.delegationScopes
                 let request = try scopes.requestScope(
@@ -337,6 +359,11 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 } else {
                     _ = try grantScope()
                 }
+            } else if isNoopRepair {
+                XCTAssertEqual(names.contains(MCPWindowToolName.selfNoop), initiallyOutbound)
+                await manager.debugSetSessionLinkCatalogEndpointsForTesting(
+                    anyActive: outbound ? [endpoint] : [], outbound: outbound ? [endpoint] : []
+                )
             } else if surfaceTransition == .activation {
                 let state = try XCTUnwrap(window.agentModeViewModel.agentSessionLinkBootstrapState(for: endpoint))
                 XCTAssertTrue(window.agentModeViewModel.agentSessionLinkActivateOverseer(for: endpoint, expected: state))
@@ -349,9 +376,31 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
 
             let stuckProjection = await manager.debugRunCatalogProjection(for: runID)
             let stuck = try XCTUnwrap(stuckProjection)
-            XCTAssertEqual(stuck.hasAgentSessionLink, surfaceTransition == .upgrade)
+            XCTAssertEqual(stuck.hasAgentSessionLink, initiallyOffersLink)
+            if isNoopRepair {
+                XCTAssertEqual(stuck.expectedSurface, stuck.returnedSurface, "Quiet support is not part of the ordinary repair fingerprint")
+                XCTAssertNil(session.codexSessionLinkCatalogRepairCycle)
+                session.runState = .completed
+                window.agentModeViewModel.test_codexCoordinator.codexRepairSessionLinkCatalogIfQuiescent(for: session)
+                XCTAssertEqual(session.runID, runID)
+                XCTAssertTrue(session.codexController === controller)
+                XCTAssertEqual(session.codexControllerGeneration, sourceGeneration)
+                XCTAssertEqual(session.codexConversationID, conversationID)
+                XCTAssertEqual(session.codexRolloutPath, rolloutPath)
+                XCTAssertNil(session.oversight.pendingAutoWake)
+                let refreshedNames = try await manager.debugListToolNames(for: connectionID)
+                XCTAssertEqual(refreshedNames.contains(MCPWindowToolName.selfNoop), outbound, "Relisting converges without recycling")
+                return
+            }
             if surfaceTransition != nil {
                 XCTAssertNotEqual(stuck.expectedSurface, stuck.returnedSurface)
+                if isNoopRepair {
+                    for name in AgentSessionLinkCatalogSurface.toolNames {
+                        XCTAssertEqual(AgentSessionLinkCatalogSurface.differs(
+                            toolName: name, expected: stuck.expectedSurface, returned: stuck.returnedSurface
+                        ), name == MCPWindowToolName.selfNoop)
+                    }
+                }
                 XCTAssertEqual(stuck.returnedSurface, unlinked.returnedSurface)
                 XCTAssertNotNil(session.codexController, "Busy provider is not replaced")
                 XCTAssertEqual(session.runID, runID)
@@ -368,7 +417,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             }
             XCTAssertEqual(stuck.hasActiveOutboundLink, outbound)
             XCTAssertEqual(stuck.routeToken?.observerEndpoint, endpoint)
-            XCTAssertEqual(stuck.isReady, surfaceTransition == .upgrade, "Schema freshness is not outbound prompt authority")
+            XCTAssertEqual(stuck.isReady, surfaceTransition == .upgrade || (isNoopRepair && outbound), "Schema freshness is not outbound prompt authority")
             XCTAssertNil(session.runID, "the stale process run is retired so cold bootstrap applies")
             XCTAssertNil(session.codexController, "exactly one controller replacement")
             XCTAssertEqual(session.codexConversationID, conversationID)
@@ -377,7 +426,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             XCTAssertNotEqual(sourceGeneration, session.codexControllerGeneration)
             if surfaceTransition != nil {
                 XCTAssertNil(session.oversight.pendingAutoWake, "An empty passive queue never manufactures a continuation")
-                XCTAssertEqual(session.oversight.overseerActivation != nil, surfaceTransition == .activation)
+                XCTAssertEqual(session.oversight.overseerActivation != nil, surfaceTransition == .activation || isNoopRepair)
                 let spentGeneration = session.codexControllerGeneration
                 window.agentModeViewModel.test_codexCoordinator.codexRepairSessionLinkCatalogIfQuiescent(for: session)
                 XCTAssertEqual(session.codexControllerGeneration, spentGeneration)
@@ -398,6 +447,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 let nextApplied = await manager.debugApplyPendingPolicy(clientName: clientName, connectionID: nextConnectionID, clientPid: Int(getpid()), bootstrapClientName: "repoprompt_ce_cli_debug", sessionKey: "next-\(nextRunID)", pidGateTimeout: 0.25, requireRunRouting: true)
                 XCTAssertEqual(nextApplied.outcome, "applied")
                 let nextNames = try await manager.debugListToolNames(for: nextConnectionID)
+                if isNoopRepair { XCTAssertEqual(nextNames.contains(MCPWindowToolName.selfNoop), outbound) }
                 XCTAssertEqual(nextNames.contains(MCPWindowToolName.agentSessionLink), !isScopeRepair)
                 XCTAssertEqual(nextNames.contains(MCPWindowToolName.becomeOverseer), oversightEnabled, "Eligible roles retain targeted bootstrap; disabled oversight still removes it")
                 if isScopeRepair {
@@ -555,6 +605,24 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
     /// Pins RP's live absent-to-present discovery, not any vendor's model-side tool cache.
     @MainActor
     final class AgentSessionLinkLiveDiscoveryTests: XCTestCase {
+        func testForkMetadataPreservesRegisteredQuietClose() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { _ in
+                try await self.exerciseLiveDiscovery(w0fProvider: .codexExec, w2Probe: .forkMetadata(malformed: false))
+            }
+        }
+
+        func testForkMalformedMetadataKeepsRegisteredCloseOrdinary() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { _ in
+                try await self.exerciseLiveDiscovery(w0fProvider: .codexExec, w2Probe: .forkMetadata(malformed: true))
+            }
+        }
+
+        func testSelfNoopTrialRoutedCallRequiresOutboundLinkAndReturnsDone() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { _ in
+                try await self.exerciseLiveDiscovery(probeSelfNoop: true)
+            }
+        }
+
         func testUserOverseeGrantRefreshesExactAgentRouteDuringHeldProviderTurn() async throws {
             try await MCPSharedServerTestLease.shared.withLease { _ in
                 try await self.exerciseLiveDiscovery()
@@ -796,6 +864,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             case inactiveBaseline(stale: Bool)
             case reprompt(phase: String)
             case undeclared
+            case forkMetadata(malformed: Bool)
             case terminal(delayed: Bool, nativeResult: Bool, closing: Bool = false, leading: Bool = false, cancel: Bool = false, corrupt: Bool = false)
             case hint(withdraw: Bool, replaced: Bool = false, ordinaryCandidate: Bool = false)
             case lateAttention
@@ -815,8 +884,9 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
 
         private func exerciseLiveDiscovery(
             activate: Bool = false, inbound: Bool = false, originalQualificationFamilyABA: Bool = false,
-            proofMutation: ProofMutation? = nil, w0fProvider: AgentProviderKind? = nil,
+            proofMutation: ProofMutation? = nil, probeSelfNoop: Bool = false, w0fProvider: AgentProviderKind? = nil,
             w2Probe: W2Probe? = nil, w3Ring: Bool = false, w3Reprompt: Bool = false, w4Display: Bool = false
+
         ) async throws {
             try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
             let manager = ServerNetworkManager.shared
@@ -964,6 +1034,13 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 XCTAssertEqual(heldTurn.activeTurnID, turnID)
                 let before = try await provider.listTools()
                 XCTAssertEqual(before.contains(MCPWindowToolName.agentSessionLink), inbound)
+                if probeSelfNoop {
+                    XCTAssertFalse(before.contains(MCPWindowToolName.selfNoop))
+                    let denied = try await connection.callTool(name: MCPWindowToolName.selfNoop, arguments: [:], timeoutSeconds: 2)
+                    let object = try MCPExportWatchdogIntegrationTests.responseObject(from: denied)
+                    let result = try XCTUnwrap(object["result"] as? [String: Any])
+                    XCTAssertEqual(result["isError"] as? Bool, true, denied.rawJSON)
+                }
                 XCTAssertTrue(before.contains(MCPWindowToolName.becomeOverseer), "Inbound discovery requests no additional authority")
                 let beforeDefinitions = try await provider.definitions(wireCaptureName: inbound ? "inbound-before" : (activate ? "activation-before" : "grant-before"))
                 try DiscoveryArtifactCapture.write(beforeDefinitions, name: inbound ? "inbound-before" : (activate ? "activation-before" : "grant-before"))
@@ -1203,6 +1280,18 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 let turnAtVisibleCatalog = await provider.heldTurnSnapshot
                 XCTAssertEqual(turnAtVisibleCatalog, heldTurn, "The refreshed catalog must be observable on the same uninterrupted provider turn")
                 XCTAssertTrue(after.contains(MCPWindowToolName.agentSessionLink))
+                if probeSelfNoop {
+                    XCTAssertTrue(after.contains(MCPWindowToolName.selfNoop))
+                    let noop = try await connection.callTool(name: MCPWindowToolName.selfNoop, arguments: [:], timeoutSeconds: 2)
+                    let object = try MCPExportWatchdogIntegrationTests.responseObject(from: noop)
+                    let result = try XCTUnwrap(object["result"] as? [String: Any])
+                    XCTAssertNotEqual(result["isError"] as? Bool, true, noop.rawJSON)
+                    let content = try XCTUnwrap(result["content"] as? [[String: Any]])
+                    let text = try XCTUnwrap(content.first?["text"] as? String)
+                    let json = text.hasPrefix("```json\n") && text.hasSuffix("\n```")
+                        ? text.dropFirst(8).dropLast(4) : Substring(text)
+                    XCTAssertEqual(try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: String], ["result": "done"], noop.rawJSON)
+                }
                 XCTAssertTrue(after.contains(MCPWindowToolName.becomeOverseer), "Targeted bootstrap remains discoverable in the continuing flow")
                 if w3Ring {
                     try await w3RegisteredRing(window: window, first: observer, second: target, firstConnection: connection, firstProvider: provider, provenReprompt: w3Reprompt)
@@ -1227,6 +1316,8 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                         try await w3InactiveBaseline(window: window, session: observer, connection: connection, provider: provider, stale: stale)
                     case let .reprompt(phase):
                         try await w2RegisteredTerminal(window: window, session: observer, connection: connection, runID: runID, delayed: false, nativeResult: true, closing: false, leading: false, cancel: false, repromptPhase: phase)
+                    case let .forkMetadata(malformed):
+                        try await w2RegisteredTerminal(window: window, session: observer, connection: connection, runID: runID, delayed: false, nativeResult: true, closing: false, leading: false, cancel: false, expectOrdinary: malformed, forkMetadata: malformed)
                     case .undeclared:
                         try await w2RegisteredTerminal(window: window, session: observer, connection: connection, runID: runID, delayed: false, nativeResult: false, closing: false, leading: false, cancel: false, w3Undeclared: true)
                     case let .terminal(delayed, nativeResult, closing, leading, cancel, corrupt):
@@ -1460,7 +1551,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
         }
 
         private var configuration = SessionLinkNativeConfigurationFixture()
-        private let eventPair = AsyncStream<NativeAgentRuntimeEvent>.makeStream()
+        private var eventPair = AsyncStream<NativeAgentRuntimeEvent>.makeStream()
         var hasActiveSession: Bool {
             connection != nil
         }
@@ -1493,6 +1584,8 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
 
         func ensureEventsStreamReady() {}
         func resetEventsStreamForNewRun() {
+            eventPair.continuation.finish()
+            eventPair = AsyncStream<NativeAgentRuntimeEvent>.makeStream()
             lifecycleRevision += 1
         }
 
@@ -1763,7 +1856,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
         func w2RegisteredTerminal(
             window: WindowState, session: AgentTabSession, connection: PersistentMCPTestEndpoint,
             runID: UUID, delayed: Bool, nativeResult: Bool, closing: Bool, leading: Bool, cancel: Bool,
-            w3Owner: AgentRunOwnership? = nil, w3Undeclared: Bool = false, w3Reprompt: Bool = false, corrupt: Bool = false, repromptPhase: String? = nil, expectOrdinary: Bool = false, w3Provider: HeldDiscoveryProvider? = nil, scaleControl: Bool? = nil, scaleDiagnostic: Bool = false, unqualifiedOrigin: Bool = false, w4Display: Bool = false, w4Repeat: Bool = false, w4BaselineTools: Int = 0
+            w3Owner: AgentRunOwnership? = nil, w3Undeclared: Bool = false, w3Reprompt: Bool = false, corrupt: Bool = false, repromptPhase: String? = nil, expectOrdinary: Bool = false, w3Provider: HeldDiscoveryProvider? = nil, scaleControl: Bool? = nil, scaleDiagnostic: Bool = false, unqualifiedOrigin: Bool = false, w4Display: Bool = false, w4Repeat: Bool = false, w4BaselineTools: Int = 0, forkMetadata: Bool? = nil
         ) async throws {
             let vm = window.agentModeViewModel
             let manager = ServerNetworkManager.shared
@@ -1833,6 +1926,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             var nativeTask: Task<Void, Never>?
             var terminalTask: Task<Void, Never>?
             var nativeIDs: [UUID] = []
+            var metadataWarnings: [String] = []
             var nativeDelivered: XCTestExpectation?
             let terminalDelivered = AsyncStream<Void>.makeStream()
             if claude {
@@ -1847,6 +1941,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 let events = decoder.events
                 nativeTask = Task {
                     for await event in events {
+                        if case let .livenessActivity(activity) = event, activity.kind == .warning { metadataWarnings.append(activity.method) }
                         await codex.test_handleCodexNativeEvent(event, session: session, sourceController: decoder)
                         switch event {
                         case let .toolCall(_, id, _, _), let .toolResult(_, id, _, _, _, _):
@@ -2057,6 +2152,20 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                         XCTAssertEqual(session.items[index].id, sameID)
                     }
                 }
+                if let malformed = forkMetadata {
+                    let frames: [(String, [String: CodexJSONValue])] = malformed ? [
+                        ("thread/name/updated", ["threadId": .string(thread), "threadName": .number(7)]),
+                        ("thread/settings/updated", ["threadId": .string(thread), "threadSettings": .null])
+                    ] : [
+                        ("thread/name/updated", ["threadId": .string(thread), "threadName": .string("renamed")]),
+                        ("thread/name/updated", ["threadId": .string(thread), "threadName": .null]),
+                        ("thread/name/updated", ["threadId": .string(thread)]),
+                        ("thread/settings/updated", ["threadId": .string(thread), "threadSettings": .object([:])])
+                    ]
+                    for (method, params) in frames {
+                        await decoder.test_handleNotification(method: method, params: params)
+                    }
+                }
                 terminalTask = Task {
                     if let w3Provider {
                         let actualTask = session.agentTask
@@ -2092,6 +2201,9 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 }
                 await terminalTask?.value
                 phase("runner-terminal-and-task-completion")
+                if let malformed = forkMetadata {
+                    XCTAssertEqual(metadataWarnings, malformed ? ["thread/name/updated", "thread/settings/updated"] : [])
+                }
                 if scaleDiagnostic {
                     await print("W3_ROUTE_TERMINAL outcome=\(String(describing: MCPRoutingWaiter.currentTerminalOutcome(runID: runID))) history=\(manager.debugRunRoutingHistoryPayload(runID: runID, limit: 30))")
                 }

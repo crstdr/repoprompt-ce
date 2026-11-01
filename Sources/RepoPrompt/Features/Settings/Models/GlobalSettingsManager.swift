@@ -698,16 +698,7 @@ extension GlobalSettingsStore {
 
     /// Invoke before constructing any settings store or decoding Agent Models profiles.
     nonisolated static func installApplicationModelIdentityPolicy() {
-        SettingsModelIdentityPolicy.installCursorCanonicalizer { raw in
-            // Exact advertised identities win over historical rename aliases.
-            if AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor)?.options.contains(where: { $0.rawValue == raw }) == true {
-                return raw
-            }
-            if let specifier = try? CursorAIModelCatalog.ModelSpecifier(raw: raw), !specifier.overrides.isEmpty {
-                return ACPModelParameterIdentity.canonicalBaseModelRaw(specifier.baseModelRaw, providerID: .cursor)
-            }
-            return CursorAIModelCatalog.canonicalAlias(raw)
-        }
+        SettingsModelIdentityPolicy.installCursorCanonicalizer(CursorAIModelCatalog.canonicalIdentity)
     }
 
     static func installProcessApplicationEventBridge(notificationCenter: NotificationCenter = .default) {

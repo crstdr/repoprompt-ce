@@ -36,13 +36,13 @@ extension AgentSessionLinkEndpointHost {
         nil
     }
 
-    var preparedSessionRuntimes: (any PreparedAgentSessionRuntimeRegistry)? {
-        nil
-    }
-
     func agentSessionLinkRunFacts(
         for _: AgentSessionLinkEndpointCandidate, capturedStatus _: DomainAgentSessionLinkStatus
     ) -> AgentRunQuietFacts? {
+        nil
+    }
+
+    var preparedSessionRuntimes: (any PreparedAgentSessionRuntimeRegistry)? {
         nil
     }
 
@@ -5967,7 +5967,7 @@ final class AgentSessionLinkRuntimeBridge {
     /// whole batch would discard the healthy siblings' cursors. Instead each target is re-fenced on
     /// its own, like `terminalWaitSurvivingStates`: survivors keep their rows and prompts, and a
     /// target that fails its own fence releases nothing. Returns `nil` only when no target survives
-    /// (or for a single target that fails), so the caller denies exactly as before.
+    /// (or for a single target that fails), or when the final survivor batch changes again.
     func pendingInteractionsForWaitObservation(
         leases: [DomainAgentSessionLinkLease]
     ) async -> (
@@ -8123,11 +8123,12 @@ final class AgentSessionLinkRuntimeBridge {
             clear(.delivered(receipt))
         case let .blocked(failure):
             switch failure {
-            case .targetNotIdle, .targetLoading:
+            case .targetNotIdle, .targetLoading, .providerSwitchUnconfirmed:
                 // The target became busy or is still hydrating. Nothing was mutated, so the entry
                 // waits for the next accepted readiness publication rather than retrying on a timer.
                 park(.targetReadiness, failure: failure)
-            case .persistenceFailed, .persistenceIndeterminate, .targetRestoreUnavailable, .targetCreationIncomplete:
+            case .persistenceFailed, .persistenceIndeterminate, .targetRestoreUnavailable, .targetCreationIncomplete,
+                 .providerHandoverDoesNotFit, .providerHandoverNeedsReview:
                 // Terminal for this entry. `persistence_failed` is retryable by the caller, but only
                 // by explicitly queuing again — never by a background loop over failing storage.
                 clear(.failed(failure))
