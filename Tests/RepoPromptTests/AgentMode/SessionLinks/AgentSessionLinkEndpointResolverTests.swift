@@ -8,6 +8,53 @@ import XCTest
 /// Resolution is a pure decision over a candidate set, so the "exactly one live eligible top-level
 /// match" rule is exercised here without constructing windows.
 final class AgentSessionLinkEndpointResolverTests: XCTestCase {
+    @MainActor
+    func testAttributionLiveSourceRoutesToItsExactWindowAndSession() async {
+        let sourceID = UUID()
+        for windowID in [1, 2] {
+            let source = makeCandidate(windowID: windowID, sessionID: sourceID)
+            var routed: [AgentSessionDeepLinkRoute] = []
+            await AppDeepLinkRouter.routeLoadedAgentSession(sessionID: sourceID, resolve: { requestedID in
+                XCTAssertEqual(requestedID, sourceID)
+                return [source]
+            }, isAvailable: { $0 == source }, navigate: { routed.append($0) })
+            XCTAssertEqual(routed, [AgentSessionDeepLinkRoute(
+                windowID: windowID, workspaceID: source.workspaceID, tabID: source.tabID, sessionID: sourceID
+            )])
+        }
+    }
+
+    @MainActor
+    func testAttributionStaleSourceNeverInvokesFocusOrRestoreNavigation() async {
+        let sourceID = UUID()
+        let live = makeCandidate(sessionID: sourceID)
+        let closed = makeCandidate(sessionID: sourceID, isClosing: true)
+        var navigationCount = 0
+        for matches in [[], [closed], [makeCandidate(sessionID: sourceID, hasLoadedPersistedState: false)], [live, live]] {
+            await AppDeepLinkRouter.routeLoadedAgentSession(
+                sessionID: sourceID,
+                resolve: { _ in matches },
+                isAvailable: { _ in true },
+                navigate: { _ in navigationCount += 1 }
+            )
+        }
+        await AppDeepLinkRouter.routeLoadedAgentSession(
+            sessionID: sourceID,
+            resolve: { _ in [live] },
+            isAvailable: { _ in false },
+            navigate: { _ in navigationCount += 1 }
+        )
+        var unready = live
+        unready.restorationReadiness = .unbound
+        await AppDeepLinkRouter.routeLoadedAgentSession(
+            sessionID: sourceID,
+            resolve: { _ in [unready] },
+            isAvailable: { _ in true },
+            navigate: { _ in navigationCount += 1 }
+        )
+        XCTAssertEqual(navigationCount, 0, "Stale attribution must not enter the focus/restore router")
+    }
+
     // MARK: - Fixtures
 
     private func makeCandidate(
