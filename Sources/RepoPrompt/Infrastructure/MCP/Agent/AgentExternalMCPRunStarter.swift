@@ -210,6 +210,7 @@ enum AgentExternalMCPRunStarter {
                 agentRaw: agentRaw,
                 modelRaw: resolvedModel,
                 reasoningEffortRaw: resolvedEffort,
+                requireInactiveRunState: true,
                 creationHandle: target.creationHandle
             )
             switch bindingDisposition {

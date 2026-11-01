@@ -1508,6 +1508,76 @@ final class AgentRunStartBudgetTests: XCTestCase {
         await fulfillment(of: [workerDone], timeout: 3)
         XCTAssertEqual(dispatches, 0)
         XCTAssertNil(vm.mcpRegistration(sessionID: fixture.sessionID))
+
+        for mutationRace in 0 ..< 3 {
+            let cancelled = try await makeFixture()
+            let owner = cancelled.window.agentModeViewModel
+            let held = Gate()
+            let reached = expectation(description: "cancelled start reached mutation boundary")
+            let suspend: @MainActor () async -> Void = {
+                reached.fulfill()
+                await held.hold()
+            }
+            if mutationRace != 0 {
+                owner.test_beforeMCPSelectionCommit = suspend
+            } else {
+                owner.test_afterMCPControlActivation = { _ in await suspend() }
+            }
+            let originalAgent = cancelled.session.selectedAgent
+            let originalModel = cancelled.session.selectedModelRaw
+            let originalEffort = cancelled.session.selectedReasoningEffortRaw
+            XCTAssertNotEqual(originalEffort, "high", "Requested effort must expose an unintended configuration write")
+            let cancelledTarget = try await owner.mcpResolveOrCreateSessionTarget(
+                tabID: nil, sessionID: cancelled.sessionID, createIfNeeded: false, sessionName: nil
+            )
+            var cancelledDispatches = 0
+            let start = Task {
+                try await AgentExternalMCPRunStarter.startPreservingCallerBinding(
+                    target: cancelledTarget, message: "cancel before configuration",
+                    metadata: .init(connectionID: nil, clientName: nil, windowID: nil),
+                    agentModeVM: owner, agentRaw: nil, modelRaw: nil, reasoningEffortRaw: "high",
+                    dispatchInstruction: { _, _, _, _, _ in
+                        cancelledDispatches += 1
+                        return .startedRun
+                    }
+                )
+            }
+            addTeardownBlock { @MainActor in
+                start.cancel()
+                await held.release()
+                _ = try? await start.value
+                owner.test_afterMCPControlActivation = nil
+                owner.test_beforeMCPSelectionCommit = nil
+                await cancelled.cleanup()
+            }
+            await fulfillment(of: [reached], timeout: 3)
+            if mutationRace == 2 {
+                cancelled.session.runState = .running
+            } else {
+                start.cancel()
+            }
+            await held.release()
+            do {
+                _ = try await start.value
+                XCTFail("Cancelled start succeeded")
+            } catch {
+                if mutationRace == 2 {
+                    XCTAssertTrue(error is MCPError)
+                } else {
+                    XCTAssertTrue(error is CancellationError)
+                }
+            }
+            XCTAssertEqual(cancelled.session.selectedAgent, originalAgent)
+            XCTAssertEqual(cancelled.session.selectedModelRaw, originalModel)
+            XCTAssertEqual(cancelled.session.selectedReasoningEffortRaw, originalEffort)
+            XCTAssertEqual(cancelledDispatches, 0)
+            if mutationRace != 2 {
+                XCTAssertNil(owner.mcpRegistration(sessionID: cancelled.sessionID))
+            }
+            cancelled.session.runState = .idle
+            owner.test_afterMCPControlActivation = nil
+            owner.test_beforeMCPSelectionCommit = nil
+        }
     }
 
     func testPostActivationExpiryKeepsAgedPreEpochSessionPollableWaitableAndCancellable() async throws {
