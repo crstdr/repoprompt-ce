@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import RepoPromptDomainRuntime
 import RepoPromptWorkspaceCore
 
 @MainActor
@@ -81,6 +82,42 @@ final class AppDeepLinkRouter {
 
     func route(agentSession route: AgentSessionDeepLinkRoute) async -> AgentSessionRouteResult {
         await routeAgentSession(route, sourceURL: nil)
+    }
+
+    func routeLoadedAgentSession(sessionID: UUID) async {
+        await Self.routeLoadedAgentSession(sessionID: sessionID, resolve: { sessionID in
+            self.windowStatesManager.agentSessionLinkCandidates(
+                forSessionIDs: [sessionID], includeLocation: false
+            )[sessionID] ?? []
+        }, isAvailable: { candidate in
+            guard let window = self.windowStatesManager.allWindows.first(where: {
+                $0.windowID == candidate.windowID && !$0.isClosing
+            }), window.workspaceManager.isInitialized,
+            let workspace = window.workspaceManager.activeWorkspace,
+            workspace.id == candidate.workspaceID else { return false }
+            return workspace.composeTabs.contains {
+                $0.id == candidate.tabID && $0.activeAgentSessionID == sessionID
+            }
+        }, navigate: { route in
+            _ = await self.route(agentSession: route)
+        })
+    }
+
+    static func routeLoadedAgentSession(
+        sessionID: UUID,
+        resolve: (UUID) -> [AgentSessionLinkEndpointCandidate],
+        isAvailable: (AgentSessionLinkEndpointCandidate) -> Bool,
+        navigate: (AgentSessionDeepLinkRoute) async -> Void
+    ) async {
+        let matches = resolve(sessionID)
+        guard matches.count == 1, let candidate = matches.first, candidate.sessionID == sessionID,
+              !candidate.isClosing, !candidate.isDeletionInProgress,
+              candidate.eligibilityInput.hasLoadedPersistedState, !candidate.bindingTransitionInProgress,
+              isAvailable(candidate) else { return }
+        await navigate(AgentSessionDeepLinkRoute(
+            windowID: candidate.windowID, workspaceID: candidate.workspaceID,
+            tabID: candidate.tabID, sessionID: sessionID
+        ))
     }
 
     private func routeLegacyURL(_ url: URL, preferredWindow: WindowState?) async {

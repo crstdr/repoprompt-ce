@@ -220,6 +220,7 @@ struct AgentMessageBubble: View {
     @Environment(\.agentRecentAssistantItemIDs) private var recentAssistantItemIDs
     @Environment(\.agentMessageRuntimeFooterByItemID) private var runtimeFooterByItemID
     @ObservedObject private var fontScale = FontScaleManager.shared
+    @State private var isOpeningAttributionSource = false
     @State private var activeCodexManagedLoginFlow: CodexManagedLoginFlow?
     @State private var codexManagedLoginOperationID: UUID?
     @State private var codexManagedLoginFeedback: String?
@@ -453,18 +454,32 @@ struct AgentMessageBubble: View {
         let label = "From \(displayName)"
         let detail = "Sent by overseeing session \(attribution.sourceSessionID.uuidString) through an oversight link."
 
-        return HStack(spacing: 4) {
-            Image(systemName: "eye.fill")
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
-            Text(label)
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .semibold))
-                .lineLimit(1)
+        return Button {
+            guard !isOpeningAttributionSource else { return }
+            isOpeningAttributionSource = true
+            Task {
+                defer { isOpeningAttributionSource = false }
+                await AppDeepLinkRouter.shared.routeLoadedAgentSession(sessionID: attribution.sourceSessionID)
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "eye.fill")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+                Text(label)
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .semibold))
+                    .lineLimit(1)
+            }
+            .foregroundColor(.purple)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(Color.purple.opacity(0.15))
+            .clipShape(Capsule())
         }
-        .foregroundColor(.purple)
-        .padding(.horizontal, 8)
-        .padding(.vertical, 3)
-        .background(Color.purple.opacity(0.15))
-        .clipShape(Capsule())
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            (hovering ? NSCursor.pointingHand : NSCursor.arrow).set()
+        }
+        .onDisappear { NSCursor.arrow.set() }
         .hoverTooltip(detail)
         .accessibilityLabel(Text(label))
         .accessibilityHint(Text(detail))
