@@ -556,7 +556,7 @@ struct AgentRunMCPToolService {
         {
             let ownership = session.runState.isActive
                 ? session.activeRunOwnership
-                : session.runLifecycle.lastTerminalCommitRevision?.ownership
+                : session.lastTerminalCommitRevision?.ownership
             // Preparation alone leaves prior-run IDs/text visible; only this turn's attempt owns them.
             if ownership?.turnEpoch == epoch, live.runID != nil || !live.isStartupPendingForMCPWait {
                 return live
