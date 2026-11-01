@@ -103,6 +103,7 @@ struct AgentProviderToolsRuntimeDisclosure: View {
     let onToggle: () -> Void
     let onApplyCodexToolSettingMutation: (CodexToolSettingMutation) -> Void
     let onApplyClaudeToolSettingMutation: (ClaudeToolSettingMutation) -> Void
+    var onNavigate: ((SettingsTab) -> Void)?
 
     var body: some View {
         if hasToolOptions {
@@ -128,7 +129,8 @@ struct AgentProviderToolsRuntimeDisclosure: View {
                         providerID: providerID,
                         binding: binding,
                         onApplyCodexToolSettingMutation: onApplyCodexToolSettingMutation,
-                        onApplyClaudeToolSettingMutation: onApplyClaudeToolSettingMutation
+                        onApplyClaudeToolSettingMutation: onApplyClaudeToolSettingMutation,
+                        onNavigate: onNavigate
                     )
                     .padding(.top, 6)
                     .transition(.opacity)
@@ -151,6 +153,7 @@ struct AgentProviderToolsRuntimeControls: View {
     let binding: AgentProviderControlsBinding
     let onApplyCodexToolSettingMutation: (CodexToolSettingMutation) -> Void
     let onApplyClaudeToolSettingMutation: (ClaudeToolSettingMutation) -> Void
+    var onNavigate: ((SettingsTab) -> Void)?
 
     var body: some View {
         VStack(alignment: .leading, spacing: AgentPermissionSettingsLayout.controlSpacing) {
@@ -159,7 +162,8 @@ struct AgentProviderToolsRuntimeControls: View {
                 if let codexTools = binding.codexTools {
                     CodexProviderToolsRuntimeSection(
                         tools: codexTools,
-                        onApplyMutation: onApplyCodexToolSettingMutation
+                        onApplyMutation: onApplyCodexToolSettingMutation,
+                        onNavigate: onNavigate
                     )
                 }
             case .claude:
@@ -180,6 +184,7 @@ struct AgentProviderToolsRuntimeControls: View {
 struct CodexProviderToolsRuntimeSection: View {
     let tools: CodexToolSettingsBinding
     let onApplyMutation: (CodexToolSettingMutation) -> Void
+    var onNavigate: ((SettingsTab) -> Void)?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -227,12 +232,9 @@ struct CodexProviderToolsRuntimeSection: View {
             .hoverTooltip("Controls Codex memory generation and use for app-server launch and thread start/resume. Off by default.")
 
             ProviderRuntimeSubsection(title: "Optional Codex Features") {
-                ProviderRuntimeToggleRow(
-                    title: "Computer Use",
-                    description: "Use /computer-use in direct Codex sessions with the installed Computer Use companion and an OpenAI-signed Codex executable. Re-signed runtimes may fail companion authentication; select a local runtime under Codex CLI → Advanced and restart if needed. Off by default. Grant Screen Recording and Accessibility permissions in macOS when prompted.",
-                    isOn: tools.computerUseEnabled,
-                    onChange: { onApplyMutation(.computerUse(enabled: $0)) }
-                )
+                Button("Configure in Settings ▸ Computer Use") {
+                    onNavigate?(.computerUse)
+                }
 
                 ProviderRuntimeToggleRow(
                     title: "Apps",

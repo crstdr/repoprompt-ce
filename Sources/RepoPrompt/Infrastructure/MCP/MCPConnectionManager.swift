@@ -15274,7 +15274,7 @@ actor ServerNetworkManager {
                                         slot: MCPCodeStructureSettlementRegistry.Slot?
                                     )
                                     if contract.cleanupDisposition == .detachAndSettle,
-                                       toolName != MCPWindowToolName.fileActions
+                                       [MCPWindowToolName.getCodeStructure, MCPWindowToolName.readFile, MCPWindowToolName.getFileTree].contains(toolName)
                                     {
                                         guard let windowID = invocationContext.dispatchAuthorization?.windowIdentity?.windowID else {
                                             throw MCPToolExecutionDispatchError.structureSettlementWindowUnresolved

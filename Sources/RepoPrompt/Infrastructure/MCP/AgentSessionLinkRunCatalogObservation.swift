@@ -93,6 +93,7 @@ struct AgentSessionLinkRunCatalogProjection: Equatable {
     }
 }
 
+/// Shared oversight-family membership for live call-grant selection and catalog fingerprinting.
 /// Fingerprints the actual client-shaped definitions, not tool-name presence or grant membership.
 /// Kept internal: no MCP wire fields and no authority are introduced.
 enum AgentSessionLinkCatalogSurface {

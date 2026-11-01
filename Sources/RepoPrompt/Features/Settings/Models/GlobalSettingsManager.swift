@@ -3,6 +3,21 @@ import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 import RepoPromptShared
 
+/// One effective policy for direct admission, designated-child admission, and native runtime availability.
+struct ComputerUsePolicy: Equatable {
+    static let masterDefaultsKey = "computerUseMasterEnabled"
+    let direct: Bool
+    let subagent: Bool
+    var runtime: Bool {
+        direct || subagent
+    }
+
+    init(master: Bool?, legacyDirect: Bool, subagent: Bool? = nil) {
+        direct = (master ?? true) && legacyDirect
+        self.subagent = (master ?? true) && (subagent ?? false)
+    }
+}
+
 // MARK: - Canonical Settings Keys
 
 //
@@ -161,16 +176,50 @@ extension GlobalSettingsStore {
         CodexGoalSupport.postDidChangeIfNeeded(previousValue: oldValue, currentValue: codexGoalSupportEnabled())
     }
 
+    var computerUsePolicy: ComputerUsePolicy {
+        ComputerUsePolicy(
+            master: scalarPreferences.agentMode?.computerUseMasterEnabled,
+            legacyDirect: CodexComputerUseWorkflow.isEnabled(persistedValue: scalarPreferences.agentMode?.codexComputerUseEnabled, master: nil),
+            subagent: scalarPreferences.agentMode?.computerUseSubagentEnabled
+        )
+    }
+
     func codexComputerUseEnabled() -> Bool {
-        CodexComputerUseWorkflow.isEnabled(persistedValue: scalarPreferences.agentMode?.codexComputerUseEnabled)
+        computerUsePolicy.direct
+    }
+
+    func setComputerUseSubagentEnabled(_ enabled: Bool) {
+        let previous = computerUsePolicy
+        updateAgentModeScalar(commit: true) { $0.computerUseSubagentEnabled = enabled }
+        notifyComputerUsePolicyChange(previous)
+    }
+
+    func setComputerUseModel(_ model: String) {
+        guard scalarPreferences.agentMode?.computerUseModel != model else { return }
+        updateAgentModeScalar(commit: true) { $0.computerUseModel = model }
+        NotificationCenter.default.post(name: .codexComputerUseDidChange, object: nil)
+    }
+
+    private func notifyComputerUsePolicyChange(_ previous: ComputerUsePolicy) {
+        if previous != computerUsePolicy { NotificationCenter.default.post(name: .codexComputerUseDidChange, object: nil) }
+    }
+
+    var computerUseMasterEnabled: Bool {
+        scalarPreferences.agentMode?.computerUseMasterEnabled ?? true
+    }
+
+    func setComputerUseMasterEnabled(_ enabled: Bool, commit: Bool = true) {
+        let previous = computerUsePolicy
+        updateAgentModeScalar(commit: commit) { $0.computerUseMasterEnabled = enabled }
+        notifyComputerUsePolicyChange(previous)
     }
 
     func setCodexComputerUseEnabled(_ enabled: Bool, commit: Bool = true) {
-        let oldValue = codexComputerUseEnabled()
+        let previous = computerUsePolicy
         updateAgentModeScalar(commit: commit) { settings in
             settings.codexComputerUseEnabled = enabled
         }
-        CodexComputerUseWorkflow.postDidChangeIfNeeded(previousValue: oldValue, currentValue: codexComputerUseEnabled())
+        notifyComputerUsePolicyChange(previous)
     }
 
     func codexReasoningSummariesEnabled() -> Bool {
@@ -657,16 +706,7 @@ extension GlobalSettingsStore {
 
     /// Invoke before constructing any settings store or decoding Agent Models profiles.
     nonisolated static func installApplicationModelIdentityPolicy() {
-        SettingsModelIdentityPolicy.installCursorCanonicalizer { raw in
-            // Exact advertised identities win over historical rename aliases.
-            if AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor)?.options.contains(where: { $0.rawValue == raw }) == true {
-                return raw
-            }
-            if let specifier = try? CursorAIModelCatalog.ModelSpecifier(raw: raw), !specifier.overrides.isEmpty {
-                return ACPModelParameterIdentity.canonicalBaseModelRaw(specifier.baseModelRaw, providerID: .cursor)
-            }
-            return CursorAIModelCatalog.canonicalAlias(raw)
-        }
+        SettingsModelIdentityPolicy.installCursorCanonicalizer(CursorAIModelCatalog.canonicalIdentity)
     }
 
     static func installProcessApplicationEventBridge(notificationCenter: NotificationCenter = .default) {

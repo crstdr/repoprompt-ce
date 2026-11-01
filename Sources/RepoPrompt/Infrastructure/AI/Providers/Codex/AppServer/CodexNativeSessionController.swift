@@ -728,6 +728,7 @@ final class CodexNativeSessionController {
         var computerUseClientPathProvider: () -> String? = { CodexNativeSessionController.computerUseClientPath() }
         var mcpServerEntriesProvider: () -> [MCPIntegrationHelper.CodexServerEntry] = { MCPIntegrationHelper.codexMCPServerEntries() }
         var skillExtraRootsProvider: () -> [URL] = { [] }
+        var computerUseHumanOnly = false
 
         /// Fail-closed RepoPrompt MCP provisioning validator, applied by `startOrResume` only for a
         /// child that expects RepoPrompt MCP tools; throwing aborts the start before any process
@@ -4530,8 +4531,12 @@ final class CodexNativeSessionController {
             turnScope(threadID: params["threadId"] as? String, turnID: params["turnId"] as? String) != nil
                 && params["metadata"] != nil ? .protocolMetadata : nil
         case "thread/settings/updated":
+            // Settings are an opaque snapshot, not model output; validate the outer envelope.
             nonEmptyString(params["threadId"] as? String) != nil
-                && isThreadSettingsMetadata(params["threadSettings"]) ? .protocolMetadata : nil
+                && params["threadSettings"] is [String: Any] ? .protocolMetadata : nil
+        case "thread/name/updated":
+            nonEmptyString(params["threadId"] as? String) != nil
+                && (params["threadName"] == nil || params["threadName"] is NSNull || params["threadName"] is String) ? .protocolMetadata : nil
         case "thread/status/changed":
             .threadStatusChanged
         case "turn/plan/updated":
@@ -5273,7 +5278,7 @@ final class CodexNativeSessionController {
         case .mcpElicitation:
             let autoApproveCompanion = shouldAutoApproveComputerUseCompanion(params: params)
             let autoApproveHost = Self.isRepoPromptMCPElicitationRequest(params: params)
-            if autoApproveHost || autoApproveCompanion {
+            if !options.computerUseHumanOnly, autoApproveHost || autoApproveCompanion {
                 logComputerUseApprovalDecision(path: .mcpElicitation, params: params, outcome: "accept")
                 await emitAutoApprovedServerRequestActivity(method: method, params: params)
                 await respondToServerRequest(
@@ -5307,7 +5312,7 @@ final class CodexNativeSessionController {
         case .permissions:
             let autoApproveCompanion = shouldAutoApproveComputerUseCompanion(params: params)
             let hostApprovalResult = Self.repoPromptPermissionsAutoApprovalResult(params: params)
-            if autoApproveCompanion,
+            if !options.computerUseHumanOnly, autoApproveCompanion,
                let permission = Self.parsePermissionsRequest(
                    requestID: request.id,
                    method: method,
@@ -5323,7 +5328,7 @@ final class CodexNativeSessionController {
                 ])
                 return
             }
-            if let approvalResult = hostApprovalResult {
+            if !options.computerUseHumanOnly, let approvalResult = hostApprovalResult {
                 logComputerUseApprovalDecision(path: .permissions, params: params, outcome: "accept")
                 await emitAutoApprovedServerRequestActivity(method: method, params: params)
                 await respondToServerRequest(id: request.id, result: approvalResult)

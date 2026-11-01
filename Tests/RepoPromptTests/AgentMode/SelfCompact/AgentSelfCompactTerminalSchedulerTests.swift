@@ -57,9 +57,9 @@ final class AgentSelfCompactTerminalSchedulerTests: XCTestCase {
                 hasActiveTools: { _ in !self.toolsAreDrained },
                 support: { self.support },
                 dispatch: { _, _, stillAdmissible in
-                    guard stillAdmissible() else { return false }
+                    guard stillAdmissible() else { return .refused(.stillAdmissibleLost) }
                     self.dispatched += 1
-                    return true
+                    return .started
                 },
                 maximumDrainPolls: 50,
                 sleep: { _ in
@@ -333,5 +333,162 @@ final class AgentSelfCompactTerminalSchedulerTests: XCTestCase {
         XCTAssertNil(teardown.state.active)
         XCTAssertEqual(teardown.dispatched, 0)
         XCTAssertLessThanOrEqual(teardown.polls, 50)
+    }
+}
+
+@MainActor
+final class AgentSelfCompactDiagnosticsTests: XCTestCase {
+    private func makeOwner() -> AgentSelfCompactOwner {
+        AgentSelfCompactOwner(
+            windowID: 1,
+            workspaceID: UUID(),
+            tabID: UUID(),
+            sessionID: UUID(),
+            persistentBindingGeneration: UUID(),
+            bindingTransitionGeneration: 1,
+            runID: UUID(),
+            runAttemptID: UUID()
+        )
+    }
+
+    private func makeAttempt() throws -> AgentSelfCompactAttempt {
+        var state = AgentSelfCompactState()
+        _ = state.reserve(
+            note: "note text that must never be logged",
+            idempotencyKey: "key",
+            maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes,
+            owner: makeOwner()
+        )
+        return try XCTUnwrap(state.active)
+    }
+
+    func testSettleRecordCarriesOnlyStructuredFieldsAndNoFreeText() throws {
+        let attempt = try makeAttempt()
+        AgentSelfCompactDiagnostics.beginCaptureForTesting()
+        defer { _ = AgentSelfCompactDiagnostics.endCaptureForTesting() }
+        AgentSelfCompactDiagnostics.settle(
+            attempt: attempt,
+            outcome: .failed,
+            cause: .drainTimeout,
+            details: .init(toolsActive: true, teardownPending: false)
+        )
+        let records = AgentSelfCompactDiagnostics.endCaptureForTesting()
+        XCTAssertEqual(records.count, 1)
+        let record = try XCTUnwrap(records.first)
+        XCTAssertEqual(record.event, .settle)
+        XCTAssertEqual(record.outcome, "failed")
+        XCTAssertEqual(record.cause, "drain_timeout")
+        XCTAssertEqual(record.phase, "scheduled")
+        XCTAssertEqual(record.toolsActive, true)
+        XCTAssertEqual(record.teardownPending, false)
+        XCTAssertEqual(record.request.count, 12)
+        XCTAssertNotEqual(record.request, attempt.id.uuidString)
+        let line = record.renderedLine
+        XCTAssertTrue(line.hasPrefix("event=selfcompact-settle "))
+        XCTAssertFalse(line.contains("note text"))
+        XCTAssertFalse(line.contains(attempt.id.uuidString))
+        XCTAssertFalse(try line.contains(XCTUnwrap(attempt.owner?.runAttemptID.uuidString)))
+        XCTAssertTrue(line.contains("request="))
+        XCTAssertTrue(line.contains("cause=drain_timeout"))
+    }
+
+    func testRejectedPublicationReasonIsBoundedToKnownEnum() throws {
+        let attempt = try makeAttempt()
+        AgentSelfCompactDiagnostics.beginCaptureForTesting()
+        defer { _ = AgentSelfCompactDiagnostics.endCaptureForTesting() }
+        var details = AgentSelfCompactDiagnostics.SettleDetails()
+        details.publication = .rejected
+        details.publicationRejection = .init(rawReason: "different_commit_already_published")
+        AgentSelfCompactDiagnostics.settle(
+            attempt: attempt,
+            outcome: .failed,
+            cause: .rejectedPublicationTimeout,
+            details: details
+        )
+        AgentSelfCompactDiagnostics.settle(
+            attempt: attempt,
+            outcome: .failed,
+            cause: .rejectedPublicationTimeout,
+            details: .init(
+                publication: .rejected,
+                publicationRejection: .init(rawReason: "some unexpected free-form reason text")
+            )
+        )
+        let records = AgentSelfCompactDiagnostics.endCaptureForTesting()
+        XCTAssertEqual(records.count, 2)
+        XCTAssertEqual(records[0].publicationReason, "different_commit_already_published")
+        XCTAssertEqual(records[1].publicationReason, "other")
+        XCTAssertFalse(records[1].renderedLine.contains("free-form"))
+    }
+
+    func testRefusedDispatchEmitsExactlyOneSettleRecordWithNamedCause() async throws {
+        var state = AgentSelfCompactState()
+        let owner = makeOwner()
+        _ = state.reserve(
+            note: "note", idempotencyKey: "key",
+            maximumNoteUTF8Bytes: AgentSessionSelfCompactNotePolicy.fallbackMaximumUTF8Bytes,
+            owner: owner
+        )
+        state.active?.admittedSupport = .claudeCode
+        let scheduler = AgentSelfCompactTerminalScheduler(
+            load: { state },
+            store: { state = $0 },
+            isCurrentOwner: { _ in true },
+            hasActiveTools: { _ in false },
+            support: { .claudeCode },
+            dispatch: { _, _, _ in .refused(.readiness(.targetNotIdle)) },
+            maximumDrainPolls: 1,
+            sleep: { _ in }
+        )
+        AgentSelfCompactDiagnostics.beginCaptureForTesting()
+        defer { _ = AgentSelfCompactDiagnostics.endCaptureForTesting() }
+        scheduler.terminalSettled(
+            runID: owner.runID,
+            runAttemptID: owner.runAttemptID,
+            terminalState: .completed,
+            publication: .accepted(successorEpoch: nil),
+            successorClaimed: false,
+            teardownSettled: { true }
+        )
+        for _ in 0 ..< 30 {
+            await Task.yield()
+        }
+        let records = AgentSelfCompactDiagnostics.endCaptureForTesting()
+        XCTAssertEqual(records.count, 1)
+        let record = try XCTUnwrap(records.first)
+        XCTAssertEqual(record.cause, "dispatch_not_started")
+        XCTAssertEqual(record.blocker, "readiness_target_not_idle")
+        XCTAssertEqual(record.outcome, "failed")
+        XCTAssertEqual(record.phase, "dispatchingCompact")
+        XCTAssertEqual(state.latest?.outcome, .failed)
+    }
+
+    func testNothingEmittedWithoutActiveSelfCompact() async {
+        var state = AgentSelfCompactState()
+        let scheduler = AgentSelfCompactTerminalScheduler(
+            load: { state },
+            store: { state = $0 },
+            isCurrentOwner: { _ in true },
+            hasActiveTools: { _ in false },
+            support: { .claudeCode },
+            dispatch: { _, _, _ in .started },
+            maximumDrainPolls: 1,
+            sleep: { _ in }
+        )
+        AgentSelfCompactDiagnostics.beginCaptureForTesting()
+        defer { _ = AgentSelfCompactDiagnostics.endCaptureForTesting() }
+        scheduler.terminalSettled(
+            runID: UUID(),
+            runAttemptID: UUID(),
+            terminalState: .completed,
+            publication: .accepted(successorEpoch: nil),
+            successorClaimed: false,
+            teardownSettled: { true }
+        )
+        scheduler.cancelForAcceptedLocalInput()
+        for _ in 0 ..< 10 {
+            await Task.yield()
+        }
+        XCTAssertTrue(AgentSelfCompactDiagnostics.endCaptureForTesting().isEmpty)
     }
 }

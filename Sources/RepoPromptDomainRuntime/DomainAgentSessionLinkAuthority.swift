@@ -683,12 +683,14 @@ package actor DomainAgentSessionLinkAuthority {
             }
         #endif
         var items: [DomainAgentSessionLinkInventoryItem] = []
-        // Intentionally retain the inherited full scan, including predicate/consent order.
-        for record in links.values {
+        // The target owner already maintains this inverse index for lifecycle invalidation.
+        // Do not sweep unrelated grants for a target-local publication or policy resolution.
+        for id in targets[targetSessionID]?.inboundLinkIDs ?? [] {
             #if DEBUG
                 if scanStart != nil { recordVisits += 1 }
             #endif
-            guard predicate(record), hasSourceConsent(record.grant) else { continue }
+            guard let record = links[id], predicate(record), hasSourceConsent(record.grant) else { continue }
+
             items.append(inventoryItem(record, outbound: false))
         }
         items.sort(by: Self.orderedByObserver)

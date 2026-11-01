@@ -148,8 +148,6 @@ class LocalProductionInstallerTests(unittest.TestCase):
         self.assertGreaterEqual(generation, 1 << 61)
         self.assertEqual(context["registry"].stat().st_mode & 0o777, 0o600)
         self.assertIn(f"Selected local certificate SHA-256: {SHA256_A}", result.stdout)
-        self.assertIn(f"Selected local signing compatibility generation: v{generation}", result.stdout)
-        self.assertIn("Local self-signed builds use in-memory secure storage", result.stdout)
         self.assertIn(f'certificate leaf = H"{SHA1_A}"', result.stdout)
         self.assertEqual(
             context["package_capture"].read_text(encoding="utf-8").strip(),
@@ -215,7 +213,7 @@ class LocalProductionInstallerTests(unittest.TestCase):
         self.assertEqual(self.registry(context)["certificateSHA256"], SHA256_C)
         self.assertTrue(context["import_log"].exists())
 
-    def test_explicit_rotation_advances_signing_compatibility_generation(self) -> None:
+    def test_explicit_rotation_advances_generation_and_preserves_prior_service_generation(self) -> None:
         result, context = self.run_installer(
             [certificate(SHA1_A, SHA256_A), certificate(SHA1_B, SHA256_B)],
             registry={"fingerprint": SHA256_A, "generation": 4},
@@ -226,10 +224,7 @@ class LocalProductionInstallerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.registry(context)["certificateSHA256"], SHA256_B)
         self.assertEqual(self.registry(context)["serviceGeneration"], 5)
-        self.assertIn("changes signing continuity; local builds use in-memory secure storage", result.stderr)
-        self.assertIn("Earlier Keychain items remain untouched with their previous access conditions", result.stderr)
-        self.assertIn("they are not copied or protected by this change", result.stderr)
-        self.assertNotIn("prior local secure-storage generation inaccessible", result.stderr)
+        self.assertIn("prior local secure-storage generation inaccessible", result.stderr)
         self.assertEqual(context["package_capture"].read_text(encoding="utf-8").strip(), f"{SHA1_B}|{SHA256_B}|5")
 
     def test_rotation_without_selection_mints_one_new_identity(self) -> None:
@@ -243,10 +238,6 @@ class LocalProductionInstallerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.registry(context)["certificateSHA256"], SHA256_C)
         self.assertEqual(self.registry(context)["serviceGeneration"], 2)
-        self.assertIn("changes signing continuity; local builds use in-memory secure storage", result.stderr)
-        self.assertIn("Earlier Keychain items remain untouched with their previous access conditions", result.stderr)
-        self.assertIn("they are not copied or protected by this change", result.stderr)
-        self.assertNotIn("prior local secure-storage generation inaccessible", result.stderr)
 
     def test_two_consecutive_installs_keep_fingerprint_generation_and_designated_requirement(self) -> None:
         first, context = self.run_installer([certificate(SHA1_A, SHA256_A)], expected_sha1=SHA1_A)

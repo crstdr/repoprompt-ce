@@ -31,7 +31,7 @@ extension AgentModeViewModel: AgentNotificationActionTarget {
         else {
             return false
         }
-        codexCoordinator.submitPermissionsDecision(session: session, request: request, decision: .decline)
+        codexCoordinator.submitPermissionsDecision(session: session, request: request, decision: .decline, origin: .humanCard)
         return session.pendingPermissionsRequest?.id != requestID
     }
 

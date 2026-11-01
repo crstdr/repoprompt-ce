@@ -129,7 +129,7 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
                         ])
                     ),
                     "until": .string(description: "[wait] change (default), idle, or sendable. Use sendable before send; idle is insufficient.", enum: ["change", "idle", "sendable"]),
-                    "timeout_seconds": .number(description: "[wait] Max seconds; default 60; 0 polls immediately."),
+                    "timeout_seconds": .number(description: "[wait] 0-60 seconds; default 60; 0 polls.", minimum: 0, maximum: 60),
                     "from": .string(description: "[read] Fresh page origin: tail (default/newest) or start (oldest).", enum: ["tail", "start"]),
                     "max_items": .integer(description: "[list, read] Item limit: list 32 default, read 30; max 100."),
                     "max_output_bytes": .integer(description: "[read] Approximate pre-JSON UTF-8 page limit; default 8000, max 20000. Rows use the page budget; budget-clipped rows carry a clip marker."),
@@ -224,6 +224,7 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
         var properties: OrderedDictionary<String, JSONSchema> = [
             "op": .string(description: "Operation.", enum: ["start", "poll", "wait", "cancel", "steer", "respond"]),
             "message": .string(description: messageDescription),
+            "computer_use": .boolean(description: MCPDomainCanonicalToolDefinitions.computerUseStartDescription, default: .bool(false)),
             "model_id": .string(description: "[start] Role label from agent_manage.list_agents task_labels (explore, engineer, pair, design — resolved via global role defaults), or an explicit compound model_id from agents[].models[].model_id to pin an exact target. Defaults to pair when omitted."),
             "model_parameters": modelParametersSchema(operations: "start"),
             "session_id": .string(description: "[poll, wait, cancel, steer, respond] Session UUID returned by a prior start/steer response. Do not fabricate it. Not accepted by start — use steer to continue an existing session."),
@@ -288,6 +289,8 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
             **Parallel agents**: When launching multiple agents in parallel, always use `detach: true` so each `start` returns immediately without blocking. You can then `wait` or `poll` each `session_id` independently. Do useful independent work before blocking, and prefer `wait` over repetitive status-only polling.
 
             **IMPORTANT — never end your turn with active agents**: Sub-agents may need approval for tool calls or ask questions via `waiting_for_input`. Always `wait`/`poll` on every started session and `respond` to any pending interactions before finishing your turn. An unattended agent will stall indefinitely.
+
+            \(MCPDomainCanonicalToolDefinitions.computerUseGuidance)
             """,
             annotations: .repoPromptLocalEphemeralState,
             inputSchema: .object(

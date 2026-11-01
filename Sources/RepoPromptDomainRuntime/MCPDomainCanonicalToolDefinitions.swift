@@ -8,6 +8,8 @@ import RepoPromptShared
 /// resource or recorded from a live app window. Both app and standalone compositions bind
 /// these values, and fingerprint tests cover every catalog entry.
 package enum MCPDomainCanonicalToolDefinitions {
+    package static let computerUseStartDescription = "[start] Create this chat's persistent Codex Computer Use child. Requires human permission in the parent chat. Reuse the child with steer; start never reuses a session."
+    package static let computerUseGuidance = "Computer Use children require human answers in the child chat. Never use respond for them. A wait timeout does not stop the child; wait again or cancel. Do not repeat an accepted task automatically."
     package static let definitions: [MCPDomainToolDefinition] = decodeDefinitions()
 
     package static func definition(named name: String) -> MCPDomainToolDefinition? {
@@ -1129,10 +1131,24 @@ package enum MCPDomainCanonicalToolDefinitions {
         return (canonicalize ? definitions.map(canonicalizeGlobalSemantics) : definitions)
             .map(advertiseModelParameters)
             .map(advertiseOracleAttachments)
+            .map(advertiseAdditionalOracles)
             .map(advertiseWorktreeListPagination)
             .map(advertiseDefaultRepositoryElection)
             .map(advertiseSessionDiscovery)
             .map(advertiseAgentControlTaskRoles)
+            .map(advertiseComputerUseChild)
+    }
+
+    private static func advertiseComputerUseChild(_ definition: MCPDomainToolDefinition) -> MCPDomainToolDefinition {
+        guard definition.name == MCPWindowToolName.agentRun,
+              case var .object(schema) = definition.inputSchema,
+              case var .object(properties)? = schema["properties"] else { return definition }
+        properties["computer_use"] = .object(["type": .string("boolean"), "default": .bool(false), "description": .string(computerUseStartDescription)])
+        schema["properties"] = .object(properties)
+        return MCPDomainToolDefinition(
+            name: definition.name, description: definition.description + "\n\n" + computerUseGuidance,
+            inputSchema: .object(schema), annotations: definition.annotations, isEnabledByDefault: definition.isEnabledByDefault
+        )
     }
 
     private static func advertiseAgentControlTaskRoles(_ definition: MCPDomainToolDefinition) -> MCPDomainToolDefinition {
@@ -1255,6 +1271,24 @@ package enum MCPDomainCanonicalToolDefinitions {
             name: definition.name,
             description: definition.description
                 + "\n\n**Cursor parameters**: `\(operations)` accept `model_parameters` as exact `config_id` and `value` pairs for app-backed Cursor sessions. Discover choices in `agent_manage.list_agents`; catalog `current_value` is the catalog default, not a live session value. Selections are applied before prompting and returned in session snapshots. Standalone headless sessions reject parameter overrides.",
+            inputSchema: .object(schema),
+            annotations: definition.annotations,
+            isEnabledByDefault: definition.isEnabledByDefault
+        )
+    }
+
+    private static func advertiseAdditionalOracles(
+        _ definition: MCPDomainToolDefinition
+    ) -> MCPDomainToolDefinition {
+        guard OracleAttachmentContract.oracleToolNames.contains(definition.name),
+              case var .object(schema) = definition.inputSchema,
+              case var .object(properties)? = schema["properties"]
+        else { return definition }
+        properties[OracleAdditionalOraclesContract.argumentName] = OracleAdditionalOraclesContract.schemaProperty()
+        schema["properties"] = .object(properties)
+        return MCPDomainToolDefinition(
+            name: definition.name,
+            description: definition.description,
             inputSchema: .object(schema),
             annotations: definition.annotations,
             isEnabledByDefault: definition.isEnabledByDefault
@@ -1522,10 +1556,15 @@ package enum MCPDomainCanonicalToolDefinitions {
                     of: oldWaitDescription,
                     with: currentWaitDescription
                 )
+            let oldStartDescription = "Pass `detach: true` to return immediately."
+            let currentStartDescription = oldStartDescription
+            let startDescription = description.contains(currentStartDescription)
+                ? description
+                : description.replacingOccurrences(of: oldStartDescription, with: currentStartDescription)
             return canonicalizeAgentControlWaitSemantics(
                 MCPDomainToolDefinition(
                     name: definition.name,
-                    description: description,
+                    description: startDescription,
                     inputSchema: definition.inputSchema,
                     annotations: definition.annotations,
                     isEnabledByDefault: definition.isEnabledByDefault
@@ -3153,6 +3192,12 @@ package enum MCPDomainCanonicalToolDefinitions {
     }
 
     #if DEBUG
+        package static func test_canonicalizeGlobalSemantics(
+            _ definition: MCPDomainToolDefinition
+        ) -> MCPDomainToolDefinition {
+            canonicalizeGlobalSemantics(definition)
+        }
+
         package static func test_agentSessionLinkAutonomyContractState(
             _ definition: MCPDomainToolDefinition
         ) -> String {
@@ -4041,8 +4086,8 @@ package enum MCPDefaultRepositoryElectionCopy {
     package static let manageWorktreeRepoRootProperty =
         "Optional loaded root path/name or repo/worktree specifier. When omitted, app-backed calls use the session's sole worktree binding, or declared PRIMARY with no bindings; multiple bindings require an identifying selector."
 
-    // `agent_run` startup keeps its own rules: explicit and created startup worktrees are PRIMARY-only, and
-    // inheritance copies the source session's complete binding set. The agent control provider reuses these.
+    /// `agent_run` startup keeps its own rules: explicit and created startup worktrees are PRIMARY-only, and
+    /// inheritance copies the source session's complete binding set. The agent control provider reuses these.
     static let agentRunObsoleteWorktreeArgs =
         "Optional start-only worktree args can bind the new session to an existing worktree (`worktree`/`worktree_id`) or create an app-managed worktree (`worktree_create=true`) before provider startup; explicit worktree args take precedence, suppress parent inheritance, and bind only the requested worktree."
     package static let agentRunWorktreeArgs =

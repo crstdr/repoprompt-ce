@@ -142,6 +142,14 @@ final class DirectHeadlessCompositionTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: snapshotURL), generated)
     }
 
+    func testAgentRunStartDescriptionCanonicalizationIsIdempotent() throws {
+        let current = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: MCPWindowToolName.agentRun))
+        let once = MCPDomainCanonicalToolDefinitions.test_canonicalizeGlobalSemantics(current)
+        let twice = MCPDomainCanonicalToolDefinitions.test_canonicalizeGlobalSemantics(once)
+        XCTAssertEqual(once, current)
+        XCTAssertEqual(twice, current)
+    }
+
     func testHeadlessOracleDescriptionsScopeTheRunLimitToAppBackedAgentMode() throws {
         // Direct-headless Oracle chats are not owned by an Agent run, so the app's current-run limit must stay qualified.
         for name in [MCPWindowToolName.askOracle, MCPWindowToolName.oracleChatLog] {
@@ -268,6 +276,10 @@ final class DirectHeadlessCompositionTests: XCTestCase {
     }
 
     func testHeadlessLaunchRejectsUnsupportedModelParametersBeforeProviderStartup() throws {
+        for (operation, flag) in [("start", Value.bool(true)), ("wait", .bool(false)), ("start", .string("true"))] {
+            XCTAssertThrowsError(try DirectHeadlessAgentBackend.validateComputerUseFlag(["computer_use": flag], operation: operation))
+        }
+        XCTAssertNoThrow(try DirectHeadlessAgentBackend.validateComputerUseFlag(["computer_use": .bool(false)], operation: "start"))
         XCTAssertThrowsError(try DirectHeadlessProviderCoordinator.resolvedLaunchMessage(args: [
             "message": .string("Reply OK"),
             "model_parameters": .array([

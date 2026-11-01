@@ -336,9 +336,9 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         }
     }
 
-    private func makeFixture(shouldManageCodexTooling: Bool = false, configureReplacement: ((MonitorFakeCodexController) -> Void)? = nil) throws -> Fixture {
+    private func makeFixture(rejectFirstNativeStartForAuth: Bool = false, shouldManageCodexTooling: Bool = false, configureReplacement: ((MonitorFakeCodexController) -> Void)? = nil) throws -> Fixture {
         let dispatches = MonitorCodexDispatchRecorder()
-        let controller = MonitorFakeCodexController(dispatches: dispatches)
+        let controller = MonitorFakeCodexController(dispatches: dispatches, rejectFirstStartForAuth: rejectFirstNativeStartForAuth)
         var initialController: MonitorFakeCodexController? = controller
         var startOrResumeHook: (@Sendable () async -> Void)?
         let authRecovery = MonitorStubCodexAuthRecovery()
@@ -1039,6 +1039,80 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         MonitorSupplementAssertions.assertNotPersisted(in: fixture.session)
     }
 
+    func testProviderSwitchNativeReadProofRechecksFrozenCompositionBeforeTransport() async throws {
+        for drift in [false, true] {
+            let fixture = try makeFixture()
+            await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
+            let session = fixture.session
+            let vm = fixture.viewModel
+            let input = try await AgentSessionLinkTransportLocalInputFixture.install(on: vm, session: session)
+            addTeardownBlock { @MainActor in await input.cleanup() }
+            await input.correction("SWITCH-READ-PROOF-CORRECTION")
+            let request = AgentChatItem.user("retained source history", sequenceIndex: 0)
+            let turn = AgentTranscriptTurn(request: .init(from: request), responseSpans: [], conclusionActivityID: nil, terminalState: .completed, startedAt: request.timestamp, completedAt: request.timestamp)
+            let projection = try AgentProviderHandover.project(AgentTranscript(turns: [turn]))
+            let source = try AgentProviderHandover.Source(provider: "source", model: "source-model")
+            let payload = AgentProviderHandover.render(AgentProviderHandover.history(projection, source: source, historyReference: nil))
+            session.pendingHandoff = .init(payload: payload, createdAt: Date(), providerSwitchDelivery: .ready)
+            vm.test_setAgentSessionSaver { _, _, _ in FileManager.default.temporaryDirectory.appendingPathComponent("switch-read-proof-\(UUID()).json") }
+            guard case let .success(.some(preparation)) = await vm.providerSwitchSendAdmission(session: session, input: "ordinary switched input") else {
+                return XCTFail("Fitting carrier must admit before native acquisition")
+            }
+            let messages = await vm.prepareProviderSwitchHandoverForSend(preparation, session: session, stopFence: .init(session: session))
+            let text = try XCTUnwrap(messages?.initial)
+            session.beginRunAttempt(source: "test.switch.nativeReadFence")
+            let gate = TestReleaseFence(name: "switched Codex optional Read proof")
+            vm.test_agentSessionLinkLocalInputReadProof = { decoration in
+                let valid = await input.bridge.proveLocalInputRead(decoration, observer: input.observer)
+                XCTAssertTrue(valid, "The existing real Read authority must pass, not cause the refusal")
+                await gate.enterAndWait()
+                return valid
+            }
+            let send = Task { @MainActor in
+                await fixture.coordinator.sendCodexNativeMessage(session: session, text: text, attachments: [])
+            }
+            defer { gate.release()
+                send.cancel()
+                vm.test_agentSessionLinkLocalInputReadProof = nil
+            }
+            let entered = await gate.waitUntilEntered()
+            XCTAssertTrue(entered)
+            let proof = try XCTUnwrap(session.pendingHandoff.providerSwitchDispatch)
+            XCTAssertNil(proof.dispatchID, "Physical acquisition must wait for Read and catalog proof; the admitted composition is already frozen")
+            XCTAssertNotNil(proof.runOwnership)
+            XCTAssertTrue(fixture.startedTurns.isEmpty)
+            let route = try XCTUnwrap(vm.agentSessionLinkRunCatalogProjectionByEndpoint[input.observer]?.routeToken)
+            let instructions = vm.providerSwitchInstructionStrings(session)
+            if drift {
+                let inventory = try XCTUnwrap(input.host.publishedPromptInventories[input.observer.sessionID])
+                vm.agentSessionLinkPublishPromptInventory(.init(
+                    observerSessionID: inventory.observerSessionID, linkSetRevision: inventory.linkSetRevision + 1,
+                    items: inventory.items + [.init(targetSessionID: UUID(), displayName: "Additional same-route lane", capabilityNames: ["poll", "read", "send_when_idle", "wait"])]
+                ), to: input.observer)
+                XCTAssertNotEqual(vm.providerSwitchInstructionStrings(session), instructions)
+            }
+            XCTAssertEqual(vm.agentSessionLinkRunCatalogProjectionByEndpoint[input.observer]?.routeToken, route, "Supplement drift must not invalidate the route instead")
+            XCTAssertEqual(session.pendingHandoff.providerSwitchDispatch, proof, "Admitted evidence must never refresh")
+            gate.release()
+            let outcome = await send.value
+            if drift {
+                XCTAssertFalse(outcome.didSend)
+                XCTAssertTrue(fixture.startedTurns.isEmpty, "No controller transport may follow frozen composition drift during proof")
+                XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .sending)
+                XCTAssertEqual(session.pendingHandoff.payload, payload)
+                XCTAssertFalse(session.items.contains { $0.recoveryDiagnostic?.outcome == "sent" })
+            } else {
+                XCTAssertEqual(outcome, .sent)
+                XCTAssertEqual(fixture.startedTurns.count, 1)
+                XCTAssertTrue(try XCTUnwrap(fixture.startedTurns.first).contains("SWITCH-READ-PROOF-CORRECTION"))
+                XCTAssertEqual(session.pendingHandoff, .init())
+                XCTAssertEqual(session.items.count(where: { $0.recoveryDiagnostic?.reason == "providerSwitch" && $0.recoveryDiagnostic?.outcome == "sent" }), 1)
+                try input.assertConsumed()
+            }
+            vm.test_agentSessionLinkLocalInputReadProof = nil
+        }
+    }
+
     func testLocalInputCodexExpectedTurnRetryUsesBaselineWithoutHarvestingNewCorrection() async throws {
         let fixture = try makeFixture()
         await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
@@ -1490,6 +1564,63 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
     }
 
     // MARK: Managed-auth recovery replay
+
+    func testProviderSwitchFirstStartAuthRejectionThenManagedReplayConfirmsExactlyOnce() async throws {
+        let fixture = try makeFixture(rejectFirstNativeStartForAuth: true)
+        await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
+        let session = fixture.session
+        session.selectedModelRaw = fixture.viewModel.defaultModelRaw(for: .codexExec)
+        let request = AgentChatItem.user("retained source history", sequenceIndex: 0)
+        let turn = AgentTranscriptTurn(request: .init(from: request), responseSpans: [], conclusionActivityID: nil, terminalState: .completed, startedAt: request.timestamp, completedAt: request.timestamp)
+        let projection = try AgentProviderHandover.project(AgentTranscript(turns: [turn]))
+        let source = try AgentProviderHandover.Source(provider: "source", model: "source-model")
+        let payload = AgentProviderHandover.render(AgentProviderHandover.history(projection, source: source, historyReference: nil))
+        session.pendingHandoff = .init(payload: payload, createdAt: Date(), providerSwitchDelivery: .ready)
+        var savedDeliveries: [AgentProviderSwitchDelivery?] = []
+        let saveURL = FileManager.default.temporaryDirectory.appendingPathComponent("provider-switch-auth-\(UUID().uuidString).json")
+        fixture.viewModel.test_setAgentSessionSaver { saved, _, _ in
+            savedDeliveries.append(saved.pendingHandoffProviderSwitchDelivery)
+            return saveURL
+        }
+        guard case let .success(.some(preparation)) = await fixture.viewModel.providerSwitchSendAdmission(session: session, input: "ordinary destination input") else {
+            return XCTFail("The first ordinary input must admit the ready carrier")
+        }
+        let messages = await fixture.viewModel.prepareProviderSwitchHandoverForSend(preparation, session: session, stopFence: .init(session: session))
+        let text = try XCTUnwrap(messages?.initial)
+        XCTAssertEqual(savedDeliveries, [.sending], "Sending must be saved before either physical attempt")
+        XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .sending)
+        XCTAssertTrue(session.pendingHandoff.isStagedForSend)
+        XCTAssertFalse(session.items.contains { $0.recoveryDiagnostic?.outcome == "sent" })
+        session.beginRunAttempt(source: "test.providerSwitch.auth.firstStartRejected")
+
+        let outcome = await fixture.coordinator.sendCodexNativeMessage(session: session, text: text, attachments: [])
+
+        guard case .sent = outcome else { return XCTFail("Existing managed-auth recovery must accept the replay: \(outcome)") }
+        let didRefresh = await fixture.authRecovery.didRefresh
+        XCTAssertTrue(didRefresh, "The first physical start must reject auth and drive the real recovery path")
+        try assertReplayUsedFreshController(fixture)
+        XCTAssertEqual(fixture.startedTurns.count, 2)
+        let rejected = try XCTUnwrap(fixture.startedTurns.first)
+        let replay = try XCTUnwrap(fixture.startedTurns.last)
+        MonitorSupplementAssertions.assertCarriesExactlyOneSupplement(rejected, userContent: text)
+        XCTAssertTrue(rejected.hasPrefix(text + "\n\n"))
+        // A rejected start never acknowledged its optional supplement. Recovery keeps the exact
+        // carrier/input baseline without promoting that unaccepted claim into replay authority.
+        XCTAssertEqual(Array(replay.utf8), Array(text.utf8))
+        MonitorSupplementAssertions.assertCarriesNoSupplement(replay)
+        XCTAssertTrue(replay.contains(payload))
+        try await AsyncTestWait.waitUntil("provider switch managed-auth replay clear save") {
+            savedDeliveries.contains { $0 == nil }
+        }
+        XCTAssertEqual(session.pendingHandoff, .init())
+        let expectedConfirmation = "Handover sent to \(session.selectedAgent.displayName) / \(fixture.viewModel.inputBarModelDisplayName(rawModel: session.selectedModelRaw, agentKind: session.selectedAgent))."
+        let confirmations = session.items.filter { $0.recoveryDiagnostic?.reason == "providerSwitch" && $0.recoveryDiagnostic?.outcome == "sent" }
+        XCTAssertEqual(confirmations.map(\.text), [expectedConfirmation], "Only the positive replay may confirm and clear the carrier")
+        guard case .success(nil) = await fixture.viewModel.providerSwitchSendAdmission(session: session, input: "next ordinary input") else {
+            return XCTFail("Positive native replay must remove the handover's next-input blocker")
+        }
+        XCTAssertEqual(session.items.count(where: { $0.recoveryDiagnostic?.outcome == "sent" }), 1)
+    }
 
     func testAuthRecoveryReplayOfSettledAutoWakeUsesExactAcceptedEnvelope() async throws {
         let fixture = try makeFixture()
@@ -2683,6 +2814,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                 await configurationGate.open()
                 await removalGate.open()
                 await manager.debugRemoveConnection(connectionID)
+                server.stopServiceObservation()
             }
             let confirmed = AgentChatItem.user("confirmed", sequenceIndex: fixture.session.nextSequenceIndex)
             fixture.session.appendItem(confirmed)
@@ -2969,7 +3101,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         let shutdownCount = await controller.shutdownCount
         let sentCount = await controller.sentCount
 
-        guard case let .failed(message) = outcome else {
+        guard case let .failed(message, _) = outcome else {
             return XCTFail("expected route loss to fail closed, got \(outcome)")
         }
         XCTAssertTrue(message.contains("could not verify the exact RepoPrompt MCP route"))
@@ -3883,12 +4015,26 @@ private actor MonitorRemovalConnection: MCPServerConnection {
 }
 
 actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
-    func emit(_ event: NativeAgentRuntimeEvent) {
-        continuation?.yield(event)
-    }
-
     private var configuration = SessionLinkNativeConfigurationFixture()
     private(set) var sentMessages: [String] = []
+    private(set) var inputBoundaryCalls: [String] = []
+    private var immediateReplyDuringSend = false
+    private var rejectBeforeWrite = false
+
+    func setRejectBeforeWrite(_ enabled: Bool) {
+        rejectBeforeWrite = enabled
+    }
+
+    private var interruptedTurnID: UUID?
+
+    func setInterruptedTurnID(_ id: UUID) {
+        interruptedTurnID = id
+    }
+
+    func setImmediateReplyDuringSend(_ enabled: Bool) {
+        immediateReplyDuringSend = enabled
+    }
+
     private var lastSentTurnID: UUID?
 
     func completeLastTurn(text: String? = nil, status: NativeAgentRuntimeTurnStatus = .completed) {
@@ -3907,15 +4053,38 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
     private var turnInFlight = false
     private var failSendAfterRecord = false
     private var sendSuspension: (@Sendable () async -> Void)?
+    private var shutdownSuspension: (@Sendable () async -> Void)?
 
     func setSendSuspension(_ suspension: @escaping @Sendable () async -> Void) {
         sendSuspension = suspension
     }
 
+    func setShutdownSuspension(_ suspension: @escaping @Sendable () async -> Void) {
+        shutdownSuspension = suspension
+    }
+
     private var finishEventsAfterSend = false
+    private var startupEvent: NativeAgentRuntimeEvent?
+
+    func setStartupEvent(_ event: NativeAgentRuntimeEvent) {
+        startupEvent = event
+    }
+
+    private var steeringConfigurationGate: TestReleaseFence?
+    private var failSteeringConfiguration = false
+
+    func setSteeringConfigurationGate(_ gate: TestReleaseFence, fail: Bool) {
+        steeringConfigurationGate = gate
+        failSteeringConfiguration = fail
+    }
 
     func setFinishEventsAfterSend(_ value: Bool) {
         finishEventsAfterSend = value
+    }
+
+    func emit(_ event: NativeAgentRuntimeEvent) {
+        _ = events
+        continuation?.yield(event)
     }
 
     func setTurnInFlight(_ value: Bool) {
@@ -3937,8 +4106,17 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
         sentMessages.count
     }
 
+    private var activeReadGate: TestReleaseFence?
+
+    func setActiveReadGate(_ gate: TestReleaseFence?) {
+        activeReadGate = gate
+    }
+
     var hasActiveSession: Bool {
-        true
+        get async {
+            if let activeReadGate { await activeReadGate.enterAndWait() }
+            return true
+        }
     }
 
     var hasTurnInFlight: Bool {
@@ -3960,7 +4138,12 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
         _ = events
     }
 
-    func resetEventsStreamForNewRun() async {}
+    func resetEventsStreamForNewRun() async {
+        continuation?.finish()
+        continuation = nil
+        stream = nil
+        _ = events
+    }
 
     func startOrResume(
         existingSessionID: String?,
@@ -3969,6 +4152,7 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
         systemPromptOverride _: String?
     ) async throws -> NativeAgentRuntimeSessionRef {
         configuration.replaceProcess()
+        if let startupEvent { emit(startupEvent) }
         startOrResumeExistingSessionIDs.append(existingSessionID)
         if rejectResume, existingSessionID != nil {
             throw NativeAgentRuntimeControllerError.processNotRunning
@@ -3994,12 +4178,38 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
         if let configurationGate {
             _ = await configurationGate.requirement()
         }
+        if let steeringConfigurationGate {
+            await steeringConfigurationGate.enterAndWait()
+            if failSteeringConfiguration {
+                throw NativeAgentRuntimeControllerError.processNotRunning
+            }
+        }
         return configuration.apply()
+    }
+
+    private var sendCompletionGate: TestReleaseFence?
+
+    func setSendCompletionGate(_ gate: TestReleaseFence?) {
+        sendCompletionGate = gate
     }
 
     func sendUserMessage(_ text: String, configuration proof: NativeAgentRuntimeConfigurationProof) async throws -> UUID {
         try configuration.validate(proof)
+        if rejectBeforeWrite {
+            await sendSuspension?()
+            throw NativeAgentRuntimeControllerError.configurationNotCurrent
+        }
+        inputBoundaryCalls.append("send")
         sentMessages.append(text)
+        if let sendCompletionGate { await sendCompletionGate.enterAndWait() }
+        if immediateReplyDuringSend {
+            let id = UUID()
+            lastSentTurnID = id
+            continuation?.yield(.stream(.init(type: "content", text: "immediate-steer-reply")))
+            continuation?.yield(.turnsCompleted(turnIDs: [id], status: .completed))
+            await sendSuspension?()
+            return id
+        }
         await sendSuspension?()
         if failSendAfterRecord {
             throw NativeAgentRuntimeControllerError.processNotRunning
@@ -4028,17 +4238,25 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
         return turnID
     }
 
-    func interruptTurn(reason _: String) async -> NativeAgentRuntimeInterruptOutcome {
-        .noTurnInFlight
+    func interruptTurn(reason: String) async -> NativeAgentRuntimeInterruptOutcome {
+        inputBoundaryCalls.append("interrupt:\(reason)")
+        if let id = interruptedTurnID {
+            interruptedTurnID = nil
+            continuation?.yield(.turnsCompleted(turnIDs: [id], status: .cancelled))
+        }
+        return .noTurnInFlight
     }
 
     func shutdown() async {
+        await shutdownSuspension?()
         configuration.replaceProcess()
         shutdownCount += 1
         continuation?.finish()
     }
 
-    func respondToPermissionRequest(id _: String, decision _: AgentApprovalDecision) async {}
+    func respondToPermissionRequest(id: String, decision: AgentApprovalDecision) async {
+        inputBoundaryCalls.append("permission:\(id):\(decision)")
+    }
 }
 
 /// Records each run-policy install while forwarding it to the shared manager, so a Claude run's
@@ -4103,6 +4321,7 @@ final class MonitorFakeCodexController: CodexSessionControllerPassiveStubDefault
     }
 
     private let dispatches: MonitorCodexDispatchRecorder
+    private let rejectFirstStartForAuth: Bool
     private let processID: pid_t?
     private let lock = NSLock()
     private var started: [String] = []
@@ -4110,6 +4329,12 @@ final class MonitorFakeCodexController: CodexSessionControllerPassiveStubDefault
     private var activeTurnID: String?
     private var threadStarted = false
     private var startOrResumeHook: (@Sendable () async -> Void)?
+    private var sendGate: TestReleaseFence?
+
+    func setSendGate(_ gate: TestReleaseFence?) {
+        lock.withLock { sendGate = gate }
+    }
+
     private var startGate: CatalogAuthorityGate?
     private var failStartAfterGate = false
     private var startSuspension: (@Sendable () async -> Void)?
@@ -4142,8 +4367,9 @@ final class MonitorFakeCodexController: CodexSessionControllerPassiveStubDefault
     private let continuation: AsyncStream<CodexNativeSessionController.Event>.Continuation
     private let stream: AsyncStream<CodexNativeSessionController.Event>
 
-    init(dispatches: MonitorCodexDispatchRecorder, processID: pid_t? = nil) {
+    init(dispatches: MonitorCodexDispatchRecorder, rejectFirstStartForAuth: Bool = false, processID: pid_t? = nil) {
         self.dispatches = dispatches
+        self.rejectFirstStartForAuth = rejectFirstStartForAuth
         self.processID = processID
         var storedContinuation: AsyncStream<CodexNativeSessionController.Event>.Continuation!
         stream = AsyncStream { storedContinuation = $0 }
@@ -4220,10 +4446,17 @@ final class MonitorFakeCodexController: CodexSessionControllerPassiveStubDefault
         reasoningEffort _: String?,
         serviceTier _: String?
     ) async throws -> CodexTurnStartReceipt {
-        lock.lock()
-        started.append(text)
-        lock.unlock()
+        let rejectsAuth = lock.withLock {
+            let rejectsAuth = rejectFirstStartForAuth && started.isEmpty
+            started.append(text)
+            return rejectsAuth
+        }
         let submissionNumber = dispatches.recordStart(text)
+        if rejectsAuth {
+            throw NSError(domain: "MonitorFakeCodexController", code: 401, userInfo: [NSLocalizedDescriptionKey: "unexpected status 401 Unauthorized from api.openai.com/v1/responses"])
+        }
+        let sendGate = lock.withLock { self.sendGate }
+        await sendGate?.enterAndWait()
         let (gate, fail, suspension) = lock.withLock { (startGate, failStartAfterGate, startSuspension) }
         await suspension?()
         if let gate { _ = await gate.requirement() }
@@ -4646,6 +4879,7 @@ extension AgentSessionLinkCodexPromptAdapterTests {
         let wakeID = try prepareAutoWake(fixture)
         let claim = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptClaim(for: fixture.session, dispatchID: .autoWake(wakeID: wakeID)))
         XCTAssertFalse(claim.routineQuietCheckIn)
+
         fixture.session.oversight.pendingAutoWake?.phase = .awaitingSettlement
         let replayOwner = fixture.session.beginRunAttempt(source: "test.auth.ordinary.replay")
         fixture.session.runState = .running
@@ -4671,17 +4905,20 @@ extension AgentSessionLinkCodexPromptAdapterTests {
 
         // Its own typed declaration/physical producer, not auth replay, owns the marker lifetime.
         seedCodexMarkerLifetimeBaseline(fixture)
+
         fixture.session.oversight.pendingAutoWake?.phase = .preparingDispatch
         let wakeGate = CatalogAuthorityGate()
         replacement.setStartGate(wakeGate, fail: false)
         addTeardownBlock { await wakeGate.open() }
         let owner = try beginCodexMarkerLifetimeOwner(fixture, wakeID: wakeID, source: "test.auth.fresh-wake")
+
         let producer = Task { @MainActor in
             await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "", attachments: [])
         }
         try await wakeGate.waitUntilEntered(timeout: 3)
         XCTAssertEqual(replacement.startedTurns, [acceptedText, AgentSessionLinkPromptComposer.decorated("", with: claim)])
         try sealCodexMarkerLifetimeDeclaration(fixture, owner: owner, wakeID: wakeID)
+
         XCTAssertTrue(fixture.session.endRunAttempt(ifCurrent: owner, source: "test.auth.fresh-wake.sealed"))
         fixture.session.runState = .completed
         weak var cohort = fixture.session.oversight.pendingAutoWake?.quietMarkerProducerLifetime
@@ -4696,6 +4933,48 @@ extension AgentSessionLinkCodexPromptAdapterTests {
         XCTAssertTrue(fixture.session.quietLedger.hostMarkerIDs.contains(wakeID))
         XCTAssertTrue(fixture.session.quietLedger.hiddenSourceIDs.contains(wakeID))
         XCTAssertEqual(fixture.session.items.count(where: { $0.id == wakeID }), 1)
+    }
+
+    func testOrdinaryManagedAuthReplayRefusesFreshQuietClaimAndLeavesInputAndReceiptOwed() async throws {
+        let fixture = try makeFixture()
+        await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
+        var proofCalls = 0
+        fixture.viewModel.test_agentSessionLinkLocalInputReadProof = { _ in
+            proofCalls += 1
+            return false
+        }
+        let seed = fixture.session.beginRunAttempt(source: "test.auth.ordinary.seed")
+        _ = await fixture.coordinator.sendCodexNativeMessage(session: fixture.session, text: "ordinary auth turn", attachments: [])
+        XCTAssertFalse(try XCTUnwrap(fixture.session.codexPendingAuthRetryTurn?.monitoringDispatchID).isAutoWakeFamily)
+        XCTAssertTrue(fixture.session.endRunAttempt(ifCurrent: seed, source: "test.auth.seed.end"))
+        fixture.session.runState = .completed
+        let wakeID = try prepareAutoWake(fixture)
+        let claim = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptClaim(for: fixture.session, dispatchID: .autoWake(wakeID: wakeID)))
+        XCTAssertFalse(claim.routineQuietCheckIn)
+        let receipt = try XCTUnwrap(claim.passive?.receipt)
+        let replayOwner = fixture.session.beginRunAttempt(source: "test.auth.ordinary.replay")
+        XCTAssertTrue(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(for: fixture.session, dispatchID: claim.dispatchID))
+        fixture.session.runState = .running
+        let beforeProofs = proofCalls
+        var newDecorations = 0
+        fixture.viewModel.test_agentSessionLinkLocalInputDecoration = { rendered in
+            newDecorations += 1
+            return .init(fragment: rendered.fragment + "\n<user_input>NEVER-HARVEST-ON-REPLAY</user_input>", markupDeltaBytes: 40, requirements: [])
+        }
+        await fixture.coordinator.test_handleCodexNativeEvent(
+            .errorNotification(.init(message: "external auth is active", willRetry: false, threadID: nil, turnID: nil, itemID: nil)),
+            session: fixture.session, sourceController: fixture.controller
+        )
+        let refreshed = await fixture.authRecovery.didRefresh
+        XCTAssertTrue(refreshed, "Actual auth recovery must reach its replay gate")
+        XCTAssertEqual(fixture.startedTurns.count, 1, "A new required wake cannot be harvested by ordinary accepted-baseline replay")
+        XCTAssertEqual(newDecorations, 0, "Replay must not compose a fresh claim or optional input")
+        XCTAssertEqual(proofCalls, beforeProofs, "Replay must not authorize another optional Read")
+        XCTAssertNil(fixture.session.quietLedger.candidateStartKey(owner: replayOwner), "Auth replay stays ordinary")
+        let queued = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptContext(for: fixture.session)?.passiveNotices)
+        XCTAssertEqual(queued.queueEpoch, receipt.queueEpoch)
+        XCTAssertEqual(queued.queueRevision, receipt.queueRevision)
+        XCTAssertEqual(queued.entries.map(\.changeSequence), receipt.deliveredStatuses.map(\.changeSequence), "Original receipt pairing stays queued, not acknowledged by refused replay")
     }
 
     func testFallbackSuccessorRefreshesTrackerBeforePhysicalToolActivity() async throws {

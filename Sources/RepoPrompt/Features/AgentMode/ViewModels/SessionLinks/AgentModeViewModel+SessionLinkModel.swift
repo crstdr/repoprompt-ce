@@ -69,7 +69,7 @@ extension AgentModeViewModel {
             do {
                 // Same workspace-aware role defaults as agent_run. Capture the concrete ID once;
                 // the final lease hop cannot substitute a different role default or warm catalogue.
-                let resolved = try AgentMCPSelectionResolver.resolve(
+                let resolved = try await AgentMCPSelectionResolver.resolve(
                     modelID: modelID, availability: admittedAvailability, workspaceID: candidate.workspaceID,
                     roleSelectionProvider: roleSelectionProvider
                 )

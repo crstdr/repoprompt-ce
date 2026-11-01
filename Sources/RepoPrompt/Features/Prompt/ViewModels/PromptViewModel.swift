@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 import RepoPromptCodeMapCore
+import RepoPromptDomainRuntime
 import RepoPromptFileSystem
 import RepoPromptInstrumentation
 import RepoPromptSettingsCore
@@ -48,6 +49,7 @@ class PromptViewModel: ObservableObject {
             (@MainActor (AgentProvisionalAdmissionIdentity, AgentAdmissionPersistenceReceipt) async -> Void)?
         private var agentAdmissionRecoveryCompletedHandlerForTesting:
             (@MainActor (AgentProvisionalAdmissionIdentity, AgentAdmissionRecoveryOutcome) async -> Void)?
+        var test_beforeAgentAdmissionFailureCleanup: (@MainActor () async -> Void)?
         private var agentAdmissionRecoveryRetryHandlerForTesting:
             (@MainActor (Int, AgentAdmissionRecoveryOutcome) async -> Void)?
 
@@ -3424,6 +3426,9 @@ class PromptViewModel: ObservableObject {
             case .commit:
                 return .created(newTab, receipt, recoveryClaim)
             case let .localRollback(reason):
+                #if DEBUG
+                    await test_beforeAgentAdmissionFailureCleanup?()
+                #endif
                 await rollbackProvisionalAgentSessionTab(
                     checkpoint: rollbackCheckpoint,
                     manager: manager
@@ -3434,6 +3439,9 @@ class PromptViewModel: ObservableObject {
                 }
                 return .rejected(receipt, reason)
             case let .recoverWorkspace(reason):
+                #if DEBUG
+                    await test_beforeAgentAdmissionFailureCleanup?()
+                #endif
                 guard recoveryClaim.beginWorkspaceRecovery() else {
                     // A changed claim does not prove that the canonical identity was removed.
                     // Preserve its evidence instead of authorizing a second allocation.

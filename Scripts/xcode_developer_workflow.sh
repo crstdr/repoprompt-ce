@@ -85,7 +85,7 @@ case "$ACTION" in
         ;;
     test)
         if [[ "${REPOPROMPT_XCODE_UNCOORDINATED:-0}" == "1" ]]; then
-            command=(./Scripts/run_without_github_tokens.sh swift test)
+            command=(./Scripts/run_without_github_tokens.sh python3 Scripts/ci_app_test_runner.py --local)
             if [[ -n "${REPOPROMPT_XCODE_TEST_FILTER:-}" ]]; then
                 command+=(--filter "$REPOPROMPT_XCODE_TEST_FILTER")
             fi
