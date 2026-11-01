@@ -164,7 +164,8 @@ enum AgentExternalMCPRunStarter {
                 originatingConnectionID: metadata.connectionID,
                 taskLabelKind: taskLabelKind,
                 startPending: true,
-                creationHandle: target.creationHandle
+                creationHandle: target.creationHandle,
+                computerUseProof: agentModeVM.session(for: target.tabID, createIfNeeded: false)?.computerUseChildProof
             )
         } catch {
             // Activation owns rollback of its registration. Do not tear down a different
@@ -178,6 +179,7 @@ enum AgentExternalMCPRunStarter {
 
         // All failures after activation may clean up only this exact inactive producer.
         let activatedSession = agentModeVM.session(for: target.tabID, createIfNeeded: false)
+        let computerUseProof = activatedSession?.computerUseChildProof
         do {
             try startExpiry?.recordActivation(sessionID: sessionID, tabID: target.tabID)
             guard let activatedSession,
@@ -192,7 +194,8 @@ enum AgentExternalMCPRunStarter {
                 guard agentModeVM.session(for: target.tabID, createIfNeeded: false) === activatedSession,
                       activatedSession.activeAgentSessionID == sessionID,
                       activatedSession.mcpControlContext == ownedActivation,
-                      pendingStartFence.permitsStart(of: activatedSession)
+                      pendingStartFence.permitsStart(of: activatedSession),
+                      !activatedSession.isComputerUseChild || computerUseProof?.permits(activatedSession) == true
                 else {
                     throw MCPError.invalidParams("The pending agent start was withdrawn or replaced before dispatch.")
                 }
@@ -214,6 +217,12 @@ enum AgentExternalMCPRunStarter {
                 expectedControlContext: ownedActivation,
                 creationHandle: target.creationHandle
             )
+            if activatedSession.isComputerUseChild {
+                try requirePendingStart()
+                guard let computerUseProof else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+                try await agentModeVM.armComputerUseChild(session: activatedSession, proof: computerUseProof)
+                try requirePendingStart()
+            }
             switch bindingDisposition {
             case .preserveCallerBinding:
                 #if DEBUG
@@ -246,6 +255,10 @@ enum AgentExternalMCPRunStarter {
             try requirePendingStart()
 
             try agentModeVM.requireMCPControlOwnership(sessionID: sessionID, expectedContext: ownedActivation)
+            if activatedSession.isComputerUseChild {
+                guard let computerUseProof else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+                try computerUseProof.markInstructionDispatch(activatedSession)
+            }
             let delivery: AgentModeViewModel.MCPInstructionDispatch = if let dispatchInstruction {
                 try await dispatchInstruction(sessionID, target.tabID, message, workflow, agentModeVM)
             } else {
@@ -256,7 +269,8 @@ enum AgentExternalMCPRunStarter {
                     workflow: workflow,
                     preserveRoutedInitialEffort: preserveRoutedInitialEffort,
                     expectedControlContext: ownedActivation,
-                    validateInitialStart: requirePendingStart
+                    validateInitialStart: requirePendingStart,
+                    computerUseProof: computerUseProof
                 )
             }
 
@@ -270,6 +284,7 @@ enum AgentExternalMCPRunStarter {
             #endif
             return StartOutcome(snapshot: snapshot, delivery: delivery)
         } catch {
+            if computerUseProof?.instructionDispatchEntered == true { throw error }
             agentModeVM.failSessionCreation(
                 target.creationHandle,
                 message: "This session did not finish preparing its first run. Create a new session."

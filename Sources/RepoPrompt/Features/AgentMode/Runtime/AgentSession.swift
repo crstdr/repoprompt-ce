@@ -257,6 +257,7 @@ struct AgentSession: Codable, Identifiable {
     var codexTotalTotalTokens: Int?
     var codexMcpSessionKey: String?
 
+    var purpose: String?
     /// Parent session ID for thread nesting (child sessions spawned from another session)
     var parentSessionID: UUID?
 
@@ -343,6 +344,7 @@ struct AgentSession: Codable, Identifiable {
         codexLastTotalTokens: Int? = nil,
         codexTotalTotalTokens: Int? = nil,
         codexMcpSessionKey: String? = nil,
+        purpose: String? = nil,
         parentSessionID: UUID? = nil,
         createdByOverseerSessionID: UUID? = nil,
         organizationalParentID: UUID? = nil,
@@ -394,6 +396,7 @@ struct AgentSession: Codable, Identifiable {
         self.codexLastTotalTokens = codexLastTotalTokens
         self.codexTotalTotalTokens = codexTotalTotalTokens
         self.codexMcpSessionKey = codexMcpSessionKey
+        self.purpose = purpose
         self.parentSessionID = parentSessionID
         self.createdByOverseerSessionID = createdByOverseerSessionID
         self.organizationalParentID = organizationalParentID
@@ -447,6 +450,7 @@ struct AgentSession: Codable, Identifiable {
         case codexLastTotalTokens
         case codexTotalTotalTokens
         case codexMcpSessionKey
+        case purpose
         case parentSessionID
         case createdByOverseerSessionID
         case organizationalParentID
@@ -521,6 +525,7 @@ struct AgentSession: Codable, Identifiable {
         codexLastTotalTokens = try container.decodeIfPresent(Int.self, forKey: .codexLastTotalTokens)
         codexTotalTotalTokens = try container.decodeIfPresent(Int.self, forKey: .codexTotalTotalTokens)
         codexMcpSessionKey = try container.decodeIfPresent(String.self, forKey: .codexMcpSessionKey)
+        purpose = try container.decodeIfPresent(String.self, forKey: .purpose)
         parentSessionID = try container.decodeIfPresent(UUID.self, forKey: .parentSessionID)
         createdByOverseerSessionID = try container.decodeIfPresent(UUID.self, forKey: .createdByOverseerSessionID)
         organizationalParentID = try container.decodeIfPresent(UUID.self, forKey: .organizationalParentID)

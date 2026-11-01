@@ -125,6 +125,8 @@ final class AgentModeProviderBindingService {
     ) -> String? {
         if isSubagent || isMCPControlled {
             switch permissionProfile {
+            case .computerUseChild:
+                return [permissionProfile.codexSandboxMode.displayName, permissionProfile.codexApprovalPolicy.displayName, permissionProfile.codexApprovalReviewer.displayName].joined(separator: " · ")
             case .mcpSafeDefaults:
                 return "MCP-started agents use the sub-agent Safe Managed permission defaults."
             case .userConfigured:

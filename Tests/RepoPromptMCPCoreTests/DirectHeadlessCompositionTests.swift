@@ -276,6 +276,10 @@ final class DirectHeadlessCompositionTests: XCTestCase {
     }
 
     func testHeadlessLaunchRejectsUnsupportedModelParametersBeforeProviderStartup() throws {
+        for (operation, flag) in [("start", Value.bool(true)), ("wait", .bool(false)), ("start", .string("true"))] {
+            XCTAssertThrowsError(try DirectHeadlessAgentBackend.validateComputerUseFlag(["computer_use": flag], operation: operation))
+        }
+        XCTAssertNoThrow(try DirectHeadlessAgentBackend.validateComputerUseFlag(["computer_use": .bool(false)], operation: "start"))
         XCTAssertThrowsError(try DirectHeadlessProviderCoordinator.resolvedLaunchMessage(args: [
             "message": .string("Reply OK"),
             "model_parameters": .array([

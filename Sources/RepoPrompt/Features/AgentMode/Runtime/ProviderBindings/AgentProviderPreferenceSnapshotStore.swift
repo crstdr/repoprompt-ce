@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 @MainActor
 final class AgentProviderPreferenceSnapshotStore {
@@ -95,8 +96,8 @@ final class AgentProviderPreferenceSnapshotStore {
                 sandboxMode = CodexAgentToolPreferences.sandboxMode(defaults: defaults, secureStore: securePermissions)
                 approvalPolicy = CodexAgentToolPreferences.approvalPolicy(defaults: defaults, secureStore: securePermissions)
                 approvalReviewer = CodexAgentToolPreferences.approvalReviewer(defaults: defaults, secureStore: securePermissions)
-            case .mcpSafeDefaults:
-                let level = CodexAgentToolPreferences.PermissionLevel.autoReview
+            case .mcpSafeDefaults, .computerUseChild:
+                let level = profile == .computerUseChild ? CodexAgentToolPreferences.PermissionLevel.readOnly : .autoReview
                 sandboxMode = level.sandboxMode
                 approvalPolicy = level.approvalPolicy
                 approvalReviewer = level.approvalReviewer
@@ -119,7 +120,7 @@ final class AgentProviderPreferenceSnapshotStore {
             let permissionMode: String = switch profile {
             case .userConfigured:
                 ClaudeAgentToolPreferences.permissionMode(defaults: defaults, secureStore: securePermissions)
-            case .mcpSafeDefaults:
+            case .mcpSafeDefaults, .computerUseChild:
                 ClaudeAgentToolPreferences.PermissionLevel.requireApproval.permissionMode
             case let .providerOverride(.claude(level)):
                 level.permissionMode
@@ -512,7 +513,7 @@ final class AgentProviderPreferenceSnapshotStore {
                 mcpServerEntries: entries,
                 mcpServerStatesByNormalizedName: states
             )
-        case .mcpSafeDefaults:
+        case .mcpSafeDefaults, .computerUseChild:
             // Codex Safe Managed keeps its product-default Bash capability while suppressing
             // every user-toggled third-party MCP server. Search remains user-configurable.
             var states: [String: Bool] = [:]
@@ -520,12 +521,12 @@ final class AgentProviderPreferenceSnapshotStore {
                 states[normalizedServerToggleKey(entry.normalizedName)] = false
             }
             return CodexToolSettingsBinding(
-                bashToolEnabled: true,
-                searchToolEnabled: CodexAgentToolPreferences.searchToolEnabled(defaults: defaults),
-                goalSupportEnabled: codexGoalSupportEnabled(),
-                computerUseEnabled: codexComputerUseEnabled(),
+                bashToolEnabled: profile != .computerUseChild,
+                searchToolEnabled: profile != .computerUseChild && CodexAgentToolPreferences.searchToolEnabled(defaults: defaults),
+                goalSupportEnabled: profile != .computerUseChild && codexGoalSupportEnabled(),
+                computerUseEnabled: profile == .computerUseChild ? GlobalSettingsStore.shared.computerUsePolicy.subagent : codexComputerUseEnabled(),
                 reasoningSummariesEnabled: codexReasoningSummariesEnabled(),
-                memoriesEnabled: codexMemoriesEnabled(),
+                memoriesEnabled: profile != .computerUseChild && codexMemoriesEnabled(),
                 appsEnabled: codexAppsEnabled(),
                 pluginsEnabled: codexPluginsEnabled(),
                 mcpElicitationEnabled: codexMCPElicitationEnabled(),
@@ -557,7 +558,7 @@ final class AgentProviderPreferenceSnapshotStore {
                 effortLevel: effortLevel,
                 agentModePromptDelivery: ClaudeAgentToolPreferences.agentModePromptDelivery(defaults: defaults)
             )
-        case .mcpSafeDefaults:
+        case .mcpSafeDefaults, .computerUseChild:
             // Safe Managed: force Bash off and keep MCP strict mode on so only the RepoPrompt
             // MCP server is reachable. Search stays available. Effort and prompt-delivery are
             // carried through so runtime behavior for those remains user-configurable.
@@ -623,8 +624,8 @@ final class AgentProviderPreferenceSnapshotStore {
         switch profile {
         case .userConfigured:
             CodexAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
-        case .mcpSafeDefaults:
-            .autoReview
+        case .mcpSafeDefaults, .computerUseChild:
+            profile == .computerUseChild ? .readOnly : .autoReview
         case let .providerOverride(.codex(level)):
             level
         case .providerOverride:
@@ -638,7 +639,7 @@ final class AgentProviderPreferenceSnapshotStore {
         switch profile {
         case .userConfigured:
             ClaudeAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
-        case .mcpSafeDefaults:
+        case .mcpSafeDefaults, .computerUseChild:
             .requireApproval
         case let .providerOverride(.claude(level)):
             level
@@ -653,7 +654,7 @@ final class AgentProviderPreferenceSnapshotStore {
         switch profile {
         case .userConfigured:
             OpenCodeAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
-        case .mcpSafeDefaults:
+        case .mcpSafeDefaults, .computerUseChild:
             .managedDefault
         case let .providerOverride(.openCode(level)):
             level
@@ -668,7 +669,7 @@ final class AgentProviderPreferenceSnapshotStore {
         switch profile {
         case .userConfigured:
             AntigravityAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
-        case .mcpSafeDefaults:
+        case .mcpSafeDefaults, .computerUseChild:
             .autoEdit
         case let .providerOverride(.antigravity(level)):
             level
@@ -683,7 +684,7 @@ final class AgentProviderPreferenceSnapshotStore {
         switch profile {
         case .userConfigured:
             CursorAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
-        case .mcpSafeDefaults:
+        case .mcpSafeDefaults, .computerUseChild:
             .managedDefault
         case let .providerOverride(.cursor(level)):
             level
@@ -698,7 +699,7 @@ final class AgentProviderPreferenceSnapshotStore {
         switch profile {
         case .userConfigured:
             GrokBuildAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
-        case .mcpSafeDefaults:
+        case .mcpSafeDefaults, .computerUseChild:
             .managedDefault
         case let .providerOverride(.grokBuild(level)):
             level

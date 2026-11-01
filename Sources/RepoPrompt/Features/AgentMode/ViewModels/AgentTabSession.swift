@@ -599,7 +599,11 @@ final class AgentTabSession: ObservableObject {
     var worktreeMergeOperations: [AgentSessionWorktreeMergeOperation] = []
     /// Permission profile for the current session. Set to `.mcpSafeDefaults`
     /// when MCP control is active, `.userConfigured` otherwise.
-    var permissionProfile: AgentModeViewModel.AgentPermissionProfile = .userConfigured
+    private var configuredPermissionProfile: AgentModeViewModel.AgentPermissionProfile = .userConfigured
+    var permissionProfile: AgentModeViewModel.AgentPermissionProfile {
+        get { isComputerUseChild ? .computerUseChild : configuredPermissionProfile }
+        set { configuredPermissionProfile = newValue }
+    }
 
     typealias PendingInstruction = AgentRunPendingInstruction
 
@@ -1073,6 +1077,11 @@ final class AgentTabSession: ObservableObject {
         didSet {
             // Usage recorded under another provider must never be reported as this provider's load.
             if selectedAgent != oldValue {
+                computerUseParentGrant = nil
+                if let holder = ComputerUseChildProof.holder, holder.parent === self || holder.child === self {
+                    holder.parent.computerUseParentGrant = nil
+                    holder.retire()
+                }
                 selectedClaudeEffortRaw = nil
                 batchingContextVouchSignals {
                     vouchedContextCount = nil
@@ -1086,6 +1095,12 @@ final class AgentTabSession: ObservableObject {
         didSet {
             // A different model can have a different window; wait for its own report.
             if selectedModelRaw != oldValue {
+                if let proof = computerUseChildProof,
+                   CodexModelSpecifier(raw: selectedModelRaw).baseModel != CodexModelSpecifier(raw: String(proof.modelID.dropFirst("codexExec:".count))).baseModel
+                {
+                    proof.parent.computerUseParentGrant = nil
+                    proof.retire()
+                }
                 if selectedAgent.usesClaudeTooling,
                    let effort = ClaudeModelSpecifier(raw: selectedModelRaw).explicitEffortLevel
                 {
@@ -1099,7 +1114,15 @@ final class AgentTabSession: ObservableObject {
         }
     }
 
-    var selectedReasoningEffortRaw: String?
+    var selectedReasoningEffortRaw: String? {
+        didSet {
+            if selectedReasoningEffortRaw != "high", let proof = computerUseChildProof {
+                proof.parent.computerUseParentGrant = nil
+                proof.retire()
+            }
+        }
+    }
+
     /// Session-owned Claude effort; shared preferences only seed a missing selection.
     var selectedClaudeEffortRaw: String?
     var persistedReasoningEffortRaw: String? {
@@ -1676,6 +1699,14 @@ final class AgentTabSession: ObservableObject {
 
     private(set) var persistenceMutationGeneration: UInt64 = 0
     var saveRequestGeneration: UInt64 = 0
+    var purpose: String?
+    var isComputerUseChild: Bool {
+        purpose != nil
+    }
+
+    var computerUseParentGrant: UUID?
+    var computerUseChildProof: ComputerUseChildProof?
+
     var parentSessionID: UUID? {
         didSet {
             if parentSessionID != nil { oversight.overseerActivation = nil }
@@ -1905,6 +1936,11 @@ final class AgentTabSession: ObservableObject {
         // Clear the outgoing proof before the generation moves so it cannot be observed under the
         // incoming incarnation.
         restorationReadiness = .unbound
+        computerUseParentGrant = nil
+        if let holder = ComputerUseChildProof.holder, holder.parent === self || holder.child === self {
+            holder.parent.computerUseParentGrant = nil
+            holder.retire()
+        }
         bindingTransitionGeneration &+= 1
         bindingTransitionInProgress = true
         // Terminal commit revisions are scoped to the binding captured by
