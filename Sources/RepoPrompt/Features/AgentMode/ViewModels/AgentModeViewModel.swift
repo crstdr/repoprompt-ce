@@ -24620,17 +24620,18 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         scheduleSave(for: session.tabID)
     }
 
+    @discardableResult
     func prepareAgentRunCancellation(
         session: TabSession,
         intent: DomainAgentRunCancellationIntent,
         origin: AgentModeRunService.CancellationOrigin
-    ) {
+    ) -> (@MainActor () async -> Void)? {
         cancelPendingInstruction(for: session)
-        claudeCoordinator.cancelPendingProviderAdoption(for: session)
+        let providerTeardown = claudeCoordinator.cancelPendingProviderAdoption(for: session)
         // Every cancellation fences this session's own deferred starts.
         session.stopState.invalidateScheduledStarts()
         // Overseer-facing withdrawal belongs to an explicit user or managed Stop only.
-        guard intent == .userStop, origin == .explicitStop else { return }
+        guard intent == .userStop, origin == .explicitStop else { return providerTeardown }
         session.stopState.invalidateQueuedDeliveries()
         session.mcpFollowUpRunPending = false
         agentSessionLinkRetractAutoWakeForUserStop(session)
@@ -24640,6 +24641,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 requiringNoCommittedDrain: false
             )
         }
+        return providerTeardown
     }
 
     private func cancelPendingInstruction(for session: TabSession) {
