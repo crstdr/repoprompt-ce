@@ -357,6 +357,7 @@ enum AgentSessionRestoreSupport {
             routineWakeIntervalSeconds: session.routineWakeIntervalSeconds,
             periodicIdleWakeEnabled: session.periodicIdleWakeEnabled,
             periodicIdleWakeIntervalSeconds: session.periodicIdleWakeIntervalSeconds,
+            purpose: session.purpose,
             parentSessionID: session.parentSessionID,
             createdByOverseerSessionID: session.createdByOverseerSessionID,
             organizationalParentID: session.organizationalParentID,

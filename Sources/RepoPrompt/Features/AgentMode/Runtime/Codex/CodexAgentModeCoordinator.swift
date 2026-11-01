@@ -251,6 +251,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
 
     private final class CodexControllerRetirementClaim {
         weak var controller: (any CodexSessionControlling)?
+        var task: Task<Void, Never>?
 
         init(controller: any CodexSessionControlling) {
             self.controller = controller
@@ -2370,13 +2371,20 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         nativeSlashCommandAvailabilityMessage(command, argumentsText: "", session: session)
     }
 
+    var computerUseControllerOrRetirementExists: Bool {
+        codexControllerRetirementTaskByTabID.values.contains { $0.includesComputerUse }
+            || viewModel?.sessions.values.contains { $0.codexControllerFeatureState?.computerUseEnabled == true || $0.codexComputerUseRevocationDepth > 0 } == true
+    }
+
     func computerUseRuntimeRequirementMessage() async -> String? {
         await computerUseRuntimePreflight()
     }
 
     private func computerUseAdmissionMessage(session: AgentTabSession, checkRuntime: Bool = true) -> String? {
-        guard CodexComputerUseWorkflow.isEnabled else { return CodexComputerUseWorkflow.disabledMessage }
-        guard session.selectedAgent == .codexExec, session.parentSessionID == nil,
+        if session.isComputerUseChild {
+            guard session.computerUseChildProof?.permits(session) == true else { return ComputerUseChildProof.denied }
+        } else if !CodexComputerUseWorkflow.isEnabled { return CodexComputerUseWorkflow.disabledMessage }
+        guard session.selectedAgent == .codexExec, session.parentSessionID == nil || session.isComputerUseChild,
               viewModel?.sessions[session.tabID] === session,
               session.codexComputerUseOwnershipTransitionHolds.isEmpty,
               codexControllerRetirementTaskByTabID[session.tabID]?.includesComputerUse != true else { return CodexComputerUseWorkflow.ineligibleMessage }
@@ -2406,6 +2414,17 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         _ = stageCodexComputerUseActivationIfNeeded(session: session)
         cancelCodexIdleShutdown(for: session.tabID)
         viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+    }
+
+    func armComputerUseChild(session: AgentTabSession, proof: ComputerUseChildProof) async throws {
+        let runtimeMessage = await computerUseRuntimePreflight()
+        guard proof.permits(session), runtimeMessage == nil,
+              computerUseAdmissionMessage(session: session) == nil
+        else {
+            throw MCPError.invalidParams(ComputerUseChildProof.denied)
+        }
+        _ = stageCodexComputerUseActivationIfNeeded(session: session)
+        cancelCodexIdleShutdown(for: session.tabID)
     }
 
     @discardableResult
@@ -2484,6 +2503,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         controller: any CodexSessionControlling,
         activationID: UUID?
     ) async -> Bool {
+        if session.isComputerUseChild, session.computerUseChildProof?.claimController(controller, session: session) != true { return false }
         guard activationID != nil || session.codexControllerFeatureState?.computerUseEnabled == true else { return true }
         let runID = session.runID
         let attemptID = session.activeRunAttemptID
@@ -2527,6 +2547,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
 
     private func computerUseForNextTurn(session: AgentTabSession) async throws -> Bool {
         guard let activation = session.pendingCodexComputerUseActivation else { return false }
+        if session.isComputerUseChild, session.computerUseChildProof?.claimNativeAttempt(session) != true { return false }
         // A transient fence waits and re-evaluates; it never disarms. Any other refusal is
         // structural and behaves exactly as before. A superseded attempt leaves the armed
         // activation for its successor to evaluate.
@@ -5930,6 +5951,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         sourceController: (any CodexSessionControlling)?,
         cancelEventTask: Bool = true
     ) async -> Bool {
+        guard !session.isComputerUseChild else { clearCodexPendingAuthRetryTurn(session)
+            return false
+        }
         guard session.selectedAgent == .codexExec, session.runState.isActive else { return false }
         // The in-flight startup owns its provider response and any auth failure until readiness settles.
         if hasCodexStartupClaim(for: session) { return true }
@@ -6389,8 +6413,26 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             codexControllerRetirementTaskByTabID.removeValue(forKey: tabID)
             logCodex("[AgentModeVM][CodexRetirement] completed tab=\(tabID) source=\(source)")
         }
+        codexControllerRetirementClaims[controllerID]?.task = task
         codexControllerRetirementTaskByTabID[tabID] = (generation: generation, task: task, includesComputerUse: includesComputerUse)
         logCodex("[AgentModeVM][CodexRetirement] scheduled tab=\(tabID) source=\(source)")
+    }
+
+    func retireCapturedComputerUseController(_ target: CodexCancellationTarget, tabID: UUID, currentSession: AgentTabSession?) async {
+        let controller = target.controller
+        let interrupt: @MainActor () async -> Void = {
+            if let identity = target.authoritativeTurnIdentity {
+                _ = try? await controller.interruptUserTurn(expectedTurnID: identity.turnID)
+            } else {
+                _ = try? await controller.reconcileAndInterruptCurrentTurn()
+            }
+        }
+        if let currentSession {
+            _ = invalidateCodexControllerForReconnect(session: currentSession, expectedController: controller, source: "child-retirement", beforeShutdown: interrupt)
+        }
+        retireCodexController(controller, tabID: tabID, source: "child-retirement", includesComputerUse: true, beforeShutdown: interrupt)
+        // Join this instance, not a tab-keyed successor's retirement.
+        await codexControllerRetirementClaims[ObjectIdentifier(controller)]?.task?.value
     }
 
     func awaitCodexComputerUseRetirement(for tabID: UUID) async {
@@ -6785,6 +6827,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         startupClaimToken: UUID? = nil
     ) async {
         guard session.operationAdmissionFailureMessage == nil else { return }
+        if session.isComputerUseChild, session.computerUseChildProof?.permits(session) != true || session.pendingCodexComputerUseActivation == nil {
+            await failCodexStartupBeforeLaunch(session: session, error: MCPError.invalidParams(ComputerUseChildProof.denied), reason: "computer-use-child-admission")
+            return
+        }
         let managedSessionFence = CodexManagedSessionFence.shared
         let sessionInstallationToken = managedSessionFence.capturePublicationToken()
         guard session.selectedAgent == .codexExec,
@@ -6842,7 +6888,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     session: session,
                     policyAlreadyInstalled: policyAlreadyInstalled,
                     deferPublicationUntilRouting: deferPublicationUntilRouting,
-                    allowMissingRolloutFallback: allowMissingRolloutFallback,
+                    allowMissingRolloutFallback: allowMissingRolloutFallback && !session.isComputerUseChild,
                     forIdleNativeCompact: forIdleNativeCompact,
                     skipResumeWhenNoPriorCodexHistory: false,
                     semanticRunState: semanticRunState,
@@ -6868,9 +6914,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
             return
         }
-        let wantsGoalSupport = CodexGoalSupport.isEnabled
+        let wantsGoalSupport = !session.isComputerUseChild && CodexGoalSupport.isEnabled
         let wantsReasoningSummaries = CodexReasoningSummaries.isEnabled
-        let wantsMemories = CodexMemories.isEnabled
+        let wantsMemories = !session.isComputerUseChild && CodexMemories.isEnabled
         let wantsCapabilities = codexCapabilitiesForLaunch(session.isMCPRelated)
         let computerUseActivationID = session.pendingCodexComputerUseActivation?.id
         var wantsComputerUse: Bool
@@ -7004,9 +7050,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                   managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken) else { return nil }
             let refreshedFeatureState = AgentTabSession.CodexControllerFeatureState(
                 computerUseEnabled: refreshedWantsComputerUse,
-                goalSupportEnabled: CodexGoalSupport.isEnabled,
+                goalSupportEnabled: !session.isComputerUseChild && CodexGoalSupport.isEnabled,
                 reasoningSummariesEnabled: CodexReasoningSummaries.isEnabled,
-                memoriesEnabled: CodexMemories.isEnabled,
+                memoriesEnabled: !session.isComputerUseChild && CodexMemories.isEnabled,
                 capabilities: refreshedWantsComputerUse ? .computerUse : codexCapabilitiesForLaunch(session.isMCPRelated)
             )
 
@@ -7193,7 +7239,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 session: session,
                 policyAlreadyInstalled: policyAlreadyInstalled,
                 deferPublicationUntilRouting: deferPublicationUntilRouting,
-                allowMissingRolloutFallback: allowMissingRolloutFallback,
+                allowMissingRolloutFallback: allowMissingRolloutFallback && !session.isComputerUseChild,
                 forIdleNativeCompact: forIdleNativeCompact,
                 skipResumeWhenNoPriorCodexHistory: skipResumeWhenNoPriorCodexHistory,
                 semanticRunState: semanticRunState,
@@ -7291,7 +7337,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 session: session,
                 policyAlreadyInstalled: true,
                 deferPublicationUntilRouting: true,
-                allowMissingRolloutFallback: allowMissingRolloutFallback,
+                allowMissingRolloutFallback: allowMissingRolloutFallback && !session.isComputerUseChild,
                 forIdleNativeCompact: forIdleNativeCompact,
                 skipResumeWhenNoPriorCodexHistory: skipResumeWhenNoPriorCodexHistory,
                 semanticRunState: semanticRunState,
@@ -7514,7 +7560,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 model: selection.model,
                 reasoningEffort: selection.reasoningEffort,
                 serviceTier: selection.serviceTier,
-                allowMissingRolloutFallback: allowMissingRolloutFallback,
+                allowMissingRolloutFallback: allowMissingRolloutFallback && !session.isComputerUseChild,
                 beforeStart: { await computerUseStartupIsCurrent(startController) }
             )
             guard await computerUseStartupIsCurrent(startController) else { return }
@@ -7561,7 +7607,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                       session.codexController.map(ObjectIdentifier.init) == ObjectIdentifier(startController) else { return }
             }
             var effectiveError: Error = error
-            if session.runState.isActive,
+            if !session.isComputerUseChild, session.runState.isActive,
                let runID = session.runID,
                CodexManagedAuthRecoveryClassifier.isRecoverable(message: error.localizedDescription),
                codexAuthRecoveryAttemptedRunIDs.insert(runID).inserted
@@ -7595,7 +7641,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                             model: selection.model,
                             reasoningEffort: selection.reasoningEffort,
                             serviceTier: selection.serviceTier,
-                            allowMissingRolloutFallback: allowMissingRolloutFallback,
+                            allowMissingRolloutFallback: allowMissingRolloutFallback && !session.isComputerUseChild,
                             beforeStart: { await computerUseStartupIsCurrent(recoveredController) }
                         )
                         guard await computerUseStartupIsCurrent(recoveredController) else { return }
@@ -7889,7 +7935,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             reasoningEffort: initialSelection.reasoningEffort,
             serviceTier: initialSelection.serviceTier
         )
-        if !isSelfNote { session.codexPendingAuthRetryTurn = .init(
+        if !isSelfNote && !session.isComputerUseChild { session.codexPendingAuthRetryTurn = .init(
             text: text,
             attachments: attachments,
             model: selection.model,
@@ -9678,6 +9724,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 ) && session.quietLedger.declarationMaySeal(owner: ownership, canonicalInvocations: [id])
             }
         }
+        let computerUseProof = session.computerUseChildProof
+        let computerUseBinding = session.currentRestorationBindingToken
+        let computerUseControllerID = session.codexController.map(ObjectIdentifier.init)
         let request = AgentRunTerminalCommitBarrier.Request(
             binding: terminalBinding,
             ownership: ownership,
@@ -9698,9 +9747,17 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             providerBuffersAreDrained: { [weak self] in
                 self?.codexTerminalBuffersAreDrained(session) == true
             },
-            postCommit: { [weak self] _, _ in
+            postCommit: { [weak self] revision, _ in
                 guard let self else { return }
                 viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+                if let computerUseProof, session.computerUseChildProof === computerUseProof,
+                   session.currentRestorationBindingToken == computerUseBinding,
+                   session.codexController.map(ObjectIdentifier.init) == computerUseControllerID,
+                   session.lastTerminalCommitRevision?.commitID == revision.commitID, session.activeRunOwnership == nil
+                {
+                    computerUseProof.retire()
+                    return
+                }
                 // Session-scoped Computer Use remains armed across local-user turns. Catalog
                 // repair and idle reclamation must not retire its otherwise reusable controller.
                 //
@@ -9981,9 +10038,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             // Auto-approve RepoPrompt MCP tool approval requests instead of forwarding to the parent agent.
             // Codex expects the literal option label (e.g. "Allow"), not a generic "accept" decision.
             let computerUseArmed = session.codexControllerFeatureState?.computerUseEnabled == true
-            if !computerUseArmed, Self.shouldAutoApproveCodexMCPToolRequest(request) {
+            if !session.isComputerUseChild, !computerUseArmed, Self.shouldAutoApproveCodexMCPToolRequest(request) {
                 let response = Self.buildAutoApprovalResponse(for: request)
-                submitUserInputResponse(session: session, requestID: request.requestID, response: response)
+                submitUserInputResponse(session: session, requestID: request.requestID, response: response, origin: .machine)
                 return
             }
             let autoApproveCompanion = CodexComputerUseWorkflow.automaticallyApprovesCompanion(
@@ -9992,7 +10049,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 approvalPolicy: session.permissionProfile.codexApprovalPolicy,
                 sandboxMode: session.permissionProfile.codexSandboxMode
             )
-            if computerUseArmed,
+            if !session.isComputerUseChild, computerUseArmed,
                let response = request.repoPromptOneShotAutoApprovalResponse
                ?? (autoApproveCompanion ? request.companionOneShotAutoApprovalResponse : nil),
                let controller = session.codexController
@@ -10004,7 +10061,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 await controller.respondToServerRequest(id: request.requestID, result: response.jsonObject)
                 return
             }
-            let request = computerUseArmed ? request.computerUseReviewRequest : request
+            let request = computerUseArmed || session.isComputerUseChild ? request.computerUseReviewRequest : request
             let alreadyPending = session.pendingUserInputRequest?.requestID == request.requestID
             let alreadyQueued = session.queuedUserInputRequests.contains { $0.requestID == request.requestID }
             guard !alreadyPending, !alreadyQueued else {
@@ -12251,7 +12308,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     }
 
     static func computerUseAllowsDecision(_ decision: AgentApprovalDecision, session: AgentTabSession) -> Bool {
-        guard session.codexControllerFeatureState?.computerUseEnabled == true else { return true }
+        guard session.isComputerUseChild || session.codexControllerFeatureState?.computerUseEnabled == true else { return true }
         switch decision {
         case .acceptForSession, .acceptWithExecpolicyAmendment: return false
         case .accept, .decline, .cancel: return true
@@ -12264,31 +12321,73 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         return computerUseAllowsDecision(decision, session: session)
     }
 
+    enum ResponseOrigin { case humanCard, machine }
+
+    private func sendInteractionResponse(
+        session: AgentTabSession,
+        origin: ResponseOrigin,
+        requestID: CodexAppServerRequestID,
+        result: [String: Any],
+        isPending: @escaping @MainActor () -> Bool,
+        settle: @escaping @MainActor () -> Void
+    ) -> Task<Bool, Never>? {
+        guard let controller = session.codexController else { return nil }
+        if session.isComputerUseChild {
+            guard origin == .humanCard, let proof = session.computerUseChildProof,
+                  proof.permits(session), isPending() else { return nil }
+            let runID = session.runID
+            let attemptID = session.activeRunAttemptID
+            return Task { @MainActor [weak self, controller] in
+                guard self?.viewModel?.sessions[session.tabID] === session, proof.permits(session),
+                      session.runID == runID, session.activeRunAttemptID == attemptID,
+                      session.codexController.map(ObjectIdentifier.init) == ObjectIdentifier(controller),
+                      isPending() else { return false }
+                settle()
+                await controller.respondToServerRequest(id: requestID, result: result)
+                return true
+            }
+        } else {
+            settle()
+            return Task { [controller] in
+                await controller.respondToServerRequest(id: requestID, result: result)
+                return true
+            }
+        }
+    }
+
     func submitApprovalDecision(
         session: AgentTabSession,
-        decision: AgentApprovalDecision
+        decision: AgentApprovalDecision,
+        origin: ResponseOrigin
     ) {
         guard let request = session.pendingApproval,
               case let .codex(requestID) = request.requestID,
-              let controller = session.codexController,
+              session.codexController != nil,
               Self.allowsApprovalDecision(decision, request: request, session: session),
               let result = Self.buildApprovalResult(decision: decision, request: request)
         else {
             return
         }
-        session.pendingApproval = nil
-        viewModel?.reconcileInteractiveRunState(session)
-        handleRunInteractionStateChange(for: session, reason: .approvalResponseSubmitted)
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-        Task { [controller] in
-            await controller.respondToServerRequest(id: requestID, result: result)
-        }
+        _ = sendInteractionResponse(
+            session: session,
+            origin: origin,
+            requestID: requestID,
+            result: result,
+            isPending: { session.pendingApproval?.id == request.id },
+            settle: { [weak self] in
+                session.pendingApproval = nil
+                self?.viewModel?.reconcileInteractiveRunState(session)
+                self?.handleRunInteractionStateChange(for: session, reason: .approvalResponseSubmitted)
+                self?.viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+            }
+        )
     }
 
     func submitPermissionsDecision(
         session: AgentTabSession,
         request: AgentPermissionsRequest,
-        decision: AgentApprovalDecision
+        decision: AgentApprovalDecision,
+        origin: ResponseOrigin
     ) {
         guard let controller = session.codexController,
               session.pendingPermissionsRequest?.id == request.id
@@ -12297,13 +12396,23 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
         guard Self.computerUseAllowsDecision(decision, session: session) else { return }
         let result = Self.buildPermissionsResult(decision: decision, request: request)
-        session.pendingPermissionsRequest = nil
-        viewModel?.reconcileInteractiveRunState(session)
-        handleRunInteractionStateChange(for: session, reason: .permissionsResponseSubmitted)
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        let submitted = sendInteractionResponse(
+            session: session,
+            origin: origin,
+            requestID: request.requestID,
+            result: result,
+            isPending: { session.pendingPermissionsRequest?.id == request.id },
+            settle: { [weak self] in
+                session.pendingPermissionsRequest = nil
+                self?.viewModel?.reconcileInteractiveRunState(session)
+                self?.handleRunInteractionStateChange(for: session, reason: .permissionsResponseSubmitted)
+                self?.viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+            }
+        )
+        guard let submitted else { return }
         let authoritativeTurnID = session.codexAuthoritativeActiveTurn?.turnID
         Task { [controller] in
-            await controller.respondToServerRequest(id: request.requestID, result: result)
+            guard await submitted.value else { return }
             if case .cancel = decision, let authoritativeTurnID {
                 _ = try? await controller.interruptUserTurn(expectedTurnID: authoritativeTurnID)
             } else if case .cancel = decision {
@@ -12312,41 +12421,87 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
     }
 
+    static func allowsComputerUseElicitation(_ request: AgentMCPElicitationRequest, response: AgentMCPElicitationResponse) -> Bool {
+        guard response.content.isEmpty, response.meta.isEmpty else { return false }
+        for raw in [request.defaultContentJSON, request.schemaJSON].compactMap(\.self) {
+            guard let object = try? JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any] else { return false }
+            if raw == request.defaultContentJSON { if !object.isEmpty { return false }
+                continue
+            }
+            guard Set(object.keys).isSubset(of: ["type", "properties", "required", "additionalProperties"]),
+                  object["type"] as? String == "object",
+                  object["properties"] == nil || (object["properties"] as? [String: Any])?.isEmpty == true,
+                  object["required"] == nil || (object["required"] as? [String])?.isEmpty == true,
+                  object["additionalProperties"] == nil || object["additionalProperties"] as? Bool == false else { return false }
+        }
+        return true
+    }
+
+    @discardableResult
     func submitMCPElicitationResponse(
         session: AgentTabSession,
         request: AgentMCPElicitationRequest,
-        response: AgentMCPElicitationResponse
-    ) {
+        response: AgentMCPElicitationResponse,
+        origin: ResponseOrigin
+    ) -> Task<Bool, Never>? {
         guard let controller = session.codexController,
               session.pendingMCPElicitationRequest?.id == request.id
         else {
-            return
+            return nil
         }
-        session.pendingMCPElicitationRequest = nil
-        if !session.queuedMCPElicitationRequests.isEmpty {
-            session.pendingMCPElicitationRequest = session.queuedMCPElicitationRequests.removeFirst()
-        }
-        viewModel?.reconcileInteractiveRunState(session)
-        handleRunInteractionStateChange(for: session, reason: .mcpElicitationResponseSubmitted)
-        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-        viewModel?.publishMCPStateChange(for: session)
+        guard !session.isComputerUseChild || response.action != .accept || Self.allowsComputerUseElicitation(request, response: response) else { return nil }
+        let submitted = sendInteractionResponse(
+            session: session,
+            origin: origin,
+            requestID: request.requestID,
+            result: response.jsonObject,
+            isPending: { session.pendingMCPElicitationRequest?.id == request.id },
+            settle: { [weak self] in
+                session.pendingMCPElicitationRequest = nil
+                if !session.queuedMCPElicitationRequests.isEmpty {
+                    session.pendingMCPElicitationRequest = session.queuedMCPElicitationRequests.removeFirst()
+                }
+                self?.viewModel?.reconcileInteractiveRunState(session)
+                self?.handleRunInteractionStateChange(for: session, reason: .mcpElicitationResponseSubmitted)
+                self?.viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+                self?.viewModel?.publishMCPStateChange(for: session)
+            }
+        )
+        guard let submitted else { return nil }
         let authoritativeTurnID = session.codexAuthoritativeActiveTurn?.turnID
         Task { [controller] in
-            await controller.respondToServerRequest(id: request.requestID, result: response.jsonObject)
+            guard await submitted.value else { return }
             if response.action == .cancel, let authoritativeTurnID {
                 _ = try? await controller.interruptUserTurn(expectedTurnID: authoritativeTurnID)
             } else if response.action == .cancel {
                 _ = try? await controller.reconcileAndInterruptCurrentTurn()
             }
         }
+        return submitted
     }
 
     @discardableResult
     func submitUserInputResponse(
         session: AgentTabSession,
         requestID: CodexAppServerRequestID,
-        response: AgentRequestUserInputResponse
+        response: AgentRequestUserInputResponse,
+        origin: ResponseOrigin
     ) -> Bool {
+        if session.isComputerUseChild {
+            guard let request = session.pendingUserInputRequest, request.requestID == requestID,
+                  request.allowsComputerUseResponse(response) else { return false }
+            _ = sendInteractionResponse(
+                session: session,
+                origin: origin,
+                requestID: requestID,
+                result: response.jsonObject,
+                isPending: { session.pendingUserInputRequest?.requestID == requestID },
+                settle: { [weak self] in
+                    self?.viewModel?.settleUserInputResponse(session: session)
+                }
+            )
+            return false // The fenced asynchronous submission owns settlement, not the caller.
+        }
         if session.codexControllerFeatureState?.computerUseEnabled == true {
             guard let request = session.pendingUserInputRequest,
                   request.requestID == requestID,

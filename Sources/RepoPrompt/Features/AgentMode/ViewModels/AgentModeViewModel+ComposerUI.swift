@@ -81,6 +81,12 @@ extension AgentModeViewModel {
 
     /// Pure presentation: no companion lookup, configuration IO, or permission probing.
     func computerUseComposerProps(session: AgentTabSession?) -> AgentComputerUseComposerProps {
+        if let session, session.selectedAgent != .codexExec, session.parentSessionID == nil,
+           !session.isComputerUseChild, sessions[session.tabID] === session, !session.bindingTransitionInProgress,
+           GlobalSettingsStore.shared.scalarPreferences.agentMode?.computerUseSubagentEnabled == true
+        {
+            return .init(isVisible: true, isOn: session.computerUseParentGrant != nil, isBusy: session.codexComputerUseArmingRequestID != nil)
+        }
         guard let session, session.selectedAgent == .codexExec, session.parentSessionID == nil,
               sessions[session.tabID] === session,
               !session.bindingTransitionInProgress else { return .hidden }

@@ -22,6 +22,7 @@ enum AgentSessionLinkInteractionManualOnlyReason: String, Equatable {
     /// A wait for the session's next instruction is not a prompt `respond` answers. A managing
     /// observer delivers that instruction with `steer` instead.
     case instructionPrompt = "instruction_prompt"
+    case computerUseHumanOnly = "computer_use_human_only"
     /// Session-wide or policy-amending approvals widen authority beyond this one request.
     case persistentDecision = "persistent_decision"
     /// An ACP provider offered no genuine one-time allow option for this request. Reported only

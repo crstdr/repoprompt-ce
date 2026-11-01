@@ -322,19 +322,21 @@ final class CodexComputerUseWorkflowTests: XCTestCase {
         """
         try script.write(to: executable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
-        let cases: [(Bool, String?, String, Bool, Bool, Bool)] = [
-            (true, "RepoPromptCE", "apply_edits", true, true, false),
-            (false, "RepoPromptCE", "apply_edits", true, true, false),
-            (true, "computer-use", "apply_edits", true, true, false),
-            (true, "computer-use", "apply_edits", false, true, true),
-            (true, "computer-use", "apply_edits", false, false, false),
-            (false, "computer-use", "apply_edits", false, true, false),
-            (true, "computer-use", "mcp__OtherServer__apply_edits", false, true, false),
-            (true, "NotRepoPromptCE", "mcp__RepoPromptCE__apply_edits", false, true, false),
-            (true, nil, "apply_edits", false, true, false),
-            (true, "RepoPromptCE", "mcp__OtherServer__apply_edits", false, true, false)
+        let cases: [(Bool, String?, String, Bool, Bool, Bool, Bool)] = [
+            (true, "RepoPromptCE", "apply_edits", true, true, false, false),
+            (false, "RepoPromptCE", "apply_edits", true, true, false, false),
+            (true, "computer-use", "apply_edits", true, true, false, false),
+            (true, "computer-use", "apply_edits", false, true, true, false),
+            (true, "computer-use", "apply_edits", false, false, false, false),
+            (false, "computer-use", "apply_edits", false, true, false, false),
+            (true, "computer-use", "mcp__OtherServer__apply_edits", false, true, false, false),
+            (true, "NotRepoPromptCE", "mcp__RepoPromptCE__apply_edits", false, true, false, false),
+            (true, nil, "apply_edits", false, true, false, false),
+            (true, "RepoPromptCE", "mcp__OtherServer__apply_edits", false, true, false, false),
+            (true, "RepoPromptCE", "apply_edits", false, true, false, true),
+            (true, "computer-use", "apply_edits", false, true, false, true)
         ]
-        for (enabled, server, tool, autoApproved, fullAccess, revoked) in cases {
+        for (enabled, server, tool, autoApproved, fullAccess, revoked, humanOnly) in cases {
             let recorder = MCPApprovalWireRecorder()
             let environment = ["HOME": root.path, "PATH": "/usr/bin:/bin"]
             let client = CodexAppServerClient(
@@ -351,7 +353,9 @@ final class CodexComputerUseWorkflowTests: XCTestCase {
             await client.updateProcessLaunchPolicy(featurePolicy: .defaultDisabled, modelReasoningSummary: nil)
             try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await client.startIfNeeded() }
             var armed = enabled
-            let controller = CodexNativeSessionController(client: client, runID: UUID(), tabID: UUID(), windowID: 1, workspacePaths: .uniform(nil), options: .agentModeDefault(approvalPolicyProvider: { fullAccess ? .never : .onRequest }, sandboxModeProvider: { .dangerFullAccess }, computerUseEnabledProvider: { armed }, computerUseClientPathProvider: { "/fake/SkyComputerUseClient" }, mcpServerEntriesProvider: { [] }))
+            var options = CodexNativeSessionController.Options.agentModeDefault(approvalPolicyProvider: { fullAccess ? .never : .onRequest }, sandboxModeProvider: { .dangerFullAccess }, computerUseEnabledProvider: { armed }, computerUseClientPathProvider: { "/fake/SkyComputerUseClient" }, mcpServerEntriesProvider: { [] })
+            options.computerUseHumanOnly = humanOnly
+            let controller = CodexNativeSessionController(client: client, runID: UUID(), tabID: UUID(), windowID: 1, workspacePaths: .uniform(nil), options: options)
             _ = try await controller.test_computerUseApprovalPolicy()
             try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await client.startIfNeeded() }
             armed = false
@@ -553,7 +557,7 @@ final class CodexComputerUseWorkflowTests: XCTestCase {
         session.codexControllerFeatureState = .init(computerUseEnabled: true, goalSupportEnabled: false, reasoningSummariesEnabled: false, memoriesEnabled: false, capabilities: .disabled)
         session.pendingPermissionsRequest = request
         let coordinator = makeCoordinator()
-        coordinator.submitPermissionsDecision(session: session, request: request, decision: .acceptForSession)
+        coordinator.submitPermissionsDecision(session: session, request: request, decision: .acceptForSession, origin: .humanCard)
         XCTAssertEqual(session.pendingPermissionsRequest?.id, request.id, "Remembered approval must not be submitted")
         await coordinator.revokeCodexComputerUse(session: session, reason: "user-off")
         XCTAssertNil(session.pendingPermissionsRequest)

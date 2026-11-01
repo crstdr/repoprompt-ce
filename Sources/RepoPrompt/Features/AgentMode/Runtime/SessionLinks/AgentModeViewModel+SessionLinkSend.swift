@@ -104,6 +104,7 @@ extension AgentModeViewModel {
         guard let session = agentSessionLinkLiveSession(matching: candidate) else {
             return .blocked(.endpointSession)
         }
+        guard !session.isComputerUseChild else { return .blocked(.targetNotIdle) }
         // A queued send is withdrawn only by an explicit Stop since it was queued; internal
         // lifecycle cancellations must not drop it. The transaction's own start fence is taken
         // now, so a cancellation during the drain still downgrades dispatch to persisted-only.
@@ -203,7 +204,7 @@ extension AgentModeViewModel {
             releaseComposerSubmitClaim(claim)
             return .blocked(.endpointPostSession)
         }
-        guard liveSession === session else {
+        guard liveSession === session, !liveSession.isComputerUseChild else {
             releaseComposerSubmitClaim(claim)
             return .blocked(.endpointPostSession)
         }
@@ -248,7 +249,7 @@ extension AgentModeViewModel {
             providerSwitchPreparation: switchPreparation
         ) {
             let dispatchLiveness = liveness()
-            guard self.agentSessionLinkLiveSession(matching: candidate) === liveSession,
+            guard !liveSession.isComputerUseChild, self.agentSessionLinkLiveSession(matching: candidate) === liveSession,
                   dispatchLiveness.permitsDelivery,
                   self.composerSubmitClaimIsCurrent(claim),
                   stopFence.permitsStart(of: liveSession),

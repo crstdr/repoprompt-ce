@@ -8,6 +8,8 @@ import RepoPromptShared
 /// resource or recorded from a live app window. Both app and standalone compositions bind
 /// these values, and fingerprint tests cover every catalog entry.
 package enum MCPDomainCanonicalToolDefinitions {
+    package static let computerUseStartDescription = "[start] Create this chat's persistent Codex Computer Use child. Requires human permission in the parent chat. Reuse the child with steer; start never reuses a session."
+    package static let computerUseGuidance = "Computer Use children require human answers in the child chat. Never use respond for them. A wait timeout does not stop the child; wait again or cancel. Do not repeat an accepted task automatically."
     package static let definitions: [MCPDomainToolDefinition] = decodeDefinitions()
 
     package static func definition(named name: String) -> MCPDomainToolDefinition? {
@@ -1133,6 +1135,19 @@ package enum MCPDomainCanonicalToolDefinitions {
             .map(advertiseDefaultRepositoryElection)
             .map(advertiseSessionDiscovery)
             .map(advertiseAgentControlTaskRoles)
+            .map(advertiseComputerUseChild)
+    }
+
+    private static func advertiseComputerUseChild(_ definition: MCPDomainToolDefinition) -> MCPDomainToolDefinition {
+        guard definition.name == MCPWindowToolName.agentRun,
+              case var .object(schema) = definition.inputSchema,
+              case var .object(properties)? = schema["properties"] else { return definition }
+        properties["computer_use"] = .object(["type": .string("boolean"), "default": .bool(false), "description": .string(computerUseStartDescription)])
+        schema["properties"] = .object(properties)
+        return MCPDomainToolDefinition(
+            name: definition.name, description: definition.description + "\n\n" + computerUseGuidance,
+            inputSchema: .object(schema), annotations: definition.annotations, isEnabledByDefault: definition.isEnabledByDefault
+        )
     }
 
     private static func advertiseAgentControlTaskRoles(_ definition: MCPDomainToolDefinition) -> MCPDomainToolDefinition {

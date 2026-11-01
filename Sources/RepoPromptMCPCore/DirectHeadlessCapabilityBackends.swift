@@ -958,12 +958,23 @@ actor DirectHeadlessAgentBackend: DomainAgentCapabilityBackend {
         return try .mcp(snapshot.toValue())
     }
 
+    nonisolated static func validateComputerUseFlag(_ args: [String: Value], operation: String) throws {
+        guard let flag = args["computer_use"] else { return }
+        guard operation == "start" else { throw MCPError.invalidParams("computer_use is valid only for start.") }
+        guard case let .bool(enabled) = flag else { throw MCPError.invalidParams("Computer Use start accepts only message, timeout, and detach.") }
+        if enabled {
+            guard Set(args.keys).isSubset(of: ["op", "computer_use", "message", "timeout", "detach"]) else { throw MCPError.invalidParams("Computer Use start accepts only message, timeout, and detach.") }
+            throw MCPError.invalidParams("Enable Computer Use and Other chats in Settings, then allow it in the calling chat.")
+        }
+    }
+
     private func dispatchLifecycle(
         args: [String: Value],
         request: DomainPhysicalToolRequest,
         defaultAgent: String
     ) async throws -> DomainPhysicalToolResult {
         let op = args["op"]?.stringValue ?? "start"
+        try Self.validateComputerUseFlag(args, operation: op)
         switch op {
         case "start":
             var normalized = args
