@@ -818,6 +818,164 @@ final class OracleGroupCancellationAdapterTests: XCTestCase {
         await finalDrain.value
     }
 
+    func testRegistryAwarenessRemainsBoundedAtOwnerAndRetentionCaps() async throws {
+        typealias Registry = OracleBackgroundInvocationRegistry
+        typealias Fixture = (registry: Registry, owner: Registry.Owner, session: AgentTabSession, text: String)
+        let iterations = 1000
+        let provider = NSObject()
+        let providerID = ObjectIdentifier(provider)
+
+        func session(for owner: Registry.Owner) -> AgentTabSession {
+            let session = AgentTabSession(tabID: owner.binding.tabID)
+            session.installPersistentSessionBinding(owner.binding)
+            session.installRunID(UUID())
+            session.oracleBackgroundOwner = owner
+            return session
+        }
+
+        func fixture(ownerCount: Int) async throws -> Fixture {
+            var tick = 0
+            let registry = Registry(now: { tick += 1
+                return Date(timeIntervalSince1970: Double(tick))
+            })
+            let owners = (0 ..< ownerCount).map { _ in self.registryOwner() }
+            let target = owners[ownerCount / 2]
+            let hold = OracleFoundationGate()
+            addTeardownBlock { @MainActor in
+                hold.release()
+                await registry.closeAll().value
+            }
+            let complete: @MainActor @Sendable (Registry.Job) async throws -> Void = { job in
+                let document = try self.registryPrepared(job)
+                try await job.prepared(document)
+                try job.recordPublishedTurn(self.registryTerminal(document))
+            }
+            // Overflow the target's session cap first, then fill the process retention cap.
+            for owner in [target] + owners.filter({ $0 != target }).prefix(3) {
+                for _ in 0 ..< (Registry.inactiveSessionLimit + (owner == target ? 1 : 0)) {
+                    let reference = try await registry.start(owner: owner, runID: UUID(), invocationID: UUID(), admissionIsCurrent: { true }, operation: complete)
+                    try await registry.join(owner: owner, reference: reference)
+                }
+            }
+            for owner in owners {
+                for _ in 0 ..< Registry.activeLimit {
+                    _ = try await registry.start(owner: owner, runID: UUID(), invocationID: UUID(), admissionIsCurrent: { true }) { job in
+                        let document = try self.registryPrepared(job)
+                        try await job.prepared(document)
+                        await hold.wait()
+                        try job.recordPublishedTurn(self.registryTerminal(document))
+                    }
+                }
+            }
+            let snapshots = owners.map { registry.snapshot(for: $0) }
+            XCTAssertEqual(Set(owners).count, ownerCount)
+            XCTAssertEqual(snapshots.count(where: { $0.epoch != nil }), ownerCount)
+            XCTAssertTrue(snapshots.allSatisfy { $0.invocations.count(where: { $0.phase.isLive }) == Registry.activeLimit })
+            XCTAssertEqual(snapshots.flatMap(\.invocations).count(where: { !$0.phase.isLive }), min(Registry.inactiveProcessLimit, ownerCount * Registry.inactiveSessionLimit))
+            XCTAssertTrue(snapshots.allSatisfy { $0.invocations.count(where: { !$0.phase.isLive }) <= Registry.inactiveSessionLimit })
+            let targetSnapshot = registry.snapshot(for: target)
+            XCTAssertEqual(targetSnapshot.invocations.count(where: { !$0.phase.isLive }), Registry.inactiveSessionLimit)
+            XCTAssertTrue(targetSnapshot.historyTruncated)
+            XCTAssertEqual(snapshots.count(where: \.historyTruncated), 1)
+            let counts = ["owners": ownerCount, "registeredOwners": snapshots.count(where: { $0.epoch != nil }), "active": snapshots.flatMap(\.invocations).count(where: { $0.phase.isLive }), "inactive": snapshots.flatMap(\.invocations).count(where: { !$0.phase.isLive }), "targetInactive": targetSnapshot.invocations.count(where: { !$0.phase.isLive }), "truncatedOwners": snapshots.count(where: \.historyTruncated)]
+            let fixtureData = try JSONSerialization.data(withJSONObject: counts, options: [.sortedKeys])
+            print("ORACLE_REGISTRY_SCALE_FIXTURE \(String(decoding: fixtureData, as: UTF8.self))")
+            do {
+                _ = try await registry.start(owner: target, runID: UUID(), invocationID: UUID(), admissionIsCurrent: { true }) { _ in
+                    XCTFail("A fifth active invocation must not launch")
+                }
+                XCTFail("Expected the active-session cap")
+            } catch {
+                XCTAssertEqual(error as? Registry.RegistryError, .limit)
+            }
+            let emptyOwner = registryOwner()
+            let empty = OracleBackgroundAwareness().reserve(session: session(for: emptyOwner), providerID: providerID, registry: registry)
+            XCTAssertNil(empty)
+            XCTAssertEqual((empty?.text ?? "").utf8.count, 0)
+            XCTAssertNil(registry.awarenessVersion(for: emptyOwner).epoch, "An empty lookup must not create an owner")
+            let reference = try XCTUnwrap(registry.snapshot(for: target, includeFinished: false).invocations.last?.reference)
+            let text = "Oracle: 4 open, 0 answers ready [g:\(reference.groupID.rawValue.uuidString)/t:\(reference.turnID.rawValue.uuidString); +3]"
+            let targetSession = session(for: target)
+            let awareness = OracleBackgroundAwareness()
+            let reservation = try XCTUnwrap(awareness.reserve(session: targetSession, providerID: providerID, registry: registry))
+            XCTAssertEqual(reservation.text, text)
+            awareness.release(reservation)
+            return (registry, target, targetSession, text)
+        }
+
+        func sample(expected: Int, operation: () -> Int) -> Double {
+            var consumed = 0
+            let start = DispatchTime.now().uptimeNanoseconds
+            for _ in 0 ..< iterations {
+                consumed += operation()
+            }
+            let elapsed = DispatchTime.now().uptimeNanoseconds - start
+            XCTAssertEqual(consumed, expected * iterations)
+            return Double(elapsed) / Double(iterations)
+        }
+
+        func measure(_ fixture: Fixture) throws -> [String: Double] {
+            let registry = fixture.registry, owner = fixture.owner
+            let version = registry.awarenessVersion(for: owner)
+            XCTAssertNotNil(version.epoch)
+            XCTAssertFalse(registry.admissionIsClosed(for: owner))
+            let awareness = OracleBackgroundAwareness()
+            let primed = try XCTUnwrap(awareness.reserve(session: fixture.session, providerID: providerID, registry: registry))
+            XCTAssertEqual(primed.text, fixture.text)
+            awareness.release(primed)
+            let bytes = fixture.text.utf8.count
+            let timings = [
+                "awarenessVersion_ns": sample(expected: Int(version.generation)) {
+                    Int(registry.awarenessVersion(for: owner).generation)
+                },
+                "admissionIsClosed_ns": sample(expected: 0) {
+                    registry.admissionIsClosed(for: owner) ? 1 : 0
+                },
+                "warmReserveRelease_ns": sample(expected: bytes) {
+                    let reservation = awareness.reserve(session: fixture.session, providerID: providerID, registry: registry)
+                    awareness.release(reservation)
+                    return reservation?.text.utf8.count ?? 0
+                },
+                "coldReserveRelease_ns": sample(expected: bytes) {
+                    let fresh = OracleBackgroundAwareness()
+                    let reservation = fresh.reserve(session: fixture.session, providerID: providerID, registry: registry)
+                    fresh.release(reservation)
+                    return reservation?.text.utf8.count ?? 0
+                }
+            ]
+            XCTAssertEqual(registry.awarenessVersion(for: owner).generation, version.generation, "Samples must not mutate the target")
+            return timings
+        }
+
+        let small = try await fixture(ownerCount: 3)
+        let large = try await fixture(ownerCount: 300)
+        var samples: [Int: [[String: Double]]] = [3: [], 300: []]
+        // Alternate order; five independent 1,000-call batches avoid a ratio on one tiny lookup.
+        for round in 0 ..< 5 {
+            for count in round.isMultiple(of: 2) ? [3, 300] : [300, 3] {
+                let timings = try measure(count == 3 ? small : large)
+                samples[count, default: []].append(timings)
+                let data = try JSONSerialization.data(withJSONObject: ["round": round, "owners": count, "iterations": iterations, "ns_per_call": timings], options: [.sortedKeys])
+                print("ORACLE_REGISTRY_SCALE \(String(decoding: data, as: UTF8.self))")
+            }
+        }
+        func median(ownerCount: Int, path: String) throws -> Double {
+            let values = try XCTUnwrap(samples[ownerCount]).compactMap { $0[path] }.sorted()
+            XCTAssertEqual(values.count, 5)
+            return try XCTUnwrap(values.dropFirst(values.count / 2).first)
+        }
+        // Calibration: warm reserve/release peaked at 2.74 us; round 5x up to 20 us.
+        // Lookup batches were 0.24–0.46 us/call: a 1 us floor avoids a noisy tiny ratio.
+        for path in ["awarenessVersion_ns", "admissionIsClosed_ns", "warmReserveRelease_ns"] {
+            let smallMedian = try median(ownerCount: 3, path: path)
+            let largeMedian = try median(ownerCount: 300, path: path)
+            XCTAssertLessThanOrEqual(largeMedian, max(smallMedian * 4, 1000), "Warm owner lookup must stay within a small multiple: \(path)")
+            XCTAssertLessThanOrEqual(largeMedian, 20000, "Warm owner lookup exceeded its calibrated absolute budget: \(path)")
+        }
+        let cold = try XCTUnwrap(samples[300]?.compactMap { $0["coldReserveRelease_ns"] }.max())
+        XCTAssertLessThanOrEqual(cold, 1_000_000, "Cold awareness must consume at most 1 ms of a 16 ms main-actor frame")
+    }
+
     private func registryOwner() -> OracleBackgroundInvocationRegistry.Owner {
         .init(workspaceID: UUID(), binding: .init(tabID: UUID(), sessionID: UUID()))
     }
