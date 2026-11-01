@@ -561,6 +561,7 @@ class WindowState: ObservableObject {
         }
         if !isPreparedSessionOwner { manager.detachPreparedRuntimeCarriers(from: self) }
         isClosing = true
+        agentModeViewModel.closeOracleBackgroundWindowAdmission()
         failUnstartedCommandsForWindowClose()
 
         if !manager.isTerminating, !isPreparedSessionOwner {
@@ -3028,6 +3029,7 @@ class WindowState: ObservableObject {
 
     func tearDown() async {
         beginClose()
+        if !WindowStatesManager.shared.isTerminating { await agentModeViewModel.joinOracleBackgroundWindowDrain() }
         // Join cancelled startup before saves/root drains so it cannot publish or hydrate late.
         await workspaceManager.awaitInitialWorkspaceActivationCompletion()
         await workspaceManager.awaitPostSwitchGitDataLoadShutdown()
