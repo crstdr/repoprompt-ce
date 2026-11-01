@@ -1698,6 +1698,78 @@ final class AgentRunStartBudgetTests: XCTestCase {
         XCTAssertEqual(vm.mcpSnapshot(sessionID: sessionID)?.status, .running)
     }
 
+    func testExpiryPreservesDispatchedRunButMasksPriorRunBeforeDispatch() async throws {
+        let fixture = try await makeFixture()
+        let vm = fixture.window.agentModeViewModel
+        let session = fixture.session
+        let gate = Gate()
+        addTeardownBlock { @MainActor in await fixture.cleanup() }
+        addTeardownBlock { await gate.release() }
+        let priorRunID = UUID()
+        session.installRunID(priorRunID)
+        session.setRunningStatus("Prior run status", source: .transport)
+        let pending = AgentRunMCPToolService.startExpirySnapshot(sessionID: fixture.sessionID, agentModeVM: vm)
+        XCTAssertNil(pending.runID)
+        XCTAssertEqual(pending.statusText, AgentRunMCPSnapshot.startupPendingStatusText)
+
+        let target = try await vm.mcpResolveOrCreateSessionTarget(
+            tabID: nil, sessionID: fixture.sessionID, createIfNeeded: false, sessionName: nil
+        )
+        let expiry = AgentRunStartExpiry(toolName: "agent_run", budgetSeconds: 5)
+        let dispatched = expectation(description: "dispatch returns before expiry")
+        let returned = expectation(description: "expiry returns while post-dispatch worker is held")
+        let finished = expectation(description: "post-dispatch worker released")
+        let runID = UUID()
+        var expected: Value?
+        var callerReturned = false
+        let caller = Task {
+            defer { callerReturned = true
+                returned.fulfill()
+            }
+            return try await AgentRunStartBudget.run(expiry: expiry) {
+                defer { finished.fulfill() }
+                _ = try await AgentExternalMCPRunStarter.startPreservingCallerBinding(
+                    target: target, message: "dispatch then suspend", metadata: .init(connectionID: nil, clientName: nil, windowID: nil),
+                    agentModeVM: vm, agentRaw: nil, modelRaw: nil, reasoningEffortRaw: nil,
+                    dispatchInstruction: { _, _, _, _, _ in
+                        await vm.prepareMCPWaitTrackingForRunStart(session: session, stopFence: AgentRunStartStopFence(session: session))
+                        XCTAssertNotNil(session.mcpControlContext?.preparedEpoch)
+                        XCTAssertNotNil(session.mcpControlContext?.currentEpoch)
+                        let prepared = AgentRunMCPToolService.startExpirySnapshot(sessionID: fixture.sessionID, agentModeVM: vm)
+                        XCTAssertNil(prepared.runID, "A prepared epoch must not expose the prior run")
+                        XCTAssertEqual(prepared.statusText, AgentRunMCPSnapshot.startupPendingStatusText)
+                        session.installRunID(runID)
+                        _ = session.beginRunAttempt(source: "start-budget-expiry-test")
+                        session.runState = .running
+                        session.setRunningStatus("Thinking…", source: .transport)
+                        return .startedRun
+                    },
+                    startExpiry: expiry
+                )
+                var object = try XCTUnwrap(vm.mcpSnapshot(sessionID: fixture.sessionID)).asObject()
+                object["_meta"] = .object(["wait_result": .string("timed_out")])
+                object.removeValue(forKey: "updated_at")
+                expected = .object(object)
+                dispatched.fulfill()
+                await gate.hold()
+                return Value.null
+            } onExpiry: { AgentRunMCPToolService.startExpiryValue(sessionID: fixture.sessionID, agentModeVM: vm) }
+        }
+        await fulfillment(of: [dispatched, returned], timeout: 7)
+        if !callerReturned {
+            caller.cancel()
+        }
+        await gate.release()
+        let result = try await caller.value
+        XCTAssertNotNil(expected)
+        var object = try XCTUnwrap(result.objectValue)
+        XCTAssertNotNil(object.removeValue(forKey: "updated_at"))
+        XCTAssertEqual(Value.object(object), expected)
+        XCTAssertEqual(result.objectValue?["run_id"], .string(runID.uuidString))
+        XCTAssertEqual(result.objectValue?["status_text"], .string("Thinking…"))
+        await fulfillment(of: [finished], timeout: 2)
+    }
+
     private enum Context {
         @TaskLocal static var marker = ""
     }
