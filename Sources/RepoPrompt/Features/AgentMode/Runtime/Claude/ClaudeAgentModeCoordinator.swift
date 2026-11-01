@@ -418,16 +418,18 @@ final class ClaudeAgentModeCoordinator {
         return listener.isBusy || listener.adoptionTask != nil
     }
 
-    func cancelPendingProviderAdoption(for session: AgentTabSession) {
-        guard hasPendingProviderAdoption(for: session) else { return }
+    @discardableResult
+    func cancelPendingProviderAdoption(for session: AgentTabSession) -> (@MainActor () async -> Void)? {
+        guard hasPendingProviderAdoption(for: session) else { return nil }
         if session.activeRunOwnership == nil {
             session.mcpFollowUpRunPending = false
             if !session.runLifecycle.terminalCommitInProgress { session.runState = .cancelled }
         }
         let runID = session.runID
         let detached = prepareClaudeCancelSync(session)
-        beginClaudeResumeTransferIfNeeded(for: session, oldController: detached)
+        let retirement = beginClaudeResumeTransferIfNeeded(for: session, oldController: detached)
         if let runID { Task { await self.cleanupAdoptedRun(session: session, runID: runID) } }
+        return retirement.map { task in { _ = await task.value } }
     }
 
     func hasPendingProviderWork(for session: AgentTabSession) -> Bool {
@@ -2236,24 +2238,27 @@ final class ClaudeAgentModeCoordinator {
         Task { await cancelClaudeRun(session, oldController: detached) }
     }
 
+    @discardableResult
     func beginClaudeResumeTransferIfNeeded(
         for session: AgentTabSession,
         oldController: DetachedClaudeController?
-    ) {
-        guard let oldController else { return }
+    ) -> Task<NativeAgentRuntimeSessionRef, Never>? {
+        guard let oldController else { return nil }
         guard pendingResumeTransferTasksByTabID[session.tabID] == nil else {
             let task = Task { @MainActor [self, session] in
                 await cancelClaudeRunAndCaptureSessionRef(session, oldController: oldController)
             }
             retiredResumeTransferTasksByTabID[session.tabID, default: []].append(task)
-            return
+            return task
         }
         let generation = UUID()
         pendingResumeTransferGenerationByTabID[session.tabID] = generation
         pendingResumeTransferEpochByTabID[session.tabID] = oldController.contextEpoch
-        pendingResumeTransferTasksByTabID[session.tabID] = Task { @MainActor [self, session] in
+        let task = Task { @MainActor [self, session] in
             await cancelClaudeRunAndCaptureSessionRef(session, oldController: oldController)
         }
+        pendingResumeTransferTasksByTabID[session.tabID] = task
+        return task
     }
 
     func awaitPendingClaudeResumeTransferIfNeeded(
