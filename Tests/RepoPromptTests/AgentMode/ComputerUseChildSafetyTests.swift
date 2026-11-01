@@ -300,9 +300,7 @@ final class ComputerUseChildSafetyTests: XCTestCase {
             f.child.pendingHandoff.providerSwitchDelivery = nil
             try await f.vm.armComputerUseChild(session: f.child, proof: f.proof)
             f.vm.promptManager?.apiSettingsViewModel?.isCodexConnected = true // Fake controller availability after configuration probes.
-            let clock = MCPExportWatchdogManualClock()
-            let scope = MCPAgentRunStartExecutionScope(connectionID: UUID(), environment: clock.environment)
-            try scope.beginDispatch()
+            try f.proof.markInstructionDispatch(f.child)
             let submitted = f.vm.submitUserTurn(text: "Inspect <TextEdit> only", tabID: f.child.tabID, isLocalComposerInput: false, computerUseProof: f.proof)
             guard case .submitted = submitted else { return XCTFail("Exact parent proof must admit the task (\(mode)): \(submitted)") }
             try await AsyncTestWait.waitUntil("designated fake native turn", timeout: 8) { f.factory.controllers.first?.startedTurnCount == 1 }
@@ -311,9 +309,8 @@ final class ComputerUseChildSafetyTests: XCTestCase {
             XCTAssertTrue(f.factory.controllers[0].startedTexts[0].contains("&lt;TextEdit&gt;"))
             let controller = f.factory.controllers[0]
             if mode == "unknown" {
-                scope.close()
-                XCTAssertFalse(scope.allowsFailureCleanup)
-                f.proof.producerSettled(retireUnacceptedStart: scope.allowsFailureCleanup)
+                XCTAssertTrue(f.proof.instructionDispatchEntered)
+                f.proof.producerSettled(retireUnacceptedStart: true)
             } else if mode != "quick" {
                 f.proof.producerSettled() // Detached start returned; no waiter owns cleanup.
             }
@@ -363,6 +360,101 @@ final class ComputerUseChildSafetyTests: XCTestCase {
         }
     }
 
+    func testInjectedCancellationErrorAndDefiniteBlockAtInstructionDispatchBoundary() async throws {
+        for afterMark in [false, true] {
+            let f = try fixture()
+            f.vm.promptManager = f.manager.promptViewModel
+            f.manager.promptViewModel.attachWorkspaceManager(f.manager)
+            try f.manager.setWorkspacePersistenceOutcomeOverrideForTesting(.notRequired(workspaceID: XCTUnwrap(f.manager.activeWorkspaceID)))
+            f.child.computerUseChildProof = nil
+            let target = try await f.vm.mcpResolveOrCreateSessionTarget(tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "dispatch boundary", parentSessionID: f.parent.activeAgentSessionID, inheritWorktreeBindings: false, expectedWorkspaceID: f.manager.activeWorkspaceID)
+            let child = f.vm.session(for: target.tabID)
+            child.purpose = "computerUse"
+            child.selectedAgent = .codexExec
+            child.selectedModelRaw = "gpt-6.1-sol"
+            child.selectedReasoningEffortRaw = "high"
+            child.computerUseChildProof = f.proof
+            f.proof.child = child
+            f.proof.creationTarget = target
+            try f.proof.claimCreation()
+            try f.proof.reserve()
+            do {
+                _ = try await AgentExternalMCPRunStarter.startApplyingRequestBindingPolicy(
+                    target: target, message: "Inspect TextEdit", metadata: .init(connectionID: nil, clientName: nil, windowID: nil),
+                    bindCurrentRequestToTab: { _, _, _ in
+                        XCTAssertFalse(f.proof.instructionDispatchEntered)
+                        if !afterMark { throw CancellationError() }
+                    },
+                    agentModeVM: f.vm, agentRaw: "codexExec", modelRaw: "gpt-6.1-sol", reasoningEffortRaw: "high",
+                    dispatchInstruction: { _, _, _, _, _ in
+                        XCTAssertTrue(f.proof.instructionDispatchEntered)
+                        throw CancellationError()
+                    }, startExpiry: .init(toolName: "agent_run", budgetSeconds: 60)
+                )
+                XCTFail("The selected cancellation schedule must throw")
+            } catch {
+                XCTAssertTrue(error is CancellationError)
+            }
+            XCTAssertEqual(f.proof.instructionDispatchEntered, afterMark)
+            await f.proof.producerSettled(retireUnacceptedStart: true)?.value
+            if afterMark {
+                XCTAssertFalse(f.proof.retiring)
+                XCTAssertTrue(ComputerUseChildProof.holder === f.proof)
+                XCTAssertNotNil(child.mcpControlContext)
+                // #219 acknowledges configured durability before dispatch, ending provisional ownership.
+                XCTAssertEqual(f.vm.test_outstandingProvisionalMCPSessionTargetCount, 0)
+                let sameParent = try ComputerUseChildProof(owner: f.vm, parent: f.parent, configuration: { .init(enabled: true, modelID: "codexExec:gpt-6.1-sol-high", modelAvailable: true) })
+                XCTAssertThrowsError(try sameParent.claimCreation()) { error in
+                    XCTAssertTrue(error.localizedDescription.contains(ComputerUseChildProof.busy))
+                }
+                let competing = try fixture(window: 2)
+                XCTAssertThrowsError(try competing.proof.reserve())
+                await competing.finish()
+                await f.finish()
+            } else {
+                XCTAssertTrue(f.proof.retiring)
+                XCTAssertNil(child.mcpControlContext)
+            }
+            XCTAssertNil(ComputerUseChildProof.holder)
+            XCTAssertEqual(f.vm.test_outstandingProvisionalMCPSessionTargetCount, 0)
+            XCTAssertTrue(f.factory.controllers.isEmpty)
+            if afterMark {
+                XCTAssertTrue(f.vm.sessions[target.tabID] === child)
+                let stored = try await AgentSessionDataService.shared.loadAgentSession(id: XCTUnwrap(target.sessionID), for: XCTUnwrap(f.manager.activeWorkspace))
+                XCTAssertEqual(stored?.purpose, "computerUse")
+                let children = try await AgentSessionDataService.shared.computerUseChildIDs(for: XCTUnwrap(f.parent.activeAgentSessionID), workspace: XCTUnwrap(f.manager.activeWorkspace))
+                XCTAssertEqual(children, try [XCTUnwrap(target.sessionID)])
+            } else {
+                XCTAssertNil(f.vm.sessions[target.tabID])
+            }
+        }
+        // The schedules above inject CancellationError; they do not call Task.cancel().
+        let blocked = try fixture()
+        try blocked.proof.claimCreation()
+        try blocked.proof.reserve()
+        try await blocked.vm.armComputerUseChild(session: blocked.child, proof: blocked.proof)
+        let childID = try XCTUnwrap(blocked.child.activeAgentSessionID)
+        let context = AgentModeViewModel.AgentMCPControlContext(
+            sessionID: childID, activationID: UUID(), registration: .init(sessionID: childID, generation: 1),
+            currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil, originatingConnectionID: nil,
+            interactionTransport: .mcp(sessionID: childID, originatingConnectionID: nil),
+            suppressUserNotifications: true, forceAutoEditEnabled: false, autoEditEnabledBeforeOverride: false, taskLabelKind: nil
+        )
+        blocked.child.mcpControlContext = context
+        blocked.child.hasLoadedPersistedState = false // Synchronous child submission refuses before starting a provider.
+        do {
+            _ = try await blocked.vm.mcpDispatchInstruction(sessionID: childID, text: "Inspect TextEdit", allowStartingRun: true, expectedControlContext: context, computerUseProof: blocked.proof)
+            XCTFail("Unloaded child must return a definite refusal")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains(ComputerUseChildProof.denied))
+        }
+        XCTAssertTrue(blocked.proof.instructionDispatchEntered)
+        XCTAssertTrue(blocked.proof.retiring)
+        await blocked.proof.producerSettled(retireUnacceptedStart: true)?.value
+        XCTAssertNil(ComputerUseChildProof.holder)
+        XCTAssertTrue(blocked.factory.controllers.isEmpty)
+    }
+
     func testStoppedSuspendedPreflightCannotDispatchOrRestoreConsent() async throws {
         let gate = TestReleaseFence(name: "child preflight")
         defer { gate.release() }
@@ -390,24 +482,6 @@ final class ComputerUseChildSafetyTests: XCTestCase {
         f.vm.turnOffComputerUseChild(f.child)
         XCTAssertNil(f.parent.computerUseParentGrant)
         XCTAssertThrowsError(try ComputerUseChildProof(owner: f.vm, parent: f.parent))
-        for accepted in [nil, false, true] as [Bool?] {
-            let request = try fixture()
-            try request.proof.reserve()
-            let clock = MCPExportWatchdogManualClock()
-            let scope = MCPAgentRunStartExecutionScope(connectionID: UUID(), environment: clock.environment)
-            try scope.beginDispatch()
-            if let accepted { scope.recordDispatch(accepted: accepted) }
-            scope.close()
-            XCTAssertThrowsError(try scope.checkAdmission())
-            await request.proof.producerSettled(retireUnacceptedStart: scope.allowsFailureCleanup)?.value
-            if accepted == false {
-                XCTAssertNil(ComputerUseChildProof.holder)
-            } else {
-                XCTAssertFalse(request.proof.retiring)
-                XCTAssertTrue(ComputerUseChildProof.holder === request.proof)
-            }
-            await request.finish()
-        }
     }
 
     func testTwoWindowsHoldSlotUntilRetirementAndRejectStaleRelease() async throws {

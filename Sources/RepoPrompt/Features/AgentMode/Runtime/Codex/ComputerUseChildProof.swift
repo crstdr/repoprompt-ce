@@ -36,6 +36,7 @@ final class ComputerUseChildProof: Equatable {
 
     private var retirementOperation: (@MainActor () async -> Bool)?
     private(set) var retiring = false
+    private(set) var instructionDispatchEntered = false
     var producerActive = true
     private var nativeAttemptID: UUID?
     private var nativeControllerID: ObjectIdentifier?
@@ -141,6 +142,11 @@ final class ComputerUseChildProof: Equatable {
             && (nativeControllerID == nil || nativeControllerID == session.codexController.map(ObjectIdentifier.init))
     }
 
+    func markInstructionDispatch(_ session: AgentTabSession) throws {
+        guard permits(session) else { throw MCPError.invalidParams(Self.denied) }
+        instructionDispatchEntered = true
+    }
+
     func claimNativeAttempt(_ session: AgentTabSession) -> Bool {
         guard permits(session), let attemptID = session.activeRunAttemptID else { return false }
         nativeAttemptID = attemptID
@@ -187,7 +193,7 @@ final class ComputerUseChildProof: Equatable {
     @discardableResult
     func producerSettled(retireUnacceptedStart: Bool = false) -> Task<Void, Never>? {
         producerActive = false
-        if retireUnacceptedStart { retire() }
+        if retireUnacceptedStart, !instructionDispatchEntered { retire() }
         if retiring {
             return finishRetirement()
         } else if child?.runState.isTerminalForCommit == true {

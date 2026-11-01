@@ -2,12 +2,12 @@ import Foundation
 import MCP
 import RepoPromptShared
 
-package enum MCPToolExecutionCleanupDisposition: String, Equatable, Sendable {
+package enum MCPToolExecutionCleanupDisposition: String, Equatable {
     case forceDisconnect = "force_disconnect"
     case detachAndSettle = "detach_and_settle"
 }
 
-package enum MCPToolExecutionContract: Equatable, Sendable {
+package enum MCPToolExecutionContract: Equatable {
     case bounded(
         deadline: Duration,
         cancellationGrace: Duration,
@@ -48,7 +48,7 @@ package enum MCPToolExecutionContract: Equatable, Sendable {
         return cleanupDisposition
     }
 
-    package enum Kind: String, Sendable {
+    package enum Kind: String {
         case bounded
         case longSynchronousCancellable = "long_synchronous_cancellable"
         case lifecycleManagedCancellable = "lifecycle_managed_cancellable"
@@ -57,7 +57,7 @@ package enum MCPToolExecutionContract: Equatable, Sendable {
     }
 }
 
-package enum MCPToolExecutionDispatchError: Error, Equatable, Sendable {
+package enum MCPToolExecutionDispatchError: Error, Equatable {
     case missingContract(toolName: String)
     case structureSettlementBusy(windowID: Int, context: MCPCodeStructureSettlementRegistry.BusyContext)
     case structureSettlementWindowUnresolved
@@ -139,11 +139,6 @@ package enum MCPToolExecutionContractCatalog {
         return result
     }()
 
-    package static func isAgentRunStartCall(toolName: String, arguments: [String: Value]) -> Bool {
-        toolName == MCPWindowToolName.agentRun && arguments["op"]?.stringValue?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "start"
-    }
-
     package static func contract(for toolName: String) -> MCPToolExecutionContract? {
         contracts[toolName]
     }
@@ -153,13 +148,6 @@ package enum MCPToolExecutionContractCatalog {
         arguments: [String: Value]
     ) -> MCPToolExecutionContract? {
         guard let baseContract = contract(for: toolName) else { return nil }
-        if isAgentRunStartCall(toolName: toolName, arguments: arguments) {
-            return .bounded(
-                deadline: MCPTimeoutPolicy.agentRunStartSetupDeadline,
-                cancellationGrace: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace,
-                cleanupDisposition: .detachAndSettle
-            )
-        }
         if [MCPWindowToolName.prompt, MCPWindowToolName.workspaceContext].contains(toolName),
            MCPPromptContextOperation.parse(toolName: toolName, arguments: arguments) == .export
         {

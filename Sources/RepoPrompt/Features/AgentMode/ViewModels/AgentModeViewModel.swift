@@ -8727,6 +8727,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             context.pendingEpochTransition = nil
         }
         session.mcpControlContext = context
+        session.mcpFollowUpRunPendingUpdatedAt = Date()
         // An accepted epoch belongs to this binding even if Stop won during the actor hop.
         // Retain it unconsumed for the next start; never leave the store ahead of its owner.
         guard stopFence.permitsStart(of: session), !Task.isCancelled else { return }
@@ -8828,6 +8829,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let supersedingMaskIsStale = session.pendingSupersedingTurnCompletions > 0
                 && session.pendingSupersedingTurnCompletionsUpdatedAt.map { now.timeIntervalSince($0) > 15 } == true
             if let terminalStatus,
+               context.currentEpoch != nil,
                followUpMaskIsStale || supersedingMaskIsStale,
                session.agentTask == nil,
                session.pendingInstructions.isEmpty,
@@ -10037,7 +10039,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
 
         var ownershipCommitted = preparation == nil
-        var scopedCommitAttempted = false
         var providerContextInvalidated = false
         var bindingsPublished = false
         // Rollback owns only a handoff staged by this transition, never a send's or
@@ -10128,23 +10129,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
             }
 
-            try MCPAgentRunStartExecutionScope.current?.checkAdmission()
             // Native teardown and handoff may await. Neither a revoked grant nor a path reused
             // for a different Git identity may become the new execution authority.
             try await revalidateAuthority?()
             try Task.checkCancellation()
             try AgentWorktreeRuntimeWorkspaceResolver.validateBindingsAvailable(desiredBindings)
             if let materializer, let preparation {
-                try MCPAgentRunStartExecutionScope.current?.recordWorktreeIntent("Inspect manage_worktree list for the existing binding; do not repeat creation.")
-                scopedCommitAttempted = MCPAgentRunStartExecutionScope.current != nil
                 _ = try await materializer.commit(preparation)
                 ownershipCommitted = true
-            }
-            if MCPAgentRunStartExecutionScope.current != nil {
-                guard sessions[session.tabID] === session,
-                      session.activeAgentSessionID == sessionID,
-                      session.worktreeBindings == previousBindings
-                else { throw ExecutionLocationTransitionError.stale }
             }
             // Root ownership installation also suspends. This is the final authority fence;
             // there is no await between its return and publishing the binding.
@@ -10188,7 +10180,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
             return session.worktreeBindings
         } catch {
-            try? MCPAgentRunStartExecutionScope.current?.enterReturn()
             if !providerContextInvalidated, let handoffRollback,
                session.pendingHandoff == handoffRollback.staged
             {
@@ -10201,7 +10192,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
                 scheduleSave(for: session)
             }
-            if !ownershipCommitted, !scopedCommitAttempted, let materializer, let preparation {
+            if !ownershipCommitted, let materializer, let preparation {
                 #if DEBUG
                     await test_beforeWorktreeBindingAbort?()
                 #endif
@@ -11496,7 +11487,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     "The target tab changed before Agent session admission completed."
                 )
             }
-            try MCPAgentRunStartExecutionScope.current?.recordTarget(sessionID: intendedSessionID, tabID: session.tabID)
             guard let freshCreation, freshCreation.sessionID == intendedSessionID,
                   freshCreation.workspaceID == expectedWorkspaceID,
                   let installedBinding = installPersistentSessionBinding(
@@ -11630,8 +11620,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let expectedSessionID = session.activeAgentSessionID
         let configurationBindingToken = session.currentRestorationBindingToken
         func requireConfigurationAdmission() throws {
-            let startScope = MCPAgentRunStartExecutionScope.current
-            try startScope?.checkAdmission()
             if session.isComputerUseChild {
                 guard creationHandle != nil, session.computerUseChildProof?.permits(session) == true else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
             }
@@ -11641,14 +11629,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             else {
                 throw MCPError.invalidParams("The Agent session changed during model configuration.")
             }
-            if let startScope {
-                guard let sessionID = session.activeAgentSessionID else { throw CancellationError() }
-                try startScope.recordTarget(sessionID: sessionID, tabID: tabID)
-            }
             if let sessionID = expectedSessionID {
                 try requireMCPControlOwnership(sessionID: sessionID, expectedContext: expectedControlContext)
             }
-            guard startScope != nil || requireInactiveRunState || !modelParameterSelections.isEmpty else { return }
+            guard requireInactiveRunState || !modelParameterSelections.isEmpty else { return }
             guard sessions[tabID] === session,
                   session.activeAgentSessionID == expectedSessionID,
                   !session.bindingTransitionInProgress,
@@ -12026,11 +12010,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 throw MCPError.invalidParams(Self.mcpResidentTargetError)
             }
         }
-        try MCPAgentRunStartExecutionScope.current?.checkAdmission()
         let activationBindingToken = session.currentRestorationBindingToken
         var activationOwnership: MCPActivationOwnership = .resident
         func requireActivationOwner() throws {
-            try MCPAgentRunStartExecutionScope.current?.checkAdmission()
             if session.isComputerUseChild, computerUseProof?.permits(session) != true { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
             guard sessions[tabID] === session,
                   session.currentRestorationBindingToken == activationBindingToken
@@ -12050,7 +12032,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         mcpRemoveAgentRunOracleReviewContexts(sessionID: sessionID)
         let existingContext = session.mcpControlContext
         let activationID = UUID()
-        try MCPAgentRunStartExecutionScope.current?.recordActivation(activationID)
         if existingContext != nil {
             codexCoordinator.handleMCPControlReset(
                 for: session,
@@ -12100,7 +12081,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             await test_afterMCPControlRegistration?(activationID)
         #endif
         func cleanupFailedRegistration() async {
-            try? MCPAgentRunStartExecutionScope.current?.enterReturn()
             #if DEBUG
                 await test_beforeFailedMCPControlRegistrationCleanup?()
             #endif
@@ -12125,11 +12105,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             throw MCPError.invalidParams(
                 "The requested agent session became active before MCP control activation."
             )
-        }
-        do { try MCPAgentRunStartExecutionScope.current?.checkAdmission() }
-        catch {
-            await cleanupFailedRegistration()
-            throw error
         }
         let priorAutoEditEnabled = existingContext?.sessionID == sessionID
             ? existingContext?.autoEditEnabledBeforeOverride ?? session.autoEditEnabled
@@ -12161,7 +12136,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // Publication transfers ownership from the app-owned admission to this exact control context.
         activationOwnership = .installed(context: activatedContext, generation: activationGeneration)
         func releaseFailedInstalledActivation() async {
-            try? MCPAgentRunStartExecutionScope.current?.enterReturn()
             guard sessions[tabID] === session,
                   session.currentRestorationBindingToken == activationBindingToken,
                   session.mcpControlActivationGeneration == activationGeneration,
@@ -12301,7 +12275,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// by durable admission; accepted targets retain their durable ownership.
     @discardableResult
     func mcpDiscardSessionTarget(_ target: MCPSessionTarget) async -> MCPSessionTargetDiscardResult {
-        try? MCPAgentRunStartExecutionScope.current?.enterReturn()
         guard let claim = target.recoveryClaim else {
             switch target.origin {
             case .existingSession, .existingTab:
@@ -13346,7 +13319,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     /// An acquired activation must remain the mutation owner after preparatory suspensions.
     func requireMCPControlOwnership(sessionID: UUID, expectedContext: AgentMCPControlContext? = nil) throws {
-        let activationID = expectedContext?.activationID ?? MCPAgentRunStartExecutionScope.current?.activationID
+        let activationID = expectedContext?.activationID
         guard let activationID else { return }
         guard let session = mcpControlledSession(sessionID: sessionID),
               let context = session.mcpControlContext,
@@ -13453,7 +13426,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let activeDispatchWakeIdentity = delivery.isActiveRunDispatch
             ? mcpActiveDispatchWakeIdentity(for: session, sessionID: sessionID)
             : nil
-        let startScope = MCPAgentRunStartExecutionScope.current
         let ackCancellationTarget = codexAttemptID.map {
             (tracker: session.codexSteerAckTracker, attemptID: $0)
         }
@@ -13471,44 +13443,43 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 session.isMCPInstructionDispatchInProgress = false
             }
             try requireMCPControlOwnership(sessionID: sessionID, expectedContext: expectedControlContext)
-            try startScope?.beginDispatch()
-            // Provider tasks have child lifetime, not the enclosing start request's lifetime.
-            submission = MCPAgentRunStartExecutionScope.$current.withValue(nil) {
-                withMCPWorkflowOverride(session: session, workflow: workflow) {
-                    if let nativePreparedTurn {
-                        return submitPreparedUserTurn(
-                            tabID: session.tabID,
-                            session: session,
-                            trimmedText: trimmedText,
-                            attachmentsToSend: [],
-                            taggedFilesToSend: [],
-                            activeWorkflow: nativePreparedTurn.bubbleWorkflow,
-                            nativePreparedTurn: nativePreparedTurn,
-                            codexAttemptID: codexAttemptID,
-                            autoEffortAudit: submittedAutoEffortAudit,
-                            isLocalComposerInput: false,
-                            scheduledProviderSwitchSubmission: { pendingSwitchSubmission = $0 },
-                            computerUseProof: computerUseProof
-                        )
-                    }
-                    return submitUserTurn(
-                        text: trimmedText,
+            if session.isComputerUseChild {
+                guard let computerUseProof else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+                try computerUseProof.markInstructionDispatch(session)
+            }
+            submission = withMCPWorkflowOverride(session: session, workflow: workflow) {
+                if let nativePreparedTurn {
+                    return submitPreparedUserTurn(
                         tabID: session.tabID,
+                        session: session,
+                        trimmedText: trimmedText,
+                        attachmentsToSend: [],
+                        taggedFilesToSend: [],
+                        activeWorkflow: nativePreparedTurn.bubbleWorkflow,
+                        nativePreparedTurn: nativePreparedTurn,
                         codexAttemptID: codexAttemptID,
-                        autoEffortSelection: submittedAutoEffortSelection,
                         autoEffortAudit: submittedAutoEffortAudit,
                         isLocalComposerInput: false,
                         scheduledProviderSwitchSubmission: { pendingSwitchSubmission = $0 },
                         computerUseProof: computerUseProof
                     )
                 }
+                return submitUserTurn(
+                    text: trimmedText,
+                    tabID: session.tabID,
+                    codexAttemptID: codexAttemptID,
+                    autoEffortSelection: submittedAutoEffortSelection,
+                    autoEffortAudit: submittedAutoEffortAudit,
+                    isLocalComposerInput: false,
+                    scheduledProviderSwitchSubmission: { pendingSwitchSubmission = $0 },
+                    computerUseProof: computerUseProof
+                )
             }
             if let pendingSwitchSubmission {
                 submission = await withTaskCancellationHandler { await pendingSwitchSubmission.value } onCancel: { pendingSwitchSubmission.cancel() }
             }
             switch submission {
             case .submitted:
-                startScope?.recordDispatch(accepted: true)
                 if let submittedAutoEffortSelection {
                     recordSubmittedAutoEffort(submittedAutoEffortSelection, for: session)
                 }
@@ -13563,7 +13534,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 handleObservedMCPStateChange(for: session)
                 return delivery
             case let .blocked(message):
-                startScope?.recordDispatch(accepted: false)
+                if session.isComputerUseChild, pendingSwitchSubmission == nil,
+                   let proof = computerUseProof, session.computerUseChildProof === proof,
+                   proof.child === session, ComputerUseChildProof.holder === proof
+                {
+                    proof.retire()
+                }
                 if let codexAttemptID {
                     session.codexSteerAckTracker.cancel(attemptID: codexAttemptID)
                 }
@@ -25729,6 +25705,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     func requireSessionConfigurationAdmission(
         _ session: TabSession, creationHandle: AgentSessionCreationHandle?
     ) throws {
+        try Task.checkCancellation()
         if let creationHandle {
             guard creationHandle.session === session else { throw PersistentBindingMutationError.staleTransition }
             try requireCurrentCreationPreparation(creationHandle)
@@ -25800,10 +25777,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             else {
                 return .deferred("Initial session creation changed while an earlier save completed.")
             }
-        }
-        // Waiting for an earlier save must not admit this request's first write after its deadline.
-        do { try MCPAgentRunStartExecutionScope.current?.checkAdmission() } catch {
-            return .deferred("Initial session creation admission expired before persistence.")
         }
         handle.session.isDirty = true
         let result = await saveSessionCore(for: handle.session.tabID, creationSave: .configured(handle))

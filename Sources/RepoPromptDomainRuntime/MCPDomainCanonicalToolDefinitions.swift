@@ -1539,7 +1539,6 @@ package enum MCPDomainCanonicalToolDefinitions {
                 )
             let oldStartDescription = "Pass `detach: true` to return immediately."
             let currentStartDescription = oldStartDescription
-                + " Start: setup ≤900s, return ≤25s; timeout may follow dispatch—inspect its session, never blindly retry."
             let startDescription = description.contains(currentStartDescription)
                 ? description
                 : description.replacingOccurrences(of: oldStartDescription, with: currentStartDescription)
@@ -4068,8 +4067,8 @@ package enum MCPDefaultRepositoryElectionCopy {
     package static let manageWorktreeRepoRootProperty =
         "Optional loaded root path/name or repo/worktree specifier. When omitted, app-backed calls use the session's sole worktree binding, or declared PRIMARY with no bindings; multiple bindings require an identifying selector."
 
-    // `agent_run` startup keeps its own rules: explicit and created startup worktrees are PRIMARY-only, and
-    // inheritance copies the source session's complete binding set. The agent control provider reuses these.
+    /// `agent_run` startup keeps its own rules: explicit and created startup worktrees are PRIMARY-only, and
+    /// inheritance copies the source session's complete binding set. The agent control provider reuses these.
     static let agentRunObsoleteWorktreeArgs =
         "Optional start-only worktree args can bind the new session to an existing worktree (`worktree`/`worktree_id`) or create an app-managed worktree (`worktree_create=true`) before provider startup; explicit worktree args take precedence, suppress parent inheritance, and bind only the requested worktree."
     package static let agentRunWorktreeArgs =

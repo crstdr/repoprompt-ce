@@ -3375,7 +3375,6 @@ class PromptViewModel: ObservableObject {
                 replacementTabID: UUID()
             )
             let recoveryClaim = AgentProvisionalAdmissionClaim(identity: provisionalIdentity)
-            try MCPAgentRunStartExecutionScope.current?.recordTarget(sessionID: sessionID, tabID: newTab.id)
 
             let preAdmissionForegroundStoredTab = manager.workspaces[index].activeComposeTabID.flatMap { activeTabID in
                 manager.workspaces[index].composeTabs.first(where: { $0.id == activeTabID })
@@ -3407,7 +3406,6 @@ class PromptViewModel: ObservableObject {
             timing.begin(.save)
             let receipt = await manager.persistAgentAdmission(provisionalIdentity, timing: timing)
             timing.end()
-            if receipt.commitEvidence != .none { MCPAgentRunStartExecutionScope.current?.confirmTarget() }
             await notifyAgentAdmissionPersistenceReceiptForTesting(
                 provisionalIdentity,
                 receipt: receipt
@@ -3428,7 +3426,6 @@ class PromptViewModel: ObservableObject {
             case .commit:
                 return .created(newTab, receipt, recoveryClaim)
             case let .localRollback(reason):
-                try? MCPAgentRunStartExecutionScope.current?.enterReturn()
                 #if DEBUG
                     await test_beforeAgentAdmissionFailureCleanup?()
                 #endif
@@ -3442,7 +3439,6 @@ class PromptViewModel: ObservableObject {
                 }
                 return .rejected(receipt, reason)
             case let .recoverWorkspace(reason):
-                try? MCPAgentRunStartExecutionScope.current?.enterReturn()
                 #if DEBUG
                     await test_beforeAgentAdmissionFailureCleanup?()
                 #endif
