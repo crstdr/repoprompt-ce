@@ -3925,9 +3925,14 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
     private var turnInFlight = false
     private var failSendAfterRecord = false
     private var sendSuspension: (@Sendable () async -> Void)?
+    private var shutdownSuspension: (@Sendable () async -> Void)?
 
     func setSendSuspension(_ suspension: @escaping @Sendable () async -> Void) {
         sendSuspension = suspension
+    }
+
+    func setShutdownSuspension(_ suspension: @escaping @Sendable () async -> Void) {
+        shutdownSuspension = suspension
     }
 
     private var finishEventsAfterSend = false
@@ -4069,6 +4074,7 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
     }
 
     func shutdown() async {
+        await shutdownSuspension?()
         configuration.replaceProcess()
         shutdownCount += 1
         continuation?.finish()

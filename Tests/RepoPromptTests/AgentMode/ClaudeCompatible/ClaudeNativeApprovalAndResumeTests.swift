@@ -3210,6 +3210,64 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         await cleanup(f)
     }
 
+    func testPendingProviderCancellationWaitsForWithdrawnControllerTeardown() async throws {
+        for hasSettledPredecessor in [false, true] {
+            let (h, session, controller, listener) = try await spyFixture()
+            if hasSettledPredecessor {
+                let predecessorID = UUID()
+                await controller.emit(.providerTurnStarted(turnID: predecessorID))
+                await until("predecessor starts") { session.activeRunOwnership != nil }
+                await controller.emit(.turnsCompleted(turnIDs: [predecessorID], status: .completed))
+                await until("predecessor settles") {
+                    session.runState == .completed && !session.runLifecycle.terminalCommitInProgress && session.activeRunOwnership == nil
+                }
+                XCTAssertNotNil(session.lastTerminalCommitRevision)
+            } else {
+                XCTAssertNil(session.lastTerminalCommitRevision)
+            }
+            let reservation = try XCTUnwrap(h.host.claudeCoordinator.reserveEventsForHostPreparation(for: session))
+            let providerID = UUID()
+            await controller.emit(.providerTurnStarted(turnID: providerID))
+            await controller.emit(.approvalRequest(.init(
+                requestID: .claudeControl("parked-teardown-approval"), method: "control/can_use_tool",
+                kind: .commandExecution, threadID: "fixture", turnID: providerID.uuidString, itemID: "tool"
+            )))
+            await until("provider approval is parked in host preparation") {
+                listener.pendingApprovalIDs == ["parked-teardown-approval"] && listener.isBusy
+            }
+            XCTAssertTrue(listener.subscription === reservation.subscription)
+            XCTAssertNil(session.activeRunOwnership)
+            let predecessorOwnership = session.lastTerminalCommitRevision?.ownership
+            let shutdownGate = Gate()
+            await controller.setShutdownSuspension { await shutdownGate.wait() }
+            let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
+            var returned = false
+            let cancellation = Task { @MainActor in
+                await service.cancelRun(
+                    tabID: session.tabID, session: session, intent: .runtimeShutdown,
+                    completion: .terminalTeardownCompleted
+                )
+                returned = true
+            }
+            await until("withdrawn controller shutdown is held") { shutdownGate.isWaiting }
+            XCTAssertNil(session.claudeController)
+            XCTAssertNil(session.activeRunOwnership, "Withdrawal must not invent a provider attempt")
+            XCTAssertEqual(session.lastTerminalCommitRevision?.ownership, predecessorOwnership)
+            XCTAssertFalse(returned, "Teardown-completed cancellation must join this provider, not just the predecessor")
+            let shutdownsBeforeRelease = await controller.shutdownCount
+            XCTAssertEqual(shutdownsBeforeRelease, 0)
+            let calls = await controller.inputBoundaryCalls
+            XCTAssertTrue(calls.contains("permission:parked-teardown-approval:cancel"))
+            shutdownGate.open()
+            await cancellation.value
+            XCTAssertTrue(returned)
+            let shutdownsAfterRelease = await controller.shutdownCount
+            XCTAssertEqual(shutdownsAfterRelease, 1)
+            XCTAssertTrue(reservation.subscription.isClosed)
+            await h.host.claudeCoordinator.shutdownClaudeSession(session)
+        }
+    }
+
     func testReplacementTransportReopensTheExistingAttemptInboxAfterEOF() async throws {
         let f = try await fixture()
         let inbox = try XCTUnwrap(f.listener.reserve())
