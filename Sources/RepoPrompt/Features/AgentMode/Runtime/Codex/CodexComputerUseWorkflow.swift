@@ -335,7 +335,7 @@ enum CodexComputerUseWorkflow {
         <computer_use_workflow>
         \(opening)
 
-        Use the installed computer-use companion's MCP tools only when they are available in this session. Do not install or enable plugins, browser integrations, or app connectors for this workflow. If exact computer-use tool names are not already visible, use tool search first; useful searches include "computer use", "browser", "screen", "click", "type", or app/site-specific terms from the user's request. If no computer-use tools are available, \(parentAgentTask ? clarification : "say so plainly and ask the user to enable or install the required Codex computer-use capability instead of hallucinating tool calls.")
+        Use the installed computer-use companion's MCP tools only when they are available in this session. Do not install or enable plugins, browser integrations, or app connectors for this workflow. If exact computer-use tool names are not already visible, use tool search first; useful searches include "computer use", "browser", "screen", "click", "type", or app/site-specific terms from the user's request. If no computer-use tools are available, \(parentAgentTask ? "report that and stop without acting." : "say so plainly and ask the user to enable or install the required Codex computer-use capability instead of hallucinating tool calls.")
 
         Safety requirements:
         - \(parentAgentTask ? clarification : "Clarify missing target app/site/account, destination, credentials, or intended action before operating.")
