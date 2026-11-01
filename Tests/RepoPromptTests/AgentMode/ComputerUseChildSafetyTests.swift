@@ -97,6 +97,61 @@ final class ComputerUseChildSafetyTests: XCTestCase {
         XCTAssertEqual(summary.externalMCP, "Third-party MCP: suppressed")
     }
 
+    func testMasterOffRevokesDirectAndParentAndRefusesChildTasks() async throws {
+        let f = try fixture()
+        try f.proof.reserve()
+        try await f.vm.armComputerUseChild(session: f.child, proof: f.proof)
+        XCTAssertNotEqual(f.parent.selectedAgent, .codexExec)
+        XCTAssertNotNil(f.parent.computerUseParentGrant)
+        XCTAssertTrue(f.proof.permits(f.child))
+        let childID = try XCTUnwrap(f.child.activeAgentSessionID)
+        // Install the existing MCP instruction context without settings or activation side effects.
+        let context = AgentModeViewModel.AgentMCPControlContext(
+            sessionID: childID, activationID: UUID(), registration: .init(sessionID: childID, generation: 1),
+            currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil, originatingConnectionID: nil,
+            interactionTransport: .mcp(sessionID: childID, originatingConnectionID: nil),
+            suppressUserNotifications: true, forceAutoEditEnabled: false, autoEditEnabledBeforeOverride: false, taskLabelKind: nil
+        )
+        f.child.mcpControlContext = context
+        XCTAssertTrue(f.vm.mcpControlledSession(sessionID: childID) === f.child)
+        let direct = f.vm.session(for: UUID())
+        direct.selectedAgent = .codexExec
+        direct.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
+        direct.codexComputerUseArmingRequestID = UUID()
+        let controller = WedgeFakeCodexController(runID: AgentModeProcessRunIdentity.startFreshProcessRun(for: direct), responses: [])
+        direct.codexController = controller
+        direct.codexControllerFeatureState = .init(computerUseEnabled: true, goalSupportEnabled: false, reasoningSummariesEnabled: false, memoriesEnabled: false, capabilities: .computerUse)
+        XCTAssertTrue(direct.isCodexComputerUseArmed)
+        XCTAssertTrue(f.child.isCodexComputerUseArmed)
+
+        f.vm.applyComputerUsePolicyTransition(.init(master: false, legacyDirect: true, subagent: true), modelChanged: false)
+
+        XCTAssertNil(f.parent.computerUseParentGrant)
+        XCTAssertFalse(f.proof.parentIsCurrent)
+        XCTAssertTrue(f.proof.retiring)
+        XCTAssertFalse(f.proof.permits(f.child))
+        XCTAssertTrue(controller.computerUseAutoApprovalRevoked)
+        XCTAssertNil(direct.codexComputerUseArmingRequestID)
+        XCTAssertFalse(direct.codexComputerUseOwnershipTransitionHolds.isEmpty)
+        XCTAssertEqual(f.vm.submitUserTurn(text: "Inspect TextEdit", tabID: f.child.tabID, isLocalComposerInput: false, computerUseProof: f.proof), .blocked(message: ComputerUseChildProof.denied))
+        do {
+            _ = try await f.vm.mcpDispatchInstruction(sessionID: childID, text: "Inspect TextEdit again", allowStartingRun: true, expectedControlContext: context, computerUseProof: f.proof)
+            XCTFail("A revoked parent must not steer its designated child")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains(ComputerUseChildProof.denied))
+        }
+        await f.finish()
+        try await AsyncTestWait.waitUntil("master-off retires direct Computer Use", timeout: 4) {
+            controller.shutdownCount == 1 && direct.codexComputerUseOwnershipTransitionHolds.isEmpty
+        }
+        XCTAssertFalse(direct.isCodexComputerUseArmed)
+        XCTAssertNil(direct.codexController)
+        XCTAssertFalse(f.child.isCodexComputerUseArmed)
+        XCTAssertNil(ComputerUseChildProof.holder)
+        XCTAssertEqual(controller.startedTurnCount, 0)
+        XCTAssertTrue(f.factory.controllers.isEmpty)
+    }
+
     func testStartFlagAllowlistAndCanonicalDefinition() throws {
         let allowed: [String: Value] = ["op": .string("start"), "computer_use": .bool(true), "message": .string("Inspect TextEdit"), "detach": .bool(true), "timeout": .int(0)]
         XCTAssertTrue(try AgentRunMCPToolService.computerUseRequested(args: allowed, operation: "start"))

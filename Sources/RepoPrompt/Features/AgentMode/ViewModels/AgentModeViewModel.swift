@@ -4160,34 +4160,39 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 let settings = GlobalSettingsStore.shared
                 let policy = settings.computerUsePolicy
                 let model = settings.scalarPreferences.agentMode?.computerUseModel
-                let revokeChildren = !policy.subagent || previousModel != model
+                let modelChanged = previousModel != model
                 previousModel = model
-                if revokeChildren {
-                    for session in sessions.values {
-                        session.computerUseParentGrant = nil
-                    }
-                    if ComputerUseChildProof.holder?.owner === self { ComputerUseChildProof.holder?.retire() }
-                }
-                for session in sessions.values where
-                    (session.isComputerUseChild ? revokeChildren : !policy.direct)
-                    && (session.isCodexComputerUseArmed || session.codexComputerUseArmingRequestID != nil || session.codexControllerFeatureState?.computerUseEnabled == true)
-                {
-                    if let proof = session.computerUseChildProof { proof.retire()
-                        continue
-                    }
-                    session.codexController?.revokeComputerUseAutoApproval()
-                    session.codexComputerUseArmingRequestID = nil
-                    let releaseAdmission = session.holdCodexComputerUseAdmission()
-                    Task { @MainActor [weak self] in
-                        defer {
-                            releaseAdmission()
-                            self?.requestUIRefresh(tabID: session.tabID, urgent: true)
-                        }
-                        await self?.codexCoordinator.revokeCodexComputerUse(session: session, reason: "setting-off")
-                    }
-                }
+                applyComputerUsePolicyTransition(policy, modelChanged: modelChanged)
             }
             .store(in: &cancellables)
+    }
+
+    func applyComputerUsePolicyTransition(_ policy: ComputerUsePolicy, modelChanged: Bool) {
+        let revokeChildren = !policy.subagent || modelChanged
+        if revokeChildren {
+            for session in sessions.values {
+                session.computerUseParentGrant = nil
+            }
+            if ComputerUseChildProof.holder?.owner === self { ComputerUseChildProof.holder?.retire() }
+        }
+        for session in sessions.values where
+            (session.isComputerUseChild ? revokeChildren : !policy.direct)
+            && (session.isCodexComputerUseArmed || session.codexComputerUseArmingRequestID != nil || session.codexControllerFeatureState?.computerUseEnabled == true)
+        {
+            if let proof = session.computerUseChildProof { proof.retire()
+                continue
+            }
+            session.codexController?.revokeComputerUseAutoApproval()
+            session.codexComputerUseArmingRequestID = nil
+            let releaseAdmission = session.holdCodexComputerUseAdmission()
+            Task { @MainActor [weak self] in
+                defer {
+                    releaseAdmission()
+                    self?.requestUIRefresh(tabID: session.tabID, urgent: true)
+                }
+                await self?.codexCoordinator.revokeCodexComputerUse(session: session, reason: "setting-off")
+            }
+        }
     }
 
     private func setupObservers() {
