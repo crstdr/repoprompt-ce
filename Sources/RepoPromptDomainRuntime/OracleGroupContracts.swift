@@ -617,6 +617,8 @@ package struct OracleLaneResult: Codable, Equatable {
     package let modelID: String
     package let status: OracleLaneResultStatus
     package let executionProfile: OracleExecutionProfile?
+    /// Exact assistant-message display text captured by the app; absent for older/direct results.
+    package let capturedModelName: String?
     package let response: String?
     package let error: OracleLaneError?
 
@@ -627,6 +629,7 @@ package struct OracleLaneResult: Codable, Equatable {
         modelID: String,
         status: OracleLaneResultStatus,
         executionProfile: OracleExecutionProfile? = nil,
+        capturedModelName: String? = nil,
         response: String? = nil,
         error: OracleLaneError? = nil
     ) throws {
@@ -648,6 +651,7 @@ package struct OracleLaneResult: Codable, Equatable {
         self.modelID = try OracleRosterContract.normalizedModelID(modelID)
         self.status = status
         self.executionProfile = executionProfile
+        self.capturedModelName = capturedModelName
         self.response = response
         self.error = error
     }
@@ -660,6 +664,7 @@ package struct OracleLaneResult: Codable, Equatable {
         case modelID = "model_id"
         case status
         case executionProfile = "execution_profile"
+        case capturedModelName = "captured_model_name"
         case response
         case error
     }
@@ -673,6 +678,7 @@ package struct OracleLaneResult: Codable, Equatable {
         let modelID = try container.decode(String.self, forKey: .modelID)
         let status = try container.decode(OracleLaneResultStatus.self, forKey: .status)
         let executionProfile = try container.decodeIfPresent(OracleExecutionProfile.self, forKey: .executionProfile)
+        let capturedModelName = try container.decodeIfPresent(String.self, forKey: .capturedModelName)
         let response = try container.decodeIfPresent(String.self, forKey: .response)
         let error = try container.decodeIfPresent(OracleLaneError.self, forKey: .error)
         try Self.validate(
@@ -692,6 +698,7 @@ package struct OracleLaneResult: Codable, Equatable {
         self.modelID = try OracleRosterContract.normalizedModelID(modelID)
         self.status = status
         self.executionProfile = executionProfile
+        self.capturedModelName = capturedModelName
         self.response = response
         self.error = error
     }

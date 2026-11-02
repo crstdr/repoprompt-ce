@@ -2665,7 +2665,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             session.codexNeedsReconnect = true
         }
         await ensureCodexNativeSession(
-            session: session
+            session: session,
+            allowMissingRolloutFallback: false,
+            forIdleNativeCompact: true
         )
         guard !hasCodexStartupClaim(for: session),
               let controller = session.codexController,
@@ -7142,7 +7144,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         }
                     }
                     logCodex("[AgentModeVM] Event task: events stream ended")
-                    cancelCodexTransportClosedFallback(for: session.tabID)
 
                     // --- Stream ended without an explicit terminal event ---
                     // If the task was cancelled (intentional teardown) or run has moved on, do nothing.
@@ -7156,6 +7157,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         return
                     }
 
+                    cancelCodexTransportClosedFallback(for: session.tabID)
                     guard session.runState.isActive else {
                         guard invalidateCodexControllerForReconnect(
                             session: session,
@@ -10007,6 +10009,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             sealAssistantBoundary(session)
             reconcileReasoningCompletion(payload, session: session)
             return
+        case .responseUsage:
+            return
         case let .tokenUsage(usage):
             guard session.runState.isActive else { return }
             viewModel?.applyCodexNativeContextUsage(usage, session: session)
@@ -11427,6 +11431,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     }
 
     #if DEBUG
+        func test_installTransportClosedFallback(_ task: Task<Void, Never>, tabID: UUID) {
+            codexTransportClosedFallbackTasksByTabID.set(tabID, task: task)
+        }
+
         @_spi(TestSupport)
         public func test_dispatchCodexFallbackHead(
             session: AgentTabSession,
@@ -11947,6 +11955,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             case .assistantCompleted: "assistantCompleted"
             case .reasoningDelta: "reasoningDelta"
             case .reasoningCompleted: "reasoningCompleted"
+            case .responseUsage: "responseUsage"
             case .tokenUsage: "tokenUsage"
             case .approvalRequest: "approvalRequest"
             case .permissionsRequest: "permissionsRequest"
@@ -11979,6 +11988,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             "reasoningDelta kind=\(payload.kind) chars=\(payload.text.count) itemID=\(payload.itemID ?? "nil") groupID=\(payload.groupID ?? "nil")"
         case let .reasoningCompleted(payload):
             "reasoningCompleted summary=\(payload.summary.count) content=\(payload.content.count) turnID=\(payload.scope.turnID) itemID=\(payload.scope.itemID)"
+        case .responseUsage:
+            "responseUsage"
         case let .tokenUsage(usage):
             "tokenUsage modelContextWindow=\(usage.modelContextWindow.map(String.init(describing:)) ?? "nil") lastTotalTokens=\(usage.lastTotalTokens.map(String.init(describing:)) ?? "nil") totalTotalTokens=\(usage.totalTotalTokens.map(String.init(describing:)) ?? "nil")"
         case let .approvalRequest(request):

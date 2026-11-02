@@ -628,41 +628,78 @@ extension AgentModeViewModel {
     /// terminal commit still publishing. `isTerminalForCommit` alone is not unsettled — a fully
     /// committed .cancelled run must not count as live forever.
     private func providerSwitchSourceIsSettled(_ session: TabSession) -> Bool {
-        !session.runState.isActive && session.agentTask == nil && !session.terminalCommitInProgress
+        !session.runState.isActive && session.agentTask == nil && !session.terminalCommitInProgress && session.activeRunOwnership == nil
     }
 
-    /// Waits `work` up to the shared managed-stop deadline; `work` is never cancelled on timeout,
-    /// so a still-running stop or provider shutdown finishes detached. Returns true on completion.
-    /// The work runs in its own task and reports through a stream: the group only races two
-    /// cancellable children (a stream read and the deadline sleep), so it returns on the first
-    /// outcome instead of waiting out an uncancellable `task.value` child.
-    private func providerSwitchAwaitManagedStopDeadline(_ work: @escaping () async -> Void) async -> Bool {
-        let (stream, continuation) = AsyncStream<Bool>.makeStream()
+    enum ProviderSwitchDeadline: Hashable {
+        case forcedStop, retirementTail, idleProbe, previewAugmentation
+    }
+
+    /// Returns the work's result, or nil when its bounded wait expires. The worker is not
+    /// cancelled: captured-runtime cleanup can finish detached, while callers fence late writes.
+    /// Only the cancellable stream read and deadline sleep belong to the racing task group.
+    private func providerSwitchAwaitDeadline<Value: Sendable>(
+        _ kind: ProviderSwitchDeadline, work: @escaping @MainActor () async -> Value
+    ) async -> Value? {
+        let (stream, continuation) = AsyncStream<Value>.makeStream()
         Task { @MainActor in
-            await work()
-            continuation.yield(true)
+            await continuation.yield(work())
             continuation.finish()
         }
+        var seconds = AgentRunStopState.managedStopDeadlineSeconds
         #if DEBUG
-            let deadlineSeconds = test_providerSwitchStopDeadlineSeconds
-        #else
-            let deadlineSeconds = AgentRunStopState.managedStopDeadlineSeconds
+            if kind == .forcedStop || kind == .retirementTail {
+                seconds = test_providerSwitchStopDeadlineSeconds
+            }
+            let gate = test_providerSwitchDeadlineGates[kind]
         #endif
-        let finished = await withTaskGroup(of: Bool.self) { group in
+        let deadlineSeconds = seconds
+        let result = await withTaskGroup(of: Value?.self) { group in
             group.addTask {
                 var iterator = stream.makeAsyncIterator()
-                return await iterator.next() ?? false
+                return await iterator.next()
             }
             group.addTask {
+                #if DEBUG
+                    if let gate {
+                        await gate()
+                        return nil
+                    }
+                #endif
                 try? await Task.sleep(nanoseconds: UInt64(deadlineSeconds * 1_000_000_000))
-                return false
+                return nil
             }
-            let first = await group.next() ?? false
+            let first = await group.next() ?? nil
             group.cancelAll()
             return first
         }
         continuation.finish()
-        return finished
+        return result
+    }
+
+    private func providerSwitchAwaitManagedStopDeadline(_ work: @escaping @MainActor () async -> Void) async -> Bool {
+        await providerSwitchAwaitDeadline(.forcedStop) { await work()
+            return true
+        } ?? false
+    }
+
+    private func providerSwitchRequireIdle(_ session: TabSession) async -> String? {
+        let result: String?? = await providerSwitchAwaitDeadline(.idleProbe) {
+            do {
+                #if DEBUG
+                    if let hook = self.test_providerSwitchIdleProbe {
+                        try await hook(session)
+                        return nil as String?
+                    }
+                #endif
+                try await self.requireIdleProviderForWorktreeBindingTransition(session)
+                return nil as String?
+            } catch { return error.localizedDescription }
+        }
+        switch result {
+        case let .some(reason): return reason
+        case .none: return AgentSessionLinkSendFailure.targetNotIdle.message
+        }
     }
 
     private func providerSwitchHistoryToolAllowed(_ session: TabSession, destination: AgentProviderKind? = nil) -> Bool {
@@ -803,6 +840,7 @@ extension AgentModeViewModel {
         var generatedSummary: ProviderSwitchGeneratedSummary?
         var choices: [ProviderSwitchChoice] = []
         var selected: AgentProviderHandover.Mode?
+        var explicitSelection: AgentProviderHandover.Mode?
         var wordLimit: Int?
         var building = true
         var updated = false
@@ -819,9 +857,37 @@ extension AgentModeViewModel {
     }
 
     struct ProviderSwitchMutation {
+        enum Phase { case preparing, detached, staged }
         let id: UUID
         let session: TabSession
-        var allowsSave = false
+        let preview: ProviderSwitchPreview
+        let saveGenerationAtEntry: UInt64
+        var phase: Phase = .preparing
+        var allowsSave: Bool {
+            phase == .staged
+        }
+    }
+
+    struct ProviderSwitchBackgroundOutcome {
+        let session: TabSession
+        let binding: AgentSessionRestorationBindingToken?
+    }
+
+    func providerSwitchIsCompletingInBackground(_ session: TabSession) -> Bool {
+        guard let mutation = providerSwitchMutation, mutation.session === session,
+              mutation.phase != .preparing,
+              session.currentRestorationBindingToken == mutation.preview.binding else { return false }
+        return providerSwitchPreview?.id != mutation.preview.id
+    }
+
+    private func endProviderSwitchMutation(_ id: UUID) {
+        guard let owned = providerSwitchMutation, owned.id == id else { return }
+        providerSwitchMutation = nil
+        if !owned.allowsSave, owned.session.saveRequestGeneration != owned.saveGenerationAtEntry,
+           owned.session.isDirty, providerSwitchPreviewIdentityIsCurrent(owned.preview)
+        {
+            scheduleSave(for: owned.session)
+        }
     }
 
     @MainActor
@@ -920,8 +986,9 @@ extension AgentModeViewModel {
     }
 
     @discardableResult
-    func openProviderSwitchPreview(agent: AgentProviderKind, model: String, tabID: UUID, updated: Bool = false, cursorParameterIntent: ProviderSwitchCursorParameterIntent? = nil, retainingSummary: ProviderSwitchGeneratedSummary? = nil) async -> UUID? {
+    func openProviderSwitchPreview(agent: AgentProviderKind, model: String, tabID: UUID, updated: Bool = false, cursorParameterIntent: ProviderSwitchCursorParameterIntent? = nil, retainingSummary: ProviderSwitchGeneratedSummary? = nil, explicitSelection: AgentProviderHandover.Mode? = nil) async -> UUID? {
         guard providerSwitchMutation == nil, let session = sessions[tabID] else { return nil }
+        providerSwitchBackgroundOutcome = nil
         let descriptor = session.pendingHandoff.providerSwitchDelivery != nil
             ? session.pendingHandoff.payload.flatMap(ProviderSwitchCarrierDescriptor.init) : nil
         // Corrupt retained source data must not acquire today's selected provider as its author.
@@ -931,7 +998,8 @@ extension AgentModeViewModel {
         } else {
             try? AgentProviderHandover.Source(provider: session.selectedAgent.displayName, model: inputBarModelDisplayName(rawModel: session.selectedModelRaw, agentKind: session.selectedAgent))
         }
-        let preview = captureProviderSwitchPreview(session, agent: agent, model: model, source: source, descriptor: descriptor, updated: updated, cursorParameterIntent: cursorParameterIntent, retainingSummary: retainingSummary)
+        var preview = captureProviderSwitchPreview(session, agent: agent, model: model, source: source, descriptor: descriptor, updated: updated, cursorParameterIntent: cursorParameterIntent, retainingSummary: retainingSummary)
+        preview.explicitSelection = explicitSelection
         providerSwitchPreview = preview
         await buildProviderSwitchPreview(preview.id)
         // A caller may act only on the preview this request opened, never a later rebuild/owner.
@@ -996,10 +1064,21 @@ extension AgentModeViewModel {
             && providerSwitchInstructionProvenance(preview.session, destination: preview.destination) == preview.instructionProvenance
     }
 
-    func providerSwitchDiscardBlocker(_ preview: ProviderSwitchPreview) -> String? {
-        guard providerSwitchPreviewIsCurrent(preview) else { return AgentSessionLinkSendFailure.providerHandoverNeedsReview.message }
-        if providerSwitchMutation != nil { return AgentSessionLinkSendFailure.targetBusy.message }
-        return providerSwitchTransitionBlocker(preview.session, resolvingHandoff: preview.originalHandoff)
+    func providerSwitchDiscardBlocker(_ session: TabSession) -> String? {
+        let preview = captureProviderSwitchPreview(session, agent: session.selectedAgent, model: session.selectedModelRaw, source: nil, descriptor: nil)
+        return providerSwitchDiscardBlocker(preview)
+    }
+
+    /// Discard clears only the exact local slot. Content/budget drift is irrelevant, but
+    /// binding, lifecycle, relocation and all live-work admission gates remain mandatory.
+    func providerSwitchDiscardBlocker(_ preview: ProviderSwitchPreview, owningMutationID: UUID? = nil) -> String? {
+        guard providerSwitchPreviewIsCurrent(preview, content: false),
+              preview.isReview, providerSwitchHasExactOwner(preview.session)
+        else { return AgentSessionLinkSendFailure.providerHandoverNeedsReview.message }
+        if let mutation = providerSwitchMutation, mutation.id != owningMutationID {
+            return AgentSessionLinkSendFailure.targetBusy.message
+        }
+        return providerSwitchTransitionBlocker(preview.session, ownsComposerClaim: owningMutationID != nil, resolvingHandoff: preview.originalHandoff)
     }
 
     func providerSwitchPreviewBlocker(_ preview: ProviderSwitchPreview) -> String? {
@@ -1023,6 +1102,24 @@ extension AgentModeViewModel {
         return providerSwitchTransitionAdmission(preview.session, resolvingHandoff: preview.originalHandoff)
     }
 
+    /// UI preference only; never persisted and never used as delivery evidence.
+    func selectProviderSwitchChoice(_ mode: AgentProviderHandover.Mode, previewID: UUID) {
+        guard let preview = providerSwitchPreview, preview.id == previewID,
+              preview.generationItemID == nil,
+              Self.providerSwitchSelection(choices: preview.choices, explicit: mode, retained: nil) == mode
+        else { return }
+        providerSwitchPreview?.explicitSelection = mode
+        providerSwitchPreview?.selected = mode
+    }
+
+    static func providerSwitchSelection(
+        choices: [ProviderSwitchChoice], explicit: AgentProviderHandover.Mode?, retained: AgentProviderHandover.Mode?
+    ) -> AgentProviderHandover.Mode? {
+        [explicit, retained, .history, .newestTurns].compactMap(\.self).first { mode in
+            choices.contains { $0.mode == mode && !$0.hidden && $0.unavailable == nil && $0.bytes > 0 }
+        }
+    }
+
     private func buildProviderSwitchPreview(_ id: UUID) async {
         guard var preview = providerSwitchPreview, preview.id == id else { return }
         let session = preview.session
@@ -1039,13 +1136,25 @@ extension AgentModeViewModel {
         let stale = Self.providerSwitchNeedsReview(session)
         let composition = preview.composition
         let wrapped = composeProviderSwitchPreviewDraft(composition, destination: preview.destination, session: session)
-        let initial = await augmentUserMessageForProviderSend(
-            wrapped, attachments: composition.images,
-            taggedFileAttachments: composition.taggedFiles, agent: preview.destination,
-            session: session, ignoresPendingHandoff: true
-        )
-        let composed = await buildInitialThreadMessageIfNeeded(tabID: session.tabID, session: session, initialMessage: initial)
-        guard providerSwitchPreview?.id == id else { return }
+        let live: @MainActor () -> Bool = { [weak self] in
+            self?.providerSwitchPreview?.id == id && self?.providerSwitchPreview?.building == true
+                && self?.providerSwitchPreview?.failure == nil
+        }
+        let stage: String?? = await providerSwitchAwaitDeadline(.previewAugmentation) {
+            let initial = await self.augmentUserMessageForProviderSend(
+                wrapped, attachments: composition.images,
+                taggedFileAttachments: composition.taggedFiles, agent: preview.destination,
+                session: session, ignoresPendingHandoff: true, shouldPublishCatalog: live
+            )
+            guard live() else { return nil as String? }
+            return await self.buildInitialThreadMessageIfNeeded(tabID: session.tabID, session: session, initialMessage: initial)
+        }
+        guard live() else { return }
+        guard let composed = stage ?? nil else {
+            providerSwitchPreview?.building = false
+            providerSwitchPreview?.failure = AgentSessionLinkSendFailure.targetNotIdle.message
+            return
+        }
         guard providerSwitchPreviewIsCurrent(preview) else {
             refreshProviderSwitchPreviewAfterDrift(preview)
             return
@@ -1122,8 +1231,14 @@ extension AgentModeViewModel {
                     preview.choices[index].unavailable = nil
                     preview.selected = preview.choices[index].mode
                 }
-            } else if !preview.isReview, budget.fits(result.full) { preview.selected = .history }
+            }
             if let summary = preview.generatedSummary { fitProviderSwitchSummary(summary, into: &preview) }
+            let retainedSelection = preview.selected
+            // Read the live pick after the last suspension, not the build's stale value copy.
+            preview.explicitSelection = providerSwitchPreview?.explicitSelection
+            preview.selected = Self.providerSwitchSelection(
+                choices: preview.choices, explicit: preview.explicitSelection, retained: retainedSelection
+            )
             preview.building = false
             providerSwitchPreview = preview
         } catch {
@@ -1235,7 +1350,7 @@ extension AgentModeViewModel {
                 && composition.includeCleanupGuidance == preview.composition.includeCleanupGuidance
                 && composition.images == preview.composition.images && composition.taggedFiles == preview.composition.taggedFiles
                 && providerSwitchInstructionProvenance(preview.session, destination: preview.destination) == preview.instructionProvenance
-            await openProviderSwitchPreview(agent: preview.destination, model: preview.model, tabID: preview.session.tabID, updated: true, cursorParameterIntent: preview.cursorParameterIntent, retainingSummary: canRetain ? preview.generatedSummary : nil)
+            await openProviderSwitchPreview(agent: preview.destination, model: preview.model, tabID: preview.session.tabID, updated: true, cursorParameterIntent: preview.cursorParameterIntent, retainingSummary: canRetain ? preview.generatedSummary : nil, explicitSelection: providerSwitchPreview?.explicitSelection)
         }
     }
 
@@ -1252,7 +1367,9 @@ extension AgentModeViewModel {
     }
 
     func cancelProviderSwitchPreview() {
-        guard providerSwitchMutation == nil else { return }
+        if let mutation = providerSwitchMutation, mutation.phase == .preparing {
+            endProviderSwitchMutation(mutation.id)
+        }
         providerSwitchPreview = nil
     }
 
@@ -1312,8 +1429,8 @@ extension AgentModeViewModel {
             && !census.placementConflictSessionIDs.contains(id) && census.uniqueRuntimeOwners[id]?.session === session
     }
 
-    private func providerSwitchClaim(_ preview: ProviderSwitchPreview) -> AgentComposerSubmitClaim? {
-        guard providerSwitchPreviewIsCurrent(preview), providerSwitchHasExactOwner(preview.session),
+    private func providerSwitchClaim(_ preview: ProviderSwitchPreview, discard: Bool = false) -> AgentComposerSubmitClaim? {
+        guard providerSwitchPreviewIsCurrent(preview, content: !discard), providerSwitchHasExactOwner(preview.session),
               let target = makeComposerSubmitTarget(tabID: preview.session.tabID, session: preview.session) else { return nil }
         let attempt = AgentComposerSubmitAttempt(
             id: UUID(),
@@ -1334,8 +1451,10 @@ extension AgentModeViewModel {
               providerSwitchPreviewBlocker(preview) == nil, let claim = providerSwitchClaim(preview) else { return }
         defer { releaseComposerSubmitClaim(claim) }
         let session = preview.session
-        do { try await requireIdleProviderForWorktreeBindingTransition(session) } catch {
-            if providerSwitchPreview?.id == id { providerSwitchPreview?.failure = error.localizedDescription }
+        if let failure = await providerSwitchRequireIdle(session) {
+            if providerSwitchPreview?.id == id {
+                providerSwitchPreview?.failure = failure
+            }
             return
         }
         guard providerSwitchPreview?.id == id, providerSwitchPreviewIsCurrent(preview), composerSubmitClaimIsCurrent(claim),
@@ -1478,44 +1597,52 @@ extension AgentModeViewModel {
               ? providerSwitchDiscardBlocker(preview) == nil
               : providerSwitchPreviewAdmission(preview).isAdmissible(forcing: forcing),
               discard ? preview.isReview : (preview.chosen != nil && preview.chosen?.unavailable == nil),
-              let claim = providerSwitchClaim(preview), let workspaceID = workspaceManager?.activeWorkspaceID else { return false }
+              let claim = providerSwitchClaim(preview, discard: discard), let workspaceID = workspaceManager?.activeWorkspaceID else { return false }
         defer { releaseComposerSubmitClaim(claim) }
         let session = preview.session
         var rollback = ProviderSwitchRollback(session)
-        let mutation = ProviderSwitchMutation(id: UUID(), session: session)
-        let saveGenerationAtEntry = session.saveRequestGeneration
+        let mutation = ProviderSwitchMutation(id: UUID(), session: session, preview: preview, saveGenerationAtEntry: session.saveRequestGeneration)
+        providerSwitchBackgroundOutcome = nil
         providerSwitchMutation = mutation
-        defer {
-            if let owned = providerSwitchMutation, owned.id == mutation.id {
-                providerSwitchMutation = nil
-                // A real user save may have reached the debounce while retirement withheld it.
-                // Resume only that existing request on a pre-staging exit, never a failed write.
-                if !owned.allowsSave, session.saveRequestGeneration != saveGenerationAtEntry,
-                   session.isDirty, providerSwitchPreviewIdentityIsCurrent(preview)
-                {
-                    scheduleSave(for: session)
-                }
-            }
-        }
+        defer { endProviderSwitchMutation(mutation.id) }
         func current() -> Bool {
             // Forcing deliberately mutates the source's live state (declines interactions, stops
             // the run); the content-revision currency check would abort on that intended drift.
             // Identity (session, binding, workspace) still has to hold in either mode.
             let previewCurrent = forcing
                 ? providerSwitchPreviewIdentityIsCurrent(preview)
-                : providerSwitchPreviewIsCurrent(preview)
+                : providerSwitchPreviewIsCurrent(preview, content: !discard)
             return composerSubmitClaimIsCurrent(claim) && providerSwitchMutation?.id == mutation.id
                 && (!requiresPresentedPreview || providerSwitchPreview?.id == id) && previewCurrent
                 && workspaceManager?.activeWorkspaceID == workspaceID && providerSwitchHasExactOwner(session)
-                && providerSwitchTransitionAdmission(
-                    session, ownsComposerClaim: true, resolvingHandoff: preview.originalHandoff
-                ).isAdmissible(forcing: forcing)
+                && (
+                    discard ? providerSwitchDiscardBlocker(preview, owningMutationID: mutation.id) == nil
+                        : providerSwitchTransitionAdmission(
+                            session, ownsComposerClaim: true, resolvingHandoff: preview.originalHandoff
+                        ).isAdmissible(forcing: forcing)
+                )
+        }
+        func transactionCurrent() -> Bool {
+            let sourceCurrent = forcing ? providerSwitchPreviewIdentityIsCurrent(preview)
+                : (
+                    providerSwitchPreviewIsCurrent(preview, content: false)
+                        && session.sourceItemsRevision == preview.sourceRevision
+                        && providerSwitchInstructionStrings(session, destination: preview.destination) == preview.instructions
+                )
+            return composerSubmitClaimIsCurrent(claim) && providerSwitchMutation?.id == mutation.id
+                && sourceCurrent && workspaceManager?.activeWorkspaceID == workspaceID
+                && providerSwitchHasExactOwner(session)
+                && providerSwitchTransitionAdmission(session, ownsComposerClaim: true, resolvingHandoff: preview.originalHandoff).isAdmissible(forcing: forcing)
         }
         var noticeID: UUID?
         var phase: RequiredSavePhase = .beforeWrite
         func presentFailure(_ message: String, matching handoff: PendingHandoffState) {
             if requiresPresentedPreview {
-                if providerSwitchPreview?.id == id { providerSwitchPreview?.failure = message }
+                if providerSwitchPreview?.id == id {
+                    providerSwitchPreview?.failure = message
+                } else if providerSwitchMutation?.id == mutation.id, providerSwitchPreviewIdentityIsCurrent(preview) {
+                    providerSwitchBackgroundOutcome = .init(session: session, binding: preview.binding)
+                }
             } else if providerSwitchPreviewIdentityIsCurrent(preview),
                       composerSubmitClaimIsCurrent(claim), providerSwitchMutation?.id == mutation.id,
                       session.pendingHandoff == handoff
@@ -1523,21 +1650,8 @@ extension AgentModeViewModel {
                 session.appendItem(.error(message, sequenceIndex: session.nextSequenceIndex))
             }
         }
-        func restoreSourceIfUnchanged() {
-            guard sessions[session.tabID] === session, session.currentRestorationBindingToken == preview.binding,
-                  composerSubmitClaimIsCurrent(claim), session.pendingHandoff == preview.originalHandoff,
-                  session.selectedAgent == preview.sourceAgent, session.selectedModelRaw == preview.sourceModel,
-                  session.selectedReasoningEffortRaw == preview.sourceReasoningEffort,
-                  session.selectedClaudeEffortRaw == preview.sourceClaudeEffort,
-                  session.acpModelParameterSelections == preview.sourceParameters
-            else { return }
-            rollback.restore(session)
-            updateBindingsFromSession(session)
-        }
         func surfaceReviewFailure() {
-            if requiresPresentedPreview, providerSwitchPreview?.id == id {
-                providerSwitchPreview?.failure = AgentSessionLinkSendFailure.providerHandoverNeedsReview.message
-            }
+            presentFailure(AgentSessionLinkSendFailure.providerHandoverNeedsReview.message, matching: session.pendingHandoff)
         }
         do {
             guard current() else { return false }
@@ -1569,7 +1683,10 @@ extension AgentModeViewModel {
                     cutoff = refreshed.cutoff
                     stagedRevision = refreshed.revision
                 } else {
-                    try await requireIdleProviderForWorktreeBindingTransition(session)
+                    if let failure = await providerSwitchRequireIdle(session) {
+                        presentFailure(failure, matching: preview.originalHandoff)
+                        return false
+                    }
                     guard current() else { return false }
                 }
                 if forcing {
@@ -1580,12 +1697,13 @@ extension AgentModeViewModel {
                 // Detached shutdown can hang on a wedged provider; bound the wait on the shared
                 // managed-stop deadline, never the mutation. The work itself is never cancelled —
                 // a slow provider still finishes retiring detached.
-                _ = await providerSwitchAwaitManagedStopDeadline {
-                    await self.retireProviderContextForProviderSwitch(session)
+                let retire = detachProviderContextForProviderSwitch(session)
+                providerSwitchMutation?.phase = .detached
+                _ = await providerSwitchAwaitDeadline(.retirementTail) { await retire()
+                    return true
                 }
-                guard current(), !forcing || providerSwitchSourceIsSettled(session) else {
-                    restoreSourceIfUnchanged()
-                    if forcing { surfaceReviewFailure() }
+                guard transactionCurrent(), !forcing || providerSwitchSourceIsSettled(session) else {
+                    surfaceReviewFailure()
                     return false
                 }
                 if forcing, session.sourceItemsRevision != stagedRevision {
@@ -1594,9 +1712,8 @@ extension AgentModeViewModel {
                     // transcript and refuse like the late path on any residual staleness.
                     guard let refreshed = await providerSwitchForcedHandoverPayload(preview, session: session),
                           session.sourceItemsRevision == refreshed.revision,
-                          providerSwitchSourceIsSettled(session), current()
+                          providerSwitchSourceIsSettled(session), transactionCurrent()
                     else {
-                        restoreSourceIfUnchanged()
                         surfaceReviewFailure()
                         return false
                     }
@@ -1645,7 +1762,7 @@ extension AgentModeViewModel {
             noticeID = notice.id
             session.appendItem(notice)
             session.isDirty = true
-            providerSwitchMutation?.allowsSave = true
+            providerSwitchMutation?.phase = .staged
             updateBindingsFromSession(session)
             let staged = session.pendingHandoff
             #if DEBUG
@@ -1678,12 +1795,6 @@ extension AgentModeViewModel {
             if providerSwitchPreview?.session === session, providerSwitchPreview?.binding == preview.binding { providerSwitchPreview = nil }
             updateBindingsFromSession(session)
             return true
-        } catch {
-            if sessions[session.tabID] === session, session.currentRestorationBindingToken == preview.binding,
-               composerSubmitClaimIsCurrent(claim), phase == .beforeWrite { rollback.restore(session) }
-            presentFailure(error.localizedDescription, matching: rollback.handoff)
-            updateBindingsFromSession(session)
-            return false
         }
     }
 }

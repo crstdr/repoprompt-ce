@@ -2474,6 +2474,41 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         await cleanup(f)
     }
 
+    func testIdleReconnectInitRefreshesAutoCompactWindowWithoutCreatingAttempt() async throws {
+        let (harness, session, _, listener) = try await spyFixture()
+        addTeardownBlock { @MainActor in await harness.host.claudeCoordinator.shutdownClaudeSession(session) }
+        let runID = session.runID
+        session.codexContextUsage = AgentContextUsage(
+            modelContextWindow: 1_000_000, lastTotalTokens: 90000, totalTotalTokens: 90000
+        )
+        XCTAssertNil(listener.subscription)
+        XCTAssertNil(session.activeRunOwnership)
+        var status = NativeAgentRuntimeRuntimeInitStatus(
+            sessionID: session.providerSessionID, tools: [], mcpServerStatuses: [:],
+            initializeResponse: nil, autoCompactWindowTokens: 400_000
+        )
+
+        listener.receive(.runtimeInit(status))
+
+        XCTAssertEqual(session.claudeAutoCompactWindowTokens, 400_000)
+        XCTAssertEqual(session.codexContextUsage?.modelContextWindow, 400_000)
+        XCTAssertEqual(session.contextUsageSnapshot?.window, 400_000)
+        XCTAssertEqual(session.contextUsageSnapshot?.used, 90000)
+        XCTAssertNil(session.activeNonCodexTurnTokenAccumulator)
+        XCTAssertNil(session.activeRunOwnership)
+        XCTAssertNil(listener.subscription)
+        XCTAssertEqual(session.runID, runID)
+        XCTAssertEqual(session.runState, .completed)
+        XCTAssertTrue(session.items.isEmpty)
+
+        // A listener bound to the previous process run cannot update its successor.
+        session.installRunID(UUID())
+        status.autoCompactWindowTokens = 200_000
+        listener.receive(.runtimeInit(status))
+        XCTAssertEqual(session.claudeAutoCompactWindowTokens, 400_000)
+        XCTAssertEqual(session.contextUsageSnapshot?.window, 400_000)
+    }
+
     func testNoiseSubagentsAndReconnectWithoutReplayDoNotCreateAttempts() async throws {
         let f = try await fixture()
         let historical = AgentChatItem.error("persisted history", sequenceIndex: f.session.nextSequenceIndex)

@@ -65,6 +65,9 @@ struct AgentInputBar: View {
     @Binding var transcriptBottomClearance: CGFloat
 
     @FocusState var isFocused: Bool
+    @State private var providerSwitchBannerHeight: CGFloat = 0
+    @State private var composerOnlyBottomInset: CGFloat = 0
+    @State private var composerOnlyBottomClearance: CGFloat = 0
 
     /// Height of the footer spacing below the composer chrome
     static let footerHeight: CGFloat = 28
@@ -95,11 +98,19 @@ struct AgentInputBar: View {
         #if DEBUG
             let _ = perfRecorder.increment("ui.body.inputBar")
         #endif
-        AgentProviderSwitchPresentation(viewModel: agentModeVM, tabID: currentTabID, content: composer)
+        AgentProviderSwitchPresentation(viewModel: agentModeVM, tabID: currentTabID, content: composer, bannerHeight: $providerSwitchBannerHeight)
+            .onChange(of: providerSwitchBannerHeight) { _, _ in syncProviderSwitchGeometry() }
+            .onChange(of: composerOnlyBottomInset) { _, _ in syncProviderSwitchGeometry() }
+            .onChange(of: composerOnlyBottomClearance) { _, _ in syncProviderSwitchGeometry() }
             .overlay(alignment: .bottom) {
                 statusPills
-                    .padding(.bottom, Self.footerHeight + ComposerChrome<EmptyView, EmptyView>.baseBarHeight + composerBottomInset - 8)
+                    .padding(.bottom, Self.footerHeight + ComposerChrome<EmptyView, EmptyView>.baseBarHeight + composerOnlyBottomInset - 8)
             }
+    }
+
+    private func syncProviderSwitchGeometry() {
+        composerBottomInset = composerOnlyBottomInset + providerSwitchBannerHeight
+        transcriptBottomClearance = composerOnlyBottomClearance + providerSwitchBannerHeight
     }
 
     private var composer: some View {
@@ -116,8 +127,8 @@ struct AgentInputBar: View {
             repromptStore: agentModeVM.repromptUIStore,
             pendingSubmissionStore: composerUI,
             resetTextFieldTrigger: $resetTextFieldTrigger,
-            composerBottomInset: $composerBottomInset,
-            transcriptBottomClearance: $transcriptBottomClearance,
+            composerBottomInset: $composerOnlyBottomInset,
+            transcriptBottomClearance: $composerOnlyBottomClearance,
             isFocused: _isFocused
         )
         .equatable()
@@ -340,7 +351,6 @@ struct AgentComposerView: View, Equatable {
     @State private var isInputEmpty: Bool = true
     @State private var chromeOcclusion: CGFloat = 0
     @State private var isSyncingDraftFromSession: Bool = false
-    @State private var isAttachmentDropTargeted: Bool = false
     @State private var showCodexToolsPopover: Bool = false
     @State private var showPermissionPopover: Bool = false
     @State private var showClaudeToolsPopover: Bool = false
@@ -351,7 +361,8 @@ struct AgentComposerView: View, Equatable {
 
     @ObservedObject private var fontScale = FontScaleManager.shared
     @ObservedObject private var globalSettings = GlobalSettingsStore.shared
-    @Environment(\.agentImageDropController) private var imageDropController
+    @Environment(\.agentAttachmentDropController) private var attachmentDropController
+    @Environment(\.agentAttachmentDropHandler) private var attachmentDropHandler
     private var fontPreset: FontScalePreset {
         fontScale.preset
     }
@@ -402,8 +413,6 @@ struct AgentComposerView: View, Equatable {
     private var canUseLinkedAgentSession: Bool {
         props.canUseLinkedAgentSession
     }
-
-    private static let attachmentDropTypes: [UTType] = [.fileURL, .image]
 
     private var canAttachFiles: Bool {
         // Grok Build advertises no ACP image capability; its provider rejects attachments.
@@ -708,8 +717,6 @@ struct AgentComposerView: View, Equatable {
             guard let notice, notice.tabID == currentTabID else { return }
             showSteeringUnsupportedNotice(notice.message)
         }
-        .onDrop(of: Self.attachmentDropTypes, isTargeted: $isAttachmentDropTargeted, perform: handleAttachmentDrop(providers:))
-        .overlay(attachmentDropOutline)
     }
 
     // MARK: - Transient Submit Guidance
@@ -785,8 +792,13 @@ struct AgentComposerView: View, Equatable {
                 onReturn: sendMessage,
                 resetTrigger: $resetTextFieldTrigger,
                 onAttachmentPaste: handleAttachmentPaste(pasteboard:),
-                onImageDragHoverChange: { [weak imageDropController] isActive in
-                    imageDropController?.setTextViewImageDragActive(isActive)
+                onAttachmentDrop: attachmentDropHandler,
+                onAttachmentDragHoverChange: { [weak attachmentDropController] isActive, pasteboard in
+                    if isActive, let pasteboard {
+                        attachmentDropController?.textViewDragEntered(pasteboard: pasteboard, currentTabID: currentTabID)
+                    } else {
+                        attachmentDropController?.setTextViewAttachmentDragActive(false)
+                    }
                 },
                 features: .agentInputBar(
                     fileTagStore: promptManager.fileManager.workspaceFileContextStore,
@@ -1803,17 +1815,6 @@ struct AgentComposerView: View, Equatable {
         }
     }
 
-    @ViewBuilder
-    private var attachmentDropOutline: some View {
-        if isAttachmentDropTargeted {
-            RoundedRectangle(cornerRadius: 12)
-                .stroke(style: StrokeStyle(lineWidth: 2, dash: [8]))
-                .foregroundColor(.accentColor)
-                .padding(.horizontal, 2)
-                .padding(.bottom, Self.footerHeight)
-        }
-    }
-
     // MARK: - Actions
 
     private func sendRepromptOriginal(expectedID: UUID) {
@@ -2026,21 +2027,6 @@ struct AgentComposerView: View, Equatable {
         }
     }
 
-    private func handleAttachmentDrop(providers: [NSItemProvider]) -> Bool {
-        guard let tabID = currentTabID, canMutateAttachments(tabID: tabID) else {
-            return false
-        }
-        return attachmentIntake.loadPreparedAttachments(from: providers) { prepared, failures in
-            guard !prepared.isEmpty || !failures.isEmpty else { return }
-            Task { @MainActor in
-                actions.reportAttachmentFailures(tabID, failures)
-                if !prepared.isEmpty {
-                    attachPreparedAttachments(prepared, tabID: tabID)
-                }
-            }
-        }
-    }
-
     private func handleAttachmentPaste(pasteboard: NSPasteboard) -> Bool {
         guard let tabID = currentTabID, canMutateAttachments(tabID: tabID) else {
             return false
@@ -2146,6 +2132,25 @@ struct AgentAttachmentIntake {
             return true
         }
         return shouldConsumeNSImageReadablePasteboard(pasteboard)
+    }
+
+    /// Build the same per-item intake used by SwiftUI. A file representation wins only within
+    /// its own item; a separate raw-image item must not disappear beside file URL items.
+    func dropProviders(from pasteboard: NSPasteboard) -> [NSItemProvider] {
+        (pasteboard.pasteboardItems ?? []).compactMap { item in
+            if item.types.contains(.fileURL) {
+                let value: NSSecureCoding = if let data = item.data(forType: .fileURL) {
+                    data as NSData
+                } else {
+                    (item.string(forType: .fileURL) ?? "") as NSString
+                }
+                return NSItemProvider(item: value, typeIdentifier: UTType.fileURL.identifier)
+            }
+            guard let identifier = bestImageTypeIdentifier(from: item.types.map(\.rawValue)) else { return nil }
+            let data = item.data(forType: NSPasteboard.PasteboardType(identifier)) ?? Data()
+            let canonical = canonicalImageType(forIdentifier: identifier)?.identifier ?? identifier
+            return NSItemProvider(item: data as NSData, typeIdentifier: canonical)
+        }
     }
 
     func loadPreparedAttachments(

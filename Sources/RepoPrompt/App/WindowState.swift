@@ -562,6 +562,7 @@ class WindowState: ObservableObject {
         if !isPreparedSessionOwner { manager.detachPreparedRuntimeCarriers(from: self) }
         isClosing = true
         agentModeViewModel.closeOracleBackgroundWindowAdmission()
+        if !isPreparedSessionOwner { manager.activityLedger.removeWindow(windowID) }
         failUnstartedCommandsForWindowClose()
 
         if !manager.isTerminating, !isPreparedSessionOwner {
