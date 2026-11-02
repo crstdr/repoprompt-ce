@@ -122,6 +122,10 @@ struct AgentProviderSwitchPreview: View {
         }
     }
 
+    static func visibleChoices(_ choices: [AgentModeViewModel.ProviderSwitchChoice]) -> [AgentModeViewModel.ProviderSwitchChoice] {
+        choices.filter { !$0.hidden && !($0.mode == .history && $0.unavailable != nil) }
+    }
+
     var body: some View {
         if let preview = viewModel.providerSwitchPreview {
             VStack(alignment: .leading, spacing: 14) {
@@ -129,8 +133,7 @@ struct AgentProviderSwitchPreview: View {
                     .font(.headline)
                 if preview.updated { Text("Preview updated.").foregroundStyle(.secondary) }
                 if preview.building { ProgressView() }
-                if preview.choices.first?.unavailable != nil { Text("Full history doesn't fit.") }
-                ForEach(preview.choices.filter { !$0.hidden }, id: \.mode.rawValue) { choice in
+                ForEach(Self.visibleChoices(preview.choices), id: \.mode.rawValue) { choice in
                     VStack(alignment: .leading, spacing: 5) {
                         HStack {
                             Button {
