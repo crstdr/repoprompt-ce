@@ -100,6 +100,21 @@ enum WindowStateCompositionFactory {
             WorkspaceApplyEditsRebaseProbeHooks.install(AppWorkspaceApplyEditsRebaseProbeRecorder())
         #endif
         let modelRouterRuntime = injectedModelRouterRuntime ?? WindowStatesManager.shared.modelRouterRuntime
+        let activityLedger = WindowStatesManager.shared.activityLedger
+        let watcherActivityFactory: WorkspaceFileContextStore.WatcherActivityFactory = { name, kind in
+            let suffix = switch kind {
+            case .primaryWorkspace: ""
+            case .sessionWorktree: " (session worktree)"
+            case .workspaceGitData: " (git data)"
+            case .supplementalSystem: " (system)"
+            }
+            let root = name + suffix
+            return { phase in
+                activityLedger.record(
+                    windowID: windowID, phase: phase == .began ? .began : .ended, root: root
+                )
+            }
+        }
         // 1) Workspace file context store + visible file-tree UI adapter
         #if DEBUG
             let defaultWorkspaceFileContextStore = WorkspaceFileContextStore(
@@ -108,7 +123,8 @@ enum WindowStateCompositionFactory {
                 nonGitCodeMapsEnabled: settingsStore.nonGitCodeMapsEnabled,
                 codeMapsGloballyDisabled: settingsStore.globalCodeMapsDisabled(),
                 restorePerfRecorder: AppWorkspaceRestorePerfRecorder(),
-                perfRecorder: AppAgentModePerfRecorder()
+                perfRecorder: AppAgentModePerfRecorder(),
+                watcherActivityFactory: watcherActivityFactory
             )
         #else
             let defaultWorkspaceFileContextStore = WorkspaceFileContextStore(
@@ -116,7 +132,8 @@ enum WindowStateCompositionFactory {
                 nonGitCodeMapsEnabled: settingsStore.nonGitCodeMapsEnabled,
                 codeMapsGloballyDisabled: settingsStore.globalCodeMapsDisabled(),
                 restorePerfRecorder: AppWorkspaceRestorePerfRecorder(),
-                perfRecorder: AppAgentModePerfRecorder()
+                perfRecorder: AppAgentModePerfRecorder(),
+                watcherActivityFactory: watcherActivityFactory
             )
         #endif
         let workspaceFileContextStore = injectedWorkspaceFileContextStore ?? defaultWorkspaceFileContextStore
