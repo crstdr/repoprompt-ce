@@ -190,6 +190,9 @@ struct WorkspaceSessionRootLifetimeSnapshot: @unchecked Sendable {
 }
 
 actor WorkspaceFileContextStore {
+    typealias WatcherActivityFactory = @Sendable (String, WorkspaceRootKind) -> FileSystemService.WatcherActivityObserver
+    private let watcherActivityFactory: WatcherActivityFactory?
+
     private let restorePerfRecorder: any WorkspaceRestorePerfRecording
     let perfRecorder: any AgentModePerfRecording
 
@@ -3418,8 +3421,10 @@ actor WorkspaceFileContextStore {
                 WorkspaceCodemapRootEpoch
             ) async -> Void = { _ in },
             restorePerfRecorder: any WorkspaceRestorePerfRecording = NoopWorkspaceRestorePerfRecorder(),
-            perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
+            perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder(),
+            watcherActivityFactory: WatcherActivityFactory? = nil
         ) {
+            self.watcherActivityFactory = watcherActivityFactory
             storeBackedSearchLane = StoreBackedWorkspaceSearchLane(configuration: searchLaneConfiguration)
             self.debugNowNanoseconds = debugNowNanoseconds
             self.unloadTerminationPolicy = unloadTerminationPolicy
@@ -3496,8 +3501,10 @@ actor WorkspaceFileContextStore {
                 WorkspaceCodemapRootEpoch
             ) async -> Void = { _ in },
             restorePerfRecorder: any WorkspaceRestorePerfRecording = NoopWorkspaceRestorePerfRecorder(),
-            perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
+            perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder(),
+            watcherActivityFactory: WatcherActivityFactory? = nil
         ) {
+            self.watcherActivityFactory = watcherActivityFactory
             storeBackedSearchLane = StoreBackedWorkspaceSearchLane(configuration: searchLaneConfiguration)
             self.unloadTerminationPolicy = unloadTerminationPolicy
             self.startupFeatureFlags = startupFeatureFlags
@@ -3891,7 +3898,8 @@ actor WorkspaceFileContextStore {
             respectRepoIgnore: configuration.respectRepoIgnore,
             respectCursorignore: configuration.respectCursorignore,
             skipSymlinks: configuration.skipSymlinks,
-            enableHierarchicalIgnores: configuration.enableHierarchicalIgnores
+            enableHierarchicalIgnores: configuration.enableHierarchicalIgnores,
+            watcherActivityObserver: watcherActivityFactory?(state.root.name, state.root.kind)
         )
         #if DEBUG
             if let watcherActivationFailurePointForNewServicesForTesting {
@@ -4364,7 +4372,10 @@ actor WorkspaceFileContextStore {
                 respectRepoIgnore: true,
                 respectCursorignore: true,
                 skipSymlinks: true,
-                enableHierarchicalIgnores: true
+                enableHierarchicalIgnores: true,
+                watcherActivityObserver: watcherActivityFactory?(
+                    URL(fileURLWithPath: standardizedPath).lastPathComponent, .sessionWorktree
+                )
             )
         } catch {
             return .fallback(.watcherActivationFailure)
@@ -12230,7 +12241,8 @@ actor WorkspaceFileContextStore {
             respectRepoIgnore: respectRepoIgnore,
             respectCursorignore: respectCursorignore,
             skipSymlinks: skipSymlinks,
-            enableHierarchicalIgnores: enableHierarchicalIgnores
+            enableHierarchicalIgnores: enableHierarchicalIgnores,
+            watcherActivityObserver: watcherActivityFactory?(root.name, root.kind)
         )
         #if DEBUG
             if let watcherActivationFailurePointForNewServicesForTesting {
