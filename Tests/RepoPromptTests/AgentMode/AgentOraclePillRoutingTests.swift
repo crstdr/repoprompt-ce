@@ -5,6 +5,7 @@ import MCP
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
+import UniformTypeIdentifiers
 import XCTest
 
 @MainActor
@@ -574,6 +575,353 @@ final class AgentOraclePillRoutingTests: XCTestCase {
             (0 ... 4).map(OracleViewModel.oracleLabel(laneIndex:)),
             ["Oracle", "Oracle 2", "Oracle 3", "Oracle 4", "Oracle 5"]
         )
+    }
+
+    func testGroupedExecutionCapturesExactQueryMessageNameAndNeverFallsBackToPredecessor() async throws {
+        let fixture = try await makeFixture()
+        defer { fixture.cleanup() }
+        // sendMessage rechecks availability before the placeholder and transport override exist.
+        fixture.composition.apiSettingsViewModel.isOpenAIKeyValid = true
+        let vm = fixture.oracleViewModel
+        defer { vm.setOraclePostPackagingTransportOverrideForTesting(nil) }
+        let profile = AgentModelsSettingsProfile(
+            planningModelRaw: AIModel.gpt54.rawValue,
+            additionalOracleModelRaws: [AIModel.gpt54Mini.rawValue]
+        )
+        let snapshot = OracleSelectionSnapshot(
+            origin: .mcp, agentModelsProfile: profile, modelPresets: [],
+            modelPresetsExposed: false, modelPresetsTemporarilyDisabled: false,
+            chatPresets: ChatPreset.BuiltIn.all(),
+            defaultChatPresets: [.chat: ChatPreset.BuiltIn.chat]
+        )
+        let execution = try OracleExecutionResolver(
+            resolveModel: AIModel.fromModelName,
+            isModelAvailable: { _ in true },
+            capturePromptConfiguration: { preset, mode in
+                OraclePromptConfiguration(
+                    chatPreset: preset, mode: mode,
+                    promptContext: PromptContextResolved(
+                        includeFiles: false, includeUserPrompt: true, includeMetaPrompts: false,
+                        includeFileTree: false, fileTreeMode: .auto, codeMapUsage: .auto,
+                        gitInclusion: GitInclusion.none, storedPromptIds: []
+                    ),
+                    systemPrompt: "Identity capture test", metaInstructions: []
+                )
+            }
+        ).resolve(choice: .oracleSend("current_chat_model"), mode: "chat", snapshot: snapshot)
+        let exactName = "  Exact current assistant footer—not the request ID  "
+        var queryIDs: [Int: UUID] = [:]
+        vm.setOraclePostPackagingTransportOverrideForTesting { _, model in
+            let session = try XCTUnwrap(vm.sessions.first { $0.preferredAIModel == model.rawValue })
+            let laneIndex = try XCTUnwrap(session.oracleLaneIndex)
+            let messages = vm.messagesSnapshot(for: session.id)
+            XCTAssertTrue(messages.contains { !$0.isUser && $0.modelName == "PREDECESSOR_MODEL" })
+            let activeQueryID = try XCTUnwrap(vm.activeQueryId(for: session.id))
+            let query = try XCTUnwrap(messages.first { $0.id == activeQueryID && !$0.isUser })
+            XCTAssertNotEqual(query.modelName, "PREDECESSOR_MODEL")
+            XCTAssertEqual(vm.oracleMemberPresentation(for: session).capturedModelName, query.modelName, "Placeholder callback publishes this exact query before transport")
+            queryIDs[laneIndex] = query.id
+            vm.updateMessage(withId: query.id) { message in
+                message = AIChatMessage(
+                    id: query.id, content: "", isUser: false,
+                    modelName: laneIndex == 1 ? exactName : nil
+                )
+            }
+            let stream = AsyncThrowingStream<ChatStreamOutput, Error> { continuation in
+                continuation.yield(ChatStreamOutput(
+                    text: "answer-\(laneIndex)", reasoning: nil,
+                    tokens: ChatTokenInfo(), terminalOutcome: .completed
+                ))
+                continuation.finish()
+            }
+            return (UUID(), stream)
+        }
+        let store = AppDomainRuntimeComposition.shared.oracleConversationStore
+        let owner = try OracleViewModel.oracleGroupOwner(workspaceID: fixture.workspace.id, tabID: fixture.tabID)
+        let completion = try await vm.tool_chatSendWithConfiguredRosterCompletion(
+            args: ["message": .string("capture identity"), "new_chat": .bool(true)],
+            promptVM: fixture.composition.promptManager,
+            tabContext: oracleTabContext(fixture),
+            callbacks: AppOracleGroupExecutionCallbacks(
+                prepared: { groupID, _, members in
+                    self.addTeardownBlock {
+                        if let retained = try await store.load(groupID: groupID, owner: owner) {
+                            try await store.delete(groupID: groupID, owner: owner, expectedRevision: retained.revision)
+                        }
+                    }
+                    for member in members {
+                        let index = try XCTUnwrap(vm.sessions.firstIndex { $0.id == member.memberID.rawValue })
+                        XCTAssertNil(vm.oracleMemberPresentation(for: vm.sessions[index]).capturedModelName)
+                        vm.sessions[index].messages = [StoredMessage(
+                            isUser: false, rawText: "previous turn", modelName: "PREDECESSOR_MODEL"
+                        )]
+                        let loaded = await vm.ensureSessionMessagesLoaded(member.memberID.rawValue)
+                        XCTAssertTrue(loaded)
+                    }
+                },
+                progress: { _ in }, laneProgress: { _, _, _ in }
+            ),
+            capturedProfile: profile,
+            selectionSnapshotOverride: snapshot,
+            resolvedStartExecution: execution
+        )
+        // Settled background lanes may already be unloaded; wait for their saves before reading disk or cleaning up.
+        await vm.drainTrackedAutosaves(for: fixture.workspace.id)
+        let laneErrors = completion.result.oracleResults.compactMap(\.error).map(\.message).joined(separator: "\n")
+        XCTAssertEqual(completion.result.oracleResults.map(\.status), [.completed, .completed], laneErrors)
+        XCTAssertEqual(completion.result.oracleResults.map(\.capturedModelName), [nil, exactName])
+        XCTAssertEqual(queryIDs.count, 2)
+        for member in completion.terminalDocument.members {
+            let queryID = try XCTUnwrap(queryIDs[member.laneID.index])
+            let session = try XCTUnwrap(vm.sessions.first { $0.id == member.memberID.rawValue })
+            let fileURL = try XCTUnwrap(session.fileURL)
+            let storedSession = try await vm.chatData.loadChatSession(from: fileURL)
+            let query = try XCTUnwrap(storedSession.messages.first { $0.id == queryID && !$0.isUser })
+            XCTAssertEqual(completion.result.oracleResults[member.laneID.index].capturedModelName, query.modelName)
+        }
+        let projections = vm.sessions
+        vm.sessions = []
+        vm.sessions = projections
+        let selected = try XCTUnwrap(projections.first { $0.oracleLaneIndex == 0 })
+        await vm.loadOracleGroupPresentation(containing: selected)
+        XCTAssertNil(vm.oracleMemberPresentation(for: selected).capturedModelName, "Primary must not borrow its predecessor or the background lane's name")
+        let sibling = try XCTUnwrap(projections.first { $0.oracleLaneIndex == 1 })
+        XCTAssertEqual(vm.oracleMemberPresentation(for: sibling).capturedModelName, exactName)
+    }
+
+    func testGroupedCurrentTurnModelNameRejectsStaleCallbacksAndNeverBorrowsAnotherLane() async throws {
+        let fixture = try await makeFixture()
+        defer { fixture.cleanup() }
+        let models = try [
+            OracleModelReference(modelID: "codex_custom_requested"),
+            OracleModelReference(modelID: "grokbuild_custom_requested")
+        ]
+        let group = try makeCanonicalOracleGroup(fixture: fixture, models: models).group
+        let member = group.members[0]
+        var session = makeProjection(member: member, group: group, fixture: fixture)
+        session.messages = [StoredMessage(isUser: false, rawText: "previous answer", modelName: "PREDECESSOR_MODEL")]
+        let sibling = makeProjection(member: group.members[1], group: group, fixture: fixture)
+        let turnID = try XCTUnwrap(group.turns.last?.id)
+        let invocationID = UUID()
+        var presentation = OracleGroupPresentation(document: group, invocationID: invocationID)
+        XCTAssertNil(presentation.member(session).providerID)
+        XCTAssertNil(presentation.member(session).capturedModelName, "No current placeholder; request IDs and prior messages are not display authority")
+        presentation.captureModelName("SIBLING_MODEL", providerID: "grokBuild", member: group.members[1], turnID: turnID, invocationID: invocationID)
+        XCTAssertNil(presentation.member(session).capturedModelName)
+        XCTAssertNil(presentation.member(session).providerID)
+        XCTAssertEqual(presentation.member(sibling).capturedModelName, "SIBLING_MODEL")
+        XCTAssertEqual(presentation.member(sibling).providerID, "grokBuild")
+
+        let mismatchedMember = try OracleGroupMember(
+            laneID: member.laneID, memberID: member.memberID,
+            publicChatID: "not-the-current-member", model: member.model
+        )
+        let staleCallbacks: [(OracleGroupMember, OracleTurnID, UUID)] = [
+            (member, OracleTurnID(rawValue: UUID()), invocationID),
+            (member, turnID, UUID()),
+            (mismatchedMember, turnID, invocationID)
+        ]
+        for (callbackMember, callbackTurn, callbackInvocation) in staleCallbacks {
+            presentation.captureModelName("STALE_MODEL", providerID: "bogus-provider", member: callbackMember, turnID: callbackTurn, invocationID: callbackInvocation)
+            XCTAssertNil(presentation.member(session).capturedModelName)
+            XCTAssertNil(presentation.member(session).providerID)
+        }
+
+        let exactName = "CLI·Captured display name (High)"
+        presentation.captureModelName(exactName, providerID: "codex", member: member, turnID: turnID, invocationID: invocationID)
+        var mismatchedSession = session
+        mismatchedSession.shortID = "replacement-projection"
+        XCTAssertNil(presentation.member(mismatchedSession).capturedModelName)
+        XCTAssertNil(presentation.member(mismatchedSession).providerID)
+        mismatchedSession = session
+        mismatchedSession.workspaceID = UUID()
+        XCTAssertNil(presentation.member(mismatchedSession).capturedModelName)
+        XCTAssertNil(presentation.member(mismatchedSession).providerID)
+        for (sequence, kind) in [OracleProgressKind.laneStarted, .laneSettled].enumerated() {
+            presentation.receive(OracleProgressEvent(
+                kind: kind, groupID: group.group.id, turnID: turnID,
+                laneID: member.laneID, sequence: UInt64(sequence)
+            ))
+            XCTAssertEqual(presentation.member(session).capturedModelName, exactName)
+            XCTAssertEqual(presentation.member(session).providerID, "codex")
+        }
+        XCTAssertEqual(presentation.member(session).status, .settled)
+        XCTAssertEqual(presentation.member(sibling).capturedModelName, "SIBLING_MODEL")
+        XCTAssertEqual(presentation.member(sibling).providerID, "grokBuild")
+        for (callbackMember, callbackTurn, callbackInvocation) in staleCallbacks {
+            presentation.captureModelName("STALE_MODEL", providerID: "bogus-provider", member: callbackMember, turnID: callbackTurn, invocationID: callbackInvocation)
+            XCTAssertEqual(presentation.member(session).capturedModelName, exactName)
+            XCTAssertEqual(presentation.member(session).providerID, "codex")
+        }
+        presentation.captureModelName(nil, member: member, turnID: turnID, invocationID: invocationID)
+        XCTAssertNil(presentation.member(session).capturedModelName, "No surviving exact-query message must not preserve an older name")
+        XCTAssertEqual(presentation.member(session).providerID, "codex")
+        presentation.captureModelName(exactName, providerID: "codex", member: member, turnID: turnID, invocationID: invocationID)
+        presentation.endExecution()
+        XCTAssertNil(presentation.member(session).capturedModelName)
+        XCTAssertNil(presentation.member(session).providerID)
+        presentation.captureModelName("LATE_MODEL", providerID: "bogus-provider", member: member, turnID: turnID, invocationID: invocationID)
+        XCTAssertNil(presentation.member(session).capturedModelName, "Ended invocations cannot republish identity")
+        XCTAssertNil(presentation.member(session).providerID)
+    }
+
+    func testGroupedTerminalModelNameIsAuthoritativeAcrossColdReloadAndLegacyRemainsUnavailable() async throws {
+        let fixture = try await makeFixture()
+        defer { fixture.cleanup() }
+        let prepared = try makeCanonicalOracleGroup(fixture: fixture).group
+        let store = AppDomainRuntimeComposition.shared.oracleConversationStore
+        try await store.create(prepared)
+        addTeardownBlock { try? await self.deleteCanonicalOracleGroup(prepared) }
+        let vm = fixture.oracleViewModel
+        var projections = prepared.members.map { makeProjection(member: $0, group: prepared, fixture: fixture) }
+        projections[1].messages = [StoredMessage(isUser: false, rawText: "older response", modelName: "OLD_FOOTER")]
+        vm.sessions = projections
+        let invocationID = UUID()
+        let turnID = try XCTUnwrap(prepared.turns.last?.id)
+        var live = OracleGroupPresentation(document: prepared, invocationID: invocationID)
+        live.captureModelName("LIVE_MODEL", providerID: "codex", member: prepared.members[0], turnID: turnID, invocationID: invocationID)
+        vm.oracleGroupPresentations[live.key] = live
+        XCTAssertEqual(vm.oracleMemberPresentation(for: projections[0]).capturedModelName, "LIVE_MODEL")
+        XCTAssertEqual(vm.oracleMemberPresentation(for: projections[0]).providerID, "codex")
+
+        let terminalName = "  Claude Code exact terminal footer  "
+        let terminal = try terminalGroup(prepared, secondaryStatus: .failed, capturedModelNames: [0: terminalName])
+        _ = try await OracleGroupTerminalPublisher.publish(
+            terminal: terminal, expectedRevision: prepared.revision, store: store
+        )
+        vm.recordOracleGroupPresentation(terminal)
+        XCTAssertEqual(vm.oracleMemberPresentation(for: projections[0]).capturedModelName, terminalName)
+        XCTAssertNil(vm.oracleMemberPresentation(for: projections[0]).providerID, "Canonical legacy result replaces transient provider identity")
+        XCTAssertNil(vm.oracleMemberPresentation(for: projections[1]).capturedModelName, "Legacy result must not borrow a stored footer")
+        var terminalPresentation = try XCTUnwrap(vm.oracleGroupPresentations[live.key])
+        terminalPresentation.captureModelName("LATE_MODEL", providerID: "bogus-provider", member: prepared.members[0], turnID: turnID, invocationID: invocationID)
+        XCTAssertEqual(terminalPresentation.member(projections[0]).capturedModelName, terminalName)
+        XCTAssertNil(terminalPresentation.member(projections[0]).providerID)
+        vm.recordOracleGroupPresentation(prepared, invocationID: invocationID)
+        XCTAssertEqual(vm.oracleMemberPresentation(for: projections[0]).capturedModelName, terminalName, "Older prepared publication cannot replace terminal identity")
+
+        vm.sessions = []
+        XCTAssertTrue(vm.oracleGroupPresentations.isEmpty)
+        vm.sessions = projections
+        await vm.loadOracleGroupPresentation(containing: projections[0])
+        XCTAssertEqual(vm.oracleMemberPresentation(for: projections[0]).capturedModelName, terminalName)
+        XCTAssertNil(vm.oracleMemberPresentation(for: projections[0]).providerID)
+        XCTAssertNil(vm.oracleMemberPresentation(for: projections[1]).capturedModelName)
+        XCTAssertEqual(vm.oracleMemberPresentation(for: projections[1]).status, .failed)
+    }
+
+    func testGroupedContinuationPreservesLegacyNilProviderRoster() async throws {
+        let fixture = try await makeFixture()
+        defer { fixture.cleanup() }
+        let vm = fixture.oracleViewModel
+        // Configure only the fixture's availability flags; all transport remains stubbed.
+        fixture.composition.apiSettingsViewModel.isOpenAIKeyValid = true
+        fixture.composition.apiSettingsViewModel.isAnthropicKeyValid = true
+        let models = try [AIModel.gpt54, .claude4Sonnet].map {
+            try OracleModelReference(modelID: $0.rawValue)
+        }
+        let prepared = try makeCanonicalOracleGroup(fixture: fixture, models: models).group
+        let store = AppDomainRuntimeComposition.shared.oracleConversationStore
+        try await store.create(prepared)
+        addTeardownBlock { try? await self.deleteCanonicalOracleGroup(prepared) }
+        let terminal = try terminalGroup(prepared, secondaryStatus: .completed)
+        let previousTurnID = try XCTUnwrap(terminal.turns.last?.id)
+        _ = try await OracleGroupTerminalPublisher.publish(
+            terminal: terminal, expectedRevision: prepared.revision, store: store
+        )
+        let projections = terminal.members.map { makeProjection(member: $0, group: terminal, fixture: fixture) }
+        vm.sessions = projections
+        let profile = AgentModelsSettingsProfile(
+            planningModelRaw: AIModel.gpt54Mini.rawValue,
+            additionalOracleModelRaws: [AIModel.gpt54Mini.rawValue]
+        )
+        let snapshot = OracleSelectionSnapshot(
+            origin: .mcp, agentModelsProfile: profile, modelPresets: [],
+            modelPresetsExposed: false, modelPresetsTemporarilyDisabled: false,
+            chatPresets: ChatPreset.BuiltIn.all(),
+            defaultChatPresets: [.chat: ChatPreset.BuiltIn.chat]
+        )
+        let transportsReady = expectation(description: "Both continuation lanes reached stub transport")
+        transportsReady.expectedFulfillmentCount = 2
+        let firstLaneSettled = expectation(description: "Primary settled while sibling transport remains gated")
+        var streams: [Int: AsyncThrowingStream<ChatStreamOutput, Error>.Continuation] = [:]
+        vm.setOraclePostPackagingTransportOverrideForTesting { _, model in
+            let laneIndex = try XCTUnwrap(models.firstIndex { $0.modelID == model.rawValue })
+            let (stream, continuation) = AsyncThrowingStream<ChatStreamOutput, Error>.makeStream()
+            streams[laneIndex] = continuation
+            transportsReady.fulfill()
+            return (UUID(), stream)
+        }
+        defer {
+            vm.setOraclePostPackagingTransportOverrideForTesting(nil)
+            for stream in streams.values {
+                stream.finish()
+            }
+        }
+        var capturedMembers: [OracleGroupMember]?
+        let invocation = Task { @MainActor in
+            try await vm.tool_chatSendWithConfiguredRosterCompletion(
+                args: ["message": .string("continue"), "chat_id": .string(terminal.members[0].publicChatID)],
+                promptVM: fixture.composition.promptManager,
+                tabContext: oracleTabContext(fixture),
+                callbacks: AppOracleGroupExecutionCallbacks(
+                    prepared: { _, _, members in capturedMembers = members },
+                    progress: { event in
+                        if event.kind == .laneSettled, event.laneID == terminal.members[0].laneID {
+                            firstLaneSettled.fulfill()
+                        }
+                    },
+                    laneProgress: { _, _, _ in }
+                ),
+                capturedProfile: profile,
+                selectionSnapshotOverride: snapshot
+            )
+        }
+        defer { invocation.cancel() }
+        await fulfillment(of: [transportsReady], timeout: 5)
+        XCTAssertEqual(streams.count, 2)
+        XCTAssertEqual(projections.map { vm.oracleMemberPresentation(for: $0).status }, [.streaming, .streaming])
+        XCTAssertEqual(projections.map { vm.oracleMemberPresentation(for: $0).providerID }, ["openAI", "anthropic"])
+
+        streams[0]?.yield(ChatStreamOutput(
+            text: "primary continuation", reasoning: nil, tokens: ChatTokenInfo(), terminalOutcome: .completed
+        ))
+        streams[0]?.finish()
+        await fulfillment(of: [firstLaneSettled], timeout: 5)
+        XCTAssertEqual(vm.oracleMemberPresentation(for: projections[0]).status, .settled)
+        XCTAssertEqual(vm.oracleMemberPresentation(for: projections[1]).status, .streaming)
+        XCTAssertEqual(projections.map { vm.oracleMemberPresentation(for: $0).providerID }, ["openAI", "anthropic"])
+
+        if let key = OracleGroupPresentation.Key(session: projections[0]),
+           let current = vm.oracleGroupPresentations[key],
+           let turnID = current.turnID, let invocationID = current.invocationID
+        {
+            var challenged = current
+            challenged.captureModelName("stale turn", providerID: "bogus-prior-turn-provider", member: terminal.members[0], turnID: previousTurnID, invocationID: invocationID)
+            XCTAssertEqual(challenged, current, "Prior-turn callbacks cannot replace current identity")
+            challenged.captureModelName("stale invocation", providerID: "bogus-other-invocation-provider", member: terminal.members[0], turnID: turnID, invocationID: UUID())
+            XCTAssertEqual(challenged, current, "Other invocations cannot replace current identity")
+        } else {
+            XCTFail("A current invocation must remain observable while its sibling is gated")
+        }
+
+        streams[1]?.yield(ChatStreamOutput(
+            text: "sibling continuation", reasoning: nil, tokens: ChatTokenInfo(), terminalOutcome: .completed
+        ))
+        streams[1]?.finish()
+        let completion = try await invocation.value
+        await vm.drainTrackedAutosaves(for: fixture.workspace.id)
+        XCTAssertEqual(try XCTUnwrap(capturedMembers), terminal.members)
+        let laneErrors = completion.result.oracleResults.compactMap(\.error).map(\.message).joined(separator: "\n")
+        XCTAssertEqual(completion.result.oracleResults.map(\.status), [.completed, .completed], laneErrors)
+        XCTAssertEqual(completion.result.oracleResults.map { $0.executionProfile?.providerID }, ["openAI", "anthropic"])
+        let loaded = try await store.load(groupID: terminal.group.id, owner: terminal.owner)
+        let continued = try XCTUnwrap(loaded)
+        XCTAssertEqual(continued.roster, terminal.roster)
+        XCTAssertEqual(continued.members, terminal.members)
+        XCTAssertTrue(continued.roster.orderedModels.allSatisfy { $0.providerID == nil })
+        XCTAssertEqual(continued.turns.count, terminal.turns.count + 1)
+        XCTAssertEqual(continued.turns.first, terminal.turns.first, "Continuation does not backfill historical metadata")
     }
 
     func testGroupedMemberStatusUsesPersistedFailureWithoutAssistantErrorText() async throws {
@@ -1268,7 +1616,8 @@ final class AgentOraclePillRoutingTests: XCTestCase {
 
     private func terminalGroup(
         _ prepared: OracleGroupDocument,
-        secondaryStatus: OracleLaneResultStatus
+        secondaryStatus: OracleLaneResultStatus,
+        capturedModelNames: [Int: String] = [:]
     ) throws -> OracleGroupDocument {
         let results = try prepared.members.map { member in
             let status: OracleLaneResultStatus = member.laneID.index == 0 ? .completed : secondaryStatus
@@ -1278,6 +1627,7 @@ final class AgentOraclePillRoutingTests: XCTestCase {
                 providerID: member.model.providerID,
                 modelID: member.model.modelID,
                 status: status,
+                capturedModelName: capturedModelNames[member.laneID.index],
                 response: status == .completed ? "Completed sibling answer" : nil,
                 error: status == .completed ? nil : OracleLaneError(
                     code: "provider_failed", message: "Synthetic lane failure", partialResponse: "Unmarked partial answer"
@@ -1291,16 +1641,19 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         ), finishedAt: prepared.updatedAt.addingTimeInterval(10))
     }
 
-    private func makeCanonicalOracleGroup(fixture: Fixture) throws -> (owner: OracleConversationOwner, group: OracleGroupDocument) {
+    private func makeCanonicalOracleGroup(
+        fixture: Fixture,
+        models suppliedModels: [OracleModelReference]? = nil
+    ) throws -> (owner: OracleConversationOwner, group: OracleGroupDocument) {
         let owner = try OracleViewModel.oracleGroupOwner(
             workspaceID: fixture.workspace.id,
             tabID: fixture.tabID
         )
-        let models = try ["model-a", "model-b"].map {
+        let models = try suppliedModels ?? ["model-a", "model-b"].map {
             try OracleModelReference(modelID: $0)
         }
         let descriptor = try OracleGroupDescriptor(size: models.count)
-        let memberIDs = [UUID(), UUID()]
+        let memberIDs = models.map { _ in UUID() }
         let members = try models.enumerated().map { index, model in
             let name = OracleViewModel.oracleProjectionName(base: "Canonical Group", laneIndex: index)
             return try OracleGroupMember(
@@ -1913,10 +2266,10 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
     }
 
     func testPaneEntryClearsAStuckTextViewHover() {
-        let controller = AgentImageDropController()
-        controller.setTextViewImageDragActive(true)
-        controller.paneDragEntered(typeIdentifiers: ["public.utf8-plain-text"], fileURLProviders: [], currentTabID: UUID())
-        XCTAssertFalse(controller.isTextViewImageDragActive)
+        let controller = AgentAttachmentDropController()
+        controller.setTextViewAttachmentDragActive(true)
+        controller.paneDragEntered(typeIdentifiers: ["public.utf8-plain-text"], currentTabID: UUID())
+        XCTAssertFalse(controller.isTextViewAttachmentDragActive)
         XCTAssertFalse(controller.isOverlayVisible)
     }
 
@@ -2038,14 +2391,14 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
     }
 
     func testPaneDropAttachesToTabCapturedAtDragStartAfterTabSwitch() {
-        let controller = AgentImageDropController()
+        let controller = AgentAttachmentDropController()
         let dragStartTab = UUID()
         let switchedTab = UUID()
-        var pendingCompletion: (([AgentAttachmentIntake.Prepared]) -> Void)?
+        var pendingCompletion: (([AgentAttachmentIntake.Prepared], [AgentAttachmentFailure]) -> Void)?
         var attachedTab: UUID?
         var attachedURLs: [URL] = []
 
-        controller.paneDragEntered(typeIdentifiers: ["public.png"], fileURLProviders: [], currentTabID: dragStartTab)
+        controller.paneDragEntered(typeIdentifiers: ["public.png"], currentTabID: dragStartTab)
         XCTAssertTrue(controller.isOverlayVisible)
         XCTAssertTrue(controller.acceptsPaneDrop)
 
@@ -2056,7 +2409,7 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
                 return true
             },
             prepareAttach: { tabID in
-                { prepared in
+                { prepared, _ in
                     attachedTab = tabID
                     attachedURLs = prepared.map(\.url)
                 }
@@ -2067,7 +2420,7 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
 
         // The asynchronous load finishes after the user switched tabs.
         let image = URL(fileURLWithPath: "/tmp/dropped.png")
-        pendingCompletion?([AgentAttachmentIntake.Prepared(url: image, isTemporary: false)])
+        pendingCompletion?([AgentAttachmentIntake.Prepared(url: image, isTemporary: false)], [])
         XCTAssertEqual(attachedTab, dragStartTab)
         XCTAssertEqual(attachedURLs, [image])
     }
@@ -2077,24 +2430,24 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
         let tabID = UUID()
         let removedSession = viewModel.session(for: tabID)
         let source = try writeSourceImage()
-        let controller = AgentImageDropController()
-        var pendingCompletion: (([AgentAttachmentIntake.Prepared]) -> Void)?
+        let controller = AgentAttachmentDropController()
+        var pendingCompletion: (([AgentAttachmentIntake.Prepared], [AgentAttachmentFailure]) -> Void)?
         var intakeTask: Task<Void, Never>?
-        controller.paneDragEntered(typeIdentifiers: ["public.png"], fileURLProviders: [], currentTabID: tabID)
+        controller.paneDragEntered(typeIdentifiers: ["public.png"], currentTabID: tabID)
         XCTAssertTrue(controller.performPaneDrop(
             currentTabID: tabID,
             load: { pendingCompletion = $0
                 return true
             },
             prepareAttach: { tabID in
-                let attach = viewModel.prepareImageAttachmentIntake(tabID: tabID)
-                return { prepared in
-                    intakeTask = Task { await attach(prepared.map(\.url)) }
+                let attach = viewModel.prepareAttachmentIntake(tabID: tabID)
+                return { prepared, failures in
+                    intakeTask = Task { await attach(prepared.map(\.url), failures) }
                 }
             }
         ))
         viewModel.test_removeSession(tabID: tabID)
-        pendingCompletion?([AgentAttachmentIntake.Prepared(url: source, isTemporary: false)])
+        pendingCompletion?([AgentAttachmentIntake.Prepared(url: source, isTemporary: false)], [])
         await intakeTask?.value
         XCTAssertNil(viewModel.session(for: tabID, createIfNeeded: false))
         XCTAssertTrue(removedSession.pendingFileAttachments.isEmpty)
@@ -2105,23 +2458,214 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
         let tabID = UUID()
         let original = viewModel.session(for: tabID)
         let source = try writeSourceImage()
-        let attachBeforeReplacement = viewModel.prepareImageAttachmentIntake(tabID: tabID)
+        let attachBeforeReplacement = viewModel.prepareAttachmentIntake(tabID: tabID)
         viewModel.test_removeSession(tabID: tabID)
         let replacement = viewModel.session(for: tabID)
-        await attachBeforeReplacement([source])
+        await attachBeforeReplacement([source], [])
         XCTAssertTrue(original.pendingFileAttachments.isEmpty)
         XCTAssertTrue(replacement.pendingFileAttachments.isEmpty)
-        let attachBeforeRebinding = viewModel.prepareImageAttachmentIntake(tabID: tabID)
+        let attachBeforeRebinding = viewModel.prepareAttachmentIntake(tabID: tabID)
         replacement.testInstallPersistentSessionBinding(sessionID: UUID())
-        await attachBeforeRebinding([source])
+        await attachBeforeRebinding([source], [])
         XCTAssertTrue(replacement.pendingFileAttachments.isEmpty)
     }
 
-    func testNonImageDropsAreNotHighlightedOrAccepted() {
-        let controller = AgentImageDropController()
+    func testPaneAndEditorDropsShareBroadFileIntakeAndReportFailuresForClaudeAndCodex() async throws {
+        var sources: [URL] = []
+        for (name, bytes) in [
+            ("report.pdf", Data("%PDF-1.7\nreport".utf8)),
+            ("table.csv", Data("name,value\na,1".utf8)),
+            ("config.json", Data("{\"enabled\":true}".utf8)),
+            ("source.custom-extension", Data("let answer = 42".utf8)),
+            ("notebook.ipynb", Data("{\"cells\":[],\"nbformat\":4}".utf8)),
+            ("document.docx", Data([0x50, 0x4B, 0x03, 0x04, 0, 0xFF])),
+            ("sheet.xlsx", Data([0x50, 0x4B, 0x03, 0x04, 0, 0xFE]))
+        ] {
+            let url = workspaceDirectory.appendingPathComponent(name)
+            try bytes.write(to: url)
+            sources.append(url)
+        }
+        try sources.append(writeSourceImage())
+        let folder = workspaceDirectory.appendingPathComponent("NotAFile", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        for agent in [AgentProviderKind.claudeCode, .codexExec] {
+            for viaEditor in [false, true] {
+                let viewModel = makeViewModel()
+                let tabID = UUID()
+                let session = viewModel.session(for: tabID)
+                session.selectedAgent = agent
+                let controller = AgentAttachmentDropController()
+                controller.paneDragEntered(typeIdentifiers: [UTType.fileURL.identifier], currentTabID: tabID)
+                XCTAssertTrue(controller.isOverlayVisible, "All file URLs highlight immediately, not just images")
+                let finished = expectation(description: "\(agent) editor=\(viaEditor)")
+                let delegate = AgentAttachmentPaneDropDelegate(
+                    controller: controller,
+                    currentTabID: { tabID },
+                    prepareAttach: { tabID in
+                        let attach = viewModel.prepareAttachmentIntake(tabID: tabID)
+                        return { urls, failures in
+                            await attach(urls, failures)
+                            finished.fulfill()
+                        }
+                    }
+                )
+                let dropped = sources + [folder]
+                if viaEditor {
+                    let pasteboard = NSPasteboard.withUniqueName()
+                    defer { pasteboard.releaseGlobally() }
+                    XCTAssertTrue(pasteboard.writeObjects(dropped.map { $0 as NSURL }))
+                    XCTAssertTrue(delegate.performDrop(pasteboard: pasteboard))
+                } else {
+                    XCTAssertTrue(delegate.performDrop(providers: dropped.map {
+                        NSItemProvider(item: $0 as NSURL, typeIdentifier: UTType.fileURL.identifier)
+                    }))
+                }
+                await fulfillment(of: [finished], timeout: 10)
+                XCTAssertFalse(controller.isOverlayVisible)
+                XCTAssertEqual(Set(session.pendingFileAttachments.map(\.fileName)), Set(sources.map(\.lastPathComponent)))
+                XCTAssertEqual(session.pendingFileAttachments.count, sources.count)
+                XCTAssertTrue(session.items.contains { $0.kind == .error && $0.text.contains("NotAFile") })
+                let message = viewModel.renderProviderMessage(text: "Inspect these files", attachments: session.pendingFileAttachments, agent: agent)
+                for attachment in session.pendingFileAttachments {
+                    guard case let .localFile(path) = attachment.source else { return XCTFail("Expected owned local file") }
+                    XCTAssertTrue(message.contains(path), "Non-images must reach the provider as file references, not be silently discarded")
+                }
+                await viewModel.prepareForWindowClose()
+            }
+        }
+    }
+
+    func testEditorRawImageDropUsesSharedOwnerAndCleansTemporaryIntake() async throws {
+        let image = try writeSourceImage()
+        let pasteboard = NSPasteboard.withUniqueName()
+        defer { pasteboard.releaseGlobally() }
+        XCTAssertTrue(try pasteboard.setData(Data(contentsOf: image), forType: .png))
+        let temporaryRoot = workspaceDirectory.appendingPathComponent("raw-drop", isDirectory: true)
+        let controller = AgentAttachmentDropController()
+        let finished = expectation(description: "raw image attached")
+        var copied: Data?
+        let delegate = AgentAttachmentPaneDropDelegate(
+            controller: controller,
+            currentTabID: { UUID() },
+            prepareAttach: { _ in { urls, failures in
+                XCTAssertTrue(failures.isEmpty)
+                copied = try? Data(contentsOf: urls[0])
+                finished.fulfill()
+            } },
+            attachmentIntake: AgentAttachmentIntake(temporaryRoot: temporaryRoot)
+        )
+        XCTAssertTrue(delegate.performDrop(pasteboard: pasteboard))
+        await fulfillment(of: [finished], timeout: 5)
+        XCTAssertEqual(copied, try Data(contentsOf: image))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: temporaryRoot.path), [])
+    }
+
+    func testDirectEditorEntryReplacesCancelledDragAndKeepsItsTabAcrossSwitch() async throws {
+        let source = try writeSourceImage()
+        let pasteboard = NSPasteboard.withUniqueName()
+        defer { pasteboard.releaseGlobally() }
+        XCTAssertTrue(pasteboard.writeObjects([source as NSURL]))
+        let viewModel = makeViewModel()
+        let originalTab = UUID()
+        let switchedTab = UUID()
+        let original = viewModel.session(for: originalTab)
+        let switched = viewModel.session(for: switchedTab)
+        let controller = AgentAttachmentDropController()
+        controller.paneDragEntered(typeIdentifiers: [UTType.fileURL.identifier], currentTabID: UUID(), dragID: "cancelled-old-drag")
+        controller.paneDragExited()
+        // Native entry can happen without a SwiftUI pane entry, or before a late pane exit.
+        controller.textViewDragEntered(pasteboard: pasteboard, currentTabID: originalTab)
+        controller.paneDragExited()
+        XCTAssertTrue(controller.isOverlayVisible)
+        let finished = expectation(description: "editor destination retained")
+        let delegate = AgentAttachmentPaneDropDelegate(
+            controller: controller,
+            currentTabID: { switchedTab },
+            prepareAttach: { tabID in
+                XCTAssertEqual(tabID, originalTab)
+                let attach = viewModel.prepareAttachmentIntake(tabID: tabID)
+                return { urls, failures in
+                    await attach(urls, failures)
+                    finished.fulfill()
+                }
+            }
+        )
+        XCTAssertTrue(delegate.performDrop(pasteboard: pasteboard))
+        await fulfillment(of: [finished], timeout: 5)
+        XCTAssertEqual(original.pendingFileAttachments.count, 1)
+        XCTAssertTrue(switched.pendingFileAttachments.isEmpty)
+        await viewModel.prepareForWindowClose()
+    }
+
+    func testDirectEditorExitClearsOverlayWithoutASwiftUIPaneExit() {
+        let pasteboard = NSPasteboard.withUniqueName()
+        defer { pasteboard.releaseGlobally() }
+        pasteboard.setString("file:///tmp/notes.txt", forType: .fileURL)
+        let controller = AgentAttachmentDropController()
+        controller.textViewDragEntered(pasteboard: pasteboard, currentTabID: UUID())
+        XCTAssertTrue(controller.isOverlayVisible)
+        controller.setTextViewAttachmentDragActive(false)
+        XCTAssertFalse(controller.isOverlayVisible)
+    }
+
+    func testFailureOnlyAndMixedDropsWhileBusyDoNotAppendTranscriptRows() async throws {
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        let session = viewModel.session(for: tabID)
+        session.runState = .running
+        let before = session.items
+        let source = try writeSourceImage()
+        let attach = viewModel.prepareAttachmentIntake(tabID: tabID)
+        for urls in [[], [source]] {
+            await attach(urls, [AgentAttachmentFailure(fileName: "folder", reason: "Not a regular file")])
+            XCTAssertEqual(session.items, before)
+            XCTAssertTrue(session.pendingFileAttachments.isEmpty)
+            XCTAssertEqual(viewModel.imageAttachmentNotice?.message, AgentImageAttachmentBlockReason.agentBusy.message)
+        }
+    }
+
+    func testMixedEditorFileAndRawImageDropKeepsBothWithoutDuplicatingRepresentations() async throws {
+        let source = try writeSourceImage()
+        let file = workspaceDirectory.appendingPathComponent("notes.txt")
+        try Data("Read these notes".utf8).write(to: file)
+        let fileItem = NSPasteboardItem()
+        XCTAssertTrue(fileItem.setString(file.absoluteString, forType: .fileURL))
+        XCTAssertTrue(try fileItem.setData(Data(contentsOf: source), forType: .png))
+        let imageItem = NSPasteboardItem()
+        XCTAssertTrue(try imageItem.setData(Data(contentsOf: source), forType: .png))
+        let pasteboard = NSPasteboard.withUniqueName()
+        defer { pasteboard.releaseGlobally() }
+        XCTAssertTrue(pasteboard.writeObjects([fileItem, imageItem]))
+        let temporaryRoot = workspaceDirectory.appendingPathComponent("mixed-drop", isDirectory: true)
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        let session = viewModel.session(for: tabID)
+        let finished = expectation(description: "file and raw image attached")
+        let delegate = AgentAttachmentPaneDropDelegate(
+            controller: AgentAttachmentDropController(), currentTabID: { tabID },
+            prepareAttach: { tabID in
+                let attach = viewModel.prepareAttachmentIntake(tabID: tabID)
+                return { urls, failures in
+                    await attach(urls, failures)
+                    finished.fulfill()
+                }
+            },
+            attachmentIntake: AgentAttachmentIntake(temporaryRoot: temporaryRoot)
+        )
+        XCTAssertTrue(delegate.performDrop(pasteboard: pasteboard))
+        await fulfillment(of: [finished], timeout: 5)
+        XCTAssertEqual(session.pendingFileAttachments.count, 2)
+        XCTAssertEqual(Set(session.pendingFileAttachments.map(\.kind)), [.text, .image])
+        XCTAssertFalse(session.items.contains { $0.kind == .error })
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: temporaryRoot.path), [])
+        await viewModel.prepareForWindowClose()
+    }
+
+    func testPlainTextDropsAreNotHighlightedOrAccepted() {
+        let controller = AgentAttachmentDropController()
         var loadCalled = false
 
-        controller.paneDragEntered(typeIdentifiers: ["public.utf8-plain-text"], fileURLProviders: [], currentTabID: UUID())
+        controller.paneDragEntered(typeIdentifiers: ["public.utf8-plain-text"], currentTabID: UUID())
         XCTAssertFalse(controller.isOverlayVisible)
         XCTAssertFalse(controller.acceptsPaneDrop)
 
@@ -2131,19 +2675,19 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
                 loadCalled = true
                 return true
             },
-            prepareAttach: { _ in { _ in XCTFail("Non-image drops must not attach") } }
+            prepareAttach: { _ in { _, _ in XCTFail("Plain-text drops must not attach") } }
         )
         XCTAssertFalse(accepted)
         XCTAssertFalse(loadCalled)
     }
 
-    func testTextViewImageDragKeepsOverlayLitAfterPaneExit() {
-        let controller = AgentImageDropController()
-        controller.paneDragEntered(typeIdentifiers: ["public.png"], fileURLProviders: [], currentTabID: UUID())
+    func testTextViewFileDragKeepsOverlayLitAfterPaneExit() {
+        let controller = AgentAttachmentDropController()
+        controller.paneDragEntered(typeIdentifiers: ["public.file-url"], currentTabID: UUID())
         controller.paneDragExited()
-        controller.setTextViewImageDragActive(true)
+        controller.setTextViewAttachmentDragActive(true)
         XCTAssertTrue(controller.isOverlayVisible)
-        controller.setTextViewImageDragActive(false)
+        controller.setTextViewAttachmentDragActive(false)
         XCTAssertFalse(controller.isOverlayVisible)
     }
 
