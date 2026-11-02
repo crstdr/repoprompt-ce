@@ -409,6 +409,392 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             return nil
         }
 
+        @MainActor
+        private final class SwitchGate {
+            private var released = false
+            private var waiters: [UUID: AsyncStream<Void>.Continuation] = [:]
+            private(set) var entries = 0
+            private(set) var returns = 0
+            var entered: Bool {
+                entries > 0
+            }
+
+            /// Completion includes cancellation of an individual waiter.
+            var returned: Bool {
+                returns > 0
+            }
+
+            var waiting: Int {
+                waiters.count
+            }
+
+            func wait() async {
+                entries += 1
+                if !released {
+                    let id = UUID()
+                    let (stream, continuation) = AsyncStream<Void>.makeStream()
+                    waiters[id] = continuation
+                    for await _ in stream {}
+                    waiters.removeValue(forKey: id)
+                }
+                returns += 1
+            }
+
+            func open() {
+                released = true
+                let pending = Array(waiters.values)
+                waiters.removeAll()
+                for waiter in pending {
+                    waiter.finish()
+                }
+            }
+        }
+
+        func testSwitchGateCancellationDoesNotReleaseOtherWaiters() async throws {
+            let gate = SwitchGate()
+            let first = Task { await gate.wait() }
+            let second = Task { await gate.wait() }
+            defer { gate.open()
+                first.cancel()
+                second.cancel()
+            }
+            try await AsyncTestWait.waitUntil("both independent gate waiters entered") { gate.waiting == 2 }
+            first.cancel()
+            await first.value
+            XCTAssertEqual(gate.returns, 1)
+            XCTAssertEqual(gate.waiting, 1)
+            gate.open()
+            await second.value
+            await gate.wait()
+            XCTAssertEqual(gate.returns, 3)
+            XCTAssertEqual(gate.waiting, 0)
+        }
+
+        func testSwitchPreviewExpiryAndCloseFenceLateCatalogPublication() async throws {
+            for close in [false, true] {
+                try await withFixture { fixture in
+                    let vm = fixture.viewModel
+                    let catalog = vm.test_providerSwitchSkillCatalog
+                    vm.storeDraftText(for: fixture.sourceSession.tabID, "preview lookup requires skill discovery")
+                    let discovery = SwitchGate()
+                    let deadline = SwitchGate()
+                    catalog.test_beforePublish = { await discovery.wait() }
+                    catalog.markDirty(reason: "exercise preview discovery publication")
+                    vm.test_providerSwitchDeadlineGates[.previewAugmentation] = { await deadline.wait() }
+                    defer { discovery.open()
+                        deadline.open()
+                        catalog.test_beforePublish = nil
+                    }
+                    let build = Task { await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: fixture.sourceSession.tabID) }
+                    try await AsyncTestWait.waitUntil("preview catalog discovery suspended") { discovery.entered }
+                    if close {
+                        vm.cancelProviderSwitchPreview()
+                    }
+                    deadline.open()
+                    _ = await build.value
+                    if close {
+                        XCTAssertNil(vm.providerSwitchPreview)
+                    } else {
+                        XCTAssertFalse(try XCTUnwrap(vm.providerSwitchPreview).building)
+                        XCTAssertNotNil(vm.providerSwitchPreview?.failure)
+                        XCTAssertTrue(vm.providerSwitchPreview?.choices.isEmpty == true)
+                    }
+                    discovery.open()
+                    try await AsyncTestWait.waitUntil("late discovery drained") { discovery.returned }
+                    if close {
+                        XCTAssertNil(vm.providerSwitchPreview)
+                    } else {
+                        XCTAssertTrue(vm.providerSwitchPreview?.choices.isEmpty == true)
+                    }
+                }
+            }
+        }
+
+        func testSwitchIdleDeadlineReleasesGenerateAndApplyWithoutLateMutation() async throws {
+            for generate in [false, true] {
+                try await withFixture { fixture in
+                    let vm = fixture.viewModel
+                    let session = fixture.sourceSession
+                    await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
+                    let id = try XCTUnwrap(vm.providerSwitchPreview?.id)
+                    let probe = SwitchGate()
+                    let deadline = SwitchGate()
+                    vm.test_providerSwitchIdleProbe = { _ in await probe.wait() }
+                    vm.test_providerSwitchDeadlineGates[.idleProbe] = { await deadline.wait() }
+                    var retirements = 0
+                    vm.test_providerSwitchRetirement = { _ in retirements += 1 }
+                    let rows = session.items.map(\.id)
+                    let original = session.selectedAgent
+                    defer { probe.open()
+                        deadline.open()
+                    }
+                    let operation = Task {
+                        if generate {
+                            await vm.generateProviderSwitchHandover(id)
+                            return false
+                        }
+                        return await vm.applyProviderSwitch(id)
+                    }
+                    try await AsyncTestWait.waitUntil("idle probe suspended") { probe.entered }
+                    deadline.open()
+                    let result = await operation.value
+                    XCTAssertFalse(result)
+                    XCTAssertNil(session.activeComposerSubmitAttempt)
+                    XCTAssertNil(vm.providerSwitchMutation)
+                    XCTAssertEqual(session.items.map(\.id), rows)
+                    XCTAssertNotNil(vm.providerSwitchPreview?.failure)
+                    probe.open()
+                    try await AsyncTestWait.waitUntil("late idle probe drained") { probe.returned }
+                    XCTAssertEqual(retirements, 0)
+                    XCTAssertEqual(session.selectedAgent, original)
+                    XCTAssertEqual(session.items.map(\.id), rows)
+                }
+            }
+        }
+
+        func testSwitchCloseBeforeDetachCancelsAndDoesNotRestoreForeignChanges() async throws {
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
+                let id = try XCTUnwrap(vm.providerSwitchPreview?.id)
+                let probe = SwitchGate()
+                vm.test_providerSwitchIdleProbe = { _ in await probe.wait() }
+                defer { probe.open() }
+                var retirements = 0
+                vm.test_providerSwitchRetirement = { _ in retirements += 1 }
+                let operation = Task { await vm.applyProviderSwitch(id) }
+                try await AsyncTestWait.waitUntil("apply preparing") { probe.entered }
+                session.codexRolloutPath = "/foreign/change"
+                vm.cancelProviderSwitchPreview()
+                XCTAssertNil(vm.providerSwitchMutation)
+                XCTAssertNil(vm.providerSwitchPreview)
+                probe.open()
+                let result = await operation.value
+                XCTAssertFalse(result)
+                XCTAssertEqual(retirements, 0)
+                XCTAssertEqual(session.codexRolloutPath, "/foreign/change")
+                XCTAssertNil(session.activeComposerSubmitAttempt)
+            }
+        }
+
+        func testSwitchCloseAfterDetachCompletesAndLateTailCannotOverwriteSuccessor() async throws {
+            for expires in [false, true] {
+                try await withFixture { fixture in
+                    let vm = fixture.viewModel
+                    let session = fixture.sourceSession
+                    session.codexComputerUseArmingRequestID = UUID()
+                    await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
+                    let id = try XCTUnwrap(vm.providerSwitchPreview?.id)
+                    let tail = SwitchGate()
+                    let deadline = SwitchGate()
+                    vm.test_providerSwitchRetirement = { _ in await tail.wait() }
+                    vm.test_providerSwitchDeadlineGates[.retirementTail] = { await deadline.wait() }
+                    defer { tail.open()
+                        deadline.open()
+                    }
+                    var saves = 0
+                    vm.test_setAgentSessionSaver { _, _, _ in saves += 1
+                        return fixture.rootURL.appendingPathComponent("switch.json")
+                    }
+                    let operation = Task { await vm.applyProviderSwitch(id) }
+                    try await AsyncTestWait.waitUntil("detached tail suspended") { tail.entered }
+                    XCTAssertEqual(vm.providerSwitchMutation?.phase, .detached)
+                    XCTAssertNil(session.codexComputerUseArmingRequestID)
+                    vm.storeDraftText(for: session.tabID, "draft edited after detach")
+                    vm.cancelProviderSwitchPreview()
+                    XCTAssertTrue(vm.providerSwitchIsCompletingInBackground(session))
+                    XCTAssertNotNil(session.activeComposerSubmitAttempt)
+                    if expires {
+                        deadline.open()
+                    } else {
+                        tail.open()
+                    }
+                    let result = await operation.value
+                    XCTAssertTrue(result)
+                    XCTAssertEqual(saves, 1)
+                    XCTAssertEqual(session.selectedAgent, .openCode)
+                    XCTAssertEqual(session.draftText, "draft edited after detach")
+                    XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .ready)
+                    XCTAssertNil(vm.providerSwitchMutation)
+                    XCTAssertNil(session.activeComposerSubmitAttempt)
+                    XCTAssertNil(vm.providerSwitchPreview)
+                    XCTAssertNil(vm.providerSwitchBackgroundOutcome)
+                    session.providerSessionID = "successor"
+                    let slot = session.pendingHandoff
+                    tail.open()
+                    try await AsyncTestWait.waitUntil("late detached cleanup returned") { tail.returned }
+                    XCTAssertEqual(session.providerSessionID, "successor")
+                    XCTAssertEqual(session.pendingHandoff, slot)
+                }
+            }
+        }
+
+        func testSwitchCloseDuringRequiredSaveKeepsSingleWriterAndClaim() async throws {
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
+                let id = try XCTUnwrap(vm.providerSwitchPreview?.id)
+                let writer = SwitchGate()
+                defer { writer.open() }
+                var writes = 0
+                vm.test_setAgentSessionSaver { _, _, _ in
+                    writes += 1
+                    await writer.wait()
+                    return fixture.rootURL.appendingPathComponent("saved.json")
+                }
+                let operation = Task { await vm.applyProviderSwitch(id) }
+                try await AsyncTestWait.waitUntil("required writer suspended") { writer.entered }
+                vm.cancelProviderSwitchPreview()
+                XCTAssertNil(vm.providerSwitchPreview)
+                XCTAssertEqual(vm.providerSwitchMutation?.phase, .staged)
+                XCTAssertTrue(vm.providerSwitchIsCompletingInBackground(session))
+                XCTAssertNotNil(session.activeComposerSubmitAttempt)
+                XCTAssertNil(vm.makeComposerSubmitTarget(tabID: session.tabID, session: session))
+                let competing = await vm.openProviderSwitchPreview(agent: .openCode, model: "other", tabID: session.tabID)
+                XCTAssertNil(competing)
+                XCTAssertEqual(writes, 1)
+                writer.open()
+                let result = await operation.value
+                XCTAssertTrue(result)
+                XCTAssertEqual(writes, 1)
+                XCTAssertNil(session.activeComposerSubmitAttempt)
+                XCTAssertNil(vm.providerSwitchMutation)
+            }
+        }
+
+        func testSwitchCloseSerializesCompetingUserSaveBehindRequiredWriter() async throws {
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
+                let id = try XCTUnwrap(vm.providerSwitchPreview?.id)
+                let writer = SwitchGate()
+                defer { writer.open() }
+                var writes = 0
+                var activeWriters = 0
+                var maximumWriters = 0
+                var savedNames: [String] = []
+                vm.test_setAgentSessionSaver { saved, _, _ in
+                    writes += 1
+                    activeWriters += 1
+                    maximumWriters = max(maximumWriters, activeWriters)
+                    defer { activeWriters -= 1 }
+                    savedNames.append(saved.name)
+                    await writer.wait()
+                    return fixture.rootURL.appendingPathComponent("serialized.json")
+                }
+                let operation = Task { await vm.applyProviderSwitch(id) }
+                try await AsyncTestWait.waitUntil("required writer held") { writer.entered }
+                vm.cancelProviderSwitchPreview()
+                vm.renameSession(tabID: session.tabID, to: "User title while writer is held")
+                let userSave = try XCTUnwrap(session.saveDebounceTask)
+                await userSave.value
+                XCTAssertEqual(writes, 1, "The user save must defer, not enter another writer")
+                XCTAssertEqual(activeWriters, 1)
+                XCTAssertNotNil(session.activeComposerSubmitAttempt)
+                XCTAssertEqual(vm.providerSwitchMutation?.phase, .staged)
+                writer.open()
+                let applied = await operation.value
+                XCTAssertFalse(applied, "A changed committing snapshot retains the existing may-commit failure policy")
+                await session.saveDebounceTask?.value
+                XCTAssertEqual(writes, 2, "The existing user request resumes once after the required writer returns")
+                XCTAssertEqual(maximumWriters, 1)
+                XCTAssertEqual(savedNames.last, "User title while writer is held")
+                XCTAssertEqual(session.selectedAgent, .openCode)
+                XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .ready)
+                XCTAssertNil(session.activeComposerSubmitAttempt)
+                XCTAssertNotNil(vm.providerSwitchBackgroundOutcome)
+            }
+        }
+
+        func testSwitchCloseAndTabChangeKeepOtherTabsPresentationOwned() async throws {
+            for beforeWriteFailure in [false, true] {
+                try await withFixture { fixture in
+                    let vm = fixture.viewModel
+                    let source = fixture.sourceSession
+                    let sourceAgent = source.selectedAgent
+                    await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: source.tabID)
+                    let id = try XCTUnwrap(vm.providerSwitchPreview?.id)
+                    let tail = SwitchGate()
+                    defer { tail.open()
+                        source.isInstallingHandoffWorktreeBindings = false
+                    }
+                    vm.test_providerSwitchRetirement = { _ in await tail.wait() }
+                    vm.test_providerSwitchBeforeSave = { session in
+                        if beforeWriteFailure { session.isInstallingHandoffWorktreeBindings = true }
+                    }
+                    vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("inactive-source.json") }
+                    let operation = Task { await vm.applyProviderSwitch(id) }
+                    try await AsyncTestWait.waitUntil("source retired with sheet still open") { tail.entered }
+                    vm.cancelProviderSwitchPreview()
+                    _ = await fixture.window.promptManager.createBlankComposeTab()
+                    let otherID = try XCTUnwrap(vm.currentTabID)
+                    XCTAssertNotEqual(otherID, source.tabID)
+                    let other = vm.session(for: otherID)
+                    other.selectedAgent = .codexExec
+                    XCTAssertNotEqual(other.selectedAgent, sourceAgent)
+                    let marker = AgentChatItem.user("Other tab remains visible", sequenceIndex: other.nextSequenceIndex)
+                    other.appendItem(marker)
+                    // Finish this new tab's own first-save binding transition before comparing
+                    // its presentation across the still-suspended source transaction.
+                    await other.saveDebounceTask?.value
+                    vm.updateBindingsFromSession(other)
+                    let presentation = vm.activeTranscriptPresentation
+                    XCTAssertEqual(presentation.tabID, otherID)
+                    XCTAssertEqual(presentation.visibleRows.map(\.id), [marker.id])
+                    tail.open()
+                    let applied = await operation.value
+                    XCTAssertEqual(applied, !beforeWriteFailure)
+                    XCTAssertEqual(source.selectedAgent, beforeWriteFailure ? sourceAgent : .openCode)
+                    XCTAssertEqual(source.pendingHandoff.providerSwitchDelivery, beforeWriteFailure ? nil : .ready)
+                    XCTAssertEqual(vm.currentTabID, otherID)
+                    XCTAssertEqual(vm.selectedAgent, other.selectedAgent)
+                    XCTAssertEqual(vm.selectedModelRaw, other.selectedModelRaw)
+                    XCTAssertEqual(vm.activeTranscriptPresentation.tabID, otherID)
+                    XCTAssertEqual(vm.activeTranscriptPresentation.visibleRows, presentation.visibleRows)
+                    XCTAssertEqual(vm.activeTranscriptPresentation.workingRows, presentation.workingRows)
+                    XCTAssertEqual(vm.activeTranscriptPresentation.visibleBlocks, presentation.visibleBlocks)
+                    XCTAssertEqual(vm.activeTranscriptPresentation.workingBlocks, presentation.workingBlocks)
+                    XCTAssertEqual(vm.activeTranscriptPresentation.hydratedPersistentBinding, other.authoritativeHydratedBinding)
+                    XCTAssertEqual(other.items.last?.text, "Other tab remains visible")
+                    XCTAssertNil(source.activeComposerSubmitAttempt)
+                }
+            }
+        }
+
+        func testSwitchClosedSheetSaveFailurePreservesBeforeWritePolicyWithoutErrorRows() async throws {
+            enum Fault: Error { case mayCommit }
+            for beforeWrite in [false, true] {
+                try await withFixture { fixture in
+                    let vm = fixture.viewModel
+                    let session = fixture.sourceSession
+                    let source = session.selectedAgent
+                    session.providerSessionID = "source-reference"
+                    await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
+                    let id = try XCTUnwrap(vm.providerSwitchPreview?.id)
+                    vm.test_providerSwitchBeforeSave = { outgoing in
+                        vm.cancelProviderSwitchPreview()
+                        if beforeWrite {
+                            outgoing.isInstallingHandoffWorktreeBindings = true
+                        }
+                    }
+                    defer { session.isInstallingHandoffWorktreeBindings = false }
+                    vm.test_setAgentSessionSaver { _, _, _ in throw Fault.mayCommit }
+                    let errors = session.items.count(where: { $0.kind == .error })
+                    let result = await vm.applyProviderSwitch(id)
+                    XCTAssertFalse(result)
+                    XCTAssertNotNil(vm.providerSwitchBackgroundOutcome)
+                    XCTAssertEqual(session.items.count(where: { $0.kind == .error }), errors)
+                    XCTAssertNil(session.activeComposerSubmitAttempt)
+                    XCTAssertEqual(session.selectedAgent, beforeWrite ? source : .openCode)
+                    XCTAssertEqual(session.providerSessionID, beforeWrite ? "source-reference" : nil)
+                    XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, beforeWrite ? nil : .ready)
+                }
+            }
+        }
+
         func testRepromptRewriteAndAuditSurvivePendingProviderSwitch() async throws {
             try await withFixture { fixture in
                 let vm = fixture.viewModel
@@ -2731,6 +3117,32 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             }
         }
 
+        func testForceSwitchRefusesBeforeDetachWhileRunOwnershipRemains() async throws {
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                session.installRunID(UUID())
+                session.beginRunAttempt(source: "test.unsettled")
+                session.runState = .running
+                vm.test_providerSwitchForceStop = { s in s.runState = .cancelled
+                    s.agentTask = nil
+                }
+                var retirements = 0
+                vm.test_providerSwitchRetirement = { _ in retirements += 1 }
+                let source = session.selectedAgent
+                await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
+                let id = try XCTUnwrap(vm.providerSwitchPreview?.id)
+                let applied = await vm.applyProviderSwitch(id, force: true)
+                XCTAssertFalse(applied)
+                XCTAssertEqual(retirements, 0)
+                XCTAssertEqual(session.selectedAgent, source)
+                XCTAssertNil(session.pendingHandoff.providerSwitchDelivery)
+                XCTAssertNotNil(session.activeRunOwnership)
+                XCTAssertNil(session.activeComposerSubmitAttempt)
+                session.endCurrentRunAttempt(source: "test.cleanup")
+            }
+        }
+
         func testForceSwitchStopsTheRunAndProceeds() async throws {
             // A live run is stopped through the ordinary local-Stop path before the handover.
             try await withFixture { fixture in
@@ -2745,6 +3157,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     stops += 1
                     s.runState = .cancelled
                     s.agentTask = nil
+                    s.endCurrentRunAttempt(source: "test.force.settled")
                 }
                 vm.test_providerSwitchRetirement = { _ in }
                 await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
@@ -2774,6 +3187,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     // Production shape: a settled .cancelled run, not .idle.
                     s.runState = .cancelled
                     s.agentTask = nil
+                    s.endCurrentRunAttempt(source: "test.force.settled")
                     let marker = AgentChatItem.assistant("post-stop-marker-text", sequenceIndex: s.nextSequenceIndex)
                     stopItemID = marker.id
                     s.appendItem(marker)
@@ -2817,6 +3231,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     stops += 1
                     s.runState = .cancelled
                     s.agentTask = nil
+                    s.endCurrentRunAttempt(source: "test.force.settled")
                     s.appendItem(.assistant(String(repeating: "x", count: AgentProviderHandover.maximumBytes + 1), sequenceIndex: s.nextSequenceIndex))
                 }
                 vm.test_providerSwitchRetirement = { _ in retirements += 1 }
@@ -2853,6 +3268,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 vm.test_providerSwitchForceStop = { s in
                     s.runState = .cancelled
                     s.agentTask = nil
+                    s.endCurrentRunAttempt(source: "test.force.settled")
                 }
                 var retireMarkerID: UUID?
                 var retirements = 0
@@ -3880,7 +4296,7 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 let requestedGeneration = session.saveRequestGeneration
                 let deferred = try XCTUnwrap(session.saveDebounceTask)
                 await deferred.value // Exercise the actual scheduled save's mutation gate.
-                vm.storeDraftText(for: session.tabID, "new draft invalidates the same-owner preview")
+                session.appendItem(.user("later accepted input invalidates the captured history", sequenceIndex: session.nextSequenceIndex))
                 release.finish(())
                 let applied = await apply.value
                 XCTAssertFalse(applied)

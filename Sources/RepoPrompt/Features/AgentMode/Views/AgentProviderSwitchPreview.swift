@@ -38,32 +38,56 @@ private struct AgentProviderSwitchBanner: View {
     @ObservedObject var session: AgentTabSession
 
     var body: some View {
-        Group {
-            if session.pendingHandoff.providerSwitchDelivery != nil {
-                VStack(alignment: .leading, spacing: 6) {
-                    if AgentModeViewModel.providerSwitchUnconfirmed(session) {
-                        Text("Switch not confirmed").font(.headline)
-                        Text("\(session.selectedAgent.displayName) may already have the handover.")
-                        Text("Your last message won't be resent.")
-                    }
-                    HStack {
-                        Button("Review") {
-                            viewModel.requestProviderSwitchBannerAction(for: session, discard: false)
-                        }
-                        Button("Discard handover") {
-                            viewModel.requestProviderSwitchBannerAction(for: session, discard: true)
-                        }
-                        .disabled(viewModel.providerSwitchDiscardBlocker(session) != nil)
-                    }
-                    .disabled(viewModel.providerSwitchMutation != nil)
-                }
-                .font(.callout)
-                .padding(10)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
-                .padding(.horizontal, 24)
-                .padding(.bottom, 8)
+        if viewModel.providerSwitchIsCompletingInBackground(session) {
+            HStack {
+                ProgressView().controlSize(.small)
+                Text("Finishing change…")
             }
+            .font(.callout)
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
+            .padding(.horizontal, 24)
+            .padding(.bottom, 8)
+        }
+        if let outcome = viewModel.providerSwitchBackgroundOutcome,
+           outcome.session === session, outcome.binding == session.currentRestorationBindingToken
+        {
+            HStack {
+                Text("Change didn't finish. Check this chat before trying again.")
+                Button("OK") { viewModel.providerSwitchBackgroundOutcome = nil }
+            }
+            .font(.callout)
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
+            .padding(.horizontal, 24)
+            .padding(.bottom, 8)
+        }
+        if session.pendingHandoff.providerSwitchDelivery != nil {
+            VStack(alignment: .leading, spacing: 6) {
+                if AgentModeViewModel.providerSwitchUnconfirmed(session) {
+                    Text("Switch not confirmed").font(.headline)
+                    Text("\(session.selectedAgent.displayName) may already have the handover.")
+                    Text("Your last message may be included in the handover history, and the new provider may act on it.")
+                }
+                HStack {
+                    Button("Review") {
+                        viewModel.requestProviderSwitchBannerAction(for: session, discard: false)
+                    }
+                    Button("Discard handover") {
+                        viewModel.requestProviderSwitchBannerAction(for: session, discard: true)
+                    }
+                    .disabled(viewModel.providerSwitchDiscardBlocker(session) != nil)
+                }
+                .disabled(viewModel.providerSwitchMutation != nil)
+            }
+            .font(.callout)
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
+            .padding(.horizontal, 24)
+            .padding(.bottom, 8)
         }
     }
 }
@@ -196,8 +220,9 @@ struct AgentProviderSwitchPreview: View {
                             .disabled(viewModel.providerSwitchDiscardBlocker(preview) != nil)
                     }
                     Spacer()
-                    Button("Cancel") { viewModel.cancelProviderSwitchPreview() }.keyboardShortcut(.cancelAction)
-                        .disabled(viewModel.providerSwitchMutation != nil)
+                    Button(viewModel.providerSwitchMutation?.phase == .detached || viewModel.providerSwitchMutation?.phase == .staged ? "Close" : "Cancel") {
+                        viewModel.cancelProviderSwitchPreview()
+                    }.keyboardShortcut(.cancelAction)
                     Button("Switch") { Task { await viewModel.applyProviderSwitch(preview.id) } }
                         .keyboardShortcut(.defaultAction)
                         .disabled(preview.building || preview.selected == nil || preview.chosen?.unavailable != nil || preview.chosen?.bytes ?? 0 == 0 || preview.generationItemID != nil || viewModel.providerSwitchPreviewBlocker(preview) != nil || viewModel.providerSwitchMutation != nil)
@@ -205,7 +230,6 @@ struct AgentProviderSwitchPreview: View {
             }
             .padding(20)
             .frame(width: 580)
-            .interactiveDismissDisabled(viewModel.providerSwitchMutation != nil)
         }
     }
 }

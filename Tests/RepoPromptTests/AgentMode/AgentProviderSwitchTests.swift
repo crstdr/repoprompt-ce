@@ -30,6 +30,23 @@
         }
 
         @MainActor
+        func testExpiredPreviewCannotPublishDiscoveredSkillsButOrdinaryRefreshStillCan() async throws {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            let commands = root.appendingPathComponent(".claude/commands")
+            try FileManager.default.createDirectory(at: commands, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            try "---\ndescription: Preview-only test skill\n---\nTest instructions".write(to: commands.appendingPathComponent("preview-fence.md"), atomically: true, encoding: .utf8)
+            let catalog = AgentSkillCatalog(homeDirectoryURL: root.appendingPathComponent("home"))
+            var live = true
+            catalog.test_beforePublish = { live = false }
+            await catalog.refresh(workspacePaths: [root.path], agentKind: .claudeCode, shouldPublish: { live })
+            XCTAssertNil(catalog.resolve(name: "preview-fence"))
+            catalog.test_beforePublish = nil
+            await catalog.refreshIfNeeded(workspacePaths: [root.path], agentKind: .claudeCode)
+            XCTAssertNotNil(catalog.resolve(name: "preview-fence"))
+        }
+
+        @MainActor
         func testSwitchViewNeverEchoesUnknownErrorsOrAgentRefusals() {
             for reason in ["private transport failure", AgentSessionLinkSendFailure.providerSwitchUnconfirmed.message] {
                 XCTAssertFalse(AgentProviderSwitchPreview.blockerText(reason).contains(reason))
