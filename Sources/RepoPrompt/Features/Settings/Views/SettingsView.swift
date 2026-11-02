@@ -747,6 +747,7 @@ enum SettingsTab: String, CaseIterable {
             [
                 "advanced",
                 "advanced settings",
+                "activity", "cpu", "memory", "file watching", "performance",
                 "file paths",
                 "path display",
                 "relative paths",
