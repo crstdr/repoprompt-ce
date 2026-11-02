@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 @testable import RepoPromptApp
+@testable import RepoPromptFileSystem
 import RepoPromptSecureStorage
 import SwiftUI
 import XCTest
@@ -466,5 +467,194 @@ final class RouterServiceSettingsPresentationTests: XCTestCase {
 
         XCTAssertEqual(presentation.links(for: first, isLastDisclosure: false).map(\.title), ["First"])
         XCTAssertEqual(presentation.links(for: last, isLastDisclosure: true).map(\.title), ["Legacy", "Unknown"])
+    }
+}
+
+final class WindowActivityLedgerTests: XCTestCase {
+    private final class Clock: @unchecked Sendable {
+        var now: UInt64 = 0
+    }
+
+    func testOverlappingRootsCountUnionAndRetainAmbiguityUntilIdle() throws {
+        let clock = Clock()
+        let ledger = WindowActivityLedger(clock: { clock.now })
+        ledger.registerWindow(1)
+        ledger.record(windowID: 1, phase: .began, root: "A")
+        clock.now = 2_000_000_000
+        ledger.record(windowID: 1, phase: .began, root: "B")
+        clock.now = 3_000_000_000
+        ledger.record(windowID: 1, phase: .ended)
+        XCTAssertEqual(try XCTUnwrap(ledger.snapshot().first).root, "Multiple roots")
+        clock.now = 5_000_000_000
+        XCTAssertEqual(try XCTUnwrap(ledger.snapshot().first).busyTotal, 5_000_000_000)
+        ledger.record(windowID: 1, phase: .ended)
+        clock.now = 9_000_000_000
+        let idle = try XCTUnwrap(ledger.snapshot().first)
+        XCTAssertEqual(idle.busyTotal, 5_000_000_000)
+        XCTAssertEqual(idle.lastEnded, 5_000_000_000)
+        XCTAssertNil(idle.busySince)
+        ledger.record(windowID: 1, phase: .began, root: "C")
+        XCTAssertEqual(try XCTUnwrap(ledger.snapshot().first).root, "C")
+    }
+
+    func testRegistrationBoundaryAndLateEventsCannotClearAnotherScope() throws {
+        let ledger = WindowActivityLedger(clock: { 10 })
+        let acceptedA = ledger.record(windowID: 1, phase: .began)
+        ledger.registerWindow(1)
+        ledger.registerWindow(1)
+        XCTAssertTrue(ledger.record(windowID: 1, phase: .began, root: "B"))
+        if acceptedA { ledger.record(windowID: 1, phase: .ended) }
+        XCTAssertEqual(try XCTUnwrap(ledger.snapshot().first).busySince, 10)
+        ledger.removeWindow(1)
+        ledger.removeWindow(1)
+        XCTAssertFalse(ledger.record(windowID: 1, phase: .ended))
+        XCTAssertFalse(ledger.record(windowID: 1, phase: .began))
+        XCTAssertTrue(ledger.snapshot().isEmpty)
+    }
+
+    func testWatcherBatchBracketsWorkAndHonorsRejectedBegin() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let clock = Clock()
+        let ledger = WindowActivityLedger(clock: { clock.now })
+        let service = try await FileSystemService(
+            path: directory.path, testIgnoreRules: IgnoreRules(policy: .nonGitRoot), isTestMode: true,
+            watcherActivityObserver: { phase in
+                let accepted = ledger.record(windowID: 1, phase: phase == .began ? .began : .ended, root: "hidden (session worktree)")
+                if phase == .began { clock.now += 100 }
+                return accepted
+            }
+        )
+        await service.processWatcherBatch(PendingFSEventBatch(), token: 1)
+        ledger.registerWindow(1)
+        await service.processWatcherBatch(PendingFSEventBatch(), token: 2)
+        let result = try XCTUnwrap(ledger.snapshot().first)
+        XCTAssertEqual(result.busyTotal, 100)
+        XCTAssertNil(result.busySince)
+        XCTAssertEqual(result.root, "hidden (session worktree)")
+        let cancelled = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            await service.processWatcherBatch(PendingFSEventBatch(), token: 3)
+        }
+        await cancelled.value
+        XCTAssertEqual(try XCTUnwrap(ledger.snapshot().first).busyTotal, 100)
+    }
+
+    func testSnapshotsAreReadOnlyAndWindowsAreIsolated() throws {
+        let clock = Clock()
+        let ledger = WindowActivityLedger(clock: { clock.now })
+        ledger.registerWindow(1)
+        ledger.registerWindow(2)
+        clock.now = 100
+        ledger.record(windowID: 1, phase: .began)
+        clock.now = 50
+        ledger.record(windowID: 1, phase: .ended)
+        XCTAssertEqual(try XCTUnwrap(ledger.snapshot().first { $0.windowID == 1 }).busyTotal, 0)
+        clock.now = 100
+        ledger.record(windowID: 1, phase: .began)
+        clock.now = 1_000_000_100
+        XCTAssertEqual(
+            ledger.snapshot().sorted { $0.windowID < $1.windowID },
+            ledger.snapshot().sorted { $0.windowID < $1.windowID }
+        )
+        XCTAssertEqual(try XCTUnwrap(ledger.snapshot().first { $0.windowID == 1 }).busyTotal, 1_000_000_000)
+        XCTAssertEqual(try XCTUnwrap(ledger.snapshot().first { $0.windowID == 2 }).busyTotal, 0)
+    }
+}
+
+final class ActivitySettingsTests: XCTestCase {
+    func testProcessCPUUsesTaskTotalsTimebaseAndResetsInvalidBaseline() {
+        var sampler = ActivityProcessSampler(numer: 3, denom: 2)
+        XCTAssertEqual(sampler.cpuText(.init(user: 0, system: 0, now: 0)), "Measuring…")
+        XCTAssertEqual(sampler.cpuText(.init(user: 600_000_000, system: 400_000_000, now: 1_000_000_000)), "150.0%")
+        XCTAssertEqual(sampler.cpuText(.init(user: 1, system: 1, now: 2_000_000_000)), "Unavailable")
+        XCTAssertEqual(sampler.cpuText(.init(user: 2, system: 2, now: 3_000_000_000)), "Measuring…")
+        XCTAssertEqual(sampler.cpuText(nil), "Unavailable")
+        XCTAssertEqual(sampler.cpuText(.init(user: 3, system: 3, now: 4_000_000_000)), "Measuring…")
+        var invalid = ActivityProcessSampler(numer: 1, denom: 0)
+        XCTAssertEqual(invalid.cpuText(.init(user: 0, system: 0, now: 0)), "Unavailable")
+    }
+
+    func testVisibleIntervalRateDoesNotDoubleCountLiveEpisodeAndReopenResetsRate() {
+        let previous = WindowActivityLedger.Snapshot(
+            windowID: 1,
+            sampledAt: 3_000_000_000,
+            busyTotal: 2_000_000_000,
+            busySince: 1_000_000_000,
+            lastEnded: nil,
+            root: "repo (session worktree)"
+        )
+        let now = WindowActivityLedger.Snapshot(
+            windowID: 1,
+            sampledAt: 4_000_000_000,
+            busyTotal: 3_000_000_000,
+            busySince: 1_000_000_000,
+            lastEnded: nil,
+            root: "repo (session worktree)"
+        )
+        let row = ActivityDisplay.Row(id: 1, title: "repo", snapshot: now, previous: previous)
+        XCTAssertEqual(row.rate, "100%")
+        XCTAssertEqual(row.total, "3.0 s")
+        XCTAssertEqual(row.status, "Busy 3.0 s")
+        XCTAssertEqual(row.root, "repo (session worktree)")
+        XCTAssertEqual(ActivityDisplay.Row(id: 1, title: "repo", snapshot: now, previous: nil).rate, "Measuring…")
+        let idle = ActivityDisplay.Row(id: 2, title: "", snapshot: nil, previous: nil)
+        XCTAssertEqual(idle.window, "Window 2")
+        XCTAssertEqual(idle.status, "Not busy yet")
+        XCTAssertEqual(idle.total, "0.0 s")
+    }
+
+    func testShortLabelsRoundPercentagesClampAndKeepFolderSuffixes() {
+        let previous = WindowActivityLedger.Snapshot(
+            windowID: 1, sampledAt: 1_000_000_000, busyTotal: 0, busySince: nil, lastEnded: nil, root: nil
+        )
+        let cases: [(UInt64, String, String, String)] = [
+            (516_000_000, "repo (session worktree)", "52%", "repo (session worktree)"),
+            (0, "repo (git data)", "0%", "repo (git data)"),
+            (1_000_000_000, "repo (system)", "100%", "repo (system)"),
+            (2_000_000_000, "Multiple roots", "100%", "Multiple folders")
+        ]
+        for (total, root, expectedRate, expectedFolder) in cases {
+            let snapshot = WindowActivityLedger.Snapshot(
+                windowID: 1, sampledAt: 2_000_000_000, busyTotal: total,
+                busySince: nil, lastEnded: 1_000_000_000, root: root
+            )
+            let row = ActivityDisplay.Row(id: 1, title: "repo", snapshot: snapshot, previous: previous)
+            XCTAssertEqual(row.window, "Window 1: repo")
+            XCTAssertEqual(row.rate, expectedRate)
+            XCTAssertEqual(row.root, expectedFolder)
+            XCTAssertEqual(row.status, "Idle 1.0 s")
+        }
+    }
+
+    func testReportUsesDisplayedValuesAndSanitizedLabels() {
+        let snapshot = WindowActivityLedger.Snapshot(
+            windowID: 1,
+            sampledAt: 65_000_000_000,
+            busyTotal: 64_000_000_000,
+            busySince: 1_000_000_000,
+            lastEnded: nil,
+            root: "repo\nroot"
+        )
+        let display = ActivityDisplay(cpu: "150.0%", memory: "2400 MiB", rows: [
+            .init(id: 1, title: "repo\twindow", snapshot: snapshot, previous: nil)
+        ], capturedAt: Date(timeIntervalSince1970: 0))
+        XCTAssertEqual(display.report, """
+        RepoPrompt CE: Activity
+        Captured: 1970-01-01T00:00:00Z
+        CPU: 150.0%
+        Memory: 2400 MiB
+        100% = one core. Window times include waiting; drawing not counted.
+        Window 1: repo window
+          Watching files: Measuring…
+          Folder: repo root
+          Busy 1 m 04 s
+          Busy total: 1 m 04 s
+        """)
+        XCTAssertEqual(ActivityDisplay.label(String(repeating: "a", count: 100)).count, 80)
+        XCTAssertEqual(ActivityDisplay.duration(3_840_000_000_000), "1 h 04 m")
+        XCTAssertEqual(ActivityDisplay.duration(100_800_000_000_000), "1 d 04 h")
+        XCTAssertTrue(SettingsTab.advanced.searchTags.contains("activity"))
     }
 }
