@@ -26019,6 +26019,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         sourceTabID explicitSourceTabID: UUID? = nil,
         activateDestination: Bool = true,
         inheritOversightLinks: Bool = true,
+        missingImagePolicy: AgentSessionAttachmentStore.HandoffMissingImagePolicy = .strict,
+        onImagesOmitted: (@MainActor (Int) -> Void)? = nil,
         isStillAuthorized: (@MainActor () -> Bool)? = nil
     ) async throws -> UUID {
         guard let promptManager,
@@ -26173,6 +26175,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 detail: "The fork was created, but its destination changed during chat cloning."
             )
         }
+        var omittedImageCount = 0
         if !localAttachments.isEmpty {
             guard let handoffAttachmentStore else {
                 throw SessionAdminPartialForkError(
@@ -26186,7 +26189,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     sourceSessionID: sourceWorktreeSnapshot.sourceSessionID,
                     destinationSessionID: destinationClaim.sessionID,
                     store: handoffAttachmentStore,
-                    temporaryRoot: handoffTemporaryRoot
+                    temporaryRoot: handoffTemporaryRoot,
+                    missingImagePolicy: missingImagePolicy
                 )
                 guard destinationIsCurrent() else {
                     throw PersistentBindingMutationError.staleTransition
@@ -26198,6 +26202,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     handoffAttachmentStore.removeSessionFolder(sessionID: destinationClaim.sessionID)
                     throw CancellationError()
                 }
+                omittedImageCount = Set(localAttachments.map(\.id)).subtracting(copied.keys).count
+                // Keep dead metadata for projection compatibility; omit bytes, not transcript references.
                 migratedItems = migratedItems.map { item in
                     var item = item
                     item.attachments = item.attachments.map { attachment in
@@ -26345,6 +26351,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // Acknowledged configured durability cannot be undone by late cancellation. Keep the
         // saved session and omit optional inheritance/focus changes when its caller has ended.
         if Task.isCancelled {
+            if omittedImageCount > 0 { onImagesOmitted?(omittedImageCount) }
             return destTabID
         }
         let childEndpoint = agentSessionLinkObserverEndpoint(tabID: destTabID)
@@ -26366,7 +26373,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 detail: "The fork was saved, but its destination changed before activation."
             )
         }
-        guard activateDestination else { return destTabID }
+        guard activateDestination else {
+            if omittedImageCount > 0 { onImagesOmitted?(omittedImageCount) }
+            return destTabID
+        }
         // 7) Switch to the destination tab, focus the cloned active Oracle chat if one
         //    exists, then update active bindings for the handoff session.
         await promptManager.switchComposeTab(destTabID)
@@ -26382,6 +26392,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
         }
         updateBindingsFromSession(destSession)
+        if omittedImageCount > 0 { onImagesOmitted?(omittedImageCount) }
 
         return destTabID
     }
