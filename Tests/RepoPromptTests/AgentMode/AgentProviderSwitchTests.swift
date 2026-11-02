@@ -10,6 +10,14 @@
         private let sessionID = UUID(uuidString: "11111111-2222-3333-4444-555555555555")!
 
         @MainActor
+        func testTokenEstimateOmitsWindowForCatalogAndAssumedBudgets() {
+            for window in [1_050_000, nil] as [Int?] {
+                let budget = Handover.Budget(catalogWindow: window, instructions: ["abcd"], composedInput: "", isPreview: true)
+                XCTAssertEqual(AgentProviderSwitchPreview.tokenEstimateText(bytes: 100, budget: budget), "~2076 tokens")
+            }
+        }
+
+        @MainActor
         func testVisibleChoicesHideOnlyUnavailableHistoryAndAlreadyHiddenRows() {
             typealias Choice = AgentModeViewModel.ProviderSwitchChoice
             let recent = Choice(mode: .newestTurns, unavailable: "the last turn alone doesn't fit")

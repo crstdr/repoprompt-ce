@@ -126,6 +126,11 @@ struct AgentProviderSwitchPreview: View {
         choices.filter { !$0.hidden && !($0.mode == .history && $0.unavailable != nil) }
     }
 
+    static func tokenEstimateText(bytes: Int, budget: AgentProviderHandover.Budget) -> String {
+        let tokens = Int((AgentProviderHandover.estimate(bytes: bytes) + budget.instructionTokens + budget.inputTokens).rounded(.up))
+        return "~\(tokens) tokens"
+    }
+
     var body: some View {
         if let preview = viewModel.providerSwitchPreview {
             VStack(alignment: .leading, spacing: 14) {
@@ -158,10 +163,7 @@ struct AgentProviderSwitchPreview: View {
                         }
                         if choice.mode != .history, let reason = choice.unavailable { Text(Self.unavailableText(reason)).foregroundStyle(.secondary) }
                         if choice.bytes > 0, let budget = preview.budget {
-                            let tokens = Int((AgentProviderHandover.estimate(bytes: choice.bytes) + budget.instructionTokens + budget.inputTokens).rounded(.up))
-                            if budget.windowSource == .assumed {
-                                Text("~\(tokens) of 128K tokens (assumed)")
-                            } else { Text("~\(tokens) of \(budget.window) tokens") }
+                            Text(Self.tokenEstimateText(bytes: choice.bytes, budget: budget))
                         }
                         if let omissions = choice.omissions { Text("Not included: \(omissions)").foregroundStyle(.secondary) }
                     }
