@@ -11410,6 +11410,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     }
 
     #if DEBUG
+        func test_installTransportClosedFallback(_ task: Task<Void, Never>, tabID: UUID) {
+            codexTransportClosedFallbackTasksByTabID.set(tabID, task: task)
+        }
+
         @_spi(TestSupport)
         public func test_dispatchCodexFallbackHead(
             session: AgentTabSession,

@@ -409,24 +409,65 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             return nil
         }
 
+        @MainActor
         private final class SwitchGate {
-            let stream: AsyncStream<Void>
-            let continuation: AsyncStream<Void>.Continuation
-            var entered = false
-            var returned = false
-            init() {
-                (stream, continuation) = AsyncStream<Void>.makeStream()
+            private var released = false
+            private var waiters: [UUID: AsyncStream<Void>.Continuation] = [:]
+            private(set) var entries = 0
+            private(set) var returns = 0
+            var entered: Bool {
+                entries > 0
+            }
+
+            /// Completion includes cancellation of an individual waiter.
+            var returned: Bool {
+                returns > 0
+            }
+
+            var waiting: Int {
+                waiters.count
             }
 
             func wait() async {
-                entered = true
-                for await _ in stream {}
-                returned = true
+                entries += 1
+                if !released {
+                    let id = UUID()
+                    let (stream, continuation) = AsyncStream<Void>.makeStream()
+                    waiters[id] = continuation
+                    for await _ in stream {}
+                    waiters.removeValue(forKey: id)
+                }
+                returns += 1
             }
 
             func open() {
-                continuation.finish()
+                released = true
+                let pending = Array(waiters.values)
+                waiters.removeAll()
+                for waiter in pending {
+                    waiter.finish()
+                }
             }
+        }
+
+        func testSwitchGateCancellationDoesNotReleaseOtherWaiters() async throws {
+            let gate = SwitchGate()
+            let first = Task { await gate.wait() }
+            let second = Task { await gate.wait() }
+            defer { gate.open()
+                first.cancel()
+                second.cancel()
+            }
+            try await AsyncTestWait.waitUntil("both independent gate waiters entered") { gate.waiting == 2 }
+            first.cancel()
+            await first.value
+            XCTAssertEqual(gate.returns, 1)
+            XCTAssertEqual(gate.waiting, 1)
+            gate.open()
+            await second.value
+            await gate.wait()
+            XCTAssertEqual(gate.returns, 3)
+            XCTAssertEqual(gate.waiting, 0)
         }
 
         func testSwitchPreviewExpiryAndCloseFenceLateCatalogPublication() async throws {
@@ -620,6 +661,106 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 XCTAssertEqual(writes, 1)
                 XCTAssertNil(session.activeComposerSubmitAttempt)
                 XCTAssertNil(vm.providerSwitchMutation)
+            }
+        }
+
+        func testSwitchCloseSerializesCompetingUserSaveBehindRequiredWriter() async throws {
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: session.tabID)
+                let id = try XCTUnwrap(vm.providerSwitchPreview?.id)
+                let writer = SwitchGate()
+                defer { writer.open() }
+                var writes = 0
+                var activeWriters = 0
+                var maximumWriters = 0
+                var savedNames: [String] = []
+                vm.test_setAgentSessionSaver { saved, _, _ in
+                    writes += 1
+                    activeWriters += 1
+                    maximumWriters = max(maximumWriters, activeWriters)
+                    defer { activeWriters -= 1 }
+                    savedNames.append(saved.name)
+                    await writer.wait()
+                    return fixture.rootURL.appendingPathComponent("serialized.json")
+                }
+                let operation = Task { await vm.applyProviderSwitch(id) }
+                try await AsyncTestWait.waitUntil("required writer held") { writer.entered }
+                vm.cancelProviderSwitchPreview()
+                vm.renameSession(tabID: session.tabID, to: "User title while writer is held")
+                let userSave = try XCTUnwrap(session.saveDebounceTask)
+                await userSave.value
+                XCTAssertEqual(writes, 1, "The user save must defer, not enter another writer")
+                XCTAssertEqual(activeWriters, 1)
+                XCTAssertNotNil(session.activeComposerSubmitAttempt)
+                XCTAssertEqual(vm.providerSwitchMutation?.phase, .staged)
+                writer.open()
+                let applied = await operation.value
+                XCTAssertFalse(applied, "A changed committing snapshot retains the existing may-commit failure policy")
+                await session.saveDebounceTask?.value
+                XCTAssertEqual(writes, 2, "The existing user request resumes once after the required writer returns")
+                XCTAssertEqual(maximumWriters, 1)
+                XCTAssertEqual(savedNames.last, "User title while writer is held")
+                XCTAssertEqual(session.selectedAgent, .openCode)
+                XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .ready)
+                XCTAssertNil(session.activeComposerSubmitAttempt)
+                XCTAssertNotNil(vm.providerSwitchBackgroundOutcome)
+            }
+        }
+
+        func testSwitchCloseAndTabChangeKeepOtherTabsPresentationOwned() async throws {
+            for beforeWriteFailure in [false, true] {
+                try await withFixture { fixture in
+                    let vm = fixture.viewModel
+                    let source = fixture.sourceSession
+                    let sourceAgent = source.selectedAgent
+                    await vm.openProviderSwitchPreview(agent: .openCode, model: "unknown-window", tabID: source.tabID)
+                    let id = try XCTUnwrap(vm.providerSwitchPreview?.id)
+                    let tail = SwitchGate()
+                    defer { tail.open()
+                        source.isInstallingHandoffWorktreeBindings = false
+                    }
+                    vm.test_providerSwitchRetirement = { _ in await tail.wait() }
+                    vm.test_providerSwitchBeforeSave = { session in
+                        if beforeWriteFailure { session.isInstallingHandoffWorktreeBindings = true }
+                    }
+                    vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("inactive-source.json") }
+                    let operation = Task { await vm.applyProviderSwitch(id) }
+                    try await AsyncTestWait.waitUntil("source retired with sheet still open") { tail.entered }
+                    vm.cancelProviderSwitchPreview()
+                    _ = await fixture.window.promptManager.createBlankComposeTab()
+                    let otherID = try XCTUnwrap(vm.currentTabID)
+                    XCTAssertNotEqual(otherID, source.tabID)
+                    let other = vm.session(for: otherID)
+                    other.selectedAgent = .codexExec
+                    XCTAssertNotEqual(other.selectedAgent, sourceAgent)
+                    let marker = AgentChatItem.user("Other tab remains visible", sequenceIndex: other.nextSequenceIndex)
+                    other.appendItem(marker)
+                    // Finish this new tab's own first-save binding transition before comparing
+                    // its presentation across the still-suspended source transaction.
+                    await other.saveDebounceTask?.value
+                    vm.updateBindingsFromSession(other)
+                    let presentation = vm.activeTranscriptPresentation
+                    XCTAssertEqual(presentation.tabID, otherID)
+                    XCTAssertEqual(presentation.visibleRows.map(\.id), [marker.id])
+                    tail.open()
+                    let applied = await operation.value
+                    XCTAssertEqual(applied, !beforeWriteFailure)
+                    XCTAssertEqual(source.selectedAgent, beforeWriteFailure ? sourceAgent : .openCode)
+                    XCTAssertEqual(source.pendingHandoff.providerSwitchDelivery, beforeWriteFailure ? nil : .ready)
+                    XCTAssertEqual(vm.currentTabID, otherID)
+                    XCTAssertEqual(vm.selectedAgent, other.selectedAgent)
+                    XCTAssertEqual(vm.selectedModelRaw, other.selectedModelRaw)
+                    XCTAssertEqual(vm.activeTranscriptPresentation.tabID, otherID)
+                    XCTAssertEqual(vm.activeTranscriptPresentation.visibleRows, presentation.visibleRows)
+                    XCTAssertEqual(vm.activeTranscriptPresentation.workingRows, presentation.workingRows)
+                    XCTAssertEqual(vm.activeTranscriptPresentation.visibleBlocks, presentation.visibleBlocks)
+                    XCTAssertEqual(vm.activeTranscriptPresentation.workingBlocks, presentation.workingBlocks)
+                    XCTAssertEqual(vm.activeTranscriptPresentation.hydratedPersistentBinding, other.authoritativeHydratedBinding)
+                    XCTAssertEqual(other.items.last?.text, "Other tab remains visible")
+                    XCTAssertNil(source.activeComposerSubmitAttempt)
+                }
             }
         }
 

@@ -631,15 +631,13 @@ extension AgentModeViewModel {
         !session.runState.isActive && session.agentTask == nil && !session.terminalCommitInProgress && session.activeRunOwnership == nil
     }
 
-    /// Waits `work` up to the shared managed-stop deadline; `work` is never cancelled on timeout,
-    /// so a still-running stop or provider shutdown finishes detached. Returns true on completion.
-    /// The work runs in its own task and reports through a stream: the group only races two
-    /// cancellable children (a stream read and the deadline sleep), so it returns on the first
-    /// outcome instead of waiting out an uncancellable `task.value` child.
     enum ProviderSwitchDeadline: Hashable {
         case forcedStop, retirementTail, idleProbe, previewAugmentation
     }
 
+    /// Returns the work's result, or nil when its bounded wait expires. The worker is not
+    /// cancelled: captured-runtime cleanup can finish detached, while callers fence late writes.
+    /// Only the cancellable stream read and deadline sleep belong to the racing task group.
     private func providerSwitchAwaitDeadline<Value: Sendable>(
         _ kind: ProviderSwitchDeadline, work: @escaping @MainActor () async -> Value
     ) async -> Value? {

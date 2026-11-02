@@ -41,27 +41,35 @@ private struct AgentProviderSwitchBanner: View {
         if viewModel.providerSwitchIsCompletingInBackground(session) {
             HStack {
                 ProgressView().controlSize(.small)
-                Text("Finishing provider switch…")
+                Text("Finishing change…")
             }
             .font(.callout)
             .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
+            .padding(.horizontal, 24)
+            .padding(.bottom, 8)
         }
         if let outcome = viewModel.providerSwitchBackgroundOutcome,
            outcome.session === session, outcome.binding == session.currentRestorationBindingToken
         {
             HStack {
-                Text("Provider switch didn't finish. Check this chat before trying again.")
+                Text("Change didn't finish. Check this chat before trying again.")
                 Button("OK") { viewModel.providerSwitchBackgroundOutcome = nil }
             }
             .font(.callout)
             .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
+            .padding(.horizontal, 24)
+            .padding(.bottom, 8)
         }
         if session.pendingHandoff.providerSwitchDelivery != nil {
             VStack(alignment: .leading, spacing: 6) {
                 if AgentModeViewModel.providerSwitchUnconfirmed(session) {
                     Text("Switch not confirmed").font(.headline)
                     Text("\(session.selectedAgent.displayName) may already have the handover.")
-                    Text("Your last message won't be resent.")
+                    Text("Your last message may be included in the handover history, and the new provider may act on it.")
                 }
                 HStack {
                     Button("Review") {

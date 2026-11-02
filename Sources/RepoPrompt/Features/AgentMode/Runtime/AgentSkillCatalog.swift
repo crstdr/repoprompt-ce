@@ -163,21 +163,19 @@ final class AgentSkillCatalog {
     /// Perform a full skill rescan.
     ///
     /// When `generation` is supplied (scheduled/async refreshes), results are only
-    /// applied if no newer refresh has been requested in the meantime. When `nil`
-    /// (synchronous / `refreshIfNeeded` callers), results are always applied.
+    /// applied if no newer refresh has been requested in the meantime. Publication also
+    /// requires `shouldPublish()` (default true); nil-generation refreshes are otherwise always applied.
     func refresh(workspacePaths: [String], agentKind: AgentProviderKind, generation: UInt64? = nil, shouldPublish: @MainActor () -> Bool = { true }) async {
         let canonicalPaths = workspacePaths.compactMap { Self.canonicalWorkspacePath($0) }
         let discovered = await discoverSkills(workspacePaths: canonicalPaths, agentKind: agentKind)
 
-        // Guard against out-of-order application: if a newer generation was
-        // requested while we were scanning, discard these (now-stale) results.
-        if let generation, generation != refreshGeneration {
-            return
-        }
-
         #if DEBUG
             await test_beforePublish?()
         #endif
+        // Check both publication guards after the last suspension.
+        if let generation, generation != refreshGeneration {
+            return
+        }
         guard shouldPublish() else { return }
         orderedSkills = discovered
         skillsByName = Dictionary(uniqueKeysWithValues: discovered.map { ($0.name.lowercased(), $0) })
