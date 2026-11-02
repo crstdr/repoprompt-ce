@@ -7135,7 +7135,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         }
                     }
                     logCodex("[AgentModeVM] Event task: events stream ended")
-                    cancelCodexTransportClosedFallback(for: session.tabID)
 
                     // --- Stream ended without an explicit terminal event ---
                     // If the task was cancelled (intentional teardown) or run has moved on, do nothing.
@@ -7149,6 +7148,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         return
                     }
 
+                    cancelCodexTransportClosedFallback(for: session.tabID)
                     guard session.runState.isActive else {
                         guard invalidateCodexControllerForReconnect(
                             session: session,
