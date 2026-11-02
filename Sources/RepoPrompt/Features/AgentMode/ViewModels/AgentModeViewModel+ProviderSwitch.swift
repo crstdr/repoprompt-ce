@@ -803,6 +803,7 @@ extension AgentModeViewModel {
         var generatedSummary: ProviderSwitchGeneratedSummary?
         var choices: [ProviderSwitchChoice] = []
         var selected: AgentProviderHandover.Mode?
+        var explicitSelection: AgentProviderHandover.Mode?
         var wordLimit: Int?
         var building = true
         var updated = false
@@ -920,7 +921,7 @@ extension AgentModeViewModel {
     }
 
     @discardableResult
-    func openProviderSwitchPreview(agent: AgentProviderKind, model: String, tabID: UUID, updated: Bool = false, cursorParameterIntent: ProviderSwitchCursorParameterIntent? = nil, retainingSummary: ProviderSwitchGeneratedSummary? = nil) async -> UUID? {
+    func openProviderSwitchPreview(agent: AgentProviderKind, model: String, tabID: UUID, updated: Bool = false, cursorParameterIntent: ProviderSwitchCursorParameterIntent? = nil, retainingSummary: ProviderSwitchGeneratedSummary? = nil, explicitSelection: AgentProviderHandover.Mode? = nil) async -> UUID? {
         guard providerSwitchMutation == nil, let session = sessions[tabID] else { return nil }
         let descriptor = session.pendingHandoff.providerSwitchDelivery != nil
             ? session.pendingHandoff.payload.flatMap(ProviderSwitchCarrierDescriptor.init) : nil
@@ -931,7 +932,8 @@ extension AgentModeViewModel {
         } else {
             try? AgentProviderHandover.Source(provider: session.selectedAgent.displayName, model: inputBarModelDisplayName(rawModel: session.selectedModelRaw, agentKind: session.selectedAgent))
         }
-        let preview = captureProviderSwitchPreview(session, agent: agent, model: model, source: source, descriptor: descriptor, updated: updated, cursorParameterIntent: cursorParameterIntent, retainingSummary: retainingSummary)
+        var preview = captureProviderSwitchPreview(session, agent: agent, model: model, source: source, descriptor: descriptor, updated: updated, cursorParameterIntent: cursorParameterIntent, retainingSummary: retainingSummary)
+        preview.explicitSelection = explicitSelection
         providerSwitchPreview = preview
         await buildProviderSwitchPreview(preview.id)
         // A caller may act only on the preview this request opened, never a later rebuild/owner.
@@ -996,10 +998,21 @@ extension AgentModeViewModel {
             && providerSwitchInstructionProvenance(preview.session, destination: preview.destination) == preview.instructionProvenance
     }
 
-    func providerSwitchDiscardBlocker(_ preview: ProviderSwitchPreview) -> String? {
-        guard providerSwitchPreviewIsCurrent(preview) else { return AgentSessionLinkSendFailure.providerHandoverNeedsReview.message }
-        if providerSwitchMutation != nil { return AgentSessionLinkSendFailure.targetBusy.message }
-        return providerSwitchTransitionBlocker(preview.session, resolvingHandoff: preview.originalHandoff)
+    func providerSwitchDiscardBlocker(_ session: TabSession) -> String? {
+        let preview = captureProviderSwitchPreview(session, agent: session.selectedAgent, model: session.selectedModelRaw, source: nil, descriptor: nil)
+        return providerSwitchDiscardBlocker(preview)
+    }
+
+    /// Discard clears only the exact local slot. Content/budget drift is irrelevant, but
+    /// binding, lifecycle, relocation and all live-work admission gates remain mandatory.
+    func providerSwitchDiscardBlocker(_ preview: ProviderSwitchPreview, owningMutationID: UUID? = nil) -> String? {
+        guard providerSwitchPreviewIsCurrent(preview, content: false),
+              preview.isReview, providerSwitchHasExactOwner(preview.session)
+        else { return AgentSessionLinkSendFailure.providerHandoverNeedsReview.message }
+        if let mutation = providerSwitchMutation, mutation.id != owningMutationID {
+            return AgentSessionLinkSendFailure.targetBusy.message
+        }
+        return providerSwitchTransitionBlocker(preview.session, ownsComposerClaim: owningMutationID != nil, resolvingHandoff: preview.originalHandoff)
     }
 
     func providerSwitchPreviewBlocker(_ preview: ProviderSwitchPreview) -> String? {
@@ -1021,6 +1034,24 @@ extension AgentModeViewModel {
         }
         if let failure = preview.failure { return .hard(failure) }
         return providerSwitchTransitionAdmission(preview.session, resolvingHandoff: preview.originalHandoff)
+    }
+
+    /// UI preference only; never persisted and never used as delivery evidence.
+    func selectProviderSwitchChoice(_ mode: AgentProviderHandover.Mode, previewID: UUID) {
+        guard let preview = providerSwitchPreview, preview.id == previewID,
+              preview.generationItemID == nil,
+              Self.providerSwitchSelection(choices: preview.choices, explicit: mode, retained: nil) == mode
+        else { return }
+        providerSwitchPreview?.explicitSelection = mode
+        providerSwitchPreview?.selected = mode
+    }
+
+    static func providerSwitchSelection(
+        choices: [ProviderSwitchChoice], explicit: AgentProviderHandover.Mode?, retained: AgentProviderHandover.Mode?
+    ) -> AgentProviderHandover.Mode? {
+        [explicit, retained, .history, .newestTurns].compactMap(\.self).first { mode in
+            choices.contains { $0.mode == mode && !$0.hidden && $0.unavailable == nil && $0.bytes > 0 }
+        }
     }
 
     private func buildProviderSwitchPreview(_ id: UUID) async {
@@ -1122,8 +1153,14 @@ extension AgentModeViewModel {
                     preview.choices[index].unavailable = nil
                     preview.selected = preview.choices[index].mode
                 }
-            } else if !preview.isReview, budget.fits(result.full) { preview.selected = .history }
+            }
             if let summary = preview.generatedSummary { fitProviderSwitchSummary(summary, into: &preview) }
+            let retainedSelection = preview.selected
+            // Read the live pick after the last suspension, not the build's stale value copy.
+            preview.explicitSelection = providerSwitchPreview?.explicitSelection
+            preview.selected = Self.providerSwitchSelection(
+                choices: preview.choices, explicit: preview.explicitSelection, retained: retainedSelection
+            )
             preview.building = false
             providerSwitchPreview = preview
         } catch {
@@ -1235,7 +1272,7 @@ extension AgentModeViewModel {
                 && composition.includeCleanupGuidance == preview.composition.includeCleanupGuidance
                 && composition.images == preview.composition.images && composition.taggedFiles == preview.composition.taggedFiles
                 && providerSwitchInstructionProvenance(preview.session, destination: preview.destination) == preview.instructionProvenance
-            await openProviderSwitchPreview(agent: preview.destination, model: preview.model, tabID: preview.session.tabID, updated: true, cursorParameterIntent: preview.cursorParameterIntent, retainingSummary: canRetain ? preview.generatedSummary : nil)
+            await openProviderSwitchPreview(agent: preview.destination, model: preview.model, tabID: preview.session.tabID, updated: true, cursorParameterIntent: preview.cursorParameterIntent, retainingSummary: canRetain ? preview.generatedSummary : nil, explicitSelection: providerSwitchPreview?.explicitSelection)
         }
     }
 
@@ -1312,8 +1349,8 @@ extension AgentModeViewModel {
             && !census.placementConflictSessionIDs.contains(id) && census.uniqueRuntimeOwners[id]?.session === session
     }
 
-    private func providerSwitchClaim(_ preview: ProviderSwitchPreview) -> AgentComposerSubmitClaim? {
-        guard providerSwitchPreviewIsCurrent(preview), providerSwitchHasExactOwner(preview.session),
+    private func providerSwitchClaim(_ preview: ProviderSwitchPreview, discard: Bool = false) -> AgentComposerSubmitClaim? {
+        guard providerSwitchPreviewIsCurrent(preview, content: !discard), providerSwitchHasExactOwner(preview.session),
               let target = makeComposerSubmitTarget(tabID: preview.session.tabID, session: preview.session) else { return nil }
         let attempt = AgentComposerSubmitAttempt(
             id: UUID(),
@@ -1478,7 +1515,7 @@ extension AgentModeViewModel {
               ? providerSwitchDiscardBlocker(preview) == nil
               : providerSwitchPreviewAdmission(preview).isAdmissible(forcing: forcing),
               discard ? preview.isReview : (preview.chosen != nil && preview.chosen?.unavailable == nil),
-              let claim = providerSwitchClaim(preview), let workspaceID = workspaceManager?.activeWorkspaceID else { return false }
+              let claim = providerSwitchClaim(preview, discard: discard), let workspaceID = workspaceManager?.activeWorkspaceID else { return false }
         defer { releaseComposerSubmitClaim(claim) }
         let session = preview.session
         var rollback = ProviderSwitchRollback(session)
@@ -1503,13 +1540,16 @@ extension AgentModeViewModel {
             // Identity (session, binding, workspace) still has to hold in either mode.
             let previewCurrent = forcing
                 ? providerSwitchPreviewIdentityIsCurrent(preview)
-                : providerSwitchPreviewIsCurrent(preview)
+                : providerSwitchPreviewIsCurrent(preview, content: !discard)
             return composerSubmitClaimIsCurrent(claim) && providerSwitchMutation?.id == mutation.id
                 && (!requiresPresentedPreview || providerSwitchPreview?.id == id) && previewCurrent
                 && workspaceManager?.activeWorkspaceID == workspaceID && providerSwitchHasExactOwner(session)
-                && providerSwitchTransitionAdmission(
-                    session, ownsComposerClaim: true, resolvingHandoff: preview.originalHandoff
-                ).isAdmissible(forcing: forcing)
+                && (
+                    discard ? providerSwitchDiscardBlocker(preview, owningMutationID: mutation.id) == nil
+                        : providerSwitchTransitionAdmission(
+                            session, ownsComposerClaim: true, resolvingHandoff: preview.originalHandoff
+                        ).isAdmissible(forcing: forcing)
+                )
         }
         var noticeID: UUID?
         var phase: RequiredSavePhase = .beforeWrite

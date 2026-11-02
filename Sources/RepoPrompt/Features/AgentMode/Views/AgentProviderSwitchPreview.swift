@@ -5,12 +5,19 @@ struct AgentProviderSwitchPresentation<Content: View>: View {
     @ObservedObject var viewModel: AgentModeViewModel
     let tabID: UUID?
     let content: Content
+    @Binding var bannerHeight: CGFloat
 
     var body: some View {
-        VStack(spacing: 8) {
-            if let tabID, let session = viewModel.sessions[tabID] {
-                AgentProviderSwitchBanner(viewModel: viewModel, session: session)
+        VStack(spacing: 0) {
+            VStack(spacing: 0) {
+                if let tabID, let session = viewModel.sessions[tabID] {
+                    AgentProviderSwitchBanner(viewModel: viewModel, session: session)
+                }
             }
+            .background(GeometryReader { geometry in
+                Color.clear.onAppear { bannerHeight = geometry.size.height }
+                    .onChange(of: geometry.size.height) { _, height in bannerHeight = height }
+            })
             content
         }
         .sheet(isPresented: Binding(
@@ -38,9 +45,6 @@ private struct AgentProviderSwitchBanner: View {
                         Text("Switch not confirmed").font(.headline)
                         Text("\(session.selectedAgent.displayName) may already have the handover.")
                         Text("Your last message won't be resent.")
-                        if let error = session.items.last(where: { $0.kind == .error })?.text {
-                            Text(error).foregroundStyle(.secondary)
-                        }
                     }
                     HStack {
                         Button("Review") {
@@ -49,6 +53,7 @@ private struct AgentProviderSwitchBanner: View {
                         Button("Discard handover") {
                             viewModel.requestProviderSwitchBannerAction(for: session, discard: true)
                         }
+                        .disabled(viewModel.providerSwitchDiscardBlocker(session) != nil)
                     }
                     .disabled(viewModel.providerSwitchMutation != nil)
                 }
@@ -57,6 +62,7 @@ private struct AgentProviderSwitchBanner: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
                 .padding(.horizontal, 24)
+                .padding(.bottom, 8)
             }
         }
     }
@@ -74,6 +80,24 @@ struct AgentProviderSwitchPreview: View {
         "\(preview.session.tabID.uuidString)|\(preview.destination.rawValue)|\(preview.model)|\(preview.isReview)"
     }
 
+    /// View-only copy: never echo transport errors or agent-directed refusal text.
+    static func blockerText(_ reason: String) -> String {
+        if reason == AgentSessionLinkSendFailure.providerHandoverNeedsReview.message {
+            return "The handover needs review. Cancel and review it again, or discard it when available."
+        }
+        return "Switch is unavailable while this chat is busy or needs attention. You can cancel and try again later."
+    }
+
+    static func unavailableText(_ reason: String) -> String {
+        switch reason {
+        case "the last turn alone doesn't fit": "The last turn alone doesn't fit."
+        case "no room for a summary": "There is no room for a summary."
+        case "the summary is too large": "The summary is too large."
+        case "the model used tools": "The summary couldn't be used because the model used tools."
+        default: "This handover option is unavailable."
+        }
+    }
+
     var body: some View {
         if let preview = viewModel.providerSwitchPreview {
             VStack(alignment: .leading, spacing: 14) {
@@ -86,7 +110,7 @@ struct AgentProviderSwitchPreview: View {
                     VStack(alignment: .leading, spacing: 5) {
                         HStack {
                             Button {
-                                viewModel.providerSwitchPreview?.selected = choice.mode
+                                viewModel.selectProviderSwitchChoice(choice.mode, previewID: preview.id)
                                 showsPayload = false
                                 payload = ""
                             } label: {
@@ -105,7 +129,7 @@ struct AgentProviderSwitchPreview: View {
                         if choice.mode == .summary, !preview.isReview {
                             Text("Runs one turn on \(preview.sourceAgent.displayName).").foregroundStyle(.secondary)
                         }
-                        if choice.mode != .history, let reason = choice.unavailable { Text("Unavailable: \(reason)").foregroundStyle(.secondary) }
+                        if choice.mode != .history, let reason = choice.unavailable { Text(Self.unavailableText(reason)).foregroundStyle(.secondary) }
                         if choice.bytes > 0, let budget = preview.budget {
                             let tokens = Int((AgentProviderHandover.estimate(bytes: choice.bytes) + budget.instructionTokens + budget.inputTokens).rounded(.up))
                             if budget.windowSource == .assumed {
@@ -160,12 +184,16 @@ struct AgentProviderSwitchPreview: View {
                         }
                     }
                 } else if let reason = admission.message(provider: preview.sourceAgent.displayName) {
-                    Text("Can't switch: \(reason)").foregroundStyle(.secondary)
+                    Text(Self.blockerText(reason)).foregroundStyle(.secondary)
+                }
+                if !preview.building, preview.failure == nil, preview.selected == nil {
+                    Text(preview.isReview ? "No handover fits. You can cancel or discard it." : "No handover fits. Generate a summary if available, or cancel.")
+                        .foregroundStyle(.secondary)
                 }
                 HStack {
                     if preview.isReview {
                         Button("Discard handover") { Task { await viewModel.applyProviderSwitch(preview.id, discard: true) } }
-                            .disabled(viewModel.providerSwitchDiscardBlocker(preview) != nil || viewModel.providerSwitchMutation != nil)
+                            .disabled(viewModel.providerSwitchDiscardBlocker(preview) != nil)
                     }
                     Spacer()
                     Button("Cancel") { viewModel.cancelProviderSwitchPreview() }.keyboardShortcut(.cancelAction)

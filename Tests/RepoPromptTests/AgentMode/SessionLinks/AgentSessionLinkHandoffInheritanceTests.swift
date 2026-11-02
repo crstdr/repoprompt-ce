@@ -3526,6 +3526,104 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             }
         }
 
+        func testPreviewRefreshRetainsGeneratedSummaryUnlessUserPicksHistory() async throws {
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                await vm.openProviderSwitchPreview(agent: .openCode, model: "destination", tabID: session.tabID)
+                let initial = try XCTUnwrap(vm.providerSwitchPreview)
+                let source = try XCTUnwrap(initial.source)
+                let summary = AgentModeViewModel.ProviderSwitchGeneratedSummary(
+                    text: "Generated summary", sourceRevision: initial.sourceRevision, cutoff: initial.cutoff,
+                    sourceProvider: source.provider, sourceModel: source.model
+                )
+                await vm.openProviderSwitchPreview(agent: .openCode, model: "destination", tabID: session.tabID, retainingSummary: summary)
+                XCTAssertEqual(vm.providerSwitchPreview?.selected, .summary)
+                for explicitPick in [false, true] {
+                    let previous = try XCTUnwrap(vm.providerSwitchPreview)
+                    if explicitPick { vm.selectProviderSwitchChoice(.history, previewID: previous.id) }
+                    session.draftText += " updated"
+                    vm.updateBindingsFromSession(session)
+                    try await AsyncTestWait.waitUntil("retained summary refresh completes") {
+                        vm.providerSwitchPreview?.id != previous.id && vm.providerSwitchPreview?.building == false
+                    }
+                    XCTAssertEqual(vm.providerSwitchPreview?.selected, explicitPick ? .history : .summary)
+                    XCTAssertNotNil(vm.providerSwitchPreview?.generatedSummary)
+                }
+            }
+        }
+
+        func testDiscardApplyAfterDraftDriftClearsOnlySlotWithoutRetirement() async throws {
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                try installSwitch(fixture)
+                session.providerSessionID = "native-context-kept"
+                await vm.openProviderSwitchPreview(agent: .openCode, model: "destination", tabID: session.tabID)
+                let preview = try XCTUnwrap(vm.providerSwitchPreview)
+                session.draftText = "draft changed without a preview refresh"
+                var retirements = 0
+                vm.test_providerSwitchRetirement = { _ in retirements += 1 }
+                vm.test_setAgentSessionSaver { _, _, _ in fixture.rootURL.appendingPathComponent("discard-drift.json") }
+                let applied = await vm.applyProviderSwitch(preview.id, discard: true)
+                XCTAssertTrue(applied)
+                XCTAssertEqual(session.pendingHandoff, .init())
+                XCTAssertEqual(session.providerSessionID, "native-context-kept")
+                XCTAssertEqual(session.draftText, "draft changed without a preview refresh")
+                XCTAssertEqual(retirements, 0)
+            }
+        }
+
+        func testPreviewRefreshPreservesPickMadeWhileRefreshIsQueued() async throws {
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                try installSwitch(fixture)
+                session.pendingHandoff.payload = session.pendingHandoff.payload?.replacingOccurrences(of: "mode=\"history\"", with: "mode=\"newest_turns\"")
+                await vm.openProviderSwitchPreview(agent: .openCode, model: "destination", tabID: session.tabID)
+                let original = try XCTUnwrap(vm.providerSwitchPreview)
+                XCTAssertEqual(original.selected, .newestTurns)
+                let entered = AgentSessionLinkStopSignal<Void>()
+                let release = AgentSessionLinkStopSignal<Void>()
+                defer { release.finish(())
+                    vm.test_beforeProviderSwitchPreviewRefresh = nil
+                }
+                vm.test_beforeProviderSwitchPreviewRefresh = { _ in entered.finish(())
+                    await release.value()
+                }
+                session.draftText = "changed draft"
+                vm.updateBindingsFromSession(session)
+                await entered.value()
+                vm.selectProviderSwitchChoice(.history, previewID: original.id)
+                release.finish(())
+                try await AsyncTestWait.waitUntil("refreshed preview keeps live pick over retained mode") {
+                    vm.providerSwitchPreview?.id != original.id && vm.providerSwitchPreview?.building == false
+                }
+                XCTAssertEqual(vm.providerSwitchPreview?.selected, .history)
+                let refreshedID = try XCTUnwrap(vm.providerSwitchPreview?.id)
+                vm.selectProviderSwitchChoice(.newestTurns, previewID: original.id)
+                XCTAssertEqual(vm.providerSwitchPreview?.id, refreshedID)
+                XCTAssertEqual(vm.providerSwitchPreview?.selected, .history, "A stale row click must not select in its successor")
+            }
+        }
+
+        func testDiscardIgnoresContentDriftButPreservesSlotAndLiveWorkGates() async throws {
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                try installSwitch(fixture)
+                await vm.openProviderSwitchPreview(agent: .openCode, model: "destination", tabID: session.tabID)
+                let preview = try XCTUnwrap(vm.providerSwitchPreview)
+                session.draftText = "draft changed after preview"
+                XCTAssertNil(vm.providerSwitchDiscardBlocker(preview))
+                session.runState = .running
+                XCTAssertNotNil(vm.providerSwitchDiscardBlocker(preview), "Discard cannot clear a live carrying attempt")
+                session.runState = .idle
+                session.pendingHandoff.payload = "successor slot"
+                XCTAssertNotNil(vm.providerSwitchDiscardBlocker(preview), "Discard must not clear a different slot")
+            }
+        }
+
         func testPreviewRefreshNeverAdoptsReboundOrReplacedChat() async throws {
             for origin in ["bindings", "queued-bindings", "queued-build"] {
                 for replacement in [false, true] where origin != "bindings" || !replacement {
