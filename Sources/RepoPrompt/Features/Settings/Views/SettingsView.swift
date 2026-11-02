@@ -24,6 +24,7 @@ struct SettingsView: View {
     var onAPIKeyUpdated: (() -> Void)?
 
     @Binding var selectedTab: SettingsTab
+    let isPresentationVisible: Bool
     @State private var searchText: String = ""
     @Environment(\.repoPromptFontScalePreset) private var fontPreset
 
@@ -72,6 +73,7 @@ struct SettingsView: View {
         windowState: WindowState,
         onAPIKeyUpdated: (() -> Void)?,
         selectedTab: Binding<SettingsTab>,
+        isPresentationVisible: Bool = false,
         closeAction: (() -> Void)? = nil
     ) {
         self.fileManager = fileManager
@@ -80,6 +82,7 @@ struct SettingsView: View {
         self.windowState = windowState
         self.onAPIKeyUpdated = onAPIKeyUpdated
         _selectedTab = selectedTab
+        self.isPresentationVisible = isPresentationVisible
         self.closeAction = closeAction
     }
 
@@ -253,7 +256,7 @@ struct SettingsView: View {
         case .workspaces:
             [.manageWorkspaces, .managePresets]
         case .general:
-            [.appearance, .notifications, .licenseUpdates, .keyboardShortcuts, .advanced, .telemetry]
+            [.appearance, .notifications, .licenseUpdates, .keyboardShortcuts, .activity, .advanced, .telemetry]
         case .copyChat:
             // `.copyPresets` and `.chatPresets` are intentionally omitted from the
             // sidebar – they now resolve to the unified Workflow Presets surface.
@@ -320,6 +323,11 @@ struct SettingsView: View {
         case .keyboardShortcuts:
             KeyboardShortcutsSettingsView()
                 .transition(.opacity.animation(.easeInOut(duration: 0.15)))
+        case .activity:
+            ScrollView {
+                ActivitySettingsView(isPresentationVisible: isPresentationVisible)
+                    .padding()
+            }
         case .advanced:
             AdvancedSettingsView(
                 fileManager: fileManager,
@@ -575,6 +583,7 @@ enum SettingsTab: String, CaseIterable {
     case mcpTools
     case permissions // Workspace approvals (RepoPrompt-mutating operations)
     case keyboardShortcuts
+    case activity
     case advanced
     case telemetry
     case notifications
@@ -607,6 +616,7 @@ enum SettingsTab: String, CaseIterable {
         case .mcpTools: "Tools"
         case .permissions: "Workspace Approvals"
         case .keyboardShortcuts: "Keyboard Shortcuts"
+        case .activity: "Activity"
         case .advanced: "Advanced"
         case .telemetry: "Telemetry"
         case .notifications: "Notifications"
@@ -641,6 +651,7 @@ enum SettingsTab: String, CaseIterable {
         case .mcpTools: "wrench.and.screwdriver"
         case .permissions: "shield.checkered"
         case .keyboardShortcuts: "keyboard"
+        case .activity: "waveform.path.ecg"
         case .advanced: "gearshape.2"
         case .telemetry: "lock.shield"
         case .notifications: "bell.badge"
@@ -691,7 +702,7 @@ enum SettingsTab: String, CaseIterable {
             .workspaces
 
         // General
-        case .appearance, .notifications, .licenseUpdates, .keyboardShortcuts, .advanced, .telemetry:
+        case .appearance, .notifications, .licenseUpdates, .keyboardShortcuts, .activity, .advanced, .telemetry:
             .general
 
         // Copy & Chat workflows
@@ -743,11 +754,12 @@ enum SettingsTab: String, CaseIterable {
                 "font size shortcut",
                 "agent shortcut"
             ]
+        case .activity:
+            ["activity", "cpu", "memory", "file watching", "performance", "agents", "running", "waiting", "main thread"]
         case .advanced:
             [
                 "advanced",
                 "advanced settings",
-                "activity", "cpu", "memory", "file watching", "performance",
                 "file paths",
                 "path display",
                 "relative paths",
