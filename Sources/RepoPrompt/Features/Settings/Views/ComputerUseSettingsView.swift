@@ -87,15 +87,14 @@ struct ComputerUseSettingsView: View {
                         Text(model).tag(model).disabled(true)
                     }
                 }
-                Text("Terra High recommended; Sol High for tasks that need deeper reasoning")
             }
             Section("Where it can run") {
-                Toggle("Codex chats", isOn: Binding(
+                Toggle("Codex chats (native)", isOn: Binding(
                     // Display the remembered legacy/environment row even while the master vetoes execution.
                     get: { CodexComputerUseWorkflow.isEnabled(persistedValue: preferences?.codexComputerUseEnabled, master: nil) },
                     set: onDirectChange
                 ))
-                Toggle("Other chats (Claude, Devin, …) — through a \"Computer Use\" subagent", isOn: Binding(
+                Toggle("Other chats (through a hidden Codex subagent)", isOn: Binding(
                     get: { preferences?.computerUseSubagentEnabled ?? false },
                     set: { settings.setComputerUseSubagentEnabled($0) }
                 ))
