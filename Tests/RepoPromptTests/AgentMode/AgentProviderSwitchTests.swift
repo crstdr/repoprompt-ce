@@ -9,6 +9,34 @@
         private let date = Date(timeIntervalSince1970: 1_700_000_000)
         private let sessionID = UUID(uuidString: "11111111-2222-3333-4444-555555555555")!
 
+        @MainActor
+        func testPreviewSelectionPrefersLivePickThenRetainedThenFittingHistoryAndRecent() {
+            typealias Choice = AgentModeViewModel.ProviderSwitchChoice
+            let history = Choice(mode: .history, retainedPayload: "history")
+            let recent = Choice(mode: .newestTurns, retainedPayload: "recent")
+            let summary = Choice(mode: .summary, retainedPayload: "summary")
+            let cases: [([Choice], Handover.Mode?, Handover.Mode?, Handover.Mode?)] = [
+                ([history, recent, summary], .newestTurns, .summary, .newestTurns),
+                ([history, recent, summary], nil, .summary, .summary),
+                ([history, recent], nil, nil, .history),
+                ([Choice(mode: .history, unavailable: "too large"), recent], nil, nil, .newestTurns),
+                ([history, Choice(mode: .newestTurns, retainedPayload: "recent", hidden: true)], .newestTurns, nil, .history),
+                ([Choice(mode: .history), recent], .history, nil, .newestTurns),
+                ([Choice(mode: .history, retainedPayload: "history", unavailable: "too large")], nil, nil, nil)
+            ]
+            for (choices, explicit, retained, expected) in cases {
+                XCTAssertEqual(AgentModeViewModel.providerSwitchSelection(choices: choices, explicit: explicit, retained: retained), expected)
+            }
+        }
+
+        @MainActor
+        func testSwitchViewNeverEchoesUnknownErrorsOrAgentRefusals() {
+            for reason in ["private transport failure", AgentSessionLinkSendFailure.providerSwitchUnconfirmed.message] {
+                XCTAssertFalse(AgentProviderSwitchPreview.blockerText(reason).contains(reason))
+                XCTAssertEqual(AgentProviderSwitchPreview.unavailableText(reason), "This handover option is unavailable.")
+            }
+        }
+
         func testPendingDeliveryCodecAndLightweightHeaderPreservePayloadAndFailClosed() async throws {
             let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
