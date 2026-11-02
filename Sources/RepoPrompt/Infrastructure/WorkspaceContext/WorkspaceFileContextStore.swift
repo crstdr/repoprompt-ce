@@ -372,6 +372,11 @@ actor WorkspaceFileContextStore {
     private static let maximumRetainedCodemapPresentationRecordsPerRoot = 64
     private static let maximumCodemapPresentationRequestsPerBundle = 4096
 
+    #if DEBUG
+        /// Follows value copies of a root without changing its canonical indexes.
+        private final class RootMutationOwnership: Sendable {}
+    #endif
+
     private struct RootState {
         let lifetimeID: UUID
         let root: WorkspaceRootRecord
@@ -381,6 +386,9 @@ actor WorkspaceFileContextStore {
         var childFolderIDsByFolderID: [UUID: [UUID]]
         var childFileIDsByFolderID: [UUID: [UUID]]
         var fileExtensionCounts: [String: Int] = [:]
+        #if DEBUG
+            var mutationOwnership = RootMutationOwnership()
+        #endif
     }
 
     private struct FileExtensionCatalogSummary {
@@ -3238,6 +3246,15 @@ actor WorkspaceFileContextStore {
         private var codemapFullRootGraphFreezeCountForTesting = 0
         private var filesInRootRequestCountForTesting = 0
         private var indexDeltaPathsExistForTesting = false
+        struct IndexDeltaPublicationWork {
+            var ancestorMembershipProbes = 0
+            var indexedFileVisits = 0
+            var parentFolderProbes = 0
+            var eventSortComparisons = 0
+            var sharedRootInventoryRecords = 0
+        }
+
+        private var indexDeltaPublicationWorkForTesting: IndexDeltaPublicationWork?
         private var appliedIndexRecordLookupRequestCountForTesting = 0
         private var appliedIndexRecordLookupRequestedRecordCountForTesting = 0
         private var appliedIndexRootSnapshotRequestCountForTesting = 0
@@ -7359,13 +7376,19 @@ actor WorkspaceFileContextStore {
 
         /// Exercise canonical mutation/publication without disk probes or watcher
         /// scheduling in the measured interval. This actor-isolated scope never suspends.
-        func applyIndexDeltasWithFakeDiskForTesting(rootID: UUID, deltas: [FileSystemDelta]) throws {
+        @discardableResult
+        func applyIndexDeltasWithFakeDiskForTesting(rootID: UUID, deltas: [FileSystemDelta]) throws -> IndexDeltaPublicationWork {
             let root = try state(for: rootID).root
             let prepared = deltas.compactMap { FileSystemDeltaPreparation.prepare($0, inRoot: root.standardizedFullPath) }
             precondition(!indexDeltaPathsExistForTesting)
             indexDeltaPathsExistForTesting = true
-            defer { indexDeltaPathsExistForTesting = false }
+            indexDeltaPublicationWorkForTesting = IndexDeltaPublicationWork()
+            defer {
+                indexDeltaPathsExistForTesting = false
+                indexDeltaPublicationWorkForTesting = nil
+            }
             applyPreparedIndexDeltaMutations(rootID: rootID, deltas: prepared)
+            return indexDeltaPublicationWorkForTesting!
         }
 
         func replayFileSystemPublicationForInvalidationDiagnosticsForTesting(
@@ -21639,6 +21662,9 @@ actor WorkspaceFileContextStore {
                 if !existed {
                     var parentPath = (relativePath as NSString).deletingLastPathComponent
                     while !parentPath.isEmpty, parentPath != "." {
+                        #if DEBUG
+                            indexDeltaPublicationWorkForTesting?.ancestorMembershipProbes += 1
+                        #endif
                         if rootStatesByID[rootID]?.folderIDsByRelativePath[parentPath] != nil {
                             existingParentPaths.insert(parentPath)
                         }
@@ -23605,8 +23631,18 @@ actor WorkspaceFileContextStore {
             generation: generation,
             rootLifetimeID: rootLifetimeID,
             modifiedFileSourceSnapshotsByID: modifiedFileSourceSnapshotsByID,
-            upsertedFiles: upsertedFiles.sorted { $0.standardizedRelativePath < $1.standardizedRelativePath },
-            upsertedFolders: upsertedFolders.sorted { $0.standardizedRelativePath < $1.standardizedRelativePath },
+            upsertedFiles: upsertedFiles.sorted {
+                #if DEBUG
+                    indexDeltaPublicationWorkForTesting?.eventSortComparisons += 1
+                #endif
+                return $0.standardizedRelativePath < $1.standardizedRelativePath
+            },
+            upsertedFolders: upsertedFolders.sorted {
+                #if DEBUG
+                    indexDeltaPublicationWorkForTesting?.eventSortComparisons += 1
+                #endif
+                return $0.standardizedRelativePath < $1.standardizedRelativePath
+            },
             removedFileIDs: removedFileIDs,
             removedFolderIDs: removedFolderIDs,
             removedFilePaths: removedFilePaths.sorted(),
@@ -23846,6 +23882,19 @@ actor WorkspaceFileContextStore {
 
     private func indexFiles(_ items: [FSItemDTO], root: WorkspaceRootRecord, state: inout RootState, indexes: inout RootIndexBuffers) {
         for item in items {
+            #if DEBUG
+                if indexDeltaPublicationWorkForTesting != nil,
+                   !isKnownUniquelyReferenced(&state.mutationOwnership)
+                {
+                    // Charge the inventory exposed to copy-on-write at this
+                    // mutation, then detach the probe along with this value.
+                    // One initial snapshot is bounded; a copied root per file is not.
+                    indexDeltaPublicationWorkForTesting?.sharedRootInventoryRecords +=
+                        state.fileIDsByRelativePath.count + state.folderIDsByRelativePath.count
+                    state.mutationOwnership = RootMutationOwnership()
+                }
+                indexDeltaPublicationWorkForTesting?.indexedFileVisits += 1
+            #endif
             let relativePath = StandardizedPath.relative(item.relativePath)
             guard state.fileIDsByRelativePath[relativePath] == nil else { continue }
             let parentID = ensureParentFolderID(for: (relativePath as NSString).deletingLastPathComponent, root: root, state: &state, indexes: &indexes)
@@ -23866,6 +23915,9 @@ actor WorkspaceFileContextStore {
     }
 
     private func ensureParentFolderID(for relativePath: String, root: WorkspaceRootRecord, state: inout RootState, indexes: inout RootIndexBuffers) -> UUID {
+        #if DEBUG
+            indexDeltaPublicationWorkForTesting?.parentFolderProbes += 1
+        #endif
         let key = StandardizedPath.relative(relativePath)
         if key.isEmpty || key == "." { return root.id }
         if let existing = state.folderIDsByRelativePath[key] { return existing }

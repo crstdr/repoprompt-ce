@@ -511,6 +511,19 @@ final class ClaudeAgentModeCoordinator {
         if let id = status.sessionID, !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             updateProviderSessionIDIfNeeded(id, for: session)
         }
+        guard session.claudeAutoCompactWindowTokens != status.autoCompactWindowTokens else { return }
+        session.claudeAutoCompactWindowTokens = status.autoCompactWindowTokens
+        // Init belongs to the controller, including reconnects with no active attempt.
+        // The estimator stores usage on the session; no synthetic stream event is needed.
+        let estimator = ClaudeContextUsageEstimator(
+            tokenEstimator: { TokenCalculationService.estimateTokens(for: $0) },
+            contextUsageBuilder: { AgentModeViewModel.contextUsageFromClaudeProviderTokens($0, modelContextWindow: $1) }
+        )
+        _ = estimator.ingestUsageSignal(
+            promptTokens: nil, completionTokens: nil, contextUsedTokens: nil,
+            modelContextWindow: nil, session: session
+        )
+        hostCapabilities.requestUIRefresh(session, false)
     }
 
     private func scheduleIdleFailure(_ session: AgentTabSession, listener: ClaudeControllerEventListener, error: String) {

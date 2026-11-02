@@ -248,7 +248,8 @@ class CatalogTests(unittest.TestCase):
             (root / 'Package.swift').write_text('// fixture manifest')
             baseline = root / 'baseline.json'
             baseline.write_text(json.dumps({'typecheck': {'function_bodies_1000ms': 0,
-                                                          'expressions_500ms': 0}}))
+                                                          'expressions_500ms': 0},
+                                            'warnings': {'first_party_unique': 0}}))
             def run_command(command: list[str], **kwargs) -> subprocess.CompletedProcess:
                 if command == ['swift', 'test', 'list', '--skip-build']:
                     environment = kwargs.get('env', {})
@@ -293,7 +294,8 @@ class CatalogTests(unittest.TestCase):
             (root / 'Package.swift').write_text('// fixture manifest')
             baseline = root / 'baseline.json'
             baseline.write_text(json.dumps({'typecheck': {'function_bodies_1000ms': 0,
-                                                          'expressions_500ms': 0}}))
+                                                          'expressions_500ms': 0},
+                                            'warnings': {'first_party_unique': 0}}))
             with mock.patch.object(ci_build, 'ROOT', root), mock.patch.object(ci_build, 'BASELINE', baseline), \
                     mock.patch('ci_app_test_runner.read_inherited_storage_preference', return_value=None), \
                     mock.patch.object(ci_build.subprocess, 'run', side_effect=[listing, subprocess.CompletedProcess([], 0, stdout=json.dumps({'targets': [{'type': 'test', 'name': 'RepoPromptTests'}]}))]) as run, \
@@ -302,6 +304,32 @@ class CatalogTests(unittest.TestCase):
                     mock.patch.dict('os.environ', {'TYPECHECK_RATCHET_ENFORCE': '0'}):
                 self.assertEqual(ci_build.main(), 0)
                 self.assertEqual(run.call_count, 2)
+
+    def test_enforced_warning_ratchet_fails_a_new_first_party_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            lines = [f'{root}/Sources/RepoPromptShared/X.swift:1:2: warning: new warning\n'] * 3
+            lines.append(f'{root}/.build/checkouts/dep/Sources/D/D.swift:1:2: warning: dependency\n')
+
+            class BuildProcess:
+                stdout = iter(lines)
+
+                def wait(self) -> int:
+                    return 0
+
+            (root / 'Package.swift').write_text('// fixture manifest')
+            baseline = root / 'baseline.json'
+            baseline.write_text(json.dumps({'typecheck': {'function_bodies_1000ms': 0, 'expressions_500ms': 0},
+                                            'warnings': {'first_party_unique': 0}}))
+            with mock.patch.object(ci_build, 'ROOT', root), mock.patch.object(ci_build, 'BASELINE', baseline), \
+                    mock.patch.object(ci_build.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)), \
+                    mock.patch.object(ci_build.subprocess, 'Popen', return_value=BuildProcess()), \
+                    mock.patch.dict('os.environ', {'TYPECHECK_RATCHET_ENFORCE': '1'}), \
+                    mock.patch('builtins.print'):
+                self.assertEqual(ci_build.main(), 1)
+            report = json.loads((root / '.build/modularization/typecheck-timing.json').read_text())
+            self.assertEqual(report['first_party_warnings']['unique'], 1)
+            self.assertEqual(report['first_party_warnings']['locations'][0]['path'], 'Sources/RepoPromptShared/X.swift')
 
     def test_import_scanner_handles_backticks_multiline_attributes_and_testing(self) -> None:
         source = ('import `AppKit`\n@_spi(\n Private\n) import `Testing`\n'
@@ -371,6 +399,31 @@ class CatalogTests(unittest.TestCase):
             if line.startswith('    name:'):
                 self.assertNotIn('${{', line)
 
+    def test_supplemental_product_workflows_are_manual_only(self) -> None:
+        # The integration profile above already gates both products. Automatic
+        # copies consume scarce macOS runners without adding an admission gate.
+        for name in ('ci-main.yml', 'release-candidate.yml'):
+            with self.subTest(workflow=name):
+                workflow = (SCRIPT_DIR.parent / '.github/workflows' / name).read_text()
+                events = workflow.split('\non:\n', 1)[1].split('\n\n', 1)[0]
+                self.assertEqual(events.strip(), 'workflow_dispatch:')
+
+    def test_package_deadlines_outlive_the_conductor_artifact_budget(self) -> None:
+        # The old 120-minute job killed a valid four-hour operation on main.
+        # Compare the independent owners rather than pinning another timeout copy.
+        root = SCRIPT_DIR.parent
+        products = (root / '.github/workflows/ci-integration-products.yml').read_text()
+        package = products.split('\n  package:\n', 1)[1]
+        job_seconds = int(package.split('    timeout-minutes:', 1)[1].splitlines()[0]) * 60
+        step = package.split('      - name: Package secret-free universal ad-hoc release candidate\n', 1)[1]
+        step = step.split('\n      - name:', 1)[0]
+        step_seconds = int(step.split('        timeout-minutes:', 1)[1].splitlines()[0]) * 60
+        operation_seconds = conductor.OperationRegistry(root)._default_timeout('release', {'subcommand': 'artifact'})
+        self.assertGreaterEqual(step_seconds, operation_seconds + 5 * 60,
+                                'Conductor must report its own deadline before GitHub cancels the step')
+        self.assertGreaterEqual(job_seconds, step_seconds + 15 * 60,
+                                'Preflight, smoke, and diagnostic upload need time outside the package step')
+
     def test_style_shell_rejects_each_failed_cancelled_or_skipped_obligation(self) -> None:
         import os
         import textwrap
@@ -414,6 +467,57 @@ class CatalogTests(unittest.TestCase):
         ci_build.record_warning(expression.replace(':3:4:', ':3:5:'), durations)
         ci_build.record_warning(function.replace(':1:1:', ':2:1:'), durations)
         self.assertEqual(ci_build.timing_counts(durations), {'function_body': 2, 'expression': 2})
+
+    def test_first_party_warning_identity_excludes_dependencies_and_timing(self) -> None:
+        root = Path('/checkout')
+        warning = "/checkout/Sources/RepoPromptShared/X.swift:7:9: warning: var 'x' was never mutated"
+        self.assertEqual(ci_build.first_party_warning(warning, root), (
+            'Sources/RepoPromptShared/X.swift', '7', '9', "var 'x' was never mutated",
+        ))
+        colored = warning.replace('warning:', '\x1b[1;35mwarning: \x1b[0m\x1b[1m')
+        self.assertEqual(ci_build.first_party_warning(colored, root), ci_build.first_party_warning(warning, root))
+        linked = ("/checkout/Sources/X.swift:1:2: warning: 'f' is deprecated [#\x1b]8;;"
+                  "https://docs.swift.org/compiler/documentation/diagnostics/deprecated-declaration\x1b\\"
+                  "DeprecatedDeclaration\x1b]8;;\x1b\\]")
+        self.assertEqual(ci_build.first_party_warning(linked, root), (
+            'Sources/X.swift', '1', '2', "'f' is deprecated [#DeprecatedDeclaration]",
+        ))
+        for owned in ('/checkout/Tests/RepoPromptTests/T.swift', '/checkout/Packages/P/Sources/P/P.swift',
+                      '/checkout/Sources/TreeSitterScannerSupport/src/scanner.c'):
+            with self.subTest(owned=owned):
+                self.assertIsNotNone(ci_build.first_party_warning(f'{owned}:1:2: warning: w', root))
+        for foreign in (
+            '/checkout/.build/checkouts/swift-nio/Sources/NIO/N.swift:1:2: warning: w',
+            '/checkout/Packages/P/.build/checkouts/dep/Sources/D/D.swift:1:2: warning: w',
+            '/checkout/Vendor/UniversalCharsetDetection/Sources/U/U.swift:1:2: warning: w',
+            '/elsewhere/Sources/RepoPrompt/X.swift:1:2: warning: w',
+            '/checkout/Sources/RepoPrompt/App/X.swift:3:4: warning: expression took 502ms to type-check',
+            '/checkout/Sources/RepoPrompt/App/X.swift:3:4: error: e',
+            'warning: unhandled resource in target RepoPrompt',
+            'ld: warning: object file built for newer macOS',
+        ):
+            with self.subTest(foreign=foreign):
+                self.assertIsNone(ci_build.first_party_warning(foreign, root))
+
+    def test_warning_ratchet_counts_unique_diagnostics_not_emissions(self) -> None:
+        root = Path('/checkout')
+        warnings: set[tuple[str, str, str, str]] = set()
+        line = '/checkout/Sources/RepoPrompt/App/X.swift:3:4: warning: capture of non-Sendable value'
+        for _ in range(25):  # one diagnostic re-emitted by many frontend jobs (#519)
+            warnings.add(ci_build.first_party_warning(line, root))
+        warnings.add(ci_build.first_party_warning(line.replace('non-Sendable', 'mutable'), root))
+        warnings.add(ci_build.first_party_warning(line.replace(':3:4:', ':5:4:'), root))
+        self.assertEqual(len(warnings), 3)
+        with mock.patch('builtins.print'):
+            self.assertFalse(ci_build.report_warning_ratchet(warnings, {'first_party_unique': 3}))
+            self.assertTrue(ci_build.report_warning_ratchet(warnings, {'first_party_unique': 2}))
+        self.assertEqual(ci_build.warning_summary(warnings), ['     3  Sources/RepoPrompt/App/X.swift'])
+
+    def test_warning_ratchet_budget_is_committed(self) -> None:
+        ratchets = json.loads(ci_build.BASELINE.read_text(encoding='utf-8'))
+        ceiling = ratchets['warnings']['first_party_unique']
+        self.assertIsInstance(ceiling, int)
+        self.assertGreaterEqual(ceiling, 0)
 
 
 if __name__ == '__main__':

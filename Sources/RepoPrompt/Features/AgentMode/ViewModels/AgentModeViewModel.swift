@@ -880,6 +880,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     var freshTaskRoutingByTabID: [UUID: FreshTaskRoutingOwnership] = [:]
+    var autoWorkflowJudgments: [UUID: Task<DecisionOutcome, Never>] = [:]
+    #if DEBUG
+        var test_autoWorkflowCatalog: [AgentWorkflowDefinition]?
+    #endif
 
     var isRestoringState = false
     private var activeUISyncSuppressionDepth = 0
@@ -5124,6 +5128,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     func prepareForWindowClose() async {
+        autoWorkflowJudgments.values.forEach { $0.cancel() }
+        autoWorkflowJudgments.removeAll()
         cancelReprompt()
         repromptUIStore.recoveries.removeAll()
         if let task = windowClosePreparationTask {
@@ -8959,7 +8965,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             parentSessionID: session.parentSessionID,
             failureReason: failureReason,
             worktreeBindings: session.worktreeBindings.map { AgentRunMCPSnapshot.WorktreeBinding(binding: $0) },
-            appActiveWorktreeMerges: session.worktreeMergeOperations.activeWorktreeMergeSummaries
+            appActiveWorktreeMerges: session.worktreeMergeOperations.activeWorktreeMergeSummaries,
+            // Publishes whether the parent holds bindings so an unbound task-aware child can be
+            // flagged in start/poll responses (#400). Unresolvable parents stay `nil`.
+            parentIsWorktreeBound: session.parentSessionID.flatMap { parentSessionID in
+                worktreeBindingState(forAgentSessionID: parentSessionID).bindings.map { !$0.isEmpty }
+            }
         )
     }
 
@@ -19172,11 +19183,22 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             if result == .submitted, let selection = choice?.selection { recordSubmittedAutoEffort(selection, for: session) }
             return result
         }
+        let original = repromptDispatchOriginals[claim.attempt.id] ?? claim.attempt.rawDraftSnapshot
+        let autoWorkflow = original.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("/")
+            ? nil
+            : await chooseAutoWorkflow(
+                text: Self.automationJudgingText(original: original, reprompted: repromptedText),
+                claim: claim, session: session
+            )
+        guard !Task.isCancelled, composerSubmitClaimIsCurrent(claim), sessions[destinationTabID] === session else {
+            return .blocked(message: Self.staleComposerSubmitTargetMessage)
+        }
         return await submitUserTurnAfterFreshTaskRouting(
             text: text,
             claim: claim,
             session: session,
             destinationTabID: destinationTabID,
+            autoWorkflow: autoWorkflow,
             repromptedText: repromptedText,
             precomputedRouting: repromptSpeculations[claim.attempt.id]
         )
@@ -19506,6 +19528,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         autoEffortSelection: AutoEffortTurnSelection? = nil,
         autoEffortAudit: AgentAutomationTurnAudit.Feature? = nil,
         routerAudit: AgentAutomationTurnAudit.Feature? = nil,
+        autoWorkflow: AutoWorkflowTurnSelection? = nil,
         repromptedText: String? = nil,
         repromptAudit: AgentAutomationTurnAudit.Reprompt? = nil,
         isLocalComposerInput: Bool = true,
@@ -19588,7 +19611,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         scheduleSkillCatalogRefresh()
 
-        let activeWorkflow = session.selectedWorkflow
+        let restorationSelectedWorkflow = session.selectedWorkflow
+        let activeWorkflow = effectiveWorkflow(session: session, autoWorkflow: autoWorkflow)
         let restorationSelectedWorkflowMutationGeneration = session.userWorkflowSelectionMutationGeneration
         let nativePreparedTurn: NativeSlashPreparedUserTurn?
         if let nativeSlashCommand = resolvedNativeSlashCommand(in: trimmedText, session: session) {
@@ -19705,7 +19729,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     routerAudit: routerAudit,
                     repromptedText: repromptedText,
                     repromptAudit: repromptAudit,
-                    restorationSelectedWorkflow: activeWorkflow,
+                    restorationSelectedWorkflow: restorationSelectedWorkflow,
                     restorationSelectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
                     stopFence: stopFence,
                     isLocalComposerInput: isLocalComposerInput,
@@ -19732,7 +19756,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             routerAudit: routerAudit,
             repromptedText: repromptedText,
             repromptAudit: repromptAudit,
-            restorationSelectedWorkflow: activeWorkflow,
+            restorationSelectedWorkflow: restorationSelectedWorkflow,
             restorationSelectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
             isLocalComposerInput: isLocalComposerInput,
             providerSwitchClaim: providerSwitchClaim,

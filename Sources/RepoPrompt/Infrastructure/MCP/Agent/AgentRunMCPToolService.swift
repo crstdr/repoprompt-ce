@@ -583,7 +583,8 @@ struct AgentRunMCPToolService {
             latestAssistantPreview: live.latestAssistantPreview, interaction: live.interaction, hookGate: live.hookGate,
             transcriptItemCount: live.transcriptItemCount, updatedAt: live.updatedAt,
             parentSessionID: live.parentSessionID, failureReason: live.failureReason,
-            worktreeBindings: live.worktreeBindings, activeWorktreeMerges: live.activeWorktreeMerges
+            worktreeBindings: live.worktreeBindings, activeWorktreeMerges: live.activeWorktreeMerges,
+            worktreeBindingState: live.worktreeBindingState, parentIsWorktreeBound: live.parentIsWorktreeBound
         )
     }
 
@@ -3049,6 +3050,12 @@ struct AgentRunMCPToolService {
         let worktreeBindings = try worktreeBindings(from: object)
         let activeWorktreeMerges = try activeWorktreeMerges(from: object)
         let modelParameterSelections = try modelParameterSelections(from: agent)
+        // An absent state key with no bindings means the producer did not publish binding
+        // knowledge (legacy or resident/expired payload); never infer `unbound` from it.
+        let worktreeBindingState = object["worktree_binding_state"]?.stringValue
+            .flatMap(AgentRunMCPSnapshot.WorktreeBindingState.init(rawValue:))
+            ?? (worktreeBindings.isEmpty ? .unknown : nil)
+        let parentIsWorktreeBound = object["parent_worktree_bound"]?.boolValue
         return AgentRunMCPSnapshot(
             sessionID: sessionID,
             runID: runID,
@@ -3069,7 +3076,9 @@ struct AgentRunMCPToolService {
             parentSessionID: parentSessionID,
             failureReason: failureReason,
             worktreeBindings: worktreeBindings,
-            appActiveWorktreeMerges: activeWorktreeMerges
+            appActiveWorktreeMerges: activeWorktreeMerges,
+            worktreeBindingState: worktreeBindingState,
+            parentIsWorktreeBound: parentIsWorktreeBound
         )
     }
 
