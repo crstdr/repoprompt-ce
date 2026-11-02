@@ -10,6 +10,18 @@
         private let sessionID = UUID(uuidString: "11111111-2222-3333-4444-555555555555")!
 
         @MainActor
+        func testVisibleChoicesHideOnlyUnavailableHistoryAndAlreadyHiddenRows() {
+            typealias Choice = AgentModeViewModel.ProviderSwitchChoice
+            let recent = Choice(mode: .newestTurns, unavailable: "the last turn alone doesn't fit")
+            let summary = Choice(mode: .summary, unavailable: "no room for a summary")
+            let unavailableHistory = Choice(mode: .history, unavailable: "too large")
+            let fittingHistory = Choice(mode: .history, retainedPayload: "history")
+            XCTAssertEqual(AgentProviderSwitchPreview.visibleChoices([unavailableHistory, recent, summary]).map(\.mode), [.newestTurns, .summary])
+            XCTAssertEqual(AgentProviderSwitchPreview.visibleChoices([fittingHistory, recent, summary]).map(\.mode), [.history, .newestTurns, .summary])
+            XCTAssertEqual(AgentProviderSwitchPreview.visibleChoices([fittingHistory, Choice(mode: .newestTurns, hidden: true), summary]).map(\.mode), [.history, .summary])
+        }
+
+        @MainActor
         func testPreviewSelectionPrefersLivePickThenRetainedThenFittingHistoryAndRecent() {
             typealias Choice = AgentModeViewModel.ProviderSwitchChoice
             let history = Choice(mode: .history, retainedPayload: "history")
