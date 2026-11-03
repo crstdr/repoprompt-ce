@@ -193,6 +193,7 @@ enum WindowStateCompositionFactory {
             switchTimingPolicy: workspaceSwitchTimingPolicy,
             restorePerfRecorder: AppWorkspaceRestorePerfRecorder()
         )
+        if sessionRuntimeWorkspace == nil { workspaceManager.activityMainWork = ActivityMainWorkCounters() }
         let routerSettingsViewModel = RouterSettingsViewModel(
             settingsStore: settingsStore,
             runtime: modelRouterRuntime,
