@@ -19,10 +19,6 @@ package enum OracleBackgroundContract {
             properties["background"] = .object(["type": .string("boolean"), "default": .bool(false)])
             properties["op"] = .object(["type": .string("string"), "enum": .array([.string("send"), .string("cancel")]), "default": .string("send")])
             schema.removeValue(forKey: "required")
-            schema["anyOf"] = .array([
-                .object(["properties": .object(["op": .object(["const": .string("cancel")])]), "required": .array([.string("op"), .string("oracle_group_id"), .string("oracle_turn_id")])]),
-                .object(["properties": .object(["op": .object(["enum": .array([.string("send")])])]), "required": .array([.string("message")])])
-            ])
         } else if tool == MCPWindowToolName.oracleChatLog {
             properties["op"] = .object(["type": .string("string"), "enum": .array([.string("read"), .string("collect")]), "default": .string("read")])
             properties["include_finished"] = .object(["type": .string("boolean"), "default": .bool(true)])

@@ -8,7 +8,7 @@ import XCTest
 
 @MainActor
 final class OraclePresetExecutionTests: XCTestCase {
-    func testBackgroundConditionalSchemaSurvivesCanonicalCallerProjection() async throws {
+    func testBackgroundFlatSchemaSurvivesCanonicalCallerProjection() async throws {
         let canonical = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: MCPWindowToolName.askOracle))
         var schema = try XCTUnwrap(canonical.inputSchema.objectValue)
         var properties = try XCTUnwrap(schema["properties"]?.objectValue)
@@ -25,16 +25,10 @@ final class OraclePresetExecutionTests: XCTestCase {
         }
         schema["properties"] = .object(properties)
         schema.removeValue(forKey: "required")
-        schema["anyOf"] = .array([
-            .object([
-                "properties": .object(["op": .object(["const": .string("cancel")])]),
-                "required": .array([.string("op"), .string("oracle_group_id"), .string("oracle_turn_id")])
-            ]),
-            .object([
-                "properties": .object(["op": .object(["enum": .array([.string("send")])])]),
-                "required": .array([.string("message")])
-            ])
-        ])
+        XCTAssertEqual(schema["type"], .string("object"))
+        for key in ["anyOf", "oneOf", "allOf", "if", "then", "not"] {
+            XCTAssertNil(schema[key], "Oracle schema root must omit \(key)")
+        }
         // Independently spell the approved recipe, including the fork roster property.
         let projected = MCPDomainToolDefinition(
             name: canonical.name,
@@ -117,6 +111,23 @@ final class OraclePresetExecutionTests: XCTestCase {
             throw XCTSkip("Production schema cache testing seam is DEBUG-only")
         #endif
         XCTAssertEqual(MCPDomainCanonicalToolDefinitions.definition(named: MCPWindowToolName.askOracle)?.inputSchema, canonical.inputSchema)
+    }
+
+    func testPublishedAppToolSchemasHaveNoRootCombinators() async throws {
+        func assertFlatRoot(_ input: Value, name: String) throws {
+            let schema = try XCTUnwrap(input.objectValue, name)
+            XCTAssertEqual(schema["type"], .string("object"), name)
+            for key in ["anyOf", "oneOf", "allOf", "if", "then", "not"] {
+                XCTAssertNil(schema[key], "\(name) schema root must omit \(key)")
+            }
+        }
+        let definitions = MCPDomainCanonicalToolDefinitions.definitions
+        XCTAssertFalse(definitions.isEmpty)
+        for definition in definitions {
+            try assertFlatRoot(definition.inputSchema, name: definition.name)
+        }
+        let canonical = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: MCPWindowToolName.askOracle))
+        let collect = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: MCPWindowToolName.oracleChatLog))
         #if DEBUG
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease)
@@ -161,9 +172,26 @@ final class OraclePresetExecutionTests: XCTestCase {
                             await AppDomainRuntimeComposition.shared.unregister(fixture.contextA.catalogService)
                             try await AppDomainRuntimeComposition.shared.register(fixture.contextA.catalogService)
                         }
+                        let catalog = await AppDomainRuntimeComposition.shared.runtime.domainHost.advertisedCatalog(.init(
+                            isGloballyEnabled: true, disabledToolNames: [],
+                            policy: .init(
+                                restrictedToolNames: MCPDomainToolCatalog.toolNames(for: agentPolicy.restrictedCapabilities),
+                                additionalToolNames: MCPDomainToolCatalog.toolNames(for: agentPolicy.grantedCapabilities),
+                                role: agentPolicy.role, allowsAgentExternalControlTools: agentPolicy.allowsAgentExternalControlTools
+                            )
+                        ))
+                        XCTAssertFalse(catalog.definitions.isEmpty)
+                        XCTAssertTrue(catalog.definitions.contains { $0.name == canonical.name })
+                        for definition in catalog.definitions {
+                            try assertFlatRoot(definition.inputSchema, name: "app catalog/\(definition.name)")
+                        }
                         let response = try await endpoint.client.request(method: "tools/list", params: [:])
                         let object = try MCPExportWatchdogIntegrationTests.responseObject(from: response)
                         let result = try JSONDecoder().decode(ListTools.Result.self, from: JSONSerialization.data(withJSONObject: XCTUnwrap(object["result"])))
+                        XCTAssertFalse(result.tools.isEmpty)
+                        for tool in result.tools {
+                            try assertFlatRoot(tool.inputSchema, name: "socket/\(tool.name)")
+                        }
                         for expected in [canonical, collect] {
                             let tool = try XCTUnwrap(result.tools.first { $0.name == expected.name }, "Missing \(expected.name); actual \(result.tools.map(\.name))")
                             XCTAssertEqual(tool.inputSchema, expected.inputSchema, "actual socket/catalog refresh=\(refresh)")
