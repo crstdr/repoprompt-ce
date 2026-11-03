@@ -475,6 +475,7 @@ struct MarkdownTextView: View, Equatable {
     let renderCadence: MarkdownRenderCadence
     private let allowsStreamingSegmentation: Bool
     @Environment(\.windowIsPresentationVisible) private var windowIsPresentationVisible
+    @Environment(\.activityMainWork) private var activityMainWork
     @Environment(\.markdownFileLinkOpener) private var markdownFileLinkOpener
     @ObservedObject private var fontScale = FontScaleManager.shared
     private var fontPreset: FontScalePreset {
@@ -695,6 +696,9 @@ struct MarkdownTextView: View, Equatable {
     }
 
     private func compileMarkdown(for signature: MarkdownRenderSignature, requestID: Int) {
+        let activity = activityMainWork
+        activity?.begin(.markdown)
+        defer { activity?.end(.markdown) }
         let document = Document(parsing: signature.text)
         var compiler = EnhancedMarkdownCompiler()
         compiler.fontSize = signature.fontSize
