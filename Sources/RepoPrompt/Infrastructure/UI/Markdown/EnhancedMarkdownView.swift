@@ -438,6 +438,7 @@ enum AttributedTextMeasurementWidthResolver {
 
 struct AttributedTextView: NSViewRepresentable {
     @Environment(\.windowIsPresentationVisible) private var windowIsPresentationVisible
+    @Environment(\.activityMainWork) private var activityMainWork
     let attributedString: NSAttributedString
     let isEditable: Bool
     let allowsTextSelection: Bool
@@ -477,6 +478,9 @@ struct AttributedTextView: NSViewRepresentable {
     }
 
     func updateNSView(_ textView: CodeBlockTextView, context: Context) {
+        let activity = activityMainWork
+        activity?.begin(.markdown)
+        defer { activity?.end(.markdown) }
         updateTextView(textView, coordinator: context.coordinator, presentationVisible: windowIsPresentationVisible)
     }
 
