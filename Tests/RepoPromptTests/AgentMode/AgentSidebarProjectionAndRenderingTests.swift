@@ -1336,7 +1336,7 @@ final class AgentSidebarHostedTapTests: XCTestCase {
         let activeIDs = active.map(\.id)
 
         XCTAssertEqual(Set(activeIDs).count, activeIDs.count)
-        XCTAssertEqual(activeIDs, [pinned.id, parent.id, child.id, older.id])
+        XCTAssertEqual(activeIDs, [pinned.id, parent.id, child.id, older.id].map(AgentSidebarActiveOccurrenceID.canonical))
         XCTAssertTrue(AgentSidebarDateSectionBuilder.activeSections(for: [], now: now).isEmpty)
 
         let today = try Self.stashedTab(index: 1, at: now)
