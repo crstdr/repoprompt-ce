@@ -78,15 +78,6 @@ struct ComputerUseSettingsView: View {
                 LabeledContent("Status") {
                     VStack(alignment: .leading) { ForEach(availability.messages, id: \.self) { Text($0) } }
                 }
-                Picker("Model", selection: Binding(get: { model }, set: { value in
-                    settings.setComputerUseModel(value)
-                })) {
-                    Text("GPT-6.1 Terra High").tag("codexExec:gpt-6.1-terra-high").disabled(!availability.terraAvailable)
-                    Text("GPT-6.1 Sol High").tag("codexExec:gpt-6.1-sol-high")
-                    if !["codexExec:gpt-6.1-terra-high", "codexExec:gpt-6.1-sol-high"].contains(model) {
-                        Text(model).tag(model).disabled(true)
-                    }
-                }
             }
             Section("Where it can run") {
                 Toggle("Codex chats (native)", isOn: Binding(
@@ -98,6 +89,17 @@ struct ComputerUseSettingsView: View {
                     get: { preferences?.computerUseSubagentEnabled ?? false },
                     set: { settings.setComputerUseSubagentEnabled($0) }
                 ))
+                if preferences?.computerUseSubagentEnabled ?? false {
+                    Picker("Computer Use subagent model", selection: Binding(get: { model }, set: { value in
+                        settings.setComputerUseModel(value)
+                    })) {
+                        Text("GPT-6.1 Terra High").tag("codexExec:gpt-6.1-terra-high").disabled(!availability.terraAvailable)
+                        Text("GPT-6.1 Sol High").tag("codexExec:gpt-6.1-sol-high")
+                        if !["codexExec:gpt-6.1-terra-high", "codexExec:gpt-6.1-sol-high"].contains(model) {
+                            Text(model).tag(model).disabled(true)
+                        }
+                    }
+                }
             }
             .disabled(!settings.computerUseMasterEnabled)
         }
