@@ -20,6 +20,37 @@ import XCTest
     final class NewWindowInitialSelectionTests: XCTestCase {
         private typealias Fixture = NewWindowInitialSelectionFixture
 
+        func testHeartbeatLeaseReleasedOnBridgeDeinit() async throws {
+            try await Fixture.run { f in
+                let window = f.makeWindow()
+                let existingBridge = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
+                await existingBridge.stopAndJoinForTesting()
+                XCTAssertEqual(DomainWorkspacePresentationBridge.heartbeatLeaseCountForTesting, 0)
+
+                var bridge: DomainWorkspacePresentationBridge? = DomainWorkspacePresentationBridge(
+                    workspaceManager: window.workspaceManager,
+                    client: DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: -9999)
+                )
+                weak var weakBridge = bridge
+                bridge?.start()
+                XCTAssertEqual(DomainWorkspacePresentationBridge.heartbeatLeaseCountForTesting, 1)
+                bridge = nil
+                XCTAssertNil(weakBridge)
+                await Task.yield()
+                XCTAssertEqual(DomainWorkspacePresentationBridge.heartbeatLeaseCountForTesting, 0)
+
+                bridge = DomainWorkspacePresentationBridge(
+                    workspaceManager: window.workspaceManager,
+                    client: DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: -9999)
+                )
+                bridge?.start()
+                bridge?.stop()
+                bridge = nil
+                await Task.yield()
+                XCTAssertEqual(DomainWorkspacePresentationBridge.heartbeatLeaseCountForTesting, 0)
+            }
+        }
+
         func testCatalogPerfCountsForeignWorkingCommits() async throws {
             CatalogPerf.shared.setSuppressAutomaticEmissionForTesting(true)
             defer {

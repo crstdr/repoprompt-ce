@@ -368,6 +368,12 @@ private enum CatalogPerfHeartbeat {
     private static var task: Task<Void, Never>?
     private static var leases = 0
 
+    #if DEBUG
+        static var leaseCountForTesting: Int {
+            leases
+        }
+    #endif
+
     static func start() {
         leases += 1
         guard task == nil else { return }
@@ -432,7 +438,16 @@ final class DomainWorkspacePresentationBridge {
     deinit {
         subscriptionTask?.cancel()
         catalogRefreshTask?.cancel()
+        if hasPerfHeartbeatLease {
+            Task { @MainActor in CatalogPerfHeartbeat.stop() }
+        }
     }
+
+    #if DEBUG
+        static var heartbeatLeaseCountForTesting: Int {
+            CatalogPerfHeartbeat.leaseCountForTesting
+        }
+    #endif
 
     func stop() {
         if hasPerfHeartbeatLease {
