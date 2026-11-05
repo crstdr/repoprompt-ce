@@ -181,14 +181,17 @@ final class WorkspaceFileDecodeCache: @unchecked Sendable {
     }
 
     fileprivate static func decodeWorkspace(
-        documentBytes: Data
+        documentBytes: Data,
+        catalogPerf: Bool = false
     ) throws -> (workspace: WorkspaceModel, normalizationRequiresSave: Bool) {
         let digest = Data(SHA256.hash(data: documentBytes))
             .map { String(format: "%02x", $0) }
             .joined()
         if let cached = shared.cachedDecode(for: digest) {
+            if catalogPerf { CatalogPerf.shared.canonicalDecode(bytesHashed: documentBytes.count, cacheHit: true) }
             return cached
         }
+        if catalogPerf { CatalogPerf.shared.canonicalDecode(bytesHashed: documentBytes.count, cacheHit: false) }
         // The decode is only memoizable when it is a pure function of the
         // bytes: custom decoders and normalization synthesize UUID()/Date()
         // fallbacks for missing fields, and those results must stay
@@ -9023,6 +9026,12 @@ class WorkspaceManagerViewModel: ObservableObject {
         rootMapPolicy: DomainCatalogRootMapPolicy,
         attempt: DomainCatalogAttempt? = nil
     ) -> DomainCatalogApplicationResult {
+        let perfStart = DispatchTime.now().uptimeNanoseconds
+        var perfFull = false
+        defer {
+            let elapsed = Double(DispatchTime.now().uptimeNanoseconds - perfStart) / 1_000_000
+            CatalogPerf.shared.application(elapsedMS: elapsed, full: perfFull)
+        }
         let attempt = attempt ?? beginDomainCatalogAttempt()
         if let rejection = catalogAdmissionRejection(snapshot, projection: projection, attempt: attempt) {
             if case let .invalidCatalog(reason) = rejection {
@@ -9047,6 +9056,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         switch projection {
         case let .full(models):
             kind = .full
+            perfFull = true
             applied = applyDomainWorkspaceProjection(
                 models,
                 canonicalRepoPathsByWorkspaceID: rootMapPolicy == .snapshotMetadata ? map(\.document.metadata.repoPaths) : nil,
@@ -9223,13 +9233,14 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     /// Shared identity-checked record decode for catalog projection and scoped restore classification.
-    func decodeDomainWorkspaceCatalogRecord(_ record: DomainWorkspaceSnapshot) throws -> WorkspaceModel {
+    func decodeDomainWorkspaceCatalogRecord(_ record: DomainWorkspaceSnapshot, catalogPerf: Bool = false) throws -> WorkspaceModel {
         #if DEBUG
             if let error = catalogRecordDecodeFailureForTesting?(record.document.workspaceID) { throw error }
         #endif
         let model = try Self.decodeDomainWorkspaceProjection(
             documentBytes: record.document.documentBytes,
-            fileURL: record.document.fileURL
+            fileURL: record.document.fileURL,
+            catalogPerf: catalogPerf
         )
         guard model.id == record.document.workspaceID else {
             throw NSError(domain: "WorkspaceChooserCatalog", code: 2, userInfo: [
@@ -17334,14 +17345,15 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     nonisolated static func decodeDomainWorkspaceProjection(
         documentBytes: Data,
-        fileURL: URL
+        fileURL: URL,
+        catalogPerf: Bool = false
     ) throws -> WorkspaceModel {
         #if DEBUG
             let workspace = try WorkspaceProjectionDecodeDiagnostics.measure(inputBytes: documentBytes.count) {
-                try WorkspaceFileDecodeCache.decodeWorkspace(documentBytes: documentBytes).workspace
+                try WorkspaceFileDecodeCache.decodeWorkspace(documentBytes: documentBytes, catalogPerf: catalogPerf).workspace
             }
         #else
-            let workspace = try WorkspaceFileDecodeCache.decodeWorkspace(documentBytes: documentBytes).workspace
+            let workspace = try WorkspaceFileDecodeCache.decodeWorkspace(documentBytes: documentBytes, catalogPerf: catalogPerf).workspace
         #endif
         // The domain authority re-writes this document from the projected value, so the original
         // bytes must be preserved here, before any projection consumer can commit a lossy copy.

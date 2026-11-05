@@ -95,7 +95,7 @@ struct DomainWorkspaceAuthorityClient {
         _ workspace: WorkspaceModel,
         fileURL: URL
     ) async throws -> DomainWorkspaceSnapshot {
-        try await store.registerReadDocument(document(for: workspace, fileURL: fileURL))
+        try await store.registerReadDocument(document(for: workspace, fileURL: fileURL, recordWriter: false))
     }
 
     func create(
@@ -325,8 +325,17 @@ struct DomainWorkspaceAuthorityClient {
         return await store.snapshot()
     }
 
-    private func document(for workspace: WorkspaceModel, fileURL: URL) throws -> DomainWorkspaceDocument {
+    private func document(for workspace: WorkspaceModel, fileURL: URL, recordWriter: Bool = true) throws -> DomainWorkspaceDocument {
+        let perfStart = DispatchTime.now().uptimeNanoseconds
+        var perfBytes = 0
+        defer {
+            if recordWriter {
+                let elapsed = Double(DispatchTime.now().uptimeNanoseconds - perfStart) / 1_000_000
+                CatalogPerf.shared.writerPreparation(ms: elapsed, bytes: perfBytes, onMainThread: Thread.isMainThread)
+            }
+        }
         let bytes = try DomainWorkspaceModelEncoder.encode(workspace)
+        perfBytes = bytes.count
         return try DomainWorkspaceDocument.decode(documentBytes: bytes, fileURL: fileURL)
     }
 
@@ -354,13 +363,50 @@ private extension DomainCommandOutcome {
     }
 }
 
+@MainActor
+private enum CatalogPerfHeartbeat {
+    private static var task: Task<Void, Never>?
+    private static var leases = 0
+
+    static func start() {
+        leases += 1
+        guard task == nil else { return }
+        task = Task {
+            let interval: UInt64 = 10_000_000
+            var previous = DispatchTime.now().uptimeNanoseconds
+            var windowStart = previous
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: interval)
+                guard !Task.isCancelled else { return }
+                let now = DispatchTime.now().uptimeNanoseconds
+                CatalogPerf.shared.heartbeat(gapMS: Double(now - previous) / 1_000_000, expectedMS: 10)
+                previous = now
+                if now - windowStart >= 10_000_000_000 {
+                    CatalogPerf.shared.emitWindow()
+                    windowStart = now
+                }
+            }
+        }
+    }
+
+    static func stop() {
+        leases -= 1
+        if leases == 0 {
+            task?.cancel()
+            task = nil
+        }
+    }
+}
+
 /// MainActor-only projection of immutable runtime snapshots into the existing app view model graph.
 /// Active-window choice is deliberately resolved here; it is never persisted as domain routing truth.
 @MainActor
 final class DomainWorkspacePresentationBridge {
     private weak var workspaceManager: WorkspaceManagerViewModel?
+    private let perfReceiverID = UUID()
     private let client: DomainWorkspaceAuthorityClient
     private var subscriptionTask: Task<Void, Never>?
+    private var hasPerfHeartbeatLease = false
     /// Subscription incarnation created by `start()` and invalidated by `stop()`. An authority read
     /// that returns after stop must neither apply a stale snapshot nor credit a newer run.
     private var subscriptionRunID: UUID?
@@ -389,6 +435,10 @@ final class DomainWorkspacePresentationBridge {
     }
 
     func stop() {
+        if hasPerfHeartbeatLease {
+            hasPerfHeartbeatLease = false
+            CatalogPerfHeartbeat.stop()
+        }
         #if DEBUG
             let stoppedRunID = subscriptionRunID
         #endif
@@ -606,6 +656,8 @@ final class DomainWorkspacePresentationBridge {
 
     func start() {
         guard subscriptionTask == nil, let manager = workspaceManager, !manager.isPreparingForWindowClose else { return }
+        CatalogPerfHeartbeat.start()
+        hasPerfHeartbeatLease = true
         let initialAttempt = manager.beginDomainCatalogAttempt()
         let runID = UUID()
         subscriptionRunID = runID
@@ -841,7 +893,7 @@ final class DomainWorkspacePresentationBridge {
                 nextModels[workspaceID] = current
             } else {
                 do {
-                    nextModels[workspaceID] = try manager.decodeDomainWorkspaceCatalogRecord(record)
+                    nextModels[workspaceID] = try manager.decodeDomainWorkspaceCatalogRecord(record, catalogPerf: true)
                 } catch {
                     failedIDs.insert(workspaceID)
                 }
@@ -892,6 +944,7 @@ final class DomainWorkspacePresentationBridge {
         runID: UUID
     ) {
         guard isCurrentRun(runID) else { return }
+        CatalogPerf.shared.receipt(receiver: perfReceiverID, full: receipt.kind == .full)
         projectedDigests = digests
         lastPublicationSequence = receipt.publicationSequence
         acceptedReconciliationGeneration = receipt.reconciliationGeneration
