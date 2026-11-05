@@ -20,6 +20,115 @@ import XCTest
     final class NewWindowInitialSelectionTests: XCTestCase {
         private typealias Fixture = NewWindowInitialSelectionFixture
 
+        func testHeartbeatLeaseReleasedOnBridgeDeinit() async throws {
+            try await Fixture.run { f in
+                let window = f.makeWindow()
+                let existingBridge = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
+                await existingBridge.stopAndJoinForTesting()
+                XCTAssertEqual(DomainWorkspacePresentationBridge.heartbeatLeaseCountForTesting, 0)
+
+                var bridge: DomainWorkspacePresentationBridge? = DomainWorkspacePresentationBridge(
+                    workspaceManager: window.workspaceManager,
+                    client: DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: -9999)
+                )
+                weak var weakBridge = bridge
+                bridge?.start()
+                XCTAssertEqual(DomainWorkspacePresentationBridge.heartbeatLeaseCountForTesting, 1)
+                bridge = nil
+                XCTAssertNil(weakBridge)
+                await Task.yield()
+                XCTAssertEqual(DomainWorkspacePresentationBridge.heartbeatLeaseCountForTesting, 0)
+
+                bridge = DomainWorkspacePresentationBridge(
+                    workspaceManager: window.workspaceManager,
+                    client: DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: -9999)
+                )
+                bridge?.start()
+                bridge?.stop()
+                bridge = nil
+                await Task.yield()
+                XCTAssertEqual(DomainWorkspacePresentationBridge.heartbeatLeaseCountForTesting, 0)
+            }
+        }
+
+        func testCatalogPerfCountsForeignWorkingCommits() async throws {
+            CatalogPerf.shared.setSuppressAutomaticEmissionForTesting(true)
+            defer {
+                _ = CatalogPerf.shared.rotate()
+                CatalogPerf.shared.setSuppressAutomaticEmissionForTesting(false)
+            }
+            for receiverCount in [1, 35] {
+                try await Fixture.run { f in
+                    let windows = (0 ..< receiverCount).map { _ in f.makeWindow() }
+                    for window in windows {
+                        _ = try await f.awaitCatalogProjection(window)
+                    }
+                    _ = CatalogPerf.shared.rotate()
+                    let author = DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: -9999)
+                    var edited = Fixture.model(id: Fixture.aardvarkID, name: "Aardvark")
+                    for index in 0 ..< 10 {
+                        let snapshot = await f.runtime.workspaceStore.workspaceSnapshot(Fixture.aardvarkID)
+                        let before = try XCTUnwrap(snapshot)
+                        edited.lastUsed = edited.lastUsed.addingTimeInterval(Double(index + 1))
+                        let outcome = try await author.replaceWorkingFailClosed(
+                            edited, fileURL: f.workspaceURL(for: edited),
+                            expectedWorkspaceRevision: before.revisions.workingRevision
+                        )
+                        XCTAssertEqual(outcome.disposition, .applied)
+                        for window in windows {
+                            let receipt = try await f.awaitCatalogProjection(window)
+                            XCTAssertEqual(receipt.catalogReceipt?.kind, .full)
+                        }
+                    }
+                    let line = try XCTUnwrap(CatalogPerf.shared.rotate())
+                    XCTAssertTrue(line.contains("receivers=\(receiverCount) "), line)
+                    XCTAssertTrue(line.contains("receipts_full=\(receiverCount * 10) "), line)
+                    XCTAssertTrue(line.contains("receipts_metadata=0 "), line)
+                    XCTAssertTrue(line.contains("receivers_full=\(receiverCount) "), line)
+                    XCTAssertTrue(line.contains("receiver_full_max=10 "), line)
+                    XCTAssertTrue(line.contains("applications_attempted=\(receiverCount * 10) "), line)
+                    XCTAssertTrue(line.contains("reconciliations_full_attempted=\(receiverCount * 10) "), line)
+                    XCTAssertTrue(line.contains("publications=workingStateCommitted:10 "), line)
+                    XCTAssertTrue(line.contains("prep_count=10 "), line)
+                    XCTAssertTrue(line.contains("write_count=10 "), line)
+                    let fields = Dictionary(uniqueKeysWithValues: line.split(separator: " ").compactMap { field -> (String, String)? in
+                        let parts = field.split(separator: "=", maxSplits: 1)
+                        guard parts.count == 2 else { return nil }
+                        return (String(parts[0]), String(parts[1]))
+                    })
+                    XCTAssertEqual(Int(fields["canonical_decodes"] ?? ""), 10)
+                    // The fork's synchronous projection also decodes once per receiver after initial acceptance.
+                    XCTAssertEqual(Int(fields["decode_cache_hits"] ?? ""), (receiverCount - 1) * 10 + receiverCount)
+                    XCTAssertGreaterThan(Int(fields["decode_bytes_hashed"] ?? "") ?? 0, 0)
+                }
+            }
+        }
+
+        func testCatalogPerfCountsOrdinarySavePreparation() async throws {
+            CatalogPerf.shared.setSuppressAutomaticEmissionForTesting(true)
+            defer {
+                _ = CatalogPerf.shared.rotate()
+                CatalogPerf.shared.setSuppressAutomaticEmissionForTesting(false)
+            }
+            try await Fixture.run { f in
+                let snapshot = await f.runtime.workspaceStore.workspaceSnapshot(Fixture.aardvarkID)
+                let original = try XCTUnwrap(snapshot)
+                var edited = Fixture.model(id: Fixture.aardvarkID, name: "Aardvark")
+                edited.lastUsed = edited.lastUsed.addingTimeInterval(60)
+                let author = DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: -9999)
+                _ = CatalogPerf.shared.rotate()
+                let outcome = try await author.savePhased(
+                    edited, fileURL: f.workspaceURL(for: edited),
+                    expectedWorkspaceRevision: original.revisions.workingRevision,
+                    expectedContentDigest: original.document.contentDigest
+                )
+                XCTAssertEqual(outcome.final.disposition, .applied)
+                let line = try XCTUnwrap(CatalogPerf.shared.rotate())
+                XCTAssertTrue(line.contains("prep_count=1 "), line)
+                XCTAssertTrue(line.contains("write_count=2 "), line)
+            }
+        }
+
         func testCatalogAttemptFencesHealthObservedAfterReadForFullAndMetadataApplications() async throws {
             for metadataOnly in [false, true] {
                 try await Fixture.run { f in

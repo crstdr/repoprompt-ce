@@ -175,6 +175,7 @@ package struct DomainWorkspaceDocument: Codable, Equatable {
         self.workspaceID = workspaceID
         self.fileURL = fileURL
         self.documentBytes = documentBytes
+        CatalogPerf.shared.documentHash(bytes: documentBytes.count)
         contentDigest = DomainContentDigest.sha256(documentBytes)
         self.metadata = metadata
     }
