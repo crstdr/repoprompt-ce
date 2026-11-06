@@ -263,6 +263,9 @@ final class ClaudeAgentModeCoordinator {
     private var pendingResumeTransferEpochByTabID: [UUID: UUID] = [:]
     private var claudeRuntimeEpochByTabID: [UUID: UUID] = [:]
     private var retiredResumeTransferTasksByTabID: [UUID: [Task<NativeAgentRuntimeSessionRef, Never>]] = [:]
+    /// Exact retirements of withdrawn pending providers, retained until they finish so a later
+    /// teardown-completed cancellation can still join them after the listener was detached.
+    private var withdrawnProviderRetirementsByTabID: [UUID: [Task<NativeAgentRuntimeSessionRef, Never>]] = [:]
     var toolTrackingHooks: AgentToolTrackingHooks = .noOp {
         didSet {
             for handler in toolHandlerByTabID.values {
@@ -394,6 +397,10 @@ final class ClaudeAgentModeCoordinator {
         controllerListeners[session.tabID]?.subscription?.append(.steeringReleased(protectedIDs: protectedIDs, inputWasAttempted: inputWasAttempted))
     }
 
+    func recheckSteeringSettlement(session: AgentTabSession) {
+        controllerListeners[session.tabID]?.subscription?.append(.settlementRecheck)
+    }
+
     func pendingProviderAdoption(for session: AgentTabSession) -> Task<Void, Never>? {
         controllerListeners[session.tabID]?.adoptionTask
     }
@@ -418,18 +425,45 @@ final class ClaudeAgentModeCoordinator {
         return listener.isBusy || listener.adoptionTask != nil
     }
 
+    /// Withdraws a pending provider adoption, if any, and returns a join over every withdrawn
+    /// provider retirement for this tab that is still running — including ones withdrawn by an
+    /// earlier publication-only cancellation — or `nil` when there is nothing to join.
     @discardableResult
     func cancelPendingProviderAdoption(for session: AgentTabSession) -> (@MainActor () async -> Void)? {
-        guard hasPendingProviderAdoption(for: session) else { return nil }
-        if session.activeRunOwnership == nil {
-            session.mcpFollowUpRunPending = false
-            if !session.runLifecycle.terminalCommitInProgress { session.runState = .cancelled }
+        if hasPendingProviderAdoption(for: session) {
+            if session.activeRunOwnership == nil {
+                session.mcpFollowUpRunPending = false
+                if !session.runLifecycle.terminalCommitInProgress { session.runState = .cancelled }
+            }
+            let runID = session.runID
+            let detached = prepareClaudeCancelSync(session)
+            if let retirement = beginClaudeResumeTransferIfNeeded(for: session, oldController: detached) {
+                retainWithdrawnProviderRetirement(retirement, tabID: session.tabID)
+            }
+            if let runID { Task { await self.cleanupAdoptedRun(session: session, runID: runID) } }
         }
-        let runID = session.runID
-        let detached = prepareClaudeCancelSync(session)
-        let retirement = beginClaudeResumeTransferIfNeeded(for: session, oldController: detached)
-        if let runID { Task { await self.cleanupAdoptedRun(session: session, runID: runID) } }
-        return retirement.map { task in { _ = await task.value } }
+        let retirements = withdrawnProviderRetirementsByTabID[session.tabID] ?? []
+        guard !retirements.isEmpty else { return nil }
+        return {
+            for task in retirements {
+                _ = await task.value
+            }
+        }
+    }
+
+    private func retainWithdrawnProviderRetirement(
+        _ retirement: Task<NativeAgentRuntimeSessionRef, Never>,
+        tabID: UUID
+    ) {
+        withdrawnProviderRetirementsByTabID[tabID, default: []].append(retirement)
+        Task { @MainActor [weak self] in
+            _ = await retirement.value
+            guard let self else { return }
+            withdrawnProviderRetirementsByTabID[tabID]?.removeAll { $0 == retirement }
+            if withdrawnProviderRetirementsByTabID[tabID]?.isEmpty == true {
+                withdrawnProviderRetirementsByTabID[tabID] = nil
+            }
+        }
     }
 
     func hasPendingProviderWork(for session: AgentTabSession) -> Bool {
@@ -477,7 +511,7 @@ final class ClaudeAgentModeCoordinator {
             guard let self, let session, let listener, listener.isCurrent() else { return }
             switch event {
             case let .runtimeInit(status):
-                observeRuntimeInit(status, session: session)
+                if observeRuntimeInit(status, session: session) { hostCapabilities.requestUIRefresh(session, false) }
                 if status.isRepoPromptServerFailed { scheduleIdleFailure(session, listener: listener, error: Self.mcpInitializationFailureMessage(sessionID: status.sessionID)) }
             case let .error(message): scheduleIdleFailure(session, listener: listener, error: message)
             default: break
@@ -507,23 +541,18 @@ final class ClaudeAgentModeCoordinator {
         eventListener(for: session).install(controller: controller, handle: handle)
     }
 
-    func observeRuntimeInit(_ status: NativeAgentRuntimeRuntimeInitStatus, session: AgentTabSession) {
+    /// Records runtime-init state for both host-run and self-started (idle) events. Every init
+    /// recomputes the effective window, including one repeating the last cap: a reset conversation
+    /// or replaced process must not keep a stale or missing window. Returns `true` when the window
+    /// changed, so the host can refresh its presentation.
+    @discardableResult
+    func observeRuntimeInit(_ status: NativeAgentRuntimeRuntimeInitStatus, session: AgentTabSession) -> Bool {
         if let id = status.sessionID, !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             updateProviderSessionIDIfNeeded(id, for: session)
         }
-        guard session.claudeAutoCompactWindowTokens != status.autoCompactWindowTokens else { return }
         session.claudeAutoCompactWindowTokens = status.autoCompactWindowTokens
-        // Init belongs to the controller, including reconnects with no active attempt.
-        // The estimator stores usage on the session; no synthetic stream event is needed.
-        let estimator = ClaudeContextUsageEstimator(
-            tokenEstimator: { TokenCalculationService.estimateTokens(for: $0) },
-            contextUsageBuilder: { AgentModeViewModel.contextUsageFromClaudeProviderTokens($0, modelContextWindow: $1) }
-        )
-        _ = estimator.ingestUsageSignal(
-            promptTokens: nil, completionTokens: nil, contextUsedTokens: nil,
-            modelContextWindow: nil, session: session
-        )
-        hostCapabilities.requestUIRefresh(session, false)
+        guard session.selectedAgent.usesClaudeNativeRuntime else { return false }
+        return ClaudeContextUsageEstimator.reconcileContextWindow(session: session, createsUsage: true)
     }
 
     private func scheduleIdleFailure(_ session: AgentTabSession, listener: ClaudeControllerEventListener, error: String) {
@@ -1921,10 +1950,11 @@ final class ClaudeAgentModeCoordinator {
                     return .superseded
                 }
                 let inputProof = await hostCapabilities.proveLocalInput(session, monitoring.claim)
-                if monitoring.claim?.localInput != nil {
-                    guard !Task.isCancelled, intentIsCurrent(intent, for: session),
-                          sessionOwnsClaudeController(controller, for: session)
-                    else { return .superseded }
+                guard !Task.isCancelled, intentIsCurrent(intent, for: session),
+                      sessionOwnsClaudeController(controller, for: session)
+                else {
+                    hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
+                    return .superseded
                 }
                 guard hostCapabilities.acquireAgentSessionLinkPhysicalDispatch(
                     session,

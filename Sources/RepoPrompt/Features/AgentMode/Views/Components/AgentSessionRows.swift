@@ -368,7 +368,7 @@ struct AgentSessionRow: View {
     }
 
     private var rowHorizontalPadding: CGFloat {
-        fontPreset.scaledClamped(10, max: 14)
+        AgentSidebarMetrics(preset: fontPreset).rowHorizontalPadding
     }
 
     private var rowVerticalPadding: CGFloat {
@@ -380,7 +380,7 @@ struct AgentSessionRow: View {
     }
 
     private var rowSpacing: CGFloat {
-        fontPreset.scaledClamped(8, max: 11)
+        AgentSidebarMetrics(preset: fontPreset).rowSpacing
     }
 
     private var titlePinSpacing: CGFloat {
@@ -1470,7 +1470,7 @@ struct AgentSessionRow: View {
             // glyph when an unseen background transition demands it.
             plateGlyph
         }
-        .frame(width: 16, height: 16)
+        .frame(width: AgentSidebarMetrics.statusPlateSize, height: AgentSidebarMetrics.statusPlateSize)
         .overlay(alignment: .bottomTrailing) {
             worktreeMarker
         }

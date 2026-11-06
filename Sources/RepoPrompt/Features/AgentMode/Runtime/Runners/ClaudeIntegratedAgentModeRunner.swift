@@ -754,7 +754,10 @@ final class ClaudeIntegratedAgentModeRunner {
                     await quotaService.observe(ClaudeCompatibleProviderRuntimeBridge.quotaObservation(from: info), lease: quotaLease, observedAt: Date())
                 }
             case let .runtimeInit(status):
-                claudeCoordinator.observeRuntimeInit(status, session: session)
+                // Only the window is recomputed, so usage provenance and vouches are left as they are.
+                if claudeCoordinator.observeRuntimeInit(status, session: session) {
+                    hooks.bindingObservation.updateBindings(session)
+                }
                 if status.isRepoPromptServerFailed {
                     return .failed(
                         errorText: ClaudeAgentModeCoordinator.mcpInitializationFailureMessage(sessionID: status.sessionID),

@@ -448,11 +448,11 @@ extension AgentModeViewModel {
         }
         let counts = agentSessionLinkCensusWorkspaceID == candidate.workspaceID
             ? agentSessionLinkSubagentCensus.counts(for: candidate.sessionID)
-            : .init()
+            : nil
         return Self.observationSnapshot(
             for: session,
             candidate: candidate,
-            subagentCounts: (running: counts.running, finished: counts.finished)
+            subagentCounts: counts.map { (running: $0.running, finished: $0.finished) }
         )
     }
 
@@ -747,7 +747,7 @@ extension AgentModeViewModel {
     static func observationSnapshot(
         for session: TabSession,
         candidate: AgentSessionLinkEndpointCandidate,
-        subagentCounts: (running: Int, finished: Int)
+        subagentCounts: (running: Int, finished: Int)?
     ) -> DomainAgentSessionObservationSnapshot {
         let projection = statusProjection(for: session)
         let blockers = sendBlockers(sendReadinessInputs(
@@ -781,7 +781,7 @@ extension AgentModeViewModel {
     static func laneBoard(
         for session: TabSession,
         blockers: [SendBlocker],
-        subagentCounts: (running: Int, finished: Int)
+        subagentCounts: (running: Int, finished: Int)?
     ) -> DomainAgentSessionLaneBoard {
         let runOutcome: DomainAgentSessionLaneBoard.RunOutcome = switch session.runState {
         case .idle: .none
@@ -801,8 +801,9 @@ extension AgentModeViewModel {
             runOutcome: runOutcome,
             failureReason: failureReason,
             sendBlockers: blockers.map(\.rawValue),
-            subagentRunning: subagentCounts.running,
-            subagentFinished: subagentCounts.finished
+            subagentRunning: subagentCounts?.running ?? 0,
+            subagentFinished: subagentCounts?.finished ?? 0,
+            subagentCountsKnown: subagentCounts != nil
         )
     }
 
