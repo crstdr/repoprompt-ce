@@ -1668,7 +1668,7 @@ struct AgentRunMCPToolService {
         if let raw = normalizedString(args["session_id"]), let sessionID = UUID(uuidString: raw),
            let child = agentModeVM.mcpControlledSession(sessionID: sessionID), child.isComputerUseChild, !child.runState.isActive
         {
-            computerUseProof = try captureComputerUseProof(owner: agentModeVM)
+            computerUseProof = try? captureComputerUseProof(owner: agentModeVM)
         }
         var computerUseAccepted = false
         defer {

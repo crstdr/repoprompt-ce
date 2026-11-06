@@ -147,7 +147,7 @@ final class ComputerUseChildRoutingTests: XCTestCase {
                 )))
             }
             service.testComputerUseConfiguration = { .init(enabled: true, modelID: "codexExec:gpt-6.1-sol-high", modelAvailable: true) }
-            service.testArmComputerUseChild = { _, _ in }
+            if !realStarter { service.testArmComputerUseChild = { _, _ in } }
             service.testBeforeProviderDispatch = { [self] in await beforeStartDispatch?() }
             service.testBeforeSteerDispatch = { [self] in await beforeSteerDispatch?() }
             if !realSteer {
@@ -255,6 +255,11 @@ final class ComputerUseChildRoutingTests: XCTestCase {
         }
 
         func finish() async {
+            beforeAdmission = nil
+            beforeMetadata = nil
+            beforeAuthorization = nil
+            beforeStartDispatch = nil
+            beforeSteerDispatch = nil
             if let catalog { await AppDomainRuntimeComposition.shared.unregister(catalog) }
             catalog = nil
             await AppDomainRuntimeComposition.shared.runtime.domainHost.debugSetBeforeProviderActivationForTesting(nil)
@@ -317,6 +322,60 @@ final class ComputerUseChildRoutingTests: XCTestCase {
                 await finishWindow()
                 await base.cleanup()
                 throw error
+            }
+        }
+    }
+
+    func testUnauthorizedSteerDoesNotDiscloseComputerUseDesignation() async throws {
+        try await withRoute { f in
+            let previousFullAccess = OverseerGlobalAutoApprove.isEnabled
+            defer { OverseerGlobalAutoApprove.isEnabled = previousFullAccess }
+            OverseerGlobalAutoApprove.isEnabled = { false }
+            f.parent.computerUseParentGrant = nil
+            let child = try await f.controlledChild(computerUse: false, parentID: f.visible.activeAgentSessionID)
+            let id = try XCTUnwrap(child.activeAgentSessionID)
+            var ordinaryResult: NSDictionary?
+            for computerUse in [false, true] {
+                child.purpose = computerUse ? "computerUse" : nil
+                let response = try await f.transport.callTool(name: "agent_run", arguments: [
+                    "op": "steer", "session_id": id.uuidString,
+                    "message": "Unauthorized fake steer", "wait": false, "_rawJSON": true
+                ])
+                XCTAssertTrue(response.rawJSON.contains("not available to this caller's scope"), response.rawJSON)
+                XCTAssertFalse(response.rawJSON.contains(ComputerUseChildProof.denied), response.rawJSON)
+                let envelope = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(response.rawJSON.utf8)) as? [String: Any])
+                let result = try XCTUnwrap(envelope["result"] as? NSDictionary)
+                if computerUse { XCTAssertEqual(result, ordinaryResult) }
+                else { ordinaryResult = result }
+            }
+            XCTAssertEqual(f.submissions, 0)
+            XCTAssertNil(child.computerUseChildProof)
+            XCTAssertNil(ComputerUseChildProof.holder)
+        }
+    }
+
+    func testNetworkIdleComputerUseSteerAcceptsOneFakeNativeTurn() async throws {
+        try await withRoute(realSteer: true, realStarter: true) { f in
+            let child = try await f.controlledChild()
+            let id = try XCTUnwrap(child.activeAgentSessionID)
+            let message = "Network idle CU steer accepted exactly once"
+            f.beforeSteerDispatch = { f.window.apiSettingsViewModel.isCodexConnected = true }
+            let response = try await f.transport.callTool(name: "agent_run", arguments: [
+                "op": "steer", "session_id": id.uuidString,
+                "message": message, "wait": false, "_rawJSON": true
+            ])
+            XCTAssertFalse(response.rawJSON.contains("\"isError\":true"), response.rawJSON)
+            try await AsyncTestWait.waitUntil("Network steer reaches fake native controller", timeout: 8) {
+                (child.codexController as? WedgeFakeCodexController)?.startedTurnCount == 1
+            }
+            let controller = try XCTUnwrap(child.codexController as? WedgeFakeCodexController)
+            XCTAssertEqual(controller.startedTurnCount, 1)
+            XCTAssertEqual(controller.startedTexts.count, 1)
+            XCTAssertTrue(controller.startedTexts[0].contains(message))
+            await f.vm.test_codexCoordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "network-steer-turn"), session: child, sourceController: controller)
+            await f.vm.test_codexCoordinator.test_handleCodexNativeEvent(.turnCompleted(turnID: "network-steer-turn", status: .completed), session: child, sourceController: controller)
+            try await AsyncTestWait.waitUntil("Completed network steer retires", timeout: 8) {
+                ComputerUseChildProof.holder == nil && controller.shutdownCount == 1
             }
         }
     }
