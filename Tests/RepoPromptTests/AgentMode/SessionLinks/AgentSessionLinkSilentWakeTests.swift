@@ -731,6 +731,7 @@ extension AgentSessionLinkRuntimeBridgeTests {
             autoWakeLanes: [.init(reference: reference, targetEndpoint: observer.domainEndpoint, targetSessionID: observer.sessionID, isEffectivelySelected: true)]
         )
         session.oversight.autoWakeOnUpdates = true
+        session.oversight.routineWakeIntervalEnabled = false
         // Hold reservation until the caller supplies the deterministic native transport.
         vm.agentSessionLinkPublishPassiveStatusNotices(queue, to: endpoint)
         let wake = try XCTUnwrap(session.oversight.pendingAutoWake)
