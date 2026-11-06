@@ -262,21 +262,19 @@ final class ComputerUseChildProof: Equatable {
     private func finishRetirement() -> Task<Void, Never> {
         if retirementTask == nil {
             let operation = retirementOperation
-            retirementTask = Task { @MainActor in await operation?() != false }
+            let creationTarget = creationTarget
+            retirementTask = Task { @MainActor [self] in
+                guard await operation?() != false else { return false }
+                if let creationTarget { return await owner.mcpDiscardSessionTarget(creationTarget) == .complete }
+                return true
+            }
         }
         return Task { @MainActor [self] in
-            // Cache native teardown, not a retryable discard result owned by the VM.
-            guard await retirementTask?.value == true else { return }
-            if let creationTarget, await owner.mcpDiscardSessionTarget(creationTarget) != .complete { return }
-            guard !producerActive else { return }
+            let retired = await retirementTask?.value
+            // Unknown rollback/teardown retains the slot; timeouts never unlock it.
+            guard retired == true, !producerActive else { return }
             release()
         }
-    }
-
-    func provisionalRecoveryDidComplete(_ claim: AgentProvisionalAdmissionClaim, owner: AgentModeViewModel) {
-        guard self.owner === owner, Self.holder === self, retiring,
-              creationTarget?.recoveryClaim === claim, claim.state == .complete else { return }
-        finishRetirement()
     }
 
     @discardableResult
