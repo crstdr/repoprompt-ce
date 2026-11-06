@@ -690,7 +690,6 @@ extension AgentSessionLinkRuntimeBridgeTests {
         observerSession.selectedAgent = .openCode
         observerSession.hasLoadedPersistedState = true
         observerSession.oversight.autoWakeOnUpdates = true
-        observerSession.oversight.routineWakeIntervalEnabled = false
         let observerID = try installRestoredFixtureBinding(observerSession, in: observerVM)
         let observer = try XCTUnwrap(observerVM.agentSessionLinkCandidate(tabID: observerTab, sessionID: observerID, tabName: "Observer", isWindowClosing: false))
         let host = FakeEndpointHost()
@@ -732,6 +731,7 @@ extension AgentSessionLinkRuntimeBridgeTests {
             autoWakeLanes: [.init(reference: reference, targetEndpoint: observer.domainEndpoint, targetSessionID: observer.sessionID, isEffectivelySelected: true)]
         )
         session.oversight.autoWakeOnUpdates = true
+        session.oversight.routineWakeIntervalEnabled = false
         // Hold reservation until the caller supplies the deterministic native transport.
         vm.agentSessionLinkPublishPassiveStatusNotices(queue, to: endpoint)
         let wake = try XCTUnwrap(session.oversight.pendingAutoWake)
