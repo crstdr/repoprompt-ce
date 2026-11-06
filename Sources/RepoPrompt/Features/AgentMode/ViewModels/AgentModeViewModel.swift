@@ -13401,8 +13401,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     }
 
-    private func withMCPInstructionSubmission<T>(session: TabSession, workflow: AgentWorkflowDefinition?, proof: ComputerUseChildProof?, operation: () -> T) throws -> T {
-        if session.isComputerUseChild, let proof {
+    private func withMCPInstructionSubmission(session: TabSession, workflow: AgentWorkflowDefinition?, proof: ComputerUseChildProof?, operation: () -> UserTurnSubmissionResult) throws -> UserTurnSubmissionResult {
+        if session.isComputerUseChild {
+            guard let proof else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
             return try proof.withInstructionSubmission(session) { withMCPWorkflowOverride(session: session, workflow: workflow, operation: operation) }
         }
         return withMCPWorkflowOverride(session: session, workflow: workflow, operation: operation)
@@ -13521,10 +13522,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 session.isMCPInstructionDispatchInProgress = false
             }
             try requireMCPControlOwnership(sessionID: sessionID, expectedContext: expectedControlContext)
-            if session.isComputerUseChild {
-                guard let computerUseProof else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
-                try computerUseProof.markInstructionDispatch(session)
-            }
             submission = try withMCPInstructionSubmission(session: session, workflow: workflow, proof: computerUseProof) {
                 if let nativePreparedTurn {
                     return submitPreparedUserTurn(

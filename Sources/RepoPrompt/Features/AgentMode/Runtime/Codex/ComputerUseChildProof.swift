@@ -56,12 +56,12 @@ final class ComputerUseRunRouteFence: @unchecked Sendable {
     }
 
     @MainActor
-    func withInstructionSubmission<T>(_ submit: () throws -> T) throws -> T {
+    func withInstructionSubmission(_ submit: () throws -> AgentModeViewModel.UserTurnSubmissionResult) throws -> AgentModeViewModel.UserTurnSubmissionResult {
         try requireCurrent()
         return try lock.withLock {
             guard valid, !submitted, !Task.isCancelled else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
             let result = try submit()
-            submitted = true
+            submitted = result == .submitted
             return result
         }
     }
@@ -137,8 +137,8 @@ final class ComputerUseChildProof: Equatable {
         try runRouteFence?.requireCurrent()
     }
 
-    func withInstructionSubmission<T>(_ session: AgentTabSession, _ submit: () throws -> T) throws -> T {
-        @MainActor func operation() throws -> T {
+    func withInstructionSubmission(_ session: AgentTabSession, _ submit: () throws -> AgentModeViewModel.UserTurnSubmissionResult) throws -> AgentModeViewModel.UserTurnSubmissionResult {
+        @MainActor func operation() throws -> AgentModeViewModel.UserTurnSubmissionResult {
             try markInstructionDispatch(session)
             return try submit()
         }

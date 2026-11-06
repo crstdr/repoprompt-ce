@@ -132,7 +132,10 @@ final class ComputerUseChildRoutingTests: XCTestCase {
                         XCTAssertEqual(child.selectedReasoningEffortRaw, "high")
                         let proof = try XCTUnwrap(child.computerUseChildProof)
                         try await beforeAdmission?()
-                        try proof.withInstructionSubmission(child) { submissions += 1 }
+                        _ = try proof.withInstructionSubmission(child) {
+                            submissions += 1
+                            return .submitted
+                        }
                     } else {
                         submissions += 1
                     }
@@ -157,7 +160,10 @@ final class ComputerUseChildRoutingTests: XCTestCase {
                     try await beforeAdmission?()
                     if child.isComputerUseChild {
                         let proof = try XCTUnwrap(child.computerUseChildProof)
-                        try proof.withInstructionSubmission(child) { submissions += 1 }
+                        _ = try proof.withInstructionSubmission(child) {
+                            submissions += 1
+                            return .submitted
+                        }
                     } else {
                         submissions += 1
                     }
@@ -279,7 +285,7 @@ final class ComputerUseChildRoutingTests: XCTestCase {
         }
     }
 
-    private func withRoute(provider: AgentProviderKind = .claudeCode, install: Bool = true, realSteer: Bool = false, realStarter: Bool = false, _ body: (RouteFixture) async throws -> Void) async throws {
+    private func withRoute(provider: AgentProviderKind = .claudeCode, install: Bool = true, realSteer: Bool = false, realStarter: Bool = false, controllerFactory: WedgeControllerFactory? = nil, _ body: (RouteFixture) async throws -> Void) async throws {
         try await MCPSharedServerTestLease.shared.withLease { lease in
             let base = try await PersistentMCPTestFixture.make(lease: lease, domainRuntime: AppDomainRuntimeComposition.shared.runtime)
             var route: RouteFixture?
@@ -291,7 +297,7 @@ final class ComputerUseChildRoutingTests: XCTestCase {
             }
             do {
                 if realStarter {
-                    let factory = WedgeControllerFactory(plans: [[.success("child-thread")]])
+                    let factory = controllerFactory ?? WedgeControllerFactory(plans: [[.success("child-thread")]])
                     let window = WindowState(agentModeViewModelFactory: { id, prompt, manager, server in
                         let vm = AgentModeViewModel(
                             testWindowID: id, shouldManageCodexTooling: false,
@@ -395,11 +401,14 @@ final class ComputerUseChildRoutingTests: XCTestCase {
             XCTAssertEqual(controller.startedTurnCount, 1)
             XCTAssertEqual(controller.startedTexts.count, 1)
             XCTAssertTrue(controller.startedTexts[0].contains(message))
+            try await f.installRoute(replacement: true)
             await f.vm.test_codexCoordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "network-steer-turn"), session: child, sourceController: controller)
             await f.vm.test_codexCoordinator.test_handleCodexNativeEvent(.turnCompleted(turnID: "network-steer-turn", status: .completed), session: child, sourceController: controller)
             try await AsyncTestWait.waitUntil("Completed network steer retires", timeout: 8) {
                 ComputerUseChildProof.holder == nil && controller.shutdownCount == 1
             }
+            XCTAssertEqual(controller.startedTurnCount, 1)
+            XCTAssertEqual(controller.shutdownCount, 1)
         }
     }
 
@@ -505,6 +514,66 @@ final class ComputerUseChildRoutingTests: XCTestCase {
                         ComputerUseChildProof.holder == nil && controller.shutdownCount == 1
                     }
                 }
+            }
+        }
+    }
+
+    func testRealStarterRefusalAfterConfiguredSaveRollsBackAndAllowsRetry() async throws {
+        let factory = WedgeControllerFactory(plans: [[.success("retry-thread")]])
+        try await withRoute(realStarter: true, controllerFactory: factory) { f in
+            var child: AgentTabSession?
+            var childID: UUID?
+            var candidate: ComputerUseRunRouteFence?
+            f.vm.test_afterConfiguredCreationAcknowledgement = { handle in
+                child = handle.session
+                childID = handle.bindingToken.bindingIdentity.sessionID
+                do {
+                    let workspace = try XCTUnwrap(f.window.workspaceManager.activeWorkspace)
+                    let saved = try await AgentSessionDataService.shared.loadAgentSession(id: handle.bindingToken.bindingIdentity.sessionID, for: workspace)
+                    XCTAssertEqual(saved?.purpose, "computerUse")
+                    XCTAssertEqual(f.vm.test_outstandingProvisionalMCPSessionTargetCount, 1)
+                } catch { XCTFail("Configured acknowledgement: \(error)") }
+            }
+            f.beforeAdmission = {
+                candidate = MCPInvocationContextBridge.current?.dispatchAuthorization?.windowIdentity?.computerUseRunRouteCandidate
+                let rejectedChild = try XCTUnwrap(child)
+                rejectedChild.hasLoadedPersistedState = false
+            }
+            let response = try await f.transport.callTool(name: "agent_run", arguments: start)
+            XCTAssertTrue(response.rawJSON.contains(ComputerUseChildProof.denied), response.rawJSON)
+            XCTAssertEqual(f.startEntries, 1)
+            XCTAssertEqual(f.submissions, 0)
+            XCTAssertFalse(try XCTUnwrap(candidate).hasSubmitted)
+            XCTAssertEqual(factory.controllers.reduce(0) { $0 + $1.startedTurnCount }, 0)
+            let rejectedChild = try XCTUnwrap(child)
+            let rejectedID = try XCTUnwrap(childID)
+            try await AsyncTestWait.waitUntil("Refused persisted CU start rolls back", timeout: 8) {
+                f.vm.test_outstandingProvisionalMCPSessionTargetCount == 0
+                    && f.vm.test_pendingMCPSessionTargetDiscardCount == 0 && ComputerUseChildProof.holder == nil
+            }
+            XCTAssertNil(f.vm.sessions[rejectedChild.tabID])
+            XCTAssertNil(f.vm.sessionIndex[rejectedID])
+            let workspace = try XCTUnwrap(f.window.workspaceManager.activeWorkspace)
+            XCTAssertFalse(workspace.composeTabs.contains { $0.id == rejectedChild.tabID || $0.activeAgentSessionID == rejectedID })
+            let saved = try await AgentSessionDataService.shared.loadAgentSession(id: rejectedID, for: workspace)
+            XCTAssertNil(saved)
+            let children = try await AgentSessionDataService.shared.computerUseChildIDs(for: XCTUnwrap(f.parent.activeAgentSessionID), workspace: workspace)
+            XCTAssertEqual(children, [])
+            f.beforeAdmission = nil
+            f.vm.test_afterConfiguredCreationAcknowledgement = nil
+            let retry = try await f.transport.callTool(name: "agent_run", arguments: start)
+            XCTAssertFalse(retry.rawJSON.contains("\"isError\":true"), retry.rawJSON)
+            XCTAssertEqual(f.startEntries, 2)
+            XCTAssertEqual(f.submissions, 1)
+            let retryChild = try XCTUnwrap(ComputerUseChildProof.holder?.child)
+            try await AsyncTestWait.waitUntil("Retry reaches fake native controller", timeout: 8) {
+                factory.controllers.reduce(0) { $0 + $1.startedTurnCount } == 1
+            }
+            let controller = try XCTUnwrap(retryChild.codexController as? WedgeFakeCodexController)
+            await f.vm.test_codexCoordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "refused-retry-turn"), session: retryChild, sourceController: controller)
+            await f.vm.test_codexCoordinator.test_handleCodexNativeEvent(.turnCompleted(turnID: "refused-retry-turn", status: .completed), session: retryChild, sourceController: controller)
+            try await AsyncTestWait.waitUntil("Successful retry retires before fixture teardown", timeout: 8) {
+                ComputerUseChildProof.holder == nil && controller.shutdownCount == 1
             }
         }
     }
