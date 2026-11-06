@@ -557,10 +557,11 @@ final class ClaudeAgentModeCoordinator {
             tokenEstimator: { TokenCalculationService.estimateTokens(for: $0) },
             contextUsageBuilder: { AgentModeViewModel.contextUsageFromClaudeProviderTokens($0, modelContextWindow: $1) }
         )
-        return estimator.ingestUsageSignal(
+        let snapshot = estimator.ingestUsageSignal(
             promptTokens: nil, completionTokens: nil, contextUsedTokens: nil,
             modelContextWindow: nil, session: session
-        ) || changed
+        )
+        return snapshot != nil || changed
     }
 
     private func scheduleIdleFailure(_ session: AgentTabSession, listener: ClaudeControllerEventListener, error: String) {
