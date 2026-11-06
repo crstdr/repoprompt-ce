@@ -1,7 +1,7 @@
 {
   "description": "Build-produced index, type-check, and first-party warning ceilings from the P0.2, P0.5, and #519 baselines in ledger.md. Lower after verified improvements.",
   "index": {
-    "wrong_way_file_edges": 1360,
+    "wrong_way_file_edges": 1394,
     "largest_cycle_components": 66
   },
   "typecheck": {

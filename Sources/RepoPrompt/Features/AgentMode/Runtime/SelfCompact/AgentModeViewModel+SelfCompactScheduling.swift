@@ -308,7 +308,7 @@ extension AgentModeViewModel {
                 await self?.agentSessionLinkCompactSupport(for: session) ?? .notSupported
             },
             dispatch: { [weak self] requestID, support, stillAdmissible in
-                guard let self else { return false }
+                guard let self else { return .refused(.viewModelDeallocated) }
                 return await agentSelfCompactDispatchNative(
                     requestID: requestID,
                     session: session,
@@ -363,13 +363,15 @@ extension AgentModeViewModel {
         session: TabSession,
         support: AgentSessionLinkCompactSupport,
         stillAdmissible: @escaping @MainActor () -> Bool
-    ) async -> Bool {
-        guard let owner = session.selfCompactState.active?.owner,
-              stillAdmissible(),
-              let target = makeComposerSubmitTarget(tabID: owner.tabID, session: session),
-              target.route == .existingAgentSession,
-              target.expectedSourceAgentSessionID == owner.sessionID
-        else { return false }
+    ) async -> AgentSelfCompactDiagnostics.CompactDispatchOutcome {
+        guard let owner = session.selfCompactState.active?.owner
+        else { return .refused(.ownerMissing) }
+        guard stillAdmissible() else { return .refused(.stillAdmissibleLost) }
+        guard let target = makeComposerSubmitTarget(tabID: owner.tabID, session: session)
+        else { return .refused(.submitTargetUnavailable) }
+        guard target.route == .existingAgentSession else { return .refused(.targetRouteMismatch) }
+        guard target.expectedSourceAgentSessionID == owner.sessionID
+        else { return .refused(.targetSessionMismatch) }
         session.selfCompactDispatchIsCurrent = { [weak self, weak session] in
             guard let self, let session else { return false }
             return agentSelfCompactOwnerIsCurrent(owner, session: session)
@@ -379,15 +381,32 @@ extension AgentModeViewModel {
         )
         guard case let .claimed(claim) = claimComposerSubmitAttempt(
             attempt, requireActiveTabOwnership: false
-        ) else { return false }
+        ) else { return .refused(.composerClaimRefused) }
         defer { releaseComposerSubmitClaim(claim) }
 
+        var lastBlocker = AgentSelfCompactDiagnostics.CompactDispatchBlocker.unknown
         let ready: @MainActor () -> Bool = { [weak self] in
-            guard let self, stillAdmissible(), composerSubmitClaimIsCurrent(claim),
-                  !Self.agentSessionLinkCompactHasQueuedProviderWork(session),
-                  workspaceManager?.activeWorkspace?.id == owner.workspaceID
-            else { return false }
-            return AgentSessionLinkDeliveryReadiness.evaluate(
+            guard let self else {
+                lastBlocker = .viewModelDeallocated
+                return false
+            }
+            guard stillAdmissible() else {
+                lastBlocker = .stillAdmissibleLost
+                return false
+            }
+            guard composerSubmitClaimIsCurrent(claim) else {
+                lastBlocker = .composerClaimLost
+                return false
+            }
+            guard !Self.agentSessionLinkCompactHasQueuedProviderWork(session) else {
+                lastBlocker = .queuedProviderWork
+                return false
+            }
+            guard workspaceManager?.activeWorkspace?.id == owner.workspaceID else {
+                lastBlocker = .workspaceMismatch
+                return false
+            }
+            let decision = AgentSessionLinkDeliveryReadiness.evaluate(
                 snapshot: Self.agentSessionLinkDeliveryReadinessSnapshot(
                     session: session,
                     endpointMatchesGrant: agentSelfCompactOwnerIsCurrent(owner, session: session),
@@ -395,9 +414,13 @@ extension AgentModeViewModel {
                     ignoresComposerSubmissionInFlight: true,
                     ignoresSelfCompactRequestID: requestID
                 )
-            ) == .ready
+            )
+            if case let .blocked(reason) = decision {
+                lastBlocker = .readiness(reason)
+            }
+            return decision == .ready
         }
-        guard ready() else { return false }
+        guard ready() else { return .refused(lastBlocker) }
 
         // The fixed system row and attempt state are saved before any native command. The note
         // itself is never written to provider-replayed row text.
@@ -410,9 +433,14 @@ extension AgentModeViewModel {
                 _ = session.removeItem(at: index)
             }
             _ = await flushSaveRequired(for: owner.tabID, workspaceID: owner.workspaceID)
-            return false
+            return .refused(.saveFailed)
         }
-        guard ready() else { return false }
+        guard ready() else {
+            if case let .readiness(reason) = lastBlocker {
+                return .refused(.readinessRecheck(reason))
+            }
+            return .refused(lastBlocker)
+        }
         var state = session.selfCompactState
         state.active?.compactProviderConversation = support == .codex
             ? session.codexConversationID : session.providerSessionID
@@ -426,7 +454,11 @@ extension AgentModeViewModel {
             isStillAdmissible: ready,
             selfCompactDispatchID: .init(requestID: requestID, stage: .compact)
         )
-        return result == .started
+        return switch result {
+        case .started: .started
+        case .notStarted: .refused(.nativeNotStarted)
+        case .startFailed: .refused(.nativeStartFailed)
+        }
     }
 
     private func agentSelfCompactNativeCompletion(

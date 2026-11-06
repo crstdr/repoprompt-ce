@@ -579,6 +579,35 @@ import XCTest
         }
 
         func testExhaustedOuterEnvelopeSkipsGraceAndDiagnosesBeforeForceDisconnect() async throws {
+            for elapsed in [Duration.seconds(10), .seconds(40)] {
+                let delayedNow = AdmissionDeadlineNowSequence(beforeExpiryCalls: 1, expiry: elapsed)
+                let heldOperation = ExportContractUncooperativeGate()
+                let sleeps = PR4AdmissionSettlementCounter()
+                let environment = MCPToolExecutionWatchdogEnvironment(
+                    now: { delayedNow.value() },
+                    sleep: { duration in
+                        sleeps.record()
+                        XCTAssertEqual(duration, max(.zero, .seconds(30) - elapsed))
+                    }
+                )
+                do {
+                    let _: Int = try await MCPToolExecutionWatchdog.execute(
+                        deadline: .seconds(30), cancellationGrace: .zero, environment: environment
+                    ) {
+                        await heldOperation.wait()
+                        return 42
+                    }
+                    XCTFail("Expected deadline escalation")
+                } catch let error as MCPToolExecutionWatchdogError {
+                    XCTAssertEqual(error, .cleanupUnresponsive)
+                } catch {
+                    await heldOperation.release()
+                    throw error
+                }
+                XCTAssertEqual(sleeps.value(), 1)
+                await heldOperation.release()
+            }
+
             let clock = MCPExportWatchdogManualClock()
             let events = ExportContractEventRecorder()
             let operationGate = ExportContractUncooperativeGate()

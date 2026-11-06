@@ -178,13 +178,14 @@ final class AgentSidebarActiveRowActions {
     func handleSelectionGesture(
         _ gesture: AgentSidebarSelectionGesture,
         model: AgentSidebarActiveRowModel
-    ) -> AgentSidebarSelectionGestureDisposition {
+    ) -> AgentSidebarSelectionGestureResult {
         guard let agentModeVM else { return .ignored }
         return agentModeVM.handleSidebarSelectionGesture(
             gesture,
             identity: model.identity,
             renderedOrder: renderedSelectionOrder,
-            workspaceID: model.workspaceID
+            workspaceID: model.workspaceID,
+            rowID: model.session.id
         )
     }
 
@@ -334,6 +335,12 @@ struct AgentSidebarActiveRow: View, Equatable {
             isSelected: model.isSelected,
             showsSelectionPresentation: model.showsSelectionPresentation,
             isInteractionEnabled: model.isInteractionEnabled,
+            tapRowID: session.id,
+            tapSelectionCount: actions.agentModeVM?.ui.sessionSidebar.selectionState.selectedIdentities.count ?? 0,
+            tapWorkspaceMatched: AgentSidebarTapWorkspaceGate.evaluate(
+                sidebarWorkspaceID: model.workspaceID,
+                activeWorkspaceID: actions.agentModeVM?.workspaceManager?.activeWorkspaceID
+            ).workspaceMatched,
             commandProgressKind: model.commandProgressKind,
             onSelectionGesture: { gesture in actions.handleSelectionGesture(gesture, model: model) },
             onSelect: { actions.select(model) },
@@ -369,6 +376,12 @@ struct AgentSidebarActiveRow: View, Equatable {
             onCopySessionID: copySessionIDAction,
             resolveSidebarOversightSummary: resolveSummary,
             resolveSidebarOversightMenu: resolveMenu,
+            diagnoseSidebarOversightMenuUnavailable: {
+                _ = actions.agentModeVM?.agentSidebarOversightMenuProps(
+                    tabID: session.tabID, expectedSessionID: session.sessionID,
+                    diagnoseUnavailable: true
+                )
+            },
             prepareSidebarOversightMenu: { actions.prepareOversight(model) },
             sidebarOversightUnavailableReason: session.sessionID == nil
                 ? AgentOversightUICopy.oversightAvailableAfterFirstMessage

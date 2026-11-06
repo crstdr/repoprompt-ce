@@ -67,6 +67,11 @@ struct AgentPermissionCapabilitySummaryBuilder {
                 warnings = sandboxMode == .dangerFullAccess
                     ? ["Sandbox is Danger Full Access — agents can modify files outside the workspace."]
                     : []
+            case .computerUseChild:
+                bash = profile.codexBashToolEnabled(userConfigured: false)
+                approval = profile.codexApprovalPolicy.displayName
+                sandbox = profile.codexSandboxMode.displayName
+                warnings = []
             case .mcpSafeDefaults:
                 let level = CodexAgentToolPreferences.PermissionLevel.autoReview
                 bash = true
@@ -88,10 +93,10 @@ struct AgentPermissionCapabilitySummaryBuilder {
                 isAvailable: isAvailable,
                 fileMutation: "Sandbox: \(sandbox)",
                 shell: bash ? "Bash enabled" : "Bash disabled",
-                externalMCP: safeManaged
+                externalMCP: profile.codexSuppressesThirdPartyMCPServers
                     ? "Third-party MCP: suppressed"
                     : "Third-party MCP: per-server (off by default)",
-                search: CodexAgentToolPreferences.searchToolEnabled(defaults: defaults)
+                search: profile != .computerUseChild && CodexAgentToolPreferences.searchToolEnabled(defaults: defaults)
                     ? "Web search allowed"
                     : "Web search disabled",
                 approvalModeDescription: "Approval: \(approval)",
@@ -111,7 +116,7 @@ struct AgentPermissionCapabilitySummaryBuilder {
                 warnings = level == .fullAccess
                     ? ["Permission mode is Full Access — tools run without approval."]
                     : []
-            case .mcpSafeDefaults:
+            case .mcpSafeDefaults, .computerUseChild:
                 permissionMode = ClaudeAgentToolPreferences.PermissionLevel.requireApproval.displayName
                 bash = false
                 strict = true
@@ -211,7 +216,7 @@ struct AgentPermissionCapabilitySummaryBuilder {
         case .devin:
             let level = devinPermissionLevel(profile: profile)
             let warnings = level.isWarning
-                ? ["Devin launches with `--permission-mode dangerous` — its tools run without approval prompts."]
+                ? ["Devin runs in its Bypass mode — its tools run without approval prompts."]
                 : []
             return AgentPermissionCapabilitySummary(
                 providerID: providerID,
@@ -262,6 +267,8 @@ struct AgentPermissionCapabilitySummaryBuilder {
         switch profile {
         case .userConfigured:
             CodexAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
+        case .computerUseChild:
+            profile.codexPermissionLevel()
         case .mcpSafeDefaults:
             .autoReview
         case let .providerOverride(.codex(level)):
@@ -275,7 +282,7 @@ struct AgentPermissionCapabilitySummaryBuilder {
         switch profile {
         case .userConfigured:
             ClaudeAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
-        case .mcpSafeDefaults:
+        case .mcpSafeDefaults, .computerUseChild:
             .requireApproval
         case let .providerOverride(.claude(level)):
             level
@@ -288,7 +295,7 @@ struct AgentPermissionCapabilitySummaryBuilder {
         switch profile {
         case .userConfigured:
             OpenCodeAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
-        case .mcpSafeDefaults:
+        case .mcpSafeDefaults, .computerUseChild:
             .managedDefault
         case let .providerOverride(.openCode(level)):
             level
@@ -301,7 +308,7 @@ struct AgentPermissionCapabilitySummaryBuilder {
         switch profile {
         case .userConfigured:
             CursorAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
-        case .mcpSafeDefaults:
+        case .mcpSafeDefaults, .computerUseChild:
             .managedDefault
         case let .providerOverride(.cursor(level)):
             level
@@ -314,7 +321,7 @@ struct AgentPermissionCapabilitySummaryBuilder {
         switch profile {
         case .userConfigured:
             GrokBuildAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
-        case .mcpSafeDefaults:
+        case .mcpSafeDefaults, .computerUseChild:
             .managedDefault
         case let .providerOverride(.grokBuild(level)):
             level
@@ -336,7 +343,7 @@ struct AgentPermissionCapabilitySummaryBuilder {
         switch profile {
         case .userConfigured:
             AntigravityAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
-        case .mcpSafeDefaults:
+        case .mcpSafeDefaults, .computerUseChild:
             .autoEdit
         case let .providerOverride(.antigravity(level)):
             level

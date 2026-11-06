@@ -34,9 +34,12 @@ final class CursorRuntimeCatalogTests: XCTestCase {
             for: .cursor
         ))
         let availability = AgentModelCatalog.AvailabilityContext(cursorAvailable: true)
-        XCTAssertEqual(AgentModelCatalog.options(for: .cursor, availability: availability), [model])
+        let projected = AgentModelCatalog.options(for: .cursor, availability: availability)
+        XCTAssertEqual(projected.map(\.rawValue), [AgentModel.cursorAuto.rawValue, model.rawValue])
+        XCTAssertEqual(projected.last?.displayName, model.displayName)
+        XCTAssertEqual(projected.last?.description, "Available through Cursor Agent.")
         XCTAssertTrue(AgentModelCatalog.isValid(rawModel: model.rawValue, for: .cursor, availability: availability))
-        XCTAssertEqual(ACPAIModelCatalog.cursorModelsFromStore().map(\.modelName), [model.rawValue])
+        XCTAssertEqual(ACPAIModelCatalog.cursorModelsFromStore().map(\.modelName), [AgentModel.cursorAuto.rawValue, model.rawValue])
         XCTAssertEqual(try XCTUnwrap(CursorAIModelCatalog.parameterSet(for: model.rawValue)).parameters, [definition])
         let unsupportedPin = ACPModelParameterSelection(
             providerID: .cursor,
@@ -98,7 +101,7 @@ final class CursorRuntimeCatalogTests: XCTestCase {
         XCTAssertEqual(clearedIdentity, selectedPin?.identity)
     }
 
-    func testExactAdvertisedAliasKeepsItsOwnParameterIdentity() {
+    func testAdvertisedHistoricalAliasKeepsStableCanonicalParameterIdentity() {
         let raws = ["grok-4.6", "cursor-grok-4.6"]
         _ = AgentACPModelRegistry.shared.updateDiscoveredModels(
             .init(
@@ -115,11 +118,35 @@ final class CursorRuntimeCatalogTests: XCTestCase {
                 }
             ), for: .cursor
         )
-        XCTAssertNotEqual(
+        XCTAssertEqual(
             ACPModelParameterIdentity(providerID: .cursor, baseModelRaw: raws[0], kind: .thinking),
             ACPModelParameterIdentity(providerID: .cursor, baseModelRaw: raws[1], kind: .thinking)
         )
-        XCTAssertEqual(ACPModelParameterResolver.parameterSet(providerID: .cursor, selectedModelRaw: raws[1])?.parameters.first?.configID, raws[1])
+        let canonical = ACPModelParameterResolver.parameterSet(providerID: .cursor, selectedModelRaw: raws[0])
+        XCTAssertEqual(ACPModelParameterResolver.parameterSet(providerID: .cursor, selectedModelRaw: raws[1]), canonical)
+        XCTAssertEqual(canonical?.parameters.first?.configID, raws.sorted().first)
+    }
+
+    func testBracketIdentityIsStableAcrossAdvertisementAndAutoNeverExposesParameters() {
+        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
+        let raw = "future-model[effort=high]"
+        let cold = ACPModelParameterIdentity(providerID: .cursor, baseModelRaw: raw, kind: .thinking)
+        let definition = ACPModelParameterDefinition(
+            kind: .thinking, configID: "effort", displayName: "Effort",
+            choices: [.init(rawValue: "high", displayName: "High")], currentValueRaw: "high"
+        )
+        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(
+            .init(
+                options: [raw, "default"].map { .init(rawValue: $0, displayName: $0, description: nil, isDefault: false) },
+                currentModelRaw: raw,
+                modelParameterSets: [raw, "default"].map { .init(baseModelRaw: $0, parameters: [definition]) }
+            ), for: .cursor
+        )
+        let warm = ACPModelParameterIdentity(providerID: .cursor, baseModelRaw: raw, kind: .thinking)
+        XCTAssertEqual(warm, cold)
+        XCTAssertEqual(warm.canonicalBaseModelRaw, "future-model")
+        XCTAssertNil(ACPModelParameterResolver.parameterSet(providerID: .cursor, selectedModelRaw: "auto"))
+        XCTAssertNil(ACPModelParameterResolver.parameterSet(providerID: .cursor, selectedModelRaw: "default"))
     }
 
     func testLegacyAbsenceAndCompleteEmptyMetadataRemainDistinctAcrossPersistence() throws {

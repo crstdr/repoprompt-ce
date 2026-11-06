@@ -524,6 +524,20 @@ fences remain in place without importing a native pre-discovery requirement into
 Catalog observations and `tools/list_changed` remain discovery/usability signals, not authority.
 Role-sized advertisement and explicit session-local activation change discovery, not target grants.
 
+## Same-process window reopen
+
+Window close still revokes live authority, leases, queues, and wakes. Before teardown, the runtime
+bridge captures only reference-backed saved pairs in the existing launch coordinator. Its current
+parked reference owns restoration or an already-admitted Unlink; historical closed references only
+fence late cleanup. Exact endpoints, durable token, and assertion generation fence both paths.
+Parking survives transient hydration and sequential closes until a valid restoration proof enters
+the ordinary establishment path. Unlink and committed deletion forget intent; failed removal uses
+the existing cleanup warning/retry. Parking is process-local, preserves no capabilities, and adds no
+UI or MCP state; cold launch keeps its existing restoration policy.
+Hydration need is derived from current readiness on existing reconciliation events; the loader owns
+loaded/in-flight deduplication. Queued passive work must still match its complete discovery owner and
+persisted descriptor before admission, so an abandoned request cannot suppress successor recovery.
+
 ## Configuration-only model selection
 
 `set_model(session_id, model_id)` requires the exact original **Manage** lease and a fully idle,
@@ -678,6 +692,31 @@ selection state and the exact lane's snooze without mutating any of them. Select
 may retract a routine pre-dispatch attempt, but not an exact live attention-backed attempt. Unlink,
 revocation, and every other hard gate still retract either kind. No control claims to cancel a
 physical provider call already in flight.
+
+## Sidebar creator names are UI-only settled presentation
+
+Active and archived creator rows use settled UI names plus known-tab/session provenance reads and
+the owner-valid index, without walking the target menu's lifecycle identity. A hydrated live nil
+creator suppresses stale indexed provenance, while a fresh unhydrated creator remains readable before
+index publication. Neither row discovers candidates or searches unrelated live sessions.
+
+The bridge derives live display names on binding/readiness/topology changes. The workspace array's
+mutation owner compares the active cohort's tab/session/name tuples, including reload/sync replacements;
+name-only changes update that UI snapshot synchronously without reconstructing provider/location
+candidates. Effective name changes also schedule a coalesced presentation-only repaint for live menus,
+whose linked/available peers and inbound labels use those names. Publication uses the existing
+exact-projection storage transaction, including a changed name signal for archived/unlinked consumers
+when exact props are equal. Late monitor publication
+re-resolves creator provenance and names against the current settled source. This changes no grants,
+prompt inventory, passive delivery, or Auto-wake policy.
+
+Live first-match `resolvedDisplayName` wins for duplicate session UUIDs; descriptive UUID lookup never
+selects an action endpoint. Up to 4,096 last-known display names are retained in launch-local memory,
+including a rename immediately followed by source removal/close. A later settled non-live source
+rename/reload updates only already-known retained names, never overriding a live first match or
+creating membership. Committed deletion prunes them.
+There is no new persisted state: after restart (or retention eviction), a non-live creator falls back
+to the requesting workspace's valid indexed name, then its compact UUID.
 
 ## Exact projection is presentation truth
 
@@ -1089,6 +1128,32 @@ immutable rendered batch by the provider produces a receipt. Attention is occurr
 stale or out-of-order receipt cannot clear a successor occurrence, an unaccepted batch leaves the
 occurrence pending, and a target may request attention again after the previous occurrence is
 receipted.
+
+### Observed user waits use the same attention owner
+
+The reducer also offers an attention occurrence when an established lane enters a deterministic user
+wait. Its immutable reason is `needsUser`; explicit requests retain `requestedAttention`. Public
+`pendingInteractionKind` supplies pending approval, permission, review, question and input evidence,
+including on links without Manage. Hook review and a live instruction wait require one supplementary
+bit in the existing private `runFacts` publication. The instruction predicate requires the waiting run
+state, continuation and wait ID together. A waiting status or prompt string alone is insufficient.
+The reducer extracts that bit before processing counters-only quiet proof, so ordinary status
+coalescing, fingerprints and receipts keep their existing behavior. Unknown proof stays unknown.
+
+First observations, restored lanes and recovery of unknown supplementary evidence baseline silently.
+A public pending edge works even without private facts. Replacing one wait with another without a
+sampled gap does not create another occurrence. Each observer has its own occurrence under its exact
+link, admission gates and receipt. Each reason uses the existing exception to routine selection,
+exact-lane snooze and interval admission. These settings retain their saved values. Inspection and
+prompt responses require their existing capabilities and user instructions.
+
+The same first-wins slot and sixteen-occurrence capacity apply. A later explicit request coalesced
+behind `needsUser` does not convert its reason. Acceptance or an observed wait exit removes that item;
+a pending explicit request survives wait exit. Capacity misses are not retried when space opens, and
+unobserved exit/re-entry is not reconstructed. The renderer uses `<needs_user>` without `requested_at`
+and explains the wait at `observed_at`, rather than claiming the lane requested attention. A frozen
+claim may lag resolution until retirement is published. Physical acquisition checks the exact
+rendered occurrence against the published queue. Provider acceptance uses the existing receipt rules.
 
 `set_waiting_on` is related context, not part of the attention transaction. It is optional,
 self-scoped and session-global, shared with every linked observer, mutable, and published non-atomically

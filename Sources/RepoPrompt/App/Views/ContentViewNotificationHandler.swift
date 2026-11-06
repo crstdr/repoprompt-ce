@@ -97,6 +97,10 @@ private struct SettingsNotificationHandler: ViewModifier {
                 guard noteTargetsCurrentWindow(note) else { return }
                 openSettings(tab: .cliProviders)
             }
+            .onReceive(NotificationCenter.default.publisher(for: .showComputerUseSettingsTab)) { note in
+                guard noteTargetsCurrentWindow(note) else { return }
+                openSettings(tab: .computerUse)
+            }
             .onReceive(NotificationCenter.default.publisher(for: .showAgentModeSettingsTab)) { note in
                 guard noteTargetsCurrentWindow(note) else { return }
                 openSettings(tab: .agentMode)

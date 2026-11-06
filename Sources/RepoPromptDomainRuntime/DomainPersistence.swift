@@ -757,7 +757,12 @@ package struct DomainPersistenceCoordinator {
         now: Date
     ) async throws -> DomainPersistenceWorkingCommit {
         try await DomainBlockingIO.run { cancellation in
-            try blockingWorker(cancellation).persistWorkingBlocking(
+            let start = DispatchTime.now().uptimeNanoseconds
+            defer {
+                let elapsed = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+                CatalogPerf.shared.writerPersistence(ms: elapsed, onMainThread: Thread.isMainThread)
+            }
+            return try blockingWorker(cancellation).persistWorkingBlocking(
                 document: document,
                 expectedRevision: expectedRevision,
                 newRevision: newRevision,
@@ -781,7 +786,12 @@ package struct DomainPersistenceCoordinator {
         now: Date
     ) async throws -> DomainPersistenceSavedCommit {
         try await DomainBlockingIO.run { cancellation in
-            try blockingWorker(cancellation).persistSavedBlocking(
+            let start = DispatchTime.now().uptimeNanoseconds
+            defer {
+                let elapsed = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+                CatalogPerf.shared.writerPersistence(ms: elapsed, onMainThread: Thread.isMainThread)
+            }
+            return try blockingWorker(cancellation).persistSavedBlocking(
                 document: document,
                 expectedWorkingRevision: expectedWorkingRevision,
                 operationID: operationID,

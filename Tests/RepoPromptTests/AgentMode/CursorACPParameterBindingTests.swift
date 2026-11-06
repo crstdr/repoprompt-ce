@@ -65,6 +65,40 @@ final class CursorACPParameterBindingTests: XCTestCase {
         XCTAssertEqual(recordedRequests(at: fixture.recordURL).map(\.method).filter { $0 == "session/set_config_option" || $0 == "session/prompt" }, ["session/set_config_option", "session/set_config_option", "session/prompt"])
     }
 
+    func testHeadlessCursorRebindsSemanticPinBeforeValidatingInheritedOverrides() async throws {
+        let fixture = try makeFixture(shape: "modern", extraEnvironment: [
+            "ACP_INCLUDE_MODEL": "1", "ACP_INCLUDE_PARAMETERS": "1",
+            "ACP_RETIRED_HIGH_EFFORT": "1", "ACP_INITIAL_FAST": "true"
+        ], providerID: .cursor)
+        let explicit = ACPModelParameterSelection(
+            providerID: .cursor, baseModelRaw: "model-b", kind: .thinking,
+            configID: "legacy-effort-id", valueRaw: "low"
+        )
+        let provider = fixture.provider
+        let headless = CursorACPHeadlessAgentProvider(
+            config: .init(
+                modelString: "model-b[Cursor.Thought-Level=High,Cursor.Fast-Mode=false]",
+                modelParameterSelections: [explicit]
+            ), providerFactory: { _ in provider },
+            controllerFactory: { provider, request, diagnosticSink in
+                try ACPAgentSessionController(
+                    provider: provider, runRequest: request, diagnosticSink: diagnosticSink,
+                    allowsProviderProcessLaunchForTesting: true
+                )
+            }
+        )
+        let stream = try await headless.streamAgentMessage(AgentMessage(userMessage: "Apply newer pin"))
+        for try await _ in stream {}
+        await headless.dispose()
+        let mutations = recordedMutationRequests(at: fixture.recordURL)
+        XCTAssertEqual(mutations.map { $0.params["configId"] as? String }, ["model", "Cursor.Thought-Level", "Cursor.Fast-Mode"])
+        XCTAssertEqual(mutations.map { $0.params["value"] as? String }, ["model-b", "low", "false"])
+        let requests = recordedRequests(at: fixture.recordURL)
+        let promptIndex = try XCTUnwrap(requests.firstIndex { $0.method == "session/prompt" })
+        let speedIndex = try XCTUnwrap(requests.firstIndex { $0.params["configId"] as? String == "Cursor.Fast-Mode" })
+        XCTAssertLessThan(speedIndex, promptIndex)
+    }
+
     func testCursorHeadlessRejectsStaleBracketSelectorBeforePrompt() async throws {
         let fixture = try makeFixture(shape: "modern", extraEnvironment: ["ACP_INCLUDE_MODEL": "1", "ACP_INCLUDE_PARAMETERS": "1"], providerID: .cursor)
         let provider = fixture.provider
@@ -312,12 +346,20 @@ final class CursorACPParameterBindingTests: XCTestCase {
         XCTAssertEqual(recordedMutationRequests(at: fixture.recordURL).first?.params["value"] as? String, "High")
     }
 
-    func testUnpinnedCursorWithoutMetadataPreservesLiveEffortThroughPromptDispatch() async throws {
-        XCTAssertTrue(ACPModelParameterResolver.resolve(
-            providerID: .cursor,
-            selectedModelRaw: "grok-4.6",
-            persistedSelections: []
-        ).isEmpty)
+    func testUntouchedCursorCatalogFallbackPreservesLiveEffortThroughPromptDispatch() async throws {
+        // The displayed CE-side default comes from Cursor's advertised catalogue, so publish one:
+        // its `grok-4.6` effort default is `high` while this session's live current is `medium`.
+        CursorDiscoveredCatalogTestSupport.reset()
+        defer { CursorDiscoveredCatalogTestSupport.reset() }
+        CursorDiscoveredCatalogTestSupport.seedStandardCatalog()
+        XCTAssertEqual(
+            ACPModelParameterResolver.resolve(
+                providerID: .cursor,
+                selectedModelRaw: "grok-4.6",
+                persistedSelections: []
+            ).first(where: { $0.definition.kind == .thinking })?.selectedChoice.rawValue,
+            "high"
+        )
 
         let fixture = try makeFixture(
             shape: "modern",

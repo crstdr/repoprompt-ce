@@ -40,6 +40,60 @@ enum AgentSidebarSelectionGestureDisposition: Equatable {
     case ignored
 }
 
+struct AgentSidebarSelectionGestureResult: Equatable {
+    var disposition: AgentSidebarSelectionGestureDisposition
+    /// Early-exit cause. Nil when `disposition` already names the outcome.
+    var reason: String?
+    var selectionCount: Int
+    var workspaceMatched: Bool
+    var rowID: UUID
+
+    /// Stub for tests that construct a row and never inspect the gesture result.
+    static let ignored = Self(
+        disposition: .ignored,
+        reason: nil,
+        selectionCount: 0,
+        workspaceMatched: false,
+        rowID: UUID()
+    )
+}
+
+enum AgentSidebarTapWorkspaceMatch: Equatable {
+    case matched
+    case missingWorkspace
+    case workspaceMismatch
+
+    var workspaceMatched: Bool {
+        self == .matched
+    }
+
+    var ignoredReason: String {
+        switch self {
+        case .matched:
+            "matched"
+        case .missingWorkspace:
+            "missing-workspace"
+        case .workspaceMismatch:
+            "workspace-mismatch"
+        }
+    }
+}
+
+enum AgentSidebarTapWorkspaceGate {
+    /// `.ignored` when the sidebar snapshot has no workspace, or that workspace is
+    /// not `WorkspaceManager.activeWorkspaceID`. The second case is another window
+    /// being the app-active workspace, or a switch that has already moved the
+    /// active id.
+    static func evaluate(
+        sidebarWorkspaceID: UUID?,
+        activeWorkspaceID: UUID?
+    ) -> AgentSidebarTapWorkspaceMatch {
+        guard let sidebarWorkspaceID else { return .missingWorkspace }
+        guard sidebarWorkspaceID == activeWorkspaceID else { return .workspaceMismatch }
+        return .matched
+    }
+}
+
 enum AgentSidebarBulkActionKind: String, Equatable {
     case delete
     case stash
@@ -146,6 +200,8 @@ struct AgentSidebarSelectionState: Equatable {
         return operation
     }
 
+    /// The same in-flight and rendered-order guards run first in
+    /// `handleSidebarSelectionGesture` so a tap log can name the reason. Keep them in sync.
     mutating func handle(
         _ gesture: AgentSidebarSelectionGesture,
         identity: AgentSidebarSelectionIdentity,

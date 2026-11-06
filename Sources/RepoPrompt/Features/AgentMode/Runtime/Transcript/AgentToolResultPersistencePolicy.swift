@@ -159,9 +159,13 @@ enum AgentToolResultPersistencePolicy {
             || normalizedToolName == "agent_explore"
             || normalizedToolName == "agent_manage"
             || normalizedToolName == "ask_oracle"
+            || normalizedToolName == "oracle_chat_log"
             || normalizedToolName == "oracle_send"
             || normalizedToolName == "context_builder"
-        let looksLikeCursorACPPayload = rawResultJSON?.contains("\"acp_status\"") == true
+        // Exact byte search: Foundation's `StringProtocol.contains` walks grapheme
+        // clusters and costs seconds per multi-megabyte payload on every sanitation
+        // pass (REPOPROMPT-1D1 / -78 / -1D7 / -1DB).
+        let looksLikeCursorACPPayload = rawResultJSON.map { containsUTF8Literal($0, "\"acp_status\"") } == true
         let needsRawObjectFallbacks =
             requiresStructuredSummaryDetails
                 || looksLikeCursorACPPayload
@@ -175,6 +179,11 @@ enum AgentToolResultPersistencePolicy {
             ? BashToolResultParser.parseMetadata(raw: rawResultJSON, context: context)
             : nil
         let statusWord: String = {
+            if ["ask_oracle", "oracle_chat_log"].contains(normalizedToolName ?? ""),
+               AgentTranscriptToolStatusSemantics.isBackgroundOracleResult(rawObject), rawObject?["oracle_results"] == nil
+            {
+                return item.toolIsError == true ? "failed" : "completed"
+            }
             if normalizedToolName != "bash",
                let executionStatus = execution?.status,
                executionStatus != .unknown
@@ -1528,6 +1537,8 @@ enum AgentToolResultPersistencePolicy {
             return agentRunSummaryJSON(normalizedToolName: normalizedToolName, statusWord: statusWord, rawObject: rawObject)
         case "agent_manage":
             return agentManageSummaryJSON(statusWord: statusWord, rawObject: rawObject)
+        case "oracle_chat_log" where AgentTranscriptToolStatusSemantics.isBackgroundOracleResult(rawObject):
+            return backgroundOracleSummaryJSON(normalizedToolName: normalizedToolName, statusWord: statusWord, rawObject: rawObject)
         case "ask_oracle", "oracle_send":
             return oracleChatSummaryJSON(
                 normalizedToolName: normalizedToolName,
@@ -2268,11 +2279,37 @@ enum AgentToolResultPersistencePolicy {
         return reply
     }
 
+    private static func backgroundOracleSummaryJSON(normalizedToolName: String?, statusWord: String, rawObject: [String: Any]?) -> String? {
+        var object = genericSummaryObject(normalizedToolName: normalizedToolName, statusWord: statusWord, processID: nil, exitCode: nil)
+        guard let rawObject else { return jsonString(from: object) }
+        // Full identifiers precede optional detail. Never retain answers or a discovery manifest.
+        for key in ["oracle_group_id", "oracle_turn_id", "context_id", "agent_session_id", "agent_run_id"] {
+            if let value = rawObject[key] as? String, value.count == 36, UUID(uuidString: value) != nil { object[key] = value }
+        }
+        for key in ["chat_id", "status", "code", "mode", "backend", "scope"] {
+            if let value = smallStringValue(rawObject, keys: [key]) { object[key] = value }
+        }
+        for key in ["oracle_count", "count", "open_count", "answer_ready_count", "retention_limit"] {
+            if let value = intValue(rawObject, keys: [key]) { object[key] = value }
+        }
+        if let truncated = rawObject["history_truncated"] as? Bool { object["history_truncated"] = truncated }
+        if let lanes = rawObject["lanes"] as? [[String: Any]] ?? rawObject["oracle_results"] as? [[String: Any]], lanes.count <= 5 {
+            let summaries = lanes.map { lane in lane.filter { ["lane_index", "chat_id", "status", "answer_ready", "partial", "truncated"].contains($0.key) } }
+            var detailed = object
+            detailed["lanes"] = summaries
+            if let json = jsonString(from: detailed), !exceedsPersistedToolSummaryBudget(json) { return json }
+        }
+        return jsonString(from: object)
+    }
+
     private static func oracleChatSummaryJSON(
         normalizedToolName: String?,
         statusWord: String,
         rawObject: [String: Any]?
     ) -> String? {
+        if AgentTranscriptToolStatusSemantics.isBackgroundOracleResult(rawObject) {
+            return backgroundOracleSummaryJSON(normalizedToolName: normalizedToolName, statusWord: statusWord, rawObject: rawObject)
+        }
         var object = genericSummaryObject(
             normalizedToolName: normalizedToolName,
             statusWord: statusWord,
@@ -2444,16 +2481,16 @@ enum AgentToolResultPersistencePolicy {
             return nil
         }
         let lowered = raw.lowercased()
-        if lowered.contains("process running with session id")
-            || lowered.contains("\"status\":\"running\"")
-            || lowered.contains("\"status\": \"running\"")
+        if containsUTF8Literal(lowered, "process running with session id")
+            || containsUTF8Literal(lowered, "\"status\":\"running\"")
+            || containsUTF8Literal(lowered, "\"status\": \"running\"")
         {
             return "running"
         }
         if let exitCode = bashTextExitCode(from: raw, context: context) {
             return exitCode == 0 ? "success" : "failed"
         }
-        if lowered.contains("stdin is closed for this session") {
+        if containsUTF8Literal(lowered, "stdin is closed for this session") {
             return "failed"
         }
         return nil
@@ -2465,9 +2502,67 @@ enum AgentToolResultPersistencePolicy {
         context: AgentToolResultProcessingContext?
     ) -> String? {
         context?.recordRegexCapture()
+        return capturedLivenessMarker(in: text, regex: regex)
+    }
+
+    // MARK: - Bounded payload scanning
+
+    /// Byte budget scanned from each end of a raw tool payload when looking for the
+    /// plain-text liveness markers (`process running with session id …`,
+    /// `process completed with exit code …`). The limit matches the window
+    /// `BashToolResultParser` already applies to the same markers, so a marker within
+    /// 32 KB of either end is still found while a multi-megabyte payload no longer
+    /// pays a full ICU regex pass on every sanitation (REPOPROMPT-1D2 / -1D9).
+    /// Unlike that parser — which measures Characters and joins its two windows with
+    /// a newline — these windows are measured in UTF-8 bytes and searched separately,
+    /// and a capture that ends exactly at the head cut is rejected rather than
+    /// reported truncated.
+    static let livenessMarkerScanByteLimit = 32768
+
+    struct LivenessScanWindow: Equatable {
+        let text: String
+        /// The window stops before the payload ends, so a capture that runs up to the
+        /// window's end may have lost trailing characters to the cut.
+        let isTruncatedAtEnd: Bool
+    }
+
+    /// The windows scanned for liveness markers, in scan order: the whole payload
+    /// when it is at most twice `byteLimit` bytes, otherwise its first and last
+    /// `byteLimit` bytes (cut at scalar boundaries). The windows are searched
+    /// separately — never joined — so a match cannot be synthesised across the gap.
+    static func livenessScanWindows(
+        for text: String,
+        byteLimit: Int = livenessMarkerScanByteLimit
+    ) -> [LivenessScanWindow] {
+        let utf8 = text.utf8
+        guard byteLimit > 0, utf8.count > byteLimit * 2 else {
+            return [LivenessScanWindow(text: text, isTruncatedAtEnd: false)]
+        }
+        let headEnd = utf8.index(utf8.startIndex, offsetBy: byteLimit)
+        let tailStart = utf8.index(utf8.endIndex, offsetBy: -byteLimit)
+        return [
+            LivenessScanWindow(text: String(text[..<headEnd]), isTruncatedAtEnd: true),
+            LivenessScanWindow(text: String(text[tailStart...]), isTruncatedAtEnd: false)
+        ]
+    }
+
+    /// First capture group of `regex` in the bounded scan windows of `text`, head
+    /// window first. For payloads within the byte budget this is the plain
+    /// whole-input `firstMatch`.
+    static func capturedLivenessMarker(in text: String?, regex: NSRegularExpression) -> String? {
         guard let text, !text.isEmpty else {
             return nil
         }
+        for window in livenessScanWindows(for: text) {
+            if let captured = captureFirstGroup(in: window, regex: regex) {
+                return captured
+            }
+        }
+        return nil
+    }
+
+    private static func captureFirstGroup(in window: LivenessScanWindow, regex: NSRegularExpression) -> String? {
+        let text = window.text
         let range = NSRange(text.startIndex ..< text.endIndex, in: text)
         guard let match = regex.firstMatch(in: text, options: [], range: range),
               match.numberOfRanges > 1
@@ -2475,13 +2570,33 @@ enum AgentToolResultPersistencePolicy {
             return nil
         }
         let groupRange = match.range(at: 1)
-        guard groupRange.location != NSNotFound,
-              let swiftRange = Range(groupRange, in: text)
-        else {
+        guard groupRange.location != NSNotFound else {
+            return nil
+        }
+        // A capture reaching the end of a truncated head window may be cut short
+        // (`exit code 12|345`); reject it rather than report a truncated value.
+        if window.isTruncatedAtEnd, NSMaxRange(groupRange) >= range.length {
+            return nil
+        }
+        guard let swiftRange = Range(groupRange, in: text) else {
             return nil
         }
         let captured = String(text[swiftRange]).trimmingCharacters(in: .whitespacesAndNewlines)
         return captured.isEmpty ? nil : captured
+    }
+
+    /// Exact UTF-8 substring test for an ASCII literal. Linear with a small constant
+    /// (libc `memmem`), unlike Foundation's grapheme-walking `contains`.
+    static func containsUTF8Literal(_ text: String, _ literal: String) -> Bool {
+        var haystack = text
+        var needle = literal
+        return haystack.withUTF8 { haystackBytes in
+            needle.withUTF8 { needleBytes in
+                guard let needleBase = needleBytes.baseAddress, !needleBytes.isEmpty else { return true }
+                guard let haystackBase = haystackBytes.baseAddress, haystackBytes.count >= needleBytes.count else { return false }
+                return memmem(haystackBase, haystackBytes.count, needleBase, needleBytes.count) != nil
+            }
+        }
     }
 
     private static func jsonObject(from raw: String?, context: AgentToolResultProcessingContext? = nil) -> [String: Any]? {

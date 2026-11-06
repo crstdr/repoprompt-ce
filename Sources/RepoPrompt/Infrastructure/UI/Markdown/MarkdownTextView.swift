@@ -474,6 +474,8 @@ struct MarkdownTextView: View, Equatable {
     let suppressBareLinksTouchingEndBoundary: Bool
     let renderCadence: MarkdownRenderCadence
     private let allowsStreamingSegmentation: Bool
+    @Environment(\.windowIsPresentationVisible) private var windowIsPresentationVisible
+    @Environment(\.activityMainWork) private var activityMainWork
     @Environment(\.markdownFileLinkOpener) private var markdownFileLinkOpener
     @ObservedObject private var fontScale = FontScaleManager.shared
     private var fontPreset: FontScalePreset {
@@ -529,6 +531,9 @@ struct MarkdownTextView: View, Equatable {
                     updateMarkdownRenderingLifecycle()
                 }
                 .onChange(of: renderRequestContext) { _, _ in
+                    updateMarkdownRenderingLifecycle()
+                }
+                .onChange(of: windowIsPresentationVisible) { _, _ in
                     updateMarkdownRenderingLifecycle()
                 }
                 .onDisappear {
@@ -612,7 +617,7 @@ struct MarkdownTextView: View, Equatable {
     }
 
     private func updateMarkdownRenderingLifecycle(now: Date = Date()) {
-        guard isMarkdown else {
+        guard isMarkdown, windowIsPresentationVisible else {
             cancelPendingCompile()
             return
         }
@@ -624,7 +629,7 @@ struct MarkdownTextView: View, Equatable {
     }
 
     private func scheduleMarkdownCompile(for context: MarkdownRenderRequestContext, now: Date = Date()) {
-        guard isMarkdown else {
+        guard isMarkdown, windowIsPresentationVisible else {
             cancelPendingCompile()
             return
         }
@@ -691,6 +696,9 @@ struct MarkdownTextView: View, Equatable {
     }
 
     private func compileMarkdown(for signature: MarkdownRenderSignature, requestID: Int) {
+        let activity = activityMainWork
+        activity?.begin(.markdown)
+        defer { activity?.end(.markdown) }
         let document = Document(parsing: signature.text)
         var compiler = EnhancedMarkdownCompiler()
         compiler.fontSize = signature.fontSize

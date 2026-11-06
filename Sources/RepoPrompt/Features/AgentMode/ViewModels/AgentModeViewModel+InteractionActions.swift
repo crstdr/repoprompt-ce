@@ -24,7 +24,7 @@ extension AgentModeViewModel {
         }
         switch request.requestID {
         case .codex:
-            codexCoordinator.submitApprovalDecision(session: session, decision: decision)
+            codexCoordinator.submitApprovalDecision(session: session, decision: decision, origin: .humanCard)
         case .claudeControl:
             claudeCoordinator.submitApprovalDecision(session: session, decision: decision)
         case let .acp(requestID):
@@ -65,13 +65,13 @@ extension AgentModeViewModel {
 
     func codexRememberedApprovalAllowed(for tabID: UUID?) -> Bool {
         guard let tabID else { return true }
-        return sessions[tabID]?.codexControllerFeatureState?.computerUseEnabled != true
+        return sessions[tabID]?.isComputerUseChild != true && sessions[tabID]?.codexControllerFeatureState?.computerUseEnabled != true
     }
 
     func submitPermissionsDecision(tabID: UUID, requestID: UUID, decision: AgentApprovalDecision) {
         guard let session = sessions[tabID], let request = session.pendingPermissionsRequest,
               request.id == requestID else { return }
-        codexCoordinator.submitPermissionsDecision(session: session, request: request, decision: decision)
+        codexCoordinator.submitPermissionsDecision(session: session, request: request, decision: decision, origin: .humanCard)
     }
 
     func submitMCPElicitationResponse(
@@ -85,7 +85,7 @@ extension AgentModeViewModel {
         else {
             return
         }
-        codexCoordinator.submitMCPElicitationResponse(session: session, request: request, response: response)
+        codexCoordinator.submitMCPElicitationResponse(session: session, request: request, response: response, origin: .humanCard)
     }
 
     func submitApplyEditsReviewDecision(

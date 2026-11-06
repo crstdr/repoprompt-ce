@@ -6,6 +6,7 @@ enum ClaudeAttemptEvent {
     case native(NativeAgentRuntimeEvent)
     case steeringReleased(protectedIDs: Set<UUID>, inputWasAttempted: Bool)
     case settlementRecheck
+    case staleActiveProbe
 }
 
 /// One recoverable inbox per attempt. Cancelling its waiter never cancels the controller iterator.
@@ -32,6 +33,10 @@ final class ClaudeAttemptEventSubscription {
         } else {
             events.append(event)
         }
+    }
+
+    var hasPendingEvents: Bool {
+        head < events.count
     }
 
     func next() async -> ClaudeAttemptEvent? {

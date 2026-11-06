@@ -127,6 +127,8 @@ struct AgentDirectRunStartOptions: Equatable {
     /// Exact row appended by this submission, never inferred from transcript history.
     /// Auto-wake and maintenance producers append no user row and leave this absent.
     var initialUserItemID: UUID?
+    /// Only the exact parent start/idle-steer submission may schedule a designated native turn.
+    var computerUseProof: ComputerUseChildProof?
     var skipsUserAugmentation: Bool {
         isLaneUpdate || periodicWakeID != nil || providerControlCommand != nil || selfCompactDispatchID != nil
     }

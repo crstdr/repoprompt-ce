@@ -155,12 +155,14 @@ actor AgentSessionDataService {
         let codexMcpSessionKey: String?
         /// Decoded leniently: one malformed capacity must not fail the header of an otherwise valid file.
         let contextWindowCapacity: LenientContextWindowCapacity?
+        let purpose: String?
         let parentSessionID: UUID?
         let createdByOverseerSessionID: UUID?
         let organizationalParentID: UUID?
         let delegationScopeID: UUID?
         let worktreeBindings: [AgentSessionWorktreeBinding]?
         let worktreeMergeOperations: [AgentSessionWorktreeMergeOperation]?
+        let pendingHandoffProviderSwitchDelivery: AgentProviderSwitchDelivery?
         let pendingHandoffPayload: String?
         let pendingHandoffCreatedAt: Date?
         let pendingHandoffSourceItemID: UUID?
@@ -1042,6 +1044,11 @@ actor AgentSessionDataService {
         }
     }
 
+    func computerUseChildIDs(for parent: UUID, workspace: WorkspaceModel) async throws -> Set<UUID>? {
+        guard let index = try await metadataIndex(for: workspace, mode: .fast) else { return nil }
+        return index.purposeChildIDsByParent[parent] ?? []
+    }
+
     func fastMetadataRecordsIfAvailable(for workspace: WorkspaceModel) async throws -> FastMetadataRecordsResult? {
         let folder = try ensureAgentSessionsFolder(for: workspace)
         let key = canonicalMetadataFolderKey(folder)
@@ -1427,10 +1434,12 @@ actor AgentSessionDataService {
                 codexTotalTotalTokens: header.codexTotalTotalTokens,
                 codexMcpSessionKey: header.codexMcpSessionKey,
                 contextWindowCapacity: header.contextWindowCapacity?.value,
+                purpose: header.purpose,
                 parentSessionID: header.parentSessionID,
                 createdByOverseerSessionID: header.createdByOverseerSessionID,
                 organizationalParentID: header.organizationalParentID,
                 delegationScopeID: header.delegationScopeID,
+                pendingHandoffProviderSwitchDelivery: header.pendingHandoffProviderSwitchDelivery,
                 pendingHandoffPayload: header.pendingHandoffPayload,
                 pendingHandoffCreatedAt: header.pendingHandoffCreatedAt,
                 pendingHandoffSourceItemID: header.pendingHandoffSourceItemID,
@@ -1492,6 +1501,7 @@ actor AgentSessionDataService {
                         agentModel: session.agentModel,
                         lastRunState: session.lastRunState,
                         acpModelParameterSelections: session.acpModelParameterSelections,
+                        purpose: session.purpose,
                         parentSessionID: session.parentSessionID,
                         createdByOverseerSessionID: session.createdByOverseerSessionID,
                         isMCPOriginated: session.isMCPOriginated,
@@ -1548,6 +1558,7 @@ actor AgentSessionDataService {
                             agentModel: session.agentModel,
                             lastRunState: session.lastRunState,
                             acpModelParameterSelections: session.acpModelParameterSelections,
+                            purpose: session.purpose,
                             parentSessionID: session.parentSessionID,
                             createdByOverseerSessionID: session.createdByOverseerSessionID,
                             isMCPOriginated: session.isMCPOriginated,
@@ -1792,6 +1803,11 @@ actor AgentSessionDataService {
         }
         var fileRemoved = false
         do {
+            let oracleDrain = await MainActor.run {
+                AppDomainRuntimeComposition.shared.oracleBackgroundInvocations.closeAll(sessionID: sessionID)
+            }
+            await oracleDrain.value
+            try Task.checkCancellation()
             if let fence = Self.destructiveCommitFence.get(), await !fence() {
                 throw AgentSessionDestructiveCommitRefused()
             }
@@ -1809,6 +1825,7 @@ actor AgentSessionDataService {
         // withdrawn even while committed cleanup is suspended. A refused attempt never sets this.
         committedSessionDeletionFileURLs.insert(fileURL)
         await AgentSessionDurableDeletionReporter.didCommitDurableDeletion(attempt, fileRemoved: fileRemoved)
+        await MainActor.run { AppDomainRuntimeComposition.shared.oracleBackgroundInvocations.removeSettledSession(sessionID) }
         // Retained images belong to the committed session; a refused attempt never reaches here.
         AgentSessionAttachmentStore.removeSessionFolder(sessionID: sessionID, agentSessionsFolder: fileURL.deletingLastPathComponent())
         finishDeletionAttempt(for: fileURL, committed: true)

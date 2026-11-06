@@ -6,8 +6,8 @@ import RepoPromptDomainRuntime
 // An idle target goes through the ordinary attributed send transaction — durable row before the run
 // starts — framed as managed direction. A running target, or one waiting for its next instruction,
 // is steered through the same submission routing a local composer message takes
-// (`submitAgentSessionLinkManagedSteer`), after the authority commit fence re-proved the user's
-// management delegation. This file owns no authority and no idempotency: the bridge reserved the
+// (`submitAgentSessionLinkManagedSteer`), after the authority commit fence re-proved Manage on the
+// exact grant. This file owns no authority and no idempotency: the bridge reserved the
 // ledger entry and supplies the fence. Invariant: every refusal before submission leaves the target
 // byte-identical, and nothing here reads, clears, or restores the target user's composer.
 
@@ -45,8 +45,8 @@ extension AgentModeViewModel {
     ///
     /// 1. exact endpoint identity of both incarnations plus the target window's closing state,
     /// 2. pure admission (no mutation on refusal); an idle target hands off to the send transaction,
-    /// 3. the authority commit fence, which re-proves the exact grant *and* the management
-    ///    delegation, as the last suspension before any row exists,
+    /// 3. the authority commit fence, which re-proves the exact grant *and* Manage capability as
+    ///    the last suspension before any row exists,
     /// 4. synchronous re-validation of identity, workspace, and admission,
     /// 5. synchronous submission of the attributed row through the target's own provider routing,
     /// 6. the provider-level outcome.
@@ -84,7 +84,7 @@ extension AgentModeViewModel {
             break
         }
 
-        // 3. Authority fence. Losing it — revocation, withdrawn management, shutdown — leaves the
+        // 3. Authority fence. Revocation, an existing restricted grant, or shutdown leaves the
         //    target untouched.
         let commit = await commitAuthorization()
         guard commit == .committed else {

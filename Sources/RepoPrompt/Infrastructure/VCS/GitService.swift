@@ -97,7 +97,9 @@ private final class GitFileManagerPrefixControlCandidateSource: GitPrefixControl
             }
             return url
         }
-        if let error = errorBox.error { throw error }
+        if let error = errorBox.error {
+            throw error
+        }
         return nil
     }
 
@@ -738,7 +740,9 @@ actor GitService {
                 return true
             }
             let parent = directory.deletingLastPathComponent()
-            if parent.path == directory.path { return false }
+            if parent.path == directory.path {
+                return false
+            }
             directory = parent
         }
         return false
@@ -1011,9 +1015,15 @@ actor GitService {
                     )
                     let eligibilityMilliseconds = Self.milliseconds(eligibilityClock.now - eligibilityStarted)
                     var args = ["worktree", "add"]
-                    if case .eligible = trackedCloneDecision { args.append("--no-checkout") }
-                    if mutationRequest.force { args.append("--force") }
-                    if mutationRequest.detach { args.append("--detach") }
+                    if case .eligible = trackedCloneDecision {
+                        args.append("--no-checkout")
+                    }
+                    if mutationRequest.force {
+                        args.append("--force")
+                    }
+                    if mutationRequest.detach {
+                        args.append("--detach")
+                    }
                     if let lockReason = mutationRequest.lockReason {
                         args.append("--lock")
                         if !lockReason.isEmpty {
@@ -1026,7 +1036,9 @@ actor GitService {
                         args.append(branch)
                     }
                     args.append(mutationRequest.path.standardizedFileURL.path)
-                    if let baseRef = mutationRequest.baseRef, !baseRef.isEmpty { args.append(baseRef) }
+                    if let baseRef = mutationRequest.baseRef, !baseRef.isEmpty {
+                        args.append(baseRef)
+                    }
 
                     let (_, stderr, exitCode) = try await Self.$worktreeCreationCommitFence.withValue(beforeCommit) {
                         try await runGit(args, at: repoURL)
@@ -1867,7 +1879,9 @@ actor GitService {
         let (config, _, configExitCode) = try await git(["config", "--list", "-z"])
         guard configExitCode == 0 else { return .ineligible(.gitCommandFailed) }
         let configAssessment = GitWorktreeTrackedCheckoutClone.assessConfig(config)
-        if let reason = configAssessment.ineligibility { return .ineligible(reason) }
+        if let reason = configAssessment.ineligibility {
+            return .ineligible(reason)
+        }
 
         let (sourceTree, _, sourceTreeExitCode) = try await git(["rev-parse", "--verify", "--quiet", "HEAD^{tree}"])
         let sourceTreeOID = trimmed(sourceTree)
@@ -1882,14 +1896,18 @@ actor GitService {
         // `worktree add --no-checkout` does not run `post-checkout`, so any hook (file-based or
         // configured) keeps the ordinary checkout that runs it.
         let (_, _, hookListExitCode) = try await git(["hook", "list", "post-checkout"])
-        if hookListExitCode == 0 { return .ineligible(.postCheckoutHook) }
+        if hookListExitCode == 0 {
+            return .ineligible(.postCheckoutHook)
+        }
         let (hookPath, _, hookPathExitCode) = try await git(["rev-parse", "--git-path", "hooks/post-checkout"])
         guard hookPathExitCode == 0 else { return .ineligible(.gitCommandFailed) }
         let hookPathValue = trimmed(hookPath)
         let hookURL = hookPathValue.hasPrefix("/")
             ? URL(fileURLWithPath: hookPathValue)
             : sourceRoot.appendingPathComponent(hookPathValue)
-        if FileManager.default.fileExists(atPath: hookURL.path) { return .ineligible(.postCheckoutHook) }
+        if FileManager.default.fileExists(atPath: hookURL.path) {
+            return .ineligible(.postCheckoutHook)
+        }
 
         let (status, _, statusExitCode) = try await git(
             ["status", "--porcelain=v2", "-z", "--untracked-files=no", "--ignore-submodules=none"]
@@ -1899,7 +1917,9 @@ actor GitService {
 
         let (indexTags, _, indexTagsExitCode) = try await git(["ls-files", "-v", "-z"])
         guard indexTagsExitCode == 0 else { return .ineligible(.gitCommandFailed) }
-        if GitWorktreeTrackedCheckoutClone.hasHiddenIndexState(indexTags) { return .ineligible(.hiddenIndexState) }
+        if GitWorktreeTrackedCheckoutClone.hasHiddenIndexState(indexTags) {
+            return .ineligible(.hiddenIndexState)
+        }
 
         // No `-l`: sizes would force Git to read every blob header.
         let (treeListing, _, treeListingExitCode) = try await git(
@@ -1930,7 +1950,9 @@ actor GitService {
             )
             guard attributesExitCode == 0 else { return .ineligible(.gitCommandFailed) }
             let assessment = GitWorktreeTrackedCheckoutClone.assessCheckoutAttributes(attributes)
-            if assessment.blocksClone { return .ineligible(.checkoutAttributes) }
+            if assessment.blocksClone {
+                return .ineligible(.checkoutAttributes)
+            }
             let entriesByPath = Dictionary(
                 entries.map { ($0.relativePath, $0) },
                 uniquingKeysWith: { first, _ in first }
@@ -2345,8 +2367,12 @@ actor GitService {
             ["merge-base", "--is-ancestor", ancestor, descendant],
             at: repoURL
         )
-        if exitCode == 0 { return true }
-        if exitCode == 1 { return false }
+        if exitCode == 0 {
+            return true
+        }
+        if exitCode == 1 {
+            return false
+        }
         throw GitError(message: "git merge-base --is-ancestor failed: \(stderr)")
     }
 
@@ -3001,7 +3027,9 @@ actor GitService {
             }
             if !stdout.isEmpty {
                 combined += stdout
-                if !combined.hasSuffix("\n") { combined += "\n" }
+                if !combined.hasSuffix("\n") {
+                    combined += "\n"
+                }
             }
         }
         return combined
@@ -3168,7 +3196,9 @@ actor GitService {
             if isQuoted {
                 if ch == "\\" {
                     let next = input.index(after: idx)
-                    if next >= input.endIndex { break }
+                    if next >= input.endIndex {
+                        break
+                    }
                     let escaped = input[next]
                     if let octal = parseOctalEscape(escaped, input: input, start: next) {
                         current.append(octal.character)
@@ -3329,7 +3359,9 @@ actor GitService {
                 }
                 if !stdout.isEmpty {
                     combined += stdout
-                    if !combined.hasSuffix("\n") { combined += "\n" }
+                    if !combined.hasSuffix("\n") {
+                        combined += "\n"
+                    }
                 }
             }
             return combined
@@ -4699,7 +4731,9 @@ actor GitService {
                 "status", "--porcelain=v2", "-z",
                 includeUntracked ? "--untracked-files=all" : "--untracked-files=no"
             ]
-            if includeIgnored { arguments.append("--ignored=matching") }
+            if includeIgnored {
+                arguments.append("--ignored=matching")
+            }
             appendLiteralPrefix(prefix, to: &arguments)
             let sealed = try await runSealedTargetEvidenceCommand(
                 arguments,
@@ -5218,8 +5252,12 @@ actor GitService {
     }
 
     nonisolated static func targetEvidenceCollectionError(_ error: any Error) -> any Error {
-        if error is CancellationError { return CancellationError() }
-        if let error = error as? GitTargetEvidenceCollectionError { return error }
+        if error is CancellationError {
+            return CancellationError()
+        }
+        if let error = error as? GitTargetEvidenceCollectionError {
+            return error
+        }
         if let error = error as? GitTargetEvidenceManifestError {
             return GitTargetEvidenceCollectionError.artifact(error)
         }
@@ -6791,9 +6829,13 @@ actor GitService {
         while true {
             try Task.checkCancellation()
             let amount = buffer.withUnsafeMutableBytes { Darwin.read(descriptor, $0.baseAddress, $0.count) }
-            if amount == 0 { break }
+            if amount == 0 {
+                break
+            }
             if amount < 0 {
-                if errno == EINTR { continue }
+                if errno == EINTR {
+                    continue
+                }
                 throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             }
             let (nextCount, overflow) = byteCount.addingReportingOverflow(amount)
@@ -6917,7 +6959,9 @@ actor GitService {
             guard let kind = controlKinds[url.lastPathComponent] else { continue }
             try addCandidate(url, kind: kind)
         }
-        if let enumerationError { throw enumerationError }
+        if let enumerationError {
+            throw enumerationError
+        }
 
         var result: [GitWorkspacePrefixControlIdentity] = []
         var totalBytes = 0
@@ -7268,7 +7312,9 @@ actor GitService {
         )
         let (autoCRLF, eol, filters) = try await (autoCRLFResult, eolResult, filtersResult)
         func optionalValue(_ result: (String, String, Int32), name: String) throws -> String? {
-            if result.2 == 1 { return nil }
+            if result.2 == 1 {
+                return nil
+            }
             guard result.2 == 0 else {
                 throw GitError(message: "git config --get \(name) failed: \(result.1)")
             }
@@ -7322,7 +7368,9 @@ actor GitService {
         )
 
         func optionalValue(_ result: (String, String, Int32), name: String) throws -> String? {
-            if result.2 == 1 { return nil }
+            if result.2 == 1 {
+                return nil
+            }
             guard result.2 == 0 else {
                 throw GitError(message: "git config --get \(name) failed")
             }
@@ -8537,14 +8585,18 @@ actor GitService {
                 let outCollector = Task(priority: .userInitiated) { () -> Data in
                     var buf = Data()
                     for await chunk in outStream {
-                        if !chunk.isEmpty { buf.append(chunk) }
+                        if !chunk.isEmpty {
+                            buf.append(chunk)
+                        }
                     }
                     return buf
                 }
                 let errCollector = Task(priority: .userInitiated) { () -> Data in
                     var buf = Data()
                     for await chunk in errStream {
-                        if !chunk.isEmpty { buf.append(chunk) }
+                        if !chunk.isEmpty {
+                            buf.append(chunk)
+                        }
                     }
                     return buf
                 }
@@ -9006,7 +9058,9 @@ actor GitService {
     }()
 
     private func parseGitDate(_ s: String) -> Date? {
-        if let d = Self.gitDateFormatter.date(from: s) { return d }
+        if let d = Self.gitDateFormatter.date(from: s) {
+            return d
+        }
         return Self.rfc3339Formatter.date(from: s)
     }
 
@@ -9065,8 +9119,12 @@ actor GitService {
             sawData = true
             let isText = data.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in
                 for byte in bytes {
-                    if byte == 0 { return false }
-                    if byte == 0x0A { lineCount += 1 }
+                    if byte == 0 {
+                        return false
+                    }
+                    if byte == 0x0A {
+                        lineCount += 1
+                    }
                 }
                 lastByte = bytes.last
                 return true

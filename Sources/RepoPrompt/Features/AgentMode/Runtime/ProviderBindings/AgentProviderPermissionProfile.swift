@@ -7,6 +7,7 @@ import Foundation
 /// provider settings, or one concrete provider-native override without mutating direct-agent
 /// preferences.
 enum AgentProviderPermissionProfile: Equatable {
+    case computerUseChild
     case userConfigured
     case mcpSafeDefaults
     case providerOverride(AgentProviderPermissionLevelID)
@@ -19,8 +20,8 @@ extension AgentProviderPermissionProfile {
         switch self {
         case .userConfigured:
             CodexAgentToolPreferences.sandboxMode()
-        case .mcpSafeDefaults:
-            CodexAgentToolPreferences.PermissionLevel.autoReview.sandboxMode
+        case .mcpSafeDefaults, .computerUseChild:
+            self == .computerUseChild ? .readOnly : CodexAgentToolPreferences.PermissionLevel.autoReview.sandboxMode
         case let .providerOverride(.codex(level)):
             level.sandboxMode
         case .providerOverride:
@@ -32,8 +33,8 @@ extension AgentProviderPermissionProfile {
         switch self {
         case .userConfigured:
             CodexAgentToolPreferences.approvalPolicy()
-        case .mcpSafeDefaults:
-            CodexAgentToolPreferences.PermissionLevel.autoReview.approvalPolicy
+        case .mcpSafeDefaults, .computerUseChild:
+            self == .computerUseChild ? .onRequest : CodexAgentToolPreferences.PermissionLevel.autoReview.approvalPolicy
         case let .providerOverride(.codex(level)):
             level.approvalPolicy
         case .providerOverride:
@@ -45,8 +46,8 @@ extension AgentProviderPermissionProfile {
         switch self {
         case .userConfigured:
             CodexAgentToolPreferences.approvalReviewer()
-        case .mcpSafeDefaults:
-            CodexAgentToolPreferences.PermissionLevel.autoReview.approvalReviewer
+        case .mcpSafeDefaults, .computerUseChild:
+            self == .computerUseChild ? .user : CodexAgentToolPreferences.PermissionLevel.autoReview.approvalReviewer
         case let .providerOverride(.codex(level)):
             level.approvalReviewer
         case .providerOverride:
@@ -58,8 +59,8 @@ extension AgentProviderPermissionProfile {
         userConfigured: Bool = CodexAgentToolPreferences.bashToolEnabled()
     ) -> Bool {
         switch self {
-        case .mcpSafeDefaults:
-            true
+        case .mcpSafeDefaults, .computerUseChild:
+            self != .computerUseChild
         case .userConfigured, .providerOverride:
             userConfigured
         }
@@ -67,7 +68,7 @@ extension AgentProviderPermissionProfile {
 
     var codexSuppressesThirdPartyMCPServers: Bool {
         switch self {
-        case .mcpSafeDefaults:
+        case .mcpSafeDefaults, .computerUseChild:
             true
         case .userConfigured, .providerOverride:
             false
@@ -79,7 +80,7 @@ extension AgentProviderPermissionProfile {
     ) -> CodexAgentToolPreferences.PermissionLevel {
         switch self {
         case .userConfigured: userConfigured
-        case .mcpSafeDefaults: .autoReview
+        case .mcpSafeDefaults, .computerUseChild: self == .computerUseChild ? .readOnly : .autoReview
         case let .providerOverride(.codex(level)): level
         case .providerOverride: .defaultPermission
         }
@@ -89,7 +90,7 @@ extension AgentProviderPermissionProfile {
         switch self {
         case .userConfigured:
             ClaudeAgentToolPreferences.permissionMode()
-        case .mcpSafeDefaults:
+        case .mcpSafeDefaults, .computerUseChild:
             ClaudeAgentToolPreferences.PermissionLevel.requireApproval.permissionMode
         case let .providerOverride(.claude(level)):
             level.permissionMode
@@ -103,7 +104,7 @@ extension AgentProviderPermissionProfile {
     ) -> ClaudeAgentToolPreferences.PermissionLevel {
         switch self {
         case .userConfigured: userConfigured
-        case .mcpSafeDefaults: .requireApproval
+        case .mcpSafeDefaults, .computerUseChild: .requireApproval
         case let .providerOverride(.claude(level)): level
         case .providerOverride: .requireApproval
         }
@@ -113,7 +114,7 @@ extension AgentProviderPermissionProfile {
         switch self {
         case .userConfigured:
             OpenCodeAgentToolPreferences.sessionModeID()
-        case .mcpSafeDefaults:
+        case .mcpSafeDefaults, .computerUseChild:
             OpenCodeAgentToolPreferences.PermissionLevel.managedDefault.sessionModeID
         case let .providerOverride(.openCode(level)):
             level.sessionModeID
@@ -127,7 +128,7 @@ extension AgentProviderPermissionProfile {
     ) -> OpenCodeAgentToolPreferences.PermissionLevel {
         switch self {
         case .userConfigured: userConfigured
-        case .mcpSafeDefaults: .managedDefault
+        case .mcpSafeDefaults, .computerUseChild: .managedDefault
         case let .providerOverride(.openCode(level)): level
         case .providerOverride: .managedDefault
         }
@@ -138,7 +139,7 @@ extension AgentProviderPermissionProfile {
     ) -> CursorAgentToolPreferences.PermissionLevel {
         switch self {
         case .userConfigured: userConfigured
-        case .mcpSafeDefaults: .managedDefault
+        case .mcpSafeDefaults, .computerUseChild: .managedDefault
         case let .providerOverride(.cursor(level)): level
         case .providerOverride: .managedDefault
         }
@@ -149,7 +150,7 @@ extension AgentProviderPermissionProfile {
     ) -> GrokBuildAgentToolPreferences.PermissionLevel {
         switch self {
         case .userConfigured: userConfigured
-        case .mcpSafeDefaults: .managedDefault
+        case .mcpSafeDefaults, .computerUseChild: .managedDefault
         case let .providerOverride(.grokBuild(level)): level
         case .providerOverride: .managedDefault
         }
@@ -160,7 +161,7 @@ extension AgentProviderPermissionProfile {
     ) -> DevinAgentToolPreferences.PermissionLevel {
         switch self {
         case .userConfigured: userConfigured
-        case .mcpSafeDefaults: .normal
+        case .mcpSafeDefaults, .computerUseChild: .normal
         case let .providerOverride(.devin(level)): level
         case .providerOverride: .normal
         }

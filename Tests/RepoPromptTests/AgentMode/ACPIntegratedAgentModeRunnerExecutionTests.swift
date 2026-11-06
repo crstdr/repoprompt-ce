@@ -1,5 +1,5 @@
 import MCP
-@testable import RepoPromptApp
+@_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 import XCTest
@@ -478,7 +478,19 @@ final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
         }
     }
 
-    func testCursorKnownModelPassesReleaseCatalogValidationBeforePrompt() throws {
+    func testCursorDiscoveredModelPassesCatalogValidationBeforePrompt() throws {
+        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: .cursor) }
+        XCTAssertTrue(AgentACPModelRegistry.shared.updateDiscoveredModels(
+            ACPDiscoveredSessionModels(
+                options: [
+                    AgentModelOption(rawValue: "grok-4.6", displayName: "Cursor Grok 4.6", description: nil, isDefault: false)
+                ],
+                currentModelRaw: "grok-4.6"
+            ),
+            for: .cursor
+        ))
+
         let model = try ACPIntegratedAgentModeRunner.testExplicitSelectedModel(
             agentKind: .cursor,
             modelString: "grok-4.6"
@@ -487,7 +499,10 @@ final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
         XCTAssertEqual(model, "grok-4.6")
     }
 
-    func testCursorAutoAliasPassesReleaseCatalogValidationBeforePrompt() throws {
+    func testCursorAutoAliasPassesCatalogValidationWithoutDiscovery() throws {
+        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: .cursor) }
+
         let model = try ACPIntegratedAgentModeRunner.testExplicitSelectedModel(
             agentKind: .cursor,
             modelString: AgentModel.cursorAuto.rawValue
@@ -496,15 +511,79 @@ final class ACPIntegratedAgentModeRunnerExecutionTests: XCTestCase {
         XCTAssertEqual(model, AgentModel.cursorAuto.rawValue)
     }
 
-    func testCursorNewConcreteModelReachesRuntimeValidationWithoutReleaseGate() throws {
-        XCTAssertEqual(try ACPIntegratedAgentModeRunner.testExplicitSelectedModel(
+    func testCursorUndiscoveredConcreteModelFailsClosedBeforePrompt() {
+        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: .cursor) }
+
+        XCTAssertThrowsError(try ACPIntegratedAgentModeRunner.testExplicitSelectedModel(
             agentKind: .cursor,
-            modelString: "grok-4.7"
-        ), "grok-4.7")
+            modelString: "cursor-future-model"
+        )) { error in
+            guard case let AIProviderError.invalidConfiguration(detail) = error else {
+                return XCTFail("Expected invalid Cursor model configuration, got \(error)")
+            }
+            XCTAssertTrue(detail.contains("cursor-future-model"))
+            XCTAssertTrue(detail.contains("last known model catalog"))
+        }
     }
 }
 
 final class AgentToolResultPayloadRetentionTests: XCTestCase {
+    /// Non-rendering ingress is not silence: Devin remains ineligible for quiet classification.
+    @MainActor
+    func testDevinInvisibleUpdateKindsRecordActivityWithoutTranscriptRows() async {
+        let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() }, replayTranscript: true)
+        var deliveredEvents = 0
+        harness.onNativeStreamResult = { _, _, _, _ in deliveredEvents += 1 }
+        let session = harness.makeSession(agent: .devin)
+        let runID = UUID()
+        session.installRunID(runID)
+        session.runState = .running
+        let owner = session.beginRunAttempt(source: "test.devin.invisible-updates")
+        defer { _ = session.endRunAttempt(ifCurrent: owner, source: "test.devin.invisible-updates.end") }
+        let runner = ACPIntegratedAgentModeRunner(
+            hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier(), toolTrackingHooks: .noOp,
+            providerFactory: { _, _ in nil },
+            controllerFactory: { provider, request in try ACPAgentSessionController(provider: provider, runRequest: request) }
+        )
+        harness.host.refreshDerivedTranscriptState(for: session)
+        let items = session.items
+        let revision = session.sourceItemsRevision
+        let preview = AgentModeViewModel.latestVisibleAssistantPreview(for: session)
+        let visibleRows = session.transcriptCanonicalVisibleRowCount
+        for kind in ["user_message_chunk", "plan", "available_commands_update", "unrecognized_future_kind"] {
+            let events = ACPDefaultSessionUpdateNormalizer.normalize(
+                ["sessionUpdate": kind, "content": ["type": "text", "text": "visible words"]], providerID: .devin
+            )
+            XCTAssertEqual(events.count, kind == "available_commands_update" ? 0 : 1, kind)
+            for event in events {
+                guard case let .stream(result) = event else { return XCTFail("Expected non-rendering activity for \(kind)") }
+                XCTAssertEqual(result.type, "event", kind)
+                XCTAssertNil(result.text, kind)
+            }
+            let deliveredBefore = deliveredEvents
+            await runner.testConsumeQuietEvents(events, session: session, runID: runID, owner: owner)
+            harness.host.flushPendingAssistantDelta(session)
+            harness.host.refreshDerivedTranscriptState(for: session)
+            XCTAssertEqual(deliveredEvents - deliveredBefore, events.count, "\(kind) must reach the stream handler")
+            XCTAssertEqual(session.items, items, kind)
+            XCTAssertEqual(session.sourceItemsRevision, revision, kind)
+            XCTAssertEqual(AgentModeViewModel.latestVisibleAssistantPreview(for: session), preview, kind)
+            XCTAssertEqual(session.transcriptCanonicalVisibleRowCount, visibleRows, kind)
+        }
+        let control = "Retained assistant control"
+        let visibleEvents = ACPDefaultSessionUpdateNormalizer.normalize(
+            ["sessionUpdate": "agent_message_chunk", "content": ["type": "text", "text": control]], providerID: .devin
+        )
+        await runner.testConsumeQuietEvents(visibleEvents, session: session, runID: runID, owner: owner)
+        harness.host.flushPendingAssistantDelta(session)
+        harness.host.finalizeStreamingItems(in: session)
+        harness.host.refreshDerivedTranscriptState(for: session)
+        XCTAssertTrue(session.items.contains { $0.kind == .assistant && $0.text == control }, "The same owner and real VM path must render visible input")
+        XCTAssertGreaterThan(session.sourceItemsRevision, revision)
+        XCTAssertGreaterThan(session.transcriptCanonicalVisibleRowCount, visibleRows)
+    }
+
     func testNormalizedEmptyTerminalUpdatesFinishStreamedLifecycleWithoutErasingContent() throws {
         let running = #"{"status":"running","content":"streamed result"}"#
         for output in ["", " \n", "[]", "{}", "null", "\"\""] {

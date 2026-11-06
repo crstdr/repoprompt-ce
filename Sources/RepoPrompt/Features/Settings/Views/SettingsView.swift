@@ -24,6 +24,7 @@ struct SettingsView: View {
     var onAPIKeyUpdated: (() -> Void)?
 
     @Binding var selectedTab: SettingsTab
+    let isPresentationVisible: Bool
     @State private var searchText: String = ""
     @Environment(\.repoPromptFontScalePreset) private var fontPreset
 
@@ -72,6 +73,7 @@ struct SettingsView: View {
         windowState: WindowState,
         onAPIKeyUpdated: (() -> Void)?,
         selectedTab: Binding<SettingsTab>,
+        isPresentationVisible: Bool = false,
         closeAction: (() -> Void)? = nil
     ) {
         self.fileManager = fileManager
@@ -80,6 +82,7 @@ struct SettingsView: View {
         self.windowState = windowState
         self.onAPIKeyUpdated = onAPIKeyUpdated
         _selectedTab = selectedTab
+        self.isPresentationVisible = isPresentationVisible
         self.closeAction = closeAction
     }
 
@@ -244,7 +247,7 @@ struct SettingsView: View {
             // Overview (formerly "Behavior") is the top-level entry point that
             // deep-links into each of the other Agent Mode settings surfaces, so
             // it sits first in the sidebar.
-            [.agentMode, .cliProviders, .agentModels, .agentPermissions, .agentWorkflows, .modelRouter, .contextBuilder]
+            [.agentMode, .cliProviders, .agentModels, .agentPermissions, .computerUse, .agentWorkflows, .modelRouter, .contextBuilder]
         case .mcp:
             [.mcp, .mcpTools, .permissions, .modelPresets]
         case .api:
@@ -252,7 +255,7 @@ struct SettingsView: View {
         case .workspaces:
             [.manageWorkspaces, .managePresets]
         case .general:
-            [.appearance, .notifications, .licenseUpdates, .keyboardShortcuts, .advanced, .telemetry]
+            [.appearance, .notifications, .licenseUpdates, .keyboardShortcuts, .activity, .advanced, .telemetry]
         case .copyChat:
             // `.copyPresets` and `.chatPresets` are intentionally omitted from the
             // sidebar – they now resolve to the unified Workflow Presets surface.
@@ -289,6 +292,9 @@ struct SettingsView: View {
     @ViewBuilder
     private var contentView: some View {
         switch selectedTab {
+        case .computerUse:
+            let provider = makeAgentProviderPermissionsSettingsViewModel()
+            ComputerUseSettingsView(onDirectChange: { provider.applyCodexToolSettingMutation(.computerUse(enabled: $0)) })
         case .appearance:
             AppearanceSettingsView(promptViewModel: promptViewModel)
                 .transition(.opacity.animation(.easeInOut(duration: 0.15)))
@@ -316,6 +322,11 @@ struct SettingsView: View {
         case .keyboardShortcuts:
             KeyboardShortcutsSettingsView()
                 .transition(.opacity.animation(.easeInOut(duration: 0.15)))
+        case .activity:
+            ScrollView {
+                ActivitySettingsView(isPresentationVisible: isPresentationVisible)
+                    .padding()
+            }
         case .advanced:
             AdvancedSettingsView(
                 fileManager: fileManager,
@@ -582,12 +593,14 @@ enum TabSection: String, Identifiable {
 }
 
 enum SettingsTab: String, CaseIterable {
+    case computerUse
     case appearance
     case licenseUpdates
     case mcp
     case mcpTools
     case permissions // Workspace approvals (RepoPrompt-mutating operations)
     case keyboardShortcuts
+    case activity
     case advanced
     case telemetry
     case notifications
@@ -613,12 +626,14 @@ enum SettingsTab: String, CaseIterable {
 
     var title: String {
         switch self {
+        case .computerUse: "Computer Use"
         case .appearance: "Appearance"
         case .licenseUpdates: "Updates"
         case .mcp: "MCP Server"
         case .mcpTools: "Tools"
         case .permissions: "Workspace Approvals"
         case .keyboardShortcuts: "Keyboard Shortcuts"
+        case .activity: "Activity"
         case .advanced: "Advanced"
         case .telemetry: "Telemetry"
         case .notifications: "Notifications"
@@ -646,12 +661,14 @@ enum SettingsTab: String, CaseIterable {
 
     var iconName: String {
         switch self {
+        case .computerUse: "desktopcomputer"
         case .appearance: "paintbrush"
         case .licenseUpdates: "arrow.down.circle"
         case .mcp: "server.rack"
         case .mcpTools: "wrench.and.screwdriver"
         case .permissions: "shield.checkered"
         case .keyboardShortcuts: "keyboard"
+        case .activity: "waveform.path.ecg"
         case .advanced: "gearshape.2"
         case .telemetry: "lock.shield"
         case .notifications: "bell.badge"
@@ -680,7 +697,7 @@ enum SettingsTab: String, CaseIterable {
     var section: TabSection? {
         switch self {
         // Agent Mode — agent-first section
-        case .cliProviders,
+        case .computerUse, .cliProviders,
              .agentModels,
              .agentPermissions,
              .agentWorkflows,
@@ -702,7 +719,7 @@ enum SettingsTab: String, CaseIterable {
             .workspaces
 
         // General
-        case .appearance, .notifications, .licenseUpdates, .keyboardShortcuts, .advanced, .telemetry:
+        case .appearance, .notifications, .licenseUpdates, .keyboardShortcuts, .activity, .advanced, .telemetry:
             .general
 
         // Copy & Chat workflows
@@ -713,6 +730,7 @@ enum SettingsTab: String, CaseIterable {
 
     var searchTags: [String] {
         switch self {
+        case .computerUse: ["desktop", "Codex", "companion", "computer use"]
         case .appearance:
             [
                 "appearance",
@@ -753,6 +771,8 @@ enum SettingsTab: String, CaseIterable {
                 "font size shortcut",
                 "agent shortcut"
             ]
+        case .activity:
+            ["activity", "cpu", "memory", "file watching", "performance", "agents", "running", "waiting", "main thread"]
         case .advanced:
             [
                 "advanced",

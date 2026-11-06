@@ -36,13 +36,13 @@ extension AgentSessionLinkEndpointHost {
         nil
     }
 
-    var preparedSessionRuntimes: (any PreparedAgentSessionRuntimeRegistry)? {
-        nil
-    }
-
     func agentSessionLinkRunFacts(
         for _: AgentSessionLinkEndpointCandidate, capturedStatus _: DomainAgentSessionLinkStatus
     ) -> AgentRunQuietFacts? {
+        nil
+    }
+
+    var preparedSessionRuntimes: (any PreparedAgentSessionRuntimeRegistry)? {
         nil
     }
 
@@ -3925,7 +3925,10 @@ final class AgentSessionLinkRuntimeBridge {
             // replay burst reproduces it and is correctly dropped instead of advancing
             // `change_sequence`.
             lastPublishedSnapshotBySession[targetEndpoint.sessionID] = seed
-            installObservation(for: liveTarget, initialActivity: seed.lastActivityAt)
+            let initialFrame = seedFacts?.supplementalNeedsUser == nil ? nil : TargetPublicationFrame(
+                endpoint: targetEndpoint, sourceSequence: seedSequence, snapshot: seed, runFacts: seedFacts
+            )
+            installObservation(for: liveTarget, initialActivity: seed.lastActivityAt, initialFrame: initialFrame)
         } else if chains[targetEndpoint.sessionID] == nil {
             // The authority already has a target record but this process lost its chain (for example
             // the previous installer's window closed between activations). Reinstalling keeps status
@@ -4604,7 +4607,8 @@ final class AgentSessionLinkRuntimeBridge {
 
     private func installObservation(
         for candidate: AgentSessionLinkEndpointCandidate,
-        initialActivity: Date?
+        initialActivity: Date?,
+        initialFrame: TargetPublicationFrame? = nil
     ) {
         guard let host else { return }
         let endpoint = candidate.domainEndpoint
@@ -4612,6 +4616,8 @@ final class AgentSessionLinkRuntimeBridge {
             removeChain(forTargetSession: endpoint.sessionID, matching: existing)
         }
         let chain = TargetPublicationChain(endpoint: endpoint, activityHighWater: initialActivity)
+        // The installing seed owns this frame; ignored joining seeds must remain unseeded.
+        chain.scheduledFrame = initialFrame
         chains[endpoint.sessionID] = chain
         chain.token = host.agentSessionLinkInstallObservation(for: candidate) { [weak self, weak chain] in
             guard let chain else { return }
@@ -5209,7 +5215,8 @@ final class AgentSessionLinkRuntimeBridge {
                     waitingOn: observation.waitingOn,
                     latestVisibleAssistantPreview: observation.latestVisibleAssistantPreview,
                     runFacts: envelope.runFacts,
-                    managedMetadata: item.capabilities.contains(.manage) ? .init(observation) : nil
+                    managedMetadata: item.capabilities.contains(.manage) ? .init(observation) : nil,
+                    hasPendingInteraction: observation.hasPendingInteraction
                 ))
             }
             outbound.append(AgentMonitorPillProps.Outbound(
@@ -5968,7 +5975,7 @@ final class AgentSessionLinkRuntimeBridge {
     /// whole batch would discard the healthy siblings' cursors. Instead each target is re-fenced on
     /// its own, like `terminalWaitSurvivingStates`: survivors keep their rows and prompts, and a
     /// target that fails its own fence releases nothing. Returns `nil` only when no target survives
-    /// (or for a single target that fails), so the caller denies exactly as before.
+    /// (or for a single target that fails), or when the final survivor batch changes again.
     func pendingInteractionsForWaitObservation(
         leases: [DomainAgentSessionLinkLease]
     ) async -> (
@@ -8140,11 +8147,12 @@ final class AgentSessionLinkRuntimeBridge {
             clear(.delivered(receipt))
         case let .blocked(failure):
             switch failure {
-            case .targetNotIdle, .targetLoading:
+            case .targetNotIdle, .targetLoading, .providerSwitchUnconfirmed:
                 // The target became busy or is still hydrating. Nothing was mutated, so the entry
                 // waits for the next accepted readiness publication rather than retrying on a timer.
                 park(.targetReadiness, failure: failure)
-            case .persistenceFailed, .persistenceIndeterminate, .targetRestoreUnavailable, .targetCreationIncomplete:
+            case .persistenceFailed, .persistenceIndeterminate, .targetRestoreUnavailable, .targetCreationIncomplete,
+                 .providerHandoverDoesNotFit, .providerHandoverNeedsReview:
                 // Terminal for this entry. `persistence_failed` is retryable by the caller, but only
                 // by explicitly queuing again — never by a background loop over failing storage.
                 clear(.failed(failure))

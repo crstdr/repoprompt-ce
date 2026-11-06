@@ -14,6 +14,7 @@ struct AgentSessionMeta {
     let agentModel: String?
     let lastRunState: String?
     let acpModelParameterSelections: [ACPModelParameterSelection]
+    var purpose: String?
     let parentSessionID: UUID?
     let createdByOverseerSessionID: UUID?
     let isMCPOriginated: Bool
@@ -34,7 +35,19 @@ struct AgentSessionMetadataIndex: Codable, Equatable {
     var schemaVersion: Int
     var generatedAt: Date
     var lastReconciledAt: Date?
-    var entries: [AgentSessionMetadataRecord]
+    var entries: [AgentSessionMetadataRecord] {
+        didSet { rebuildPurposeChildren() }
+    }
+
+    private(set) var purposeChildIDsByParent: [UUID: Set<UUID>] = [:]
+
+    private mutating func rebuildPurposeChildren() {
+        purposeChildIDsByParent.removeAll(keepingCapacity: true)
+        for entry in entries where entry.purpose != nil {
+            if let parent = entry.parentSessionID { purposeChildIDsByParent[parent, default: []].insert(entry.id) }
+        }
+    }
+
     var quarantinedFiles: [AgentSessionMetadataQuarantineRecord]
 
     init(
@@ -49,6 +62,7 @@ struct AgentSessionMetadataIndex: Codable, Equatable {
         self.lastReconciledAt = lastReconciledAt
         self.entries = entries
         self.quarantinedFiles = quarantinedFiles
+        rebuildPurposeChildren()
     }
 
     enum CodingKeys: String, CodingKey {
@@ -66,6 +80,7 @@ struct AgentSessionMetadataIndex: Codable, Equatable {
         lastReconciledAt = try container.decodeIfPresent(Date.self, forKey: .lastReconciledAt)
         entries = try container.decodeIfPresent([AgentSessionMetadataRecord].self, forKey: .entries) ?? []
         quarantinedFiles = try container.decodeIfPresent([AgentSessionMetadataQuarantineRecord].self, forKey: .quarantinedFiles) ?? []
+        rebuildPurposeChildren()
     }
 }
 
@@ -94,6 +109,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
     var routineWakeIntervalSeconds: Int
     var periodicIdleWakeEnabled: Bool
     var periodicIdleWakeIntervalSeconds: Int
+    var purpose: String?
     var parentSessionID: UUID?
     var createdByOverseerSessionID: UUID?
     /// Mutable organizational placement; `nil` follows spawn provenance. Deliberately **not** listed
@@ -175,6 +191,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         routineWakeIntervalSeconds: Int = AgentSessionLinkRoutineWakeInterval.defaultSeconds,
         periodicIdleWakeEnabled: Bool = false,
         periodicIdleWakeIntervalSeconds: Int = AgentSessionLinkPeriodicWakeInterval.defaultSeconds,
+        purpose: String? = nil,
         parentSessionID: UUID?,
         createdByOverseerSessionID: UUID? = nil,
         organizationalParentID: UUID? = nil,
@@ -216,6 +233,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         self.routineWakeIntervalSeconds = AgentSessionLinkRoutineWakeInterval.normalized(routineWakeIntervalSeconds)
         self.periodicIdleWakeEnabled = periodicIdleWakeEnabled
         self.periodicIdleWakeIntervalSeconds = AgentSessionLinkPeriodicWakeInterval.normalized(periodicIdleWakeIntervalSeconds)
+        self.purpose = purpose
         self.parentSessionID = parentSessionID
         self.createdByOverseerSessionID = createdByOverseerSessionID
         self.organizationalParentID = organizationalParentID
@@ -259,6 +277,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         case routineWakeIntervalSeconds
         case periodicIdleWakeEnabled
         case periodicIdleWakeIntervalSeconds
+        case purpose
         case parentSessionID
         case createdByOverseerSessionID
         case organizationalParentID
@@ -320,6 +339,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             container.decodeIfPresent(Int.self, forKey: .periodicIdleWakeIntervalSeconds)
                 ?? AgentSessionLinkPeriodicWakeInterval.defaultSeconds
         )
+        purpose = try container.decodeIfPresent(String.self, forKey: .purpose)
         parentSessionID = try container.decodeIfPresent(UUID.self, forKey: .parentSessionID)
         createdByOverseerSessionID = try container.decodeIfPresent(UUID.self, forKey: .createdByOverseerSessionID)
         organizationalParentID = try container.decodeIfPresent(UUID.self, forKey: .organizationalParentID)
@@ -361,6 +381,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             routineWakeIntervalSeconds: routineWakeIntervalSeconds,
             periodicIdleWakeEnabled: periodicIdleWakeEnabled,
             periodicIdleWakeIntervalSeconds: periodicIdleWakeIntervalSeconds,
+            purpose: purpose,
             parentSessionID: parentSessionID,
             createdByOverseerSessionID: createdByOverseerSessionID,
             organizationalParentID: organizationalParentID,
@@ -383,6 +404,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             agentModel: agentModelRaw,
             lastRunState: lastRunStateRaw,
             acpModelParameterSelections: acpModelParameterSelections,
+            purpose: purpose,
             parentSessionID: parentSessionID,
             createdByOverseerSessionID: createdByOverseerSessionID,
             isMCPOriginated: isMCPOriginated,
@@ -414,6 +436,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             && routineWakeIntervalSeconds == other.routineWakeIntervalSeconds
             && periodicIdleWakeEnabled == other.periodicIdleWakeEnabled
             && periodicIdleWakeIntervalSeconds == other.periodicIdleWakeIntervalSeconds
+            && purpose == other.purpose
             && parentSessionID == other.parentSessionID
             && createdByOverseerSessionID == other.createdByOverseerSessionID
             && organizationalParentID == other.organizationalParentID
@@ -469,6 +492,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             routineWakeIntervalSeconds: session.routineWakeIntervalSeconds,
             periodicIdleWakeEnabled: session.periodicIdleWakeEnabled,
             periodicIdleWakeIntervalSeconds: session.periodicIdleWakeIntervalSeconds,
+            purpose: session.purpose,
             parentSessionID: session.parentSessionID,
             createdByOverseerSessionID: session.createdByOverseerSessionID,
             organizationalParentID: session.organizationalParentID,

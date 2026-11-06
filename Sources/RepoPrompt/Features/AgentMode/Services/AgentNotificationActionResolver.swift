@@ -67,6 +67,8 @@ enum AgentNotificationActionResolver {
     ) -> AgentNotificationActionOutcome {
         guard let session = target.notificationSession(tabID: request.tabID) else { return .stale }
         guard session.activeAgentSessionID == request.sessionID else { return .stale }
+        // Designated children require their asynchronous, identity-fenced in-chat cards.
+        guard !session.isComputerUseChild else { return .ineligible }
         let isMCPControlled = target.notificationSessionIsMCPControlled(tabID: request.tabID)
 
         switch request.notificationKind {

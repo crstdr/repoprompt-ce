@@ -105,9 +105,6 @@ struct AdvancedSettingsView: View {
             VStack(alignment: .leading, spacing: 16) {
                 headerSection
 
-                Divider()
-                    .padding(.horizontal, -16)
-
                 fileSystemSection
 
                 Divider()

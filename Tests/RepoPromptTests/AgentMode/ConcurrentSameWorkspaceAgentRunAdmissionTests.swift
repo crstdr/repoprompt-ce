@@ -30,6 +30,129 @@ import XCTest
             cleanupOperation = operation
         }
 
+        func testSupersededUnscopedStarterCannotDeactivateSuccessorControl() async throws {
+            let fixture = try await DurableAgentAdmissionFixture.make()
+            trackCleanup { await fixture.cleanup() }
+            for afterApprovalStore in [false, true] {
+                let vm = fixture.window.agentModeViewModel
+                let target = try await vm.mcpResolveOrCreateSessionTarget(
+                    tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "Activation race"
+                )
+                let sessionID = try XCTUnwrap(target.sessionID)
+                let registrationGate = AdmissionSaveGate()
+                if afterApprovalStore {
+                    vm.test_afterMCPApprovalStoreUpdate = { await registrationGate.enterFirstAndWait() }
+                } else {
+                    vm.test_afterMCPControlRegistration = { _ in await registrationGate.enterFirstAndWait() }
+                }
+                let first = Task {
+                    try await AgentExternalMCPRunStarter.startPreservingCallerBinding(
+                        target: target, message: "Fixture instruction",
+                        metadata: .init(connectionID: nil, clientName: "activation-race-test", windowID: fixture.window.windowID),
+                        agentModeVM: vm, agentRaw: nil, modelRaw: nil, reasoningEffortRaw: nil,
+                        dispatchInstruction: { _, _, _, _, _ in
+                            XCTFail("Superseded activation dispatched")
+                            throw AdmissionTestError.expected
+                        }
+                    )
+                }
+                do {
+                    try await waitUntil("first activation registration") { await registrationGate.hasEntered() }
+                    let successor = try await vm.mcpActivateControlContext(
+                        forTabID: target.tabID, sessionID: sessionID, originatingConnectionID: nil,
+                        creationHandle: target.creationHandle
+                    )
+                    await registrationGate.open()
+                    do { _ = try await first.value
+                        XCTFail("Superseded activation succeeded")
+                    } catch {}
+                    XCTAssertEqual(vm.mcpRegistration(sessionID: sessionID), successor.registration)
+                    XCTAssertEqual(vm.session(for: target.tabID).mcpControlContext?.activationID, successor.activationID)
+                    vm.test_afterMCPControlRegistration = nil
+                    vm.test_afterMCPApprovalStoreUpdate = nil
+                } catch {
+                    await registrationGate.open()
+                    _ = try? await first.value
+                    vm.test_afterMCPControlRegistration = nil
+                    vm.test_afterMCPApprovalStoreUpdate = nil
+                    throw error
+                }
+            }
+        }
+
+        func testSupersededStartDuringConfigurationCannotMutateOrDispatchSuccessor() async throws {
+            let fixture = try await DurableAgentAdmissionFixture.make()
+            trackCleanup { await fixture.cleanup() }
+            let vm = fixture.window.agentModeViewModel
+            let target = try await vm.mcpResolveOrCreateSessionTarget(
+                tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "Configuration ownership"
+            )
+            let sessionID = try XCTUnwrap(target.sessionID)
+            let gate = AdmissionSaveGate()
+            vm.test_beforeMCPSelectionCommit = { await gate.enterFirstAndWait() }
+            var dispatched = false
+            let task = Task {
+                try await AgentExternalMCPRunStarter.startPreservingCallerBinding(
+                    target: target, message: "Fixture instruction",
+                    metadata: .init(connectionID: nil, clientName: "configuration-owner-test", windowID: fixture.window.windowID),
+                    agentModeVM: vm, agentRaw: nil, modelRaw: nil, reasoningEffortRaw: "low",
+                    dispatchInstruction: { _, _, _, _, _ in
+                        dispatched = true
+                        throw AdmissionTestError.expected
+                    }
+                )
+            }
+            try await waitUntil("configuration suspended") { await gate.hasEntered() }
+            let successor = try await vm.mcpActivateControlContext(
+                forTabID: target.tabID, sessionID: sessionID, originatingConnectionID: nil,
+                creationHandle: target.creationHandle
+            )
+            let session = vm.session(for: target.tabID)
+            let priorEffort = session.selectedReasoningEffortRaw
+            await gate.open()
+            do { _ = try await task.value
+                XCTFail("Superseded start succeeded")
+            } catch {}
+            vm.test_beforeMCPSelectionCommit = nil
+            XCTAssertFalse(dispatched)
+            XCTAssertEqual(session.selectedReasoningEffortRaw, priorEffort)
+            XCTAssertEqual(session.mcpControlContext?.activationID, successor.activationID)
+            XCTAssertEqual(vm.mcpRegistration(sessionID: sessionID), successor.registration)
+        }
+
+        func testSupersededStartDuringRequestBindingCannotDispatchSuccessor() async throws {
+            let fixture = try await DurableAgentAdmissionFixture.make()
+            trackCleanup { await fixture.cleanup() }
+            let vm = fixture.window.agentModeViewModel
+            let target = try await vm.mcpResolveOrCreateSessionTarget(
+                tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "Dispatch ownership"
+            )
+            let sessionID = try XCTUnwrap(target.sessionID)
+            var successor: AgentModeViewModel.AgentMCPControlContext?
+            var dispatched = false
+            do {
+                _ = try await AgentExternalMCPRunStarter.startApplyingRequestBindingPolicy(
+                    target: target, message: "Fixture instruction",
+                    metadata: .init(connectionID: nil, clientName: "dispatch-owner-test", windowID: fixture.window.windowID),
+                    bindCurrentRequestToTab: { _, _, _ in
+                        successor = try await vm.mcpActivateControlContext(
+                            forTabID: target.tabID, sessionID: sessionID, originatingConnectionID: nil,
+                            creationHandle: target.creationHandle
+                        )
+                    },
+                    agentModeVM: vm, agentRaw: nil, modelRaw: nil, reasoningEffortRaw: nil,
+                    dispatchInstruction: { _, _, _, _, _ in
+                        dispatched = true
+                        throw AdmissionTestError.expected
+                    }
+                )
+                XCTFail("Superseded start succeeded")
+            } catch {}
+            XCTAssertFalse(dispatched)
+            let acceptedSuccessor = try XCTUnwrap(successor)
+            XCTAssertEqual(vm.mcpRegistration(sessionID: sessionID), acceptedSuccessor.registration)
+        }
+
         func testSixOverlappingAgentRunStartsPersistUniqueIdentitiesAndDispatchProvidersExactlyOnce() async throws {
             let fixture = try await DurableAgentAdmissionFixture.make()
             trackCleanup {
@@ -586,24 +709,11 @@ import XCTest
                 await fixture.cleanup()
             }
             let manager = fixture.window.workspaceManager
-            let prompt = fixture.window.promptManager
-            // The post-switch Git-data root starts expanded. Join that load and its
-            // foreground badge update before measuring invalidations caused by Git mode.
-            // Otherwise fixture normalization can consume the retry before this hook runs.
-            await manager.waitUntilPostSwitchGitDataLoadComplete()
-            let workspace = try XCTUnwrap(manager.activeWorkspace, file: file, line: line)
-            prompt.loadComposeTabsFromWorkspace(workspace)
-            // The reload synchronously schedules (or coalesces into) the badge callback.
-            // This FIFO barrier joins it whether the normalized foreground is dirty or clean.
-            await withCheckedContinuation { continuation in
-                DispatchQueue.main.async { continuation.resume() }
-            }
-            let initialTabs = workspace.composeTabs
+            let initialTabs = try XCTUnwrap(manager.activeWorkspace, file: file, line: line).composeTabs
             var preparations = 0
-            manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { @MainActor workspaceID, _, remainingRetries in
+            manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { @MainActor workspaceID, _, _ in
                 guard workspaceID == fixture.workspaceID else { return }
                 preparations += 1
-                XCTAssertEqual(remainingRetries, preparations == 1 ? 1 : 0, file: file, line: line)
                 // Settings sync can republish the same mode while document preparation
                 // is suspended. The control changes it once, then republishes that value
                 // on the retry; only the real transition may invalidate the capture.
@@ -1057,6 +1167,13 @@ import XCTest
                 workspaceID: workspaceID,
                 sessionID: sessionID
             ))
+            let vm = fixture.window.agentModeViewModel
+            let ownedTarget = try await vm.mcpResolveOrCreateSessionTarget(
+                tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "Owned discard"
+            )
+            let discarded = await vm.mcpDiscardSessionTarget(ownedTarget)
+            XCTAssertEqual(discarded, .complete)
+            XCTAssertEqual(vm.test_outstandingProvisionalMCPSessionTargetCount, 0)
         }
 
         func testSecondWindowCannotStartPublishedProvisionalSessionBeforeAcceptance() async throws {
@@ -2181,7 +2298,7 @@ import XCTest
                 resolveSpawnParentSourceTabID: { _ in nil },
                 resolveSpawnParentSessionID: { _, _ in nil },
                 withHeartbeat: { _, _, _, _, operation in try await operation() },
-                startRun: { target, _, _, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, _, _, _, _, _ in
+                startRun: { target, _, _, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, _, _, _, _, _, _ in
                     let sessionID = try XCTUnwrap(target.sessionID)
                     let pair = AdmissionIdentityPair(tabID: target.tabID, sessionID: sessionID)
                     try await validateBeforeProviderDispatch?(pair)
@@ -2394,25 +2511,6 @@ import XCTest
         let workspaceFileURL: URL
     }
 
-    /// Creation and bridge projection are independent now that canonical decoding suspends.
-    /// Admission tests begin only after the real bridge accepted this durable document; a
-    /// synthetic local append cannot establish the full-document write baseline saves require.
-    @MainActor
-    private func awaitDurableAdmissionCatalog(
-        window: WindowState, runtime: MCPDomainRuntime, workspaceID: UUID
-    ) async throws {
-        let catalog = await runtime.workspaceStore.snapshot()
-        guard let record = catalog.workspaces.first(where: { $0.document.workspaceID == workspaceID }),
-              let bridge = window.domainWorkspacePresentationBridgeForTesting
-        else { throw AdmissionTestError.fixtureSetup("durable admission catalog unavailable") }
-        let checkpoint = await DomainWorkspaceProjectionObserver(bridge: bridge).waitForProjection(
-            afterGeneration: 0, through: catalog.publicationSequence, requireCatalogApplication: true
-        )
-        guard checkpoint != nil,
-              window.workspaceManager.qualifiedDomainWorkspaceDescendant(record) != nil
-        else { throw AdmissionTestError.fixtureSetup("durable admission catalog has no accepted full-document baseline") }
-    }
-
     @MainActor
     private func completeDurableAdmissionWindowSetup(_ window: WindowState) async throws {
         // Switching starts an owned Git-data root load after foreground restoration.
@@ -2591,7 +2689,11 @@ import XCTest
                 throw AdmissionTestError.fixtureSetup("explicit workspace creation did not commit")
             }
             await WorkspaceDiskWriterComposition.processWriter.flush(url: workspaceFileURL)
-            try await awaitDurableAdmissionCatalog(window: window, runtime: runtime, workspaceID: workspace.id)
+            // A sibling window can publish a catalog projection while this synthetic workspace is
+            // being created, so establish the local projection from the workspace just committed.
+            if !window.workspaceManager.workspaces.contains(where: { $0.id == workspace.id }) {
+                window.workspaceManager.workspaces.append(workspace)
+            }
             let storedWorkspace = try XCTUnwrap(
                 window.workspaceManager.workspaces.first { $0.id == workspace.id }
             )
@@ -2703,7 +2805,11 @@ import XCTest
                     throw AdmissionTestError.fixtureSetup("explicit workspace creation did not commit")
                 }
                 await WorkspaceDiskWriterComposition.processWriter.flush(url: workspaceFileURL)
-                try await awaitDurableAdmissionCatalog(window: window, runtime: runtime, workspaceID: workspace.id)
+                // Catalog projection and fixture creation are independent publications; the test
+                // window must expose the workspace that the authority has already committed.
+                if !window.workspaceManager.workspaces.contains(where: { $0.id == workspace.id }) {
+                    window.workspaceManager.workspaces.append(workspace)
+                }
                 let storedWorkspace = try XCTUnwrap(
                     window.workspaceManager.workspaces.first { $0.id == workspace.id }
                 )

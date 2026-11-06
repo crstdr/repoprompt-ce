@@ -20,6 +20,7 @@ extension Notification.Name {
     static let showCLIProvidersTab = Notification.Name("showCLIProvidersTab")
     /// Posted when the UI should show the Agent Mode settings tab
     static let showAgentModeSettingsTab = Notification.Name("showAgentModeSettingsTab")
+    static let showComputerUseSettingsTab = Notification.Name("showComputerUseSettingsTab")
     /// Posted when the UI should open Settings to the Model Router tab.
     static let showModelRouterSettingsTab = Notification.Name("showModelRouterSettingsTab")
     /// Posted when the UI should open Settings to the Agent Models tab.
@@ -89,6 +90,8 @@ extension Notification.Name {
     /// Posted when a compose tab is linked to or unlinked from a persistent Agent session.
     /// userInfo: ["tabID": UUID, "windowID": Int, "previousSessionID": UUID?, "sessionID": UUID?]
     static let agentSessionBindingDidChange = Notification.Name("agentSessionBindingDidChange")
+    /// Payload-free, MainActor presentation refresh; grants no authority.
+    static let agentSessionLinkCandidatesDidChange = Notification.Name("agentSessionLinkCandidatesDidChange")
 
     /// Toggle the Agent session sidebar for the focused window.
     /// `userInfo["windowID"]` should be the target window ID.

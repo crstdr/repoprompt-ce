@@ -2717,6 +2717,7 @@ actor DomainWorkspaceContextAuthority {
         diagnostic: String?
     ) {
         publicationSequence &+= 1
+        CatalogPerf.shared.publication(kind)
         if let workspaceID, var record = records[workspaceID] {
             let operation: DomainWorkspaceTransitionDiagnostic.Operation = switch kind {
             case .savedDocumentCommitted: .savedCommit

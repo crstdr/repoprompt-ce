@@ -1,5 +1,5 @@
 {
-  "description": "Codex required discovery merge-forward after oversight revert: measured upstream/main bdfa1b3910fe4aef7722ed787d52efad3552ae96 app baseline 604207 plus exact net PR app-source delta 122 = 604329, with zero app-line headroom. Required discovery, cold compaction ownership and renewed replacement admission are unchanged. All other upstream numeric metrics and enforcement remain unchanged. Agent Re-prompt adds the seven explicitly planned app-boundary test suites; only the testable-import ceiling increases by seven (333 to 340), with no source-size ratchet relaxation.",
+  "description": "Fork sync 2026-10-15: upstream e310a32ee429baeb0f182eac85077978d8c83a10 baseline/enforcement plus measured positive fork-only deltas through fork main 54eee9d43 (#165): app_shared_accessor_uses +10, app_target_swift_files +6, app_target_swift_lines +2994, app_wrong_way_file_edges +12, first_party_swift_lines +3317, tests_sleep_calls +1, tests_testable_import_app_files +5. Existing upstream drift is not absorbed. Fork sync 2026-10-23: combined source measured app_files_over_2000_lines 48, app_files_over_5000_lines 16, app_static_shared_declarations 89, tests_testable_import_app_files 345. Upstream #1432 adds seven app-boundary suites, so the combined test-import ceiling is 338 + 7 = 345. Re-measured after merging upstream ffd641575: all four gated combined-source measurements remain 48/16/89/345. All other ceilings and advisory baselines remain unchanged; tracked drift is reported, not absorbed. Fork sync 2026-10-18: app_files_over_2000_lines 47->48 for combined AgentManageMCPToolService.swift (2005 lines); all other ceilings unchanged, per explicit fork sync decision. Hold branch sync/upstream-20261025-hold-1335 (2026-10-25): app_files_over_5000_lines 16->17 for ACPAgentSessionController.swift (4893 -> 5010) after the standing-hold revert of upstream #1335 restores the attested Devin auto-approval machinery pending Cristian's accept-or-hold decision; bounded to the hold branch only.",
   "ratcheted": [
     "app_files_over_5000_lines",
     "app_files_over_2000_lines",
@@ -17,18 +17,18 @@
   ],
   "metrics": {
     "app_components": 69,
-    "app_files_over_2000_lines": 47,
-    "app_files_over_5000_lines": 16,
+    "app_files_over_2000_lines": 48,
+    "app_files_over_5000_lines": 17,
     "app_largest_cycle_components": 64,
     "app_share_permille": 868,
-    "app_shared_accessor_uses": 1218,
+    "app_shared_accessor_uses": 1228,
     "app_static_shared_declarations": 89,
-    "app_target_swift_files": 1126,
-    "app_target_swift_lines": 604329,
+    "app_target_swift_files": 1132,
+    "app_target_swift_lines": 607323,
     "app_userdefaults_standard_uses": 234,
-    "app_wrong_way_file_edges": 1079,
-    "first_party_swift_lines": 747202,
-    "tests_sleep_calls": 59,
-    "tests_testable_import_app_files": 340
+    "app_wrong_way_file_edges": 1091,
+    "first_party_swift_lines": 750519,
+    "tests_sleep_calls": 60,
+    "tests_testable_import_app_files": 345
   }
 }

@@ -114,10 +114,6 @@ private struct WorkspaceFileCachedLoadResult {
 final class WorkspaceFileDecodeCache: @unchecked Sendable {
     static let shared = WorkspaceFileDecodeCache()
 
-    /// Serialize immutable codec preparation across windows under the existing cache owner,
-    /// rather than introduce another process singleton or initialize the app/runtime for a codec.
-    let documentPreparation = WorkspaceDocumentPreparation()
-
     private let lock = NSLock()
     private var cachedWorkspacesByKey: [WorkspaceFileDecodeCacheKey: WorkspaceModel] = [:]
     private var scheduledNormalizationSaveKeys: Set<WorkspaceFileDecodeCacheKey> = []
@@ -185,14 +181,17 @@ final class WorkspaceFileDecodeCache: @unchecked Sendable {
     }
 
     fileprivate static func decodeWorkspace(
-        documentBytes: Data
+        documentBytes: Data,
+        catalogPerf: Bool = false
     ) throws -> (workspace: WorkspaceModel, normalizationRequiresSave: Bool) {
         let digest = Data(SHA256.hash(data: documentBytes))
             .map { String(format: "%02x", $0) }
             .joined()
         if let cached = shared.cachedDecode(for: digest) {
+            if catalogPerf { CatalogPerf.shared.canonicalDecode(bytesHashed: documentBytes.count, cacheHit: true) }
             return cached
         }
+        if catalogPerf { CatalogPerf.shared.canonicalDecode(bytesHashed: documentBytes.count, cacheHit: false) }
         // The decode is only memoizable when it is a pure function of the
         // bytes: custom decoders and normalization synthesize UUID()/Date()
         // fallbacks for missing fields, and those results must stay
@@ -1191,6 +1190,8 @@ enum DomainCatalogApplicationResult: Equatable {
 /// in its own folder + workspace.json, and maintain an index file for all known workspaces.
 @MainActor
 class WorkspaceManagerViewModel: ObservableObject {
+    // Installed once by window composition; nonvisual owners have no window work to charge.
+    var activityMainWork: ActivityMainWorkCounters?
     let restorePerfRecorder: any WorkspaceRestorePerfRecording
     private let workspaceSaveTracer: WorkspaceSaveTracer
 
@@ -8137,18 +8138,11 @@ class WorkspaceManagerViewModel: ObservableObject {
                       domainWorkingCommitGeneration[workspaceID] == generation,
                       self.workspace(withID: workspaceID)?.isEphemeral == false
                 else { return }
-                let document = try await WorkspaceFileDecodeCache.shared.documentPreparation.document(for: workspace, fileURL: fileURL)
-                try Task.checkCancellation()
-                guard domainWorkingCommitGeneration[workspaceID] == generation,
-                      self.workspace(withID: workspaceID)?.isEphemeral == false
-                else { return }
-                try registerPendingFullDocumentWrite(
-                    workspace, baseline: writeBaseline, operationIDs: [operationID],
-                    permitsLocalDescendants: permitsLocalDescendants, preparedDigest: document.contentDigest
-                )
+                try registerPendingFullDocumentWrite(workspace, baseline: writeBaseline, operationIDs: [operationID], permitsLocalDescendants: permitsLocalDescendants)
                 defer { pendingFullDocumentWrites.removeValue(forKey: operationID) }
                 let outcome = try await domainWorkspaceAuthorityClient.replaceWorkingFailClosed(
-                    document,
+                    workspace,
+                    fileURL: fileURL,
                     expectedWorkspaceRevision: expectedWorkspaceRevision,
                     operationID: operationID
                 )
@@ -8214,18 +8208,6 @@ class WorkspaceManagerViewModel: ObservableObject {
         return baseline.adoptionGeneration
     }
 
-    /// Preserve an owned descendant of these exact canonical bytes, never infer a write baseline.
-    func qualifiedDomainWorkspaceDescendant(_ record: DomainWorkspaceSnapshot) -> WorkspaceModel? {
-        let workspaceID = record.document.workspaceID
-        guard let local = workspace(withID: workspaceID), !local.isEphemeral,
-              let baseline = fullDocumentWriteBaseline(workspaceID: workspaceID),
-              baseline.workingRevision == record.revisions.workingRevision,
-              baseline.contentDigest == record.document.contentDigest,
-              baseline.fileURL == record.document.fileURL
-        else { return nil }
-        return local
-    }
-
     private func fullDocumentWriteBaseline(workspaceID: UUID) -> FullDocumentWriteBaseline? {
         guard catalogApplicationDepth == 0, !requiresFullCatalogReconciliation,
               let baseline = fullDocumentWriteBaselines[workspaceID],
@@ -8285,8 +8267,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         _ workspace: WorkspaceModel,
         baseline: FullDocumentWriteBaseline,
         operationIDs: [UUID],
-        permitsLocalDescendants: Bool,
-        preparedDigest: String? = nil
+        permitsLocalDescendants: Bool
     ) throws {
         let currentBaseline = fullDocumentWriteBaseline(workspaceID: workspace.id)
         guard currentBaseline == baseline else {
@@ -8295,7 +8276,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             if currentBaseline == nil { requestFullDocumentAdoption(workspaceID: workspace.id) }
             throw WorkspacePersistenceFailure(category: .workspaceChanged)
         }
-        let digest = try preparedDigest ?? DomainWorkspaceAuthorityClient.documentDigest(for: workspace)
+        let digest = try DomainWorkspaceAuthorityClient.documentDigest(for: workspace)
         let pending = PendingFullDocumentWrite(
             workspaceID: workspace.id, baseline: baseline,
             resultingRevision: baseline.workingRevision &+ (digest == baseline.contentDigest ? 0 : 1),
@@ -9315,6 +9296,12 @@ class WorkspaceManagerViewModel: ObservableObject {
         rootMapPolicy: DomainCatalogRootMapPolicy,
         attempt: DomainCatalogAttempt? = nil
     ) -> DomainCatalogApplicationResult {
+        let perfStart = DispatchTime.now().uptimeNanoseconds
+        var perfFull = false
+        defer {
+            let elapsed = Double(DispatchTime.now().uptimeNanoseconds - perfStart) / 1_000_000
+            CatalogPerf.shared.application(elapsedMS: elapsed, full: perfFull)
+        }
         let attempt = attempt ?? beginDomainCatalogAttempt()
         if let rejection = catalogAdmissionRejection(snapshot, projection: projection, attempt: attempt) {
             if case let .invalidCatalog(reason) = rejection {
@@ -9339,6 +9326,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         switch projection {
         case let .full(models):
             kind = .full
+            perfFull = true
             applied = applyDomainWorkspaceProjection(
                 models,
                 canonicalRepoPathsByWorkspaceID: rootMapPolicy == .snapshotMetadata ? map(\.document.metadata.repoPaths) : nil,
@@ -9515,22 +9503,14 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     /// Shared identity-checked record decode for catalog projection and scoped restore classification.
-    func decodeDomainWorkspaceCatalogRecord(_ record: DomainWorkspaceSnapshot) throws -> WorkspaceModel {
-        try checkDomainWorkspaceCatalogRecordDecoding(record)
-        return try Self.decodeDomainWorkspaceCatalogRecordBytes(record)
-    }
-
-    /// Fault injection stays on the manager's actor; immutable bytes are decoded separately.
-    func checkDomainWorkspaceCatalogRecordDecoding(_ record: DomainWorkspaceSnapshot) throws {
+    func decodeDomainWorkspaceCatalogRecord(_ record: DomainWorkspaceSnapshot, catalogPerf: Bool = false) throws -> WorkspaceModel {
         #if DEBUG
             if let error = catalogRecordDecodeFailureForTesting?(record.document.workspaceID) { throw error }
         #endif
-    }
-
-    nonisolated static func decodeDomainWorkspaceCatalogRecordBytes(_ record: DomainWorkspaceSnapshot) throws -> WorkspaceModel {
         let model = try Self.decodeDomainWorkspaceProjection(
             documentBytes: record.document.documentBytes,
-            fileURL: record.document.fileURL
+            fileURL: record.document.fileURL,
+            catalogPerf: catalogPerf
         )
         guard model.id == record.document.workspaceID else {
             throw NSError(domain: "WorkspaceChooserCatalog", code: 2, userInfo: [
@@ -9538,32 +9518,6 @@ class WorkspaceManagerViewModel: ObservableObject {
             ])
         }
         return model
-    }
-
-    /// Local provenance observed across CPU preparation. Even an equal-value setter or a point
-    /// adoption can require a new cache reuse plan without invalidating decoded canonical bytes.
-    struct CatalogPreparationWitness: Equatable {
-        let publicationSerial: UInt64
-        let reconciliationGeneration: UInt64
-        let requiresFullReconciliation: Bool
-        let adoptionGenerations: [UUID: UInt64]
-        let stateVersions: [UUID: Int]
-        let revisions: [UUID: DomainRevisionState]
-        let digests: [UUID: String]
-        let health: [UUID: DomainAuthorityHealth]
-    }
-
-    var catalogPreparationWitness: CatalogPreparationWitness {
-        CatalogPreparationWitness(
-            publicationSerial: workspacePublicationSerial,
-            reconciliationGeneration: domainCatalogReconciliationGeneration,
-            requiresFullReconciliation: requiresFullCatalogReconciliation,
-            adoptionGenerations: fullDocumentAdoptionGenerations,
-            stateVersions: stateVersionByWorkspaceID,
-            revisions: domainWorkspaceRevisionsByID,
-            digests: domainWorkspaceDigestsByID,
-            health: domainWorkspaceHealthByID
-        )
     }
 
     #if DEBUG
@@ -11100,27 +11054,48 @@ class WorkspaceManagerViewModel: ObservableObject {
         _ = updateComposeTabStoredOnly(tab, inWorkspaceID: workspaceID)
     }
 
-    /// Exact-identity stored update. This avoids duplicate-tab ambiguity and dirties the
-    /// workspace that was actually mutated rather than whichever workspace is active.
+    /// Workspace-qualified stored update. Preserve first-match lookup for duplicate IDs;
+    /// dirty the workspace that was actually mutated rather than whichever workspace is active.
     @MainActor
     @discardableResult
     func updateComposeTabStoredOnly(_ tab: ComposeTabState, inWorkspaceID workspaceID: UUID) -> Bool {
+        let activity = activityMainWork
+        activity?.begin(.selection)
+        defer { activity?.end(.selection) }
         guard let workspaceIndex = workspaces.firstIndex(where: { $0.id == workspaceID }),
               let tabIndex = workspaces[workspaceIndex].composeTabs.firstIndex(where: { $0.id == tab.id })
         else { return false }
 
-        let oldSelection = workspaces[workspaceIndex].composeTabs[tabIndex].selection
+        let previous = workspaces[workspaceIndex].composeTabs[tabIndex]
+        // Selection equality alone must not discard session-identity or other content edits.
+        guard previous != tab else { return true }
         var updatedTab = tab
         updatedTab.lastModified = Date()
-        workspaces[workspaceIndex].composeTabs[tabIndex] = updatedTab
-        recordSelectionRevisionIfChanged(
-            workspaceIndex: workspaceIndex,
-            tabIndex: tabIndex,
-            oldSelection: oldSelection,
-            newSelection: updatedTab.selection,
-            reason: "updateComposeTabStoredOnly"
-        )
-        workspaces[workspaceIndex].dateModified = Date()
+        var replacement = workspaces[workspaceIndex]
+        replacement.composeTabs[tabIndex] = updatedTab
+        replacement.dateModified = Date()
+        // The snapshot path's indexed identity proof is an optimization, not lookup authority:
+        // ambiguous/unresolvable IDs still mutate the first match through generic maintenance.
+        if workspaceIndexMap[workspaceID] == workspaceIndex,
+           modelRoutingTabIndexes[workspaceID]?[tab.id] == tabIndex,
+           previous.activeAgentSessionID == updatedTab.activeAgentSessionID
+        {
+            composeTabPresentationPublication = (workspaceID, [tab.id])
+        }
+        workspaces[workspaceIndex] = replacement
+        // Synchronous publication subscribers can reorder or remove either owner.
+        // Reacquire both identities; a removed target must not revise its former neighbor.
+        if let storedWorkspaceIndex = workspaces.firstIndex(where: { $0.id == workspaceID }),
+           let storedTabIndex = workspaces[storedWorkspaceIndex].composeTabs.firstIndex(where: { $0.id == tab.id })
+        {
+            recordSelectionRevisionIfChanged(
+                workspaceIndex: storedWorkspaceIndex,
+                tabIndex: storedTabIndex,
+                oldSelection: previous.selection,
+                newSelection: updatedTab.selection,
+                reason: "updateComposeTabStoredOnly"
+            )
+        }
 
         // Important: do NOT call promptViewModel.loadComposeTabsFromWorkspace(...)
         // and do NOT publish snapshots here. We only persist the stored tab data.
@@ -17175,9 +17150,6 @@ class WorkspaceManagerViewModel: ObservableObject {
             throw WorkspaceDirectWriteError.ephemeralWorkspace
         }
 
-        // Encode/hash once off main. The existing post-preparation capture, lifecycle and own-save
-        // fences below also cover this suspension; no prepared bytes authorize a later stale write.
-        let preparedDocument = try await WorkspaceFileDecodeCache.shared.documentPreparation.document(for: workspaceToSave, fileURL: targetURL)
         #if DEBUG
             await workspaceSavePreparationDidFinishHandlerForTesting?(
                 workspace.id,
@@ -17234,11 +17206,11 @@ class WorkspaceManagerViewModel: ObservableObject {
                 workspaceToSave,
                 baseline: writeBaseline,
                 operationIDs: pendingOperationIDs,
-                permitsLocalDescendants: workspaceToSave == capture.localWorkspace,
-                preparedDigest: preparedDocument.contentDigest
+                permitsLocalDescendants: workspaceToSave == capture.localWorkspace
             )
             let phasedOutcome = try await domainWorkspaceAuthorityClient.saveFailClosed(
-                preparedDocument,
+                workspaceToSave,
+                fileURL: targetURL,
                 expectedWorkspaceRevision: exactExpectedWorkspaceRevision,
                 expectedContentDigest: exactExpectedContentDigest,
                 operationIDs: operationIDs
@@ -17324,11 +17296,11 @@ class WorkspaceManagerViewModel: ObservableObject {
                     workspaceToSave,
                     baseline: writeBaseline,
                     operationIDs: pendingOperationIDs,
-                    permitsLocalDescendants: workspaceToSave == capture.localWorkspace,
-                    preparedDigest: preparedDocument.contentDigest
+                    permitsLocalDescendants: workspaceToSave == capture.localWorkspace
                 )
                 let phased = try await domainWorkspaceAuthorityClient.saveFailClosed(
-                    preparedDocument,
+                    workspaceToSave,
+                    fileURL: targetURL,
                     expectedWorkspaceRevision: writeBaseline.workingRevision,
                     expectedContentDigest: writeBaseline.contentDigest,
                     operationIDs: operationIDs
@@ -17370,7 +17342,7 @@ class WorkspaceManagerViewModel: ObservableObject {
            fullDocumentAdoptionGenerations[workspaceToSave.id, default: 0] == capture.adoptionGeneration,
            let revisions = outcome.workspace?.revisions ?? outcome.after,
            let digest = outcome.workspace?.document.contentDigest ?? outcome.resultingDigest,
-           digest == preparedDocument.contentDigest
+           digest == (try? DomainWorkspaceAuthorityClient.documentDigest(for: workspaceToSave))
         {
             // Explicit creation owns the first full document. No existing record's CAS is borrowed.
             adoptFullDocumentBaseline(workspaceID: workspaceToSave.id, revisions: revisions, digest: digest, fileURL: targetURL)
@@ -17713,14 +17685,15 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     nonisolated static func decodeDomainWorkspaceProjection(
         documentBytes: Data,
-        fileURL: URL
+        fileURL: URL,
+        catalogPerf: Bool = false
     ) throws -> WorkspaceModel {
         #if DEBUG
             let workspace = try WorkspaceProjectionDecodeDiagnostics.measure(inputBytes: documentBytes.count) {
-                try WorkspaceFileDecodeCache.decodeWorkspace(documentBytes: documentBytes).workspace
+                try WorkspaceFileDecodeCache.decodeWorkspace(documentBytes: documentBytes, catalogPerf: catalogPerf).workspace
             }
         #else
-            let workspace = try WorkspaceFileDecodeCache.decodeWorkspace(documentBytes: documentBytes).workspace
+            let workspace = try WorkspaceFileDecodeCache.decodeWorkspace(documentBytes: documentBytes, catalogPerf: catalogPerf).workspace
         #endif
         // The domain authority re-writes this document from the projected value, so the original
         // bytes must be preserved here, before any projection consumer can commit a lossy copy.

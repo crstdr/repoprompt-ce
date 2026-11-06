@@ -1117,7 +1117,8 @@ import XCTest
             let peerDocument = try DomainWorkspaceAuthorityClient.document(for: peer, fileURL: fileURL)
             let peerClient = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -991)
             let peerSave = try await peerClient.saveFailClosed(
-                peerDocument,
+                peer,
+                fileURL: fileURL,
                 expectedWorkspaceRevision: current.revisions.workingRevision,
                 expectedContentDigest: current.document.contentDigest
             )

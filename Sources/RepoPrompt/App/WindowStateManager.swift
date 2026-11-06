@@ -546,6 +546,7 @@ class WindowStatesManager: ObservableObject {
 
     /// 🚀 Single, shared instance for the entire app
     static let shared = WindowStatesManager()
+    let activityLedger = WindowActivityLedger()
 
     /// App-global bundled router registry plus shared backend credential/readiness authorities.
     let modelRouterRuntime = AgentTaskRouterRuntime()
@@ -1097,6 +1098,7 @@ class WindowStatesManager: ObservableObject {
             let registerStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
         #endif
         allWindows.append(state)
+        activityLedger.registerWindow(state.windowID)
         #if DEBUG
             WorkspaceRestorePerfLog.log(
                 "restore.window registered windowID=\(state.windowID) registeredWindows=\(allWindows.count) pendingRestoreEntries=\(restoreQueue.count)"
@@ -1204,6 +1206,7 @@ class WindowStatesManager: ObservableObject {
         invalidateAgentSessionLinks(forClosedWindowID: state.windowID)
         // Retract every attention notification this window owned; its sessions are gone.
         NotificationService.shared.agentNotifications.removeWindow(state.windowID)
+        activityLedger.removeWindow(state.windowID)
         explicitlyClosingWindowIDs.remove(state.windowID)
         // A window that closes mid-restore must not leave the persistence gate held.
         restorePersistenceGate.finishRestoringWindow(state.windowID)
@@ -1394,6 +1397,7 @@ class WindowStatesManager: ObservableObject {
                     self.closingWindowReferences.compactMap(\.value)
             )
             self.isTerminating = true
+            _ = AppDomainRuntimeComposition.shared.oracleBackgroundInvocations.beginShutdown()
             // Before any async teardown: `stopAllServers()` clears each window's MCP tools request,
             // and the final session writes must still record the user's per-window switch (#143).
             for window in self.terminationWindowSnapshot {
@@ -1499,6 +1503,8 @@ class WindowStatesManager: ObservableObject {
     /// Safe to call after `signalTermination()` — fences new work and joins provider/process
     /// teardown before MCP servers stop.
     func shutdownAllAgentSessions() async {
+        let oracleDrain = AppDomainRuntimeComposition.shared.oracleBackgroundInvocations.beginShutdown()
+        _ = await OracleBackgroundInvocationRegistry.awaitDrain(oracleDrain, timeout: 2)
         closingWindowReferences.removeAll { $0.value == nil }
         let windows = deduplicatedWindows(
             terminationWindowSnapshot + allWindows + Array(preparedOversightWindows.values) + Array(retiringPreparedOversightWindows.values) + closingWindowReferences.compactMap(\.value)

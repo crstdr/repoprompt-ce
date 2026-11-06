@@ -1,6 +1,113 @@
 import AppKit
+import OSLog
 import RepoPromptDomainRuntime
 import SwiftUI
+
+// MARK: - Sidebar tap diagnostics
+
+@MainActor
+enum AgentSidebarTapModifierReader {
+    /// Flags from `NSApp.currentEvent` when the tap handler runs.
+    ///
+    /// This is not captured from the mouse-down that started the click. A later
+    /// flags-changed or key event can be current, and a command or shift bit on
+    /// that event reinterprets the click. A nil app or a nil current event is a
+    /// plain click. `NSApp` is an implicitly unwrapped optional, so a test
+    /// process that has not created the shared application must not touch it.
+    static func currentFlags() -> NSEvent.ModifierFlags {
+        guard NSApp != nil else { return [] }
+        return NSApp.currentEvent?.modifierFlags ?? []
+    }
+
+    static func gesture(for flags: NSEvent.ModifierFlags) -> AgentSidebarSelectionGesture {
+        var modifiers: AgentSidebarSelectionModifiers = []
+        if flags.contains(.command) { modifiers.insert(.command) }
+        if flags.contains(.shift) { modifiers.insert(.shift) }
+        return AgentSidebarSelectionGesture(modifiers: modifiers)
+    }
+}
+
+@MainActor
+enum AgentSidebarTapDiagnostics {
+    static let logger = Logger(subsystem: "com.repoprompt.agents", category: "sidebar-tap")
+
+    #if DEBUG
+        static var recordForTests = false
+        static var testLines: [String] = []
+    #endif
+
+    static func log(
+        disposition: AgentSidebarSelectionGestureDisposition,
+        reason: String?,
+        modifierFlags: NSEvent.ModifierFlags,
+        selectionCount: Int,
+        workspaceMatched: Bool,
+        rowID: UUID?
+    ) {
+        let outcome = switch disposition {
+        case .activate:
+            "activate"
+        case .selectionChanged:
+            "selectionChanged"
+        case .ignored:
+            "ignored"
+        }
+        var fields = ["outcome=\(outcome)"]
+        if let reason, reason != outcome {
+            fields.append("reason=\(reason)")
+        }
+        fields.append(contentsOf: [
+            "flags=\(modifierFlags.rawValue)",
+            "selection=\(selectionCount)",
+            "workspaceMatched=\(workspaceMatched)",
+            "row=\(rowID?.uuidString ?? "none")"
+        ])
+        let line = fields.joined(separator: " ")
+        logger.log("\(line, privacy: .public)")
+        #if DEBUG
+            if recordForTests {
+                testLines.append(line)
+            }
+        #endif
+    }
+}
+
+@MainActor
+enum AgentSidebarRowTap {
+    static func handle(
+        isInteractionEnabled: Bool,
+        tapRowID: UUID?,
+        tapSelectionCount: Int,
+        tapWorkspaceMatched: Bool,
+        onSelectionGesture: (AgentSidebarSelectionGesture) -> AgentSidebarSelectionGestureResult,
+        onActivate: () -> Void
+    ) {
+        let flags = AgentSidebarTapModifierReader.currentFlags()
+        guard isInteractionEnabled else {
+            AgentSidebarTapDiagnostics.log(
+                disposition: .ignored,
+                reason: "interaction-disabled",
+                modifierFlags: flags,
+                selectionCount: tapSelectionCount,
+                workspaceMatched: tapWorkspaceMatched,
+                rowID: tapRowID
+            )
+            return
+        }
+        let result = onSelectionGesture(AgentSidebarTapModifierReader.gesture(for: flags))
+        AgentSidebarTapDiagnostics.log(
+            disposition: result.disposition,
+            reason: result.reason,
+            modifierFlags: flags,
+            selectionCount: result.selectionCount,
+            workspaceMatched: result.workspaceMatched,
+            rowID: result.rowID
+        )
+        if result.disposition == .activate {
+            onActivate()
+        }
+    }
+}
 
 // MARK: - Agent Session Row
 
@@ -60,8 +167,11 @@ struct AgentSessionRow: View {
     var isSelected = false
     var showsSelectionPresentation = false
     var isInteractionEnabled = true
+    var tapRowID: UUID?
+    var tapSelectionCount = 0
+    var tapWorkspaceMatched = false
     var commandProgressKind: AgentSidebarBulkActionKind?
-    let onSelectionGesture: (AgentSidebarSelectionGesture) -> AgentSidebarSelectionGestureDisposition
+    let onSelectionGesture: (AgentSidebarSelectionGesture) -> AgentSidebarSelectionGestureResult
     let onSelect: () -> Void
     let onTogglePin: () -> Void
     var onStash: (() -> Void)?
@@ -78,6 +188,7 @@ struct AgentSessionRow: View {
     var resolveSidebarOversightSummary: (@MainActor () -> AgentSidebarOversightSummary?)?
     /// Fresh full choices at activation; action handlers revalidate captured exact identities.
     var resolveSidebarOversightMenu: (@MainActor () -> AgentSidebarOversightMenuProps?)?
+    var diagnoseSidebarOversightMenuUnavailable: (@MainActor () -> Void)?
     var prepareSidebarOversightMenu: (@MainActor () -> Void)?
     /// Non-nil when the row could host oversight but lacks a bound session ID (a fresh chat
     /// before the first send, or any ID-less row): the context menu then offers the Oversee-by
@@ -224,6 +335,9 @@ struct AgentSessionRow: View {
     private func currentContextMenuSnapshot() -> ContextMenuSnapshot {
         if allowsDirectMutations { prepareSidebarOversightMenu?() }
         let menu = presentableSidebarOversightMenu
+        if allowsDirectMutations, menu == nil {
+            diagnoseSidebarOversightMenuUnavailable?()
+        }
         var unavailableReason = sidebarOversightUnavailableReason
         if unavailableReason == nil,
            resolveSidebarOversightMenu != nil,
@@ -406,6 +520,9 @@ struct AgentSessionRow: View {
                 return item.refreshingSubmenu {
                     if allowsDirectMutations { prepareSidebarOversightMenu?() }
                     guard let menu = presentableSidebarOversightMenu else {
+                        if allowsDirectMutations {
+                            diagnoseSidebarOversightMenuUnavailable?()
+                        }
                         let reason = sidebarOversightUnavailableReason
                             ?? sidebarOversightMenuUnavailableFallback
                         return .submenu(item.title, accessibilityValue: reason, items: [.message(reason)])
@@ -844,19 +961,15 @@ struct AgentSessionRow: View {
         showDeleteConfirmation = true
     }
 
-    private var currentSelectionGesture: AgentSidebarSelectionGesture {
-        var modifiers: AgentSidebarSelectionModifiers = []
-        let flags = NSApp.currentEvent?.modifierFlags ?? []
-        if flags.contains(.command) { modifiers.insert(.command) }
-        if flags.contains(.shift) { modifiers.insert(.shift) }
-        return AgentSidebarSelectionGesture(modifiers: modifiers)
-    }
-
     private func handleRowTap() {
-        guard isInteractionEnabled else { return }
-        if onSelectionGesture(currentSelectionGesture) == .activate {
-            onSelect()
-        }
+        AgentSidebarRowTap.handle(
+            isInteractionEnabled: isInteractionEnabled,
+            tapRowID: tapRowID,
+            tapSelectionCount: tapSelectionCount,
+            tapWorkspaceMatched: tapWorkspaceMatched,
+            onSelectionGesture: onSelectionGesture,
+            onActivate: onSelect
+        )
     }
 
     private func toggleSelection() {
@@ -1349,7 +1462,7 @@ struct AgentSessionRow: View {
             // plate fill and the identity glyph so the chevron/arrow/dot
             // remains visually centered while the ring conveys motion.
             if runState == .running {
-                AgentRowActivityArc(tint: runningAccentColor)
+                AgentRowRunningIndicator(tint: runningAccentColor)
                     .allowsHitTesting(false)
             }
 
@@ -1628,18 +1741,37 @@ struct AgentSessionRow: View {
 ///   should not out-shout it.
 struct AgentRowActivityArc: View {
     var tint: Color = .accentColor
+    var reduceMotionOverride: Bool?
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.windowIsPresentationVisible) private var isWindowPresentationVisible
 
     var body: some View {
         // Spun by the render server (see `AgentRowActivityArcLayerView`): a SwiftUI `repeatForever`
         // rotation here re-rendered the row's whole window on the main thread every frame.
-        AgentRowAnimatedActivityArc(tint: tint, isPresentationVisible: isWindowPresentationVisible)
+        AgentRowAnimatedActivityArc(tint: tint, isPresentationVisible: isWindowPresentationVisible && !(reduceMotionOverride ?? reduceMotion))
             .frame(width: AgentRowActivityArcLayerView.diameter, height: AgentRowActivityArcLayerView.diameter)
-            // An AppKit view is not an accessibility element on its own; this keeps the arc one
-            // element carrying the "Running" label.
             .accessibilityElement()
-            .accessibilityLabel("Running")
+            .accessibilityLabel(AgentRowRunningIndicator.accessibilityLabelText)
+    }
+}
+
+/// The running row's status glyph. The layer owner pauses decorative motion in hidden windows.
+struct AgentRowRunningIndicator: View {
+    static let accessibilityLabelText = "Running"
+
+    var tint: Color = .accentColor
+    /// Nil reads the process Reduce Motion setting. Tests pin it so the hosted
+    /// indicator does not depend on the runner's accessibility preferences.
+    var reduceMotionOverride: Bool?
+
+    init(tint: Color = .accentColor, reduceMotionOverride: Bool? = nil) {
+        self.tint = tint
+        self.reduceMotionOverride = reduceMotionOverride
+    }
+
+    var body: some View {
+        AgentRowActivityArc(tint: tint, reduceMotionOverride: reduceMotionOverride)
     }
 }
 

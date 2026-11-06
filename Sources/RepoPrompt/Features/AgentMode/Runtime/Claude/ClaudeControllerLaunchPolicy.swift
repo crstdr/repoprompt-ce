@@ -13,7 +13,7 @@ struct ClaudeControllerLaunchPolicy: Equatable {
         securePermissions: AgentPermissionSecureStore?
     ) -> ClaudeControllerLaunchPolicy {
         switch profile {
-        case .mcpSafeDefaults:
+        case .mcpSafeDefaults, .computerUseChild:
             ClaudeControllerLaunchPolicy(
                 permissionMode: permissionMode,
                 allowNativeBashTool: false,

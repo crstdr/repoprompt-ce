@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptSettingsCore
@@ -603,5 +604,82 @@ final class OversightLinkConfirmationSuppressionTests: XCTestCase {
         )
         XCTAssertTrue(store.suppressOversightLinkConfirmation())
         XCTAssertTrue(AgentOversightLinkConfirmation.isSuppressed(settings: store))
+    }
+}
+
+@MainActor
+final class ComputerUseSettingsTests: XCTestCase {
+    func testLegacyDecodeAndEnvironmentSpellingsPreserveUpgradeBehavior() throws {
+        for stored in [nil, false, true] as [Bool?] {
+            let bytes = stored.map { "{\"codexComputerUseEnabled\":\($0)}" } ?? "{}"
+            let row = try JSONDecoder().decode(GlobalScalarPreferences.AgentModeSettings.self, from: Data(bytes.utf8))
+            for raw in ["", "0", "1", "true", "yes", "on", " TRUE ", "enabled"] {
+                let envOn = ["1", "true", "yes", "on", " TRUE "].contains(raw)
+                XCTAssertEqual(CodexComputerUseWorkflow.isEnabled(persistedValue: row.codexComputerUseEnabled, master: nil, environment: ["RP_CODEX_COMPUTER_USE": raw]), (stored ?? false) || envOn)
+            }
+            XCTAssertFalse(try String(decoding: JSONEncoder().encode(row), as: UTF8.self).contains("computerUseMasterEnabled"))
+        }
+    }
+
+    func testMasterAndDirectMutationsPreserveRowsAndNotifyDirectObserver() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let suite = UUID().uuidString, defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let file = GlobalSettingsFileStore(fileURL: root.appendingPathComponent("settings.json"))
+        let store = GlobalSettingsStore(defaults: defaults, fileStore: file)
+        store.setCodexComputerUseEnabled(true, commit: false)
+        var changes = 0
+        let observer = NotificationCenter.default.publisher(for: .codexComputerUseDidChange).sink { _ in changes += 1 }
+        defer { observer.cancel() }
+        for master in [false, true] {
+            store.setComputerUseMasterEnabled(master, commit: false)
+            XCTAssertEqual(store.codexComputerUseEnabled(), master)
+            XCTAssertEqual(store.scalarPreferences.agentMode?.codexComputerUseEnabled, true)
+            XCTAssertEqual(CodexComputerUseWorkflow.isEnabled(persistedValue: false, master: master, environment: ["RP_CODEX_COMPUTER_USE": "on"]), master)
+        }
+        XCTAssertEqual(changes, 2)
+        store.updateAgentModeScalar(commit: false) { $0.computerUseSubagentEnabled = true
+            $0.computerUseModel = "future-model"
+        }
+        store.setComputerUseMasterEnabled(false)
+        let restored = GlobalSettingsStore(defaults: defaults, fileStore: file)
+        XCTAssertEqual(restored.scalarPreferences.agentMode, store.scalarPreferences.agentMode)
+        XCTAssertFalse(restored.codexComputerUseEnabled())
+        CodexAgentModeBooleanPreference.computerUse.setEnabled(true, defaults: defaults)
+        XCTAssertTrue(CodexComputerUseWorkflow.isEnabled(defaults: defaults))
+        defaults.set(false, forKey: ComputerUsePolicy.masterDefaultsKey)
+        XCTAssertFalse(CodexComputerUseWorkflow.isEnabled(defaults: defaults))
+        XCTAssertEqual(defaults.object(forKey: "enableCodexComputerUse") as? Bool, true)
+        CodexComputerUseWorkflow.setEnabledForTesting(false)
+        defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
+        restored.setComputerUseMasterEnabled(true, commit: false)
+        XCTAssertFalse(restored.codexComputerUseEnabled())
+    }
+
+    func testStatusSnapshotsAndInvalidatedAppearanceDropsLateResult() async {
+        let url = URL(fileURLWithPath: "/fake/codex")
+        let expanded = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("codex").path
+        XCTAssertEqual(ComputerUseAvailability.externalRuntimeURL(" \n~/bin/../codex ", isExecutable: { $0 == expanded })?.path, expanded)
+        XCTAssertNil(ComputerUseAvailability.externalRuntimeURL("relative/codex", isExecutable: { _ in true }))
+        XCTAssertNil(ComputerUseAvailability.externalRuntimeURL(FileManager.default.temporaryDirectory.path))
+        let cases: [(Bool, URL?, Bool, [String])] = [(true, Optional(url), true, ["✓ Computer Use companion installed", "✓ OpenAI-signed Codex runtime"]), (false, Optional(url), false, ["Computer Use companion missing", "Codex runtime is not OpenAI-signed"]), (false, nil, false, ["Computer Use companion missing", "Codex runtime unavailable"])]
+        for (companion, runtime, signed, expected) in cases {
+            XCTAssertEqual(ComputerUseAvailability.snapshot(companion: companion, runtime: runtime, signed: { _ in signed }), expected)
+        }
+        let status = ComputerUseAvailability()
+        await status.refresh { (["current"], true) }
+        XCTAssertEqual(status.messages, ["current"])
+        XCTAssertTrue(status.terraAvailable)
+        var continuation: CheckedContinuation<(messages: [String], terraAvailable: Bool), Never>?
+        let pending = Task { await status.refresh { await withCheckedContinuation { continuation = $0 } } }
+        while continuation == nil {
+            await Task.yield()
+        }
+        status.invalidate()
+        continuation?.resume(returning: (["stale"], false))
+        await pending.value
+        XCTAssertEqual(status.messages, ["Checking Computer Use availability…"])
+        XCTAssertTrue(status.terraAvailable)
     }
 }

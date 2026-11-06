@@ -149,6 +149,13 @@ final class AgentNotificationActionResolverTests: XCTestCase {
         let id = installApproval()
         let reference = try reference()
 
+        for purpose in ["computerUse", "unknown"] {
+            session.purpose = purpose
+            XCTAssertEqual(resolve(.approve, reference: reference), .ineligible)
+            XCTAssertEqual(session.pendingApproval?.id, id)
+            XCTAssertTrue(target.approvals.isEmpty)
+        }
+        session.purpose = nil
         XCTAssertEqual(resolve(.approve, reference: reference), .applied)
         XCTAssertEqual(target.approvals.map(\.0), [id])
         XCTAssertEqual(target.approvals.first?.1, .accept)

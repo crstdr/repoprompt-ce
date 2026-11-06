@@ -2,12 +2,12 @@ import Foundation
 import MCP
 import RepoPromptShared
 
-package enum MCPToolExecutionCleanupDisposition: String, Equatable, Sendable {
+package enum MCPToolExecutionCleanupDisposition: String, Equatable {
     case forceDisconnect = "force_disconnect"
     case detachAndSettle = "detach_and_settle"
 }
 
-package enum MCPToolExecutionContract: Equatable, Sendable {
+package enum MCPToolExecutionContract: Equatable {
     case bounded(
         deadline: Duration,
         cancellationGrace: Duration,
@@ -48,7 +48,7 @@ package enum MCPToolExecutionContract: Equatable, Sendable {
         return cleanupDisposition
     }
 
-    package enum Kind: String, Sendable {
+    package enum Kind: String {
         case bounded
         case longSynchronousCancellable = "long_synchronous_cancellable"
         case lifecycleManagedCancellable = "lifecycle_managed_cancellable"
@@ -57,7 +57,7 @@ package enum MCPToolExecutionContract: Equatable, Sendable {
     }
 }
 
-package enum MCPToolExecutionDispatchError: Error, Equatable, Sendable {
+package enum MCPToolExecutionDispatchError: Error, Equatable {
     case missingContract(toolName: String)
     case structureSettlementBusy(windowID: Int, context: MCPCodeStructureSettlementRegistry.BusyContext)
     case structureSettlementWindowUnresolved

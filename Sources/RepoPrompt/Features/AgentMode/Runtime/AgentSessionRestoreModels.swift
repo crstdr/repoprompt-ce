@@ -20,6 +20,7 @@ struct AgentSessionIndexEntry: Identifiable, Equatable {
     var routineWakeIntervalSeconds: Int = AgentSessionLinkRoutineWakeInterval.defaultSeconds
     var periodicIdleWakeEnabled: Bool = false
     var periodicIdleWakeIntervalSeconds: Int = AgentSessionLinkPeriodicWakeInterval.defaultSeconds
+    var purpose: String?
     var parentSessionID: UUID?
     var createdByOverseerSessionID: UUID?
     /// Mutable organizational placement; `nil` follows spawn provenance.

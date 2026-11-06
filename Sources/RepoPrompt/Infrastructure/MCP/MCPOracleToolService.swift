@@ -65,6 +65,10 @@ struct MCPOracleToolService {
     }
 
     func executeOracleChatLog(args: [String: Value], invocationContext: ToolInvocationContext) async throws -> Value {
+        let operation = try OracleBackgroundContract.operation(args, read: true)
+        if operation == "collect" { return try await executeBackgroundOracleControl(args: args, invocation: invocationContext, cancel: false) }
+        var args = args
+        args.removeValue(forKey: "op")
         guard let connectionID = invocationContext.connectionID else {
             throw MCPError.invalidParams("oracle_chat_log requires an active MCP connection")
         }
@@ -118,6 +122,19 @@ struct MCPOracleToolService {
     // MARK: - ask_oracle (agent-mode only)
 
     func executeAskOracle(args: [String: Value], invocationContext: ToolInvocationContext) async throws -> Value {
+        let operation = try OracleBackgroundContract.operation(args, read: false)
+        if operation == "cancel" { return try await executeBackgroundOracleControl(args: args, invocation: invocationContext, cancel: true) }
+        let background = try OracleBackgroundContract.boolean(args, "background", default: false)
+        let backgroundCaller: OracleBackgroundCaller?
+        if background {
+            guard invocationContext.metadata.invocationID != nil,
+                  let caller = try await self.backgroundCaller(args: args, invocation: invocationContext, tool: askOracleToolName), caller.admitsStart
+            else { return Self.backgroundEnvelope(.unsupported, reason: "session") }
+            backgroundCaller = caller
+        } else { backgroundCaller = nil }
+        var args = args
+        args.removeValue(forKey: "op")
+        args.removeValue(forKey: "background")
         try Self.validateOracleArguments(toolName: MCPWindowToolName.askOracle, args: args)
         try validateCommonOracleArgs(args)
         let attachmentRequests = try OracleAttachmentContract.parseArguments(args)
@@ -129,17 +146,20 @@ struct MCPOracleToolService {
         let message = (args["message"]?.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         let modeRaw = args["mode"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "chat"
         let exportResponse = try parseExportResponseFlag(args)
+        if background && exportResponse { return Self.backgroundEnvelope(.unsupported, reason: "export") }
         let newChat = args["new_chat"]?.boolValue ?? false
         let chatID = args["chat_id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedChatID = (chatID?.isEmpty == false) ? chatID : nil
         let requestedModelOverride = try parseOracleModelOverride(args["model"])
+        let additionalOracles = try OracleAdditionalOraclesContract.parseArguments(args)
         let route: OracleConversationRoute
         do {
             route = try OracleConversationRoute.resolve(
                 chatID: normalizedChatID,
                 newChat: newChat,
                 modelOverride: requestedModelOverride,
-                whenMissingChatID: .startNew
+                whenMissingChatID: .startNew,
+                additionalOracles: additionalOracles
             )
         } catch {
             throw MCPError.invalidParams(error.localizedDescription)
@@ -172,6 +192,11 @@ struct MCPOracleToolService {
         }
 
         let owner = await resolveAgentOracleOwner(tabID: tabID, targetWindow: targetWindow, tabContext: virtualContext)
+        if let continuationChatID {
+            let controlCaller: OracleBackgroundCaller? = if let backgroundCaller { backgroundCaller }
+            else { try? await self.backgroundCaller(args: args, invocation: invocationContext, tool: askOracleToolName) }
+            if let caller = controlCaller, let busy = await backgroundBusyContinuation(chatID: continuationChatID, caller: caller) { return busy }
+        }
         var tabContext: OracleViewModel.OracleSendTabContext
         if let virtualContext, virtualContext.tabID == tabID {
             tabContext = try await oracleSendTabContext(
@@ -264,18 +289,27 @@ struct MCPOracleToolService {
         if let modelOverride {
             chatArgs["model"] = .string(modelOverride)
         }
+        if let additionalOracles {
+            chatArgs[OracleAdditionalOraclesContract.argumentName] = .array(additionalOracles.map(Value.string))
+        }
+
+        if let backgroundCaller, let invocationID = invocationContext.metadata.invocationID {
+            return try await startBackgroundOracle(args: chatArgs, tabContext: tabContext, caller: backgroundCaller, invocationID: invocationID)
+        }
 
         await sendStageProgress(connectionID, askOracleToolName, "starting", "Starting Oracle...")
 
         let capturedChatArgs = chatArgs
         let capturedTabContext = tabContext
-        var result = try await withHeartbeat(
-            connectionID,
-            askOracleToolName,
-            "waiting",
-            "Waiting for Oracle response..."
-        ) {
-            try await sendChat(capturedChatArgs, promptVM, capturedTabContext)
+        var result: [String: Value]
+        do {
+            result = try await withHeartbeat(
+                connectionID, askOracleToolName, "waiting", "Waiting for Oracle response..."
+            ) { try await sendChat(capturedChatArgs, promptVM, capturedTabContext) }
+        } catch OracleGroupClaimError.conflict {
+            let caller = try? await self.backgroundCaller(args: args, invocation: invocationContext, tool: askOracleToolName)
+            guard let busy = await backgroundBusyAfterClaim(args: chatArgs, caller: caller) else { throw OracleGroupClaimError.conflict }
+            return busy
         }
 
         if exportResponse {
@@ -309,13 +343,15 @@ struct MCPOracleToolService {
         let chatID = args["chat_id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedChatID = (chatID?.isEmpty == false) ? chatID : nil
         let requestedModelOverride = try parseOracleModelOverride(args["model"])
+        let additionalOracles = try OracleAdditionalOraclesContract.parseArguments(args)
         let route: OracleConversationRoute
         do {
             route = try OracleConversationRoute.resolve(
                 chatID: normalizedChatID,
                 newChat: newChat,
                 modelOverride: requestedModelOverride,
-                whenMissingChatID: .continueCurrent
+                whenMissingChatID: .continueCurrent,
+                additionalOracles: additionalOracles
             )
         } catch {
             throw MCPError.invalidParams(error.localizedDescription)
@@ -389,13 +425,15 @@ struct MCPOracleToolService {
 
         let capturedTabContext = tabContext
         let capturedChatArgs = chatArgs
-        var result = try await withHeartbeat(
-            connectionID,
-            oracleSendToolName,
-            "waiting",
-            "Waiting for Oracle response..."
-        ) {
-            try await sendChat(capturedChatArgs, promptVM, capturedTabContext)
+        var result: [String: Value]
+        do {
+            result = try await withHeartbeat(
+                connectionID, oracleSendToolName, "waiting", "Waiting for Oracle response..."
+            ) { try await sendChat(capturedChatArgs, promptVM, capturedTabContext) }
+        } catch OracleGroupClaimError.conflict {
+            let caller = try? await backgroundCaller(args: args, invocation: invocationContext, tool: oracleSendToolName)
+            guard let busy = await backgroundBusyAfterClaim(args: chatArgs, caller: caller) else { throw OracleGroupClaimError.conflict }
+            return busy
         }
 
         if exportResponse {
@@ -470,7 +508,7 @@ struct MCPOracleToolService {
     }
 
     private static let oracleArgumentNames = [
-        "message", "mode", "chat_id", "new_chat", "model", OracleAttachmentContract.argumentName, "export_response"
+        "message", "mode", "chat_id", "new_chat", "model", OracleAdditionalOraclesContract.argumentName, OracleAttachmentContract.argumentName, "export_response"
     ]
 
     /// The deprecated `images` alias is accepted but deliberately not listed, so the error steers
@@ -546,19 +584,24 @@ struct MCPOracleToolService {
     }
 
     private func executeOracleModelsUtility() async throws -> Value {
+        let window = try requireTargetWindow()
+        let primaryLabel = OracleRosterContract.displayLabel(laneIndex: 0)
         let settingsStore = GlobalSettingsStore.shared
         let exposesPresets = settingsStore.mcpShowModelPresets()
             && !settingsStore.mcpTemporarilyDisablePresets()
         let presets = exposesPresets ? ModelPresetsManager.shared.allPresets() : []
-        guard !presets.isEmpty else {
-            let model = try defaultCurrentChatModelInfo()
-            return .string(
-                "Available models:\n- \(model.id): \(model.name) — modes: [Chat, Plan, Review] — \(model.description ?? "MCP Oracle Model")"
-            )
+        var lines: [String] = []
+        if presets.isEmpty {
+            do {
+                let model = try defaultCurrentChatModelInfo()
+                lines.append("Available models:\n- \(model.id): \(model.name) — modes: [Chat, Plan, Review] — \(model.description ?? "MCP Oracle Model")")
+            } catch {
+                lines.append("- \(primaryLabel): \(error.localizedDescription)")
+            }
+        } else {
+            lines.append("Available Model Presets (automatic-selection priority order):")
         }
-
         let chatPresets = ChatPresetManager.shared.allPresets
-        var lines = ["Available Model Presets (automatic-selection priority order):"]
         for (priority, preset) in presets.enumerated() {
             lines.append("- \(priority + 1). \(preset.name) (\(preset.id.uuidString))")
             for (laneIndex, rawModel) in preset.modelStrings.enumerated() {
@@ -567,7 +610,7 @@ struct MCPOracleToolService {
                     let availability = promptVM.mcpOracleIsProviderConfigured(for: model)
                         ? "available"
                         : "unavailable"
-                    lines.append("  - \(label): \(model.displayName) — \(availability)")
+                    lines.append("  - \(label): \(model.displayName) (\(rawModel)) — \(availability)")
                 } else {
                     lines.append("  - \(label): \(rawModel) — unknown model")
                 }
@@ -589,6 +632,19 @@ struct MCPOracleToolService {
             if let description = preset.description, !description.isEmpty {
                 lines.append("  - \(description)")
             }
+        }
+        let workspaceID = window.workspaceManager.activeWorkspace?.id
+        let profile = settingsStore.effectiveAgentModelsProfile(workspaceID: workspaceID)
+        lines.append("Configured Oracle settings roster (not Model Presets):")
+        if profile.planningModelRaw == nil {
+            lines.append("- \(primaryLabel): not configured")
+        }
+        let roster: [(Int, String)] = profile.planningModelRaw.map { [(0, $0)] } ?? []
+        for (laneIndex, identifier) in roster + profile.additionalOracleModelRaws.enumerated().map({ ($0.offset + 1, $0.element) }) {
+            let availability = AIModel.fromModelName(identifier).map {
+                promptVM.mcpOracleIsProviderConfigured(for: $0) ? "available" : "unavailable"
+            } ?? "unknown model"
+            lines.append("- \(OracleRosterContract.displayLabel(laneIndex: laneIndex)): \(identifier) — \(availability)")
         }
         return .string(lines.joined(separator: "\n"))
     }

@@ -162,9 +162,14 @@ package enum SecureKeyValueStorageFactory {
             // until bootstrap installs an authenticated committed-bridge override.
             EphemeralSecureKeyValueStore.shared
         case .localSelfSigned:
-            // Defense in depth for manually constructed or legacy decisions:
-            // local signing continuity must never select a persistent secret store.
-            EphemeralSecureKeyValueStore.shared
+            if let fingerprint = decision.localCertificateFingerprint,
+               let generation = decision.localServiceGeneration,
+               generation > 0
+            {
+                KeychainService.localSelfSigned(fingerprint: fingerprint, generation: generation)
+            } else {
+                EphemeralSecureKeyValueStore.shared
+            }
         case .appleDevelopmentDebug:
             if decision.appleDevelopmentTeamIdentifier == RuntimeCodeSigningPolicy.signingTeamIdentifier {
                 KeychainService.debugShared

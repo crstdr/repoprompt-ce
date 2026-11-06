@@ -211,6 +211,26 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
             let shutdownCount = await native.shutdownCount
             XCTAssertEqual(shutdownCount, 0)
         }
+
+        var aborted = false
+        fixture.viewModel.test_afterWorktreeBindingPreparation = { throw CancellationError() }
+        fixture.viewModel.test_beforeWorktreeBindingAbort = { aborted = true }
+        defer {
+            fixture.viewModel.test_afterWorktreeBindingPreparation = nil
+            fixture.viewModel.test_beforeWorktreeBindingAbort = nil
+        }
+        do {
+            _ = try await fixture.viewModel.transitionWorktreeBindings(
+                [], forSessionID: fixture.sessionID, intent: .externalManagement
+            )
+            XCTFail("Failed preparation must abort")
+        } catch is CancellationError {
+            XCTAssertTrue(aborted)
+            XCTAssertEqual(fixture.session.worktreeBindings, original)
+            let ownership = await fixture.prompt.workspaceFileContextStore.sessionWorktreeOwnershipDebugSnapshotForTesting()
+            XCTAssertEqual(ownership.provisionalOwnerCount, 0)
+            XCTAssertEqual(ownership.installedOwnerCount, 1)
+        }
     }
 
     func testPersistenceFailureDoesNotPretendCommittedSwitchWasRejected() async throws {

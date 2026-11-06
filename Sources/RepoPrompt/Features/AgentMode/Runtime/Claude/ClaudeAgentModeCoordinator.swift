@@ -73,8 +73,10 @@ final class ClaudeAgentModeCoordinator {
 
     enum NativeSendOutcome: Equatable {
         case sent
-        case failed(message: String)
+        case failed(message: String, providerWriteAttempted: Bool = false)
         case superseded
+        /// Currency was lost after crossing a provider write boundary; never definite no-write.
+        case supersededAfterWriteAttempt
     }
 
     struct HostCapabilities {
@@ -204,6 +206,10 @@ final class ClaudeAgentModeCoordinator {
     struct DetachedClaudeController {
         fileprivate let controller: any NativeAgentRuntimeControlling
         fileprivate let toolHandler: ClaudeAgentToolTrackingHandler?
+        /// The Claude runtime context epoch captured when this controller was
+        /// detached; travels with the owner so a late transfer registration
+        /// cannot inherit a successor cancellation's epoch.
+        fileprivate let contextEpoch: UUID?
         fileprivate var pendingPermissionIDs: [String] = []
     }
 
@@ -240,11 +246,22 @@ final class ClaudeAgentModeCoordinator {
     private var toolHandlerByTabID: [UUID: ClaudeAgentToolTrackingHandler] = [:]
     /// Tracks only a temporary Auto effort applied to this exact live controller.
     /// The next ordinary turn restores the user's manual effort before dispatch.
+    private var nativeSendsInFlightByTabID: [UUID: Int] = [:]
+
+    func hasNativeSendOrToolWork(session: AgentTabSession, runID: UUID) -> Bool {
+        nativeSendsInFlightByTabID[session.tabID, default: 0] > 0
+            || hasPendingResumeTransfer(for: session)
+            || hasActiveMCPTools(runID)
+            || hasActiveChildAgentRunWaits(runID)
+    }
+
     private var appliedAutoEffortByTabID: [UUID: (controllerID: ObjectIdentifier, effort: ClaudeCodeEffortLevel)] = [:]
     private var controllerLaunchSettingsByTabID: [UUID: ControllerLaunchSettings] = [:]
     private var controllerRetirementGenerationByTabID: [UUID: UUID] = [:]
     private var pendingResumeTransferTasksByTabID: [UUID: Task<NativeAgentRuntimeSessionRef, Never>] = [:]
     private var pendingResumeTransferGenerationByTabID: [UUID: UUID] = [:]
+    private var pendingResumeTransferEpochByTabID: [UUID: UUID] = [:]
+    private var claudeRuntimeEpochByTabID: [UUID: UUID] = [:]
     private var retiredResumeTransferTasksByTabID: [UUID: [Task<NativeAgentRuntimeSessionRef, Never>]] = [:]
     /// Exact retirements of withdrawn pending providers, retained until they finish so a later
     /// teardown-completed cancellation can still join them after the listener was detached.
@@ -349,6 +366,8 @@ final class ClaudeAgentModeCoordinator {
         resumeTransferTasks.forEach { $0.cancel() }
         pendingResumeTransferTasksByTabID.removeAll()
         pendingResumeTransferGenerationByTabID.removeAll()
+        pendingResumeTransferEpochByTabID.removeAll()
+        claudeRuntimeEpochByTabID.removeAll()
         retiredResumeTransferTasksByTabID.removeAll()
     }
 
@@ -533,7 +552,17 @@ final class ClaudeAgentModeCoordinator {
         }
         session.claudeAutoCompactWindowTokens = status.autoCompactWindowTokens
         guard session.selectedAgent.usesClaudeNativeRuntime else { return false }
-        return ClaudeContextUsageEstimator.reconcileContextWindow(session: session, createsUsage: true)
+        let changed = ClaudeContextUsageEstimator.reconcileContextWindow(session: session, createsUsage: true)
+        guard session.contextUsageSnapshot == nil else { return changed }
+        let estimator = ClaudeContextUsageEstimator(
+            tokenEstimator: { TokenCalculationService.estimateTokens(for: $0) },
+            contextUsageBuilder: { AgentModeViewModel.contextUsageFromClaudeProviderTokens($0, modelContextWindow: $1) }
+        )
+        let snapshot = estimator.ingestUsageSignal(
+            promptTokens: nil, completionTokens: nil, contextUsedTokens: nil,
+            modelContextWindow: nil, session: session
+        )
+        return snapshot != nil || changed
     }
 
     private func scheduleIdleFailure(_ session: AgentTabSession, listener: ClaudeControllerEventListener, error: String) {
@@ -904,7 +933,12 @@ final class ClaudeAgentModeCoordinator {
         let toolHandler = removeToolTracking ? toolHandlerByTabID.removeValue(forKey: session.tabID) : nil
         let pendingPermissionIDs = controllerListeners[session.tabID]?.pendingApprovalIDs ?? []
         clearClaudeControllerLaunchMetadata(for: session, preservingAttemptEvents: preservingAttemptEvents)
-        return DetachedClaudeController(controller: controller, toolHandler: toolHandler, pendingPermissionIDs: pendingPermissionIDs)
+        return DetachedClaudeController(
+            controller: controller,
+            toolHandler: toolHandler,
+            contextEpoch: currentClaudeRuntimeEpoch(for: session),
+            pendingPermissionIDs: pendingPermissionIDs
+        )
     }
 
     private func clearClaudeControllerLaunchMetadata(
@@ -1314,6 +1348,12 @@ final class ClaudeAgentModeCoordinator {
         reinstallRunRoutingPolicy: (@MainActor () async -> Bool)? = nil,
         inputAttemptChanged: (@MainActor (Bool) -> Void)? = nil
     ) async -> NativeSendOutcome {
+        nativeSendsInFlightByTabID[session.tabID, default: 0] += 1
+        defer {
+            let remaining = nativeSendsInFlightByTabID[session.tabID, default: 1] - 1
+            if remaining == 0 { nativeSendsInFlightByTabID.removeValue(forKey: session.tabID) }
+            else { nativeSendsInFlightByTabID[session.tabID] = remaining }
+        }
         guard intentIsCurrent(intent, for: session) else { return .superseded }
         let isSelfNote = selfCompactDispatchID?.stage == .note
         let isMaintenance = providerControlCommand != nil || isSelfNote
@@ -1348,21 +1388,21 @@ final class ClaudeAgentModeCoordinator {
                 return recordSendFailure(
                     "The session was rebound before the requested command could run, so it was not run.",
                     session: session,
-                    intent: intent
+                    intent: intent, providerWriteAttempted: false
                 )
             }
             guard session.providerSessionID == command.expectedProviderConversation else {
                 return recordSendFailure(
                     "Claude could not resume the conversation the requested command was for, so it was not run.",
                     session: session,
-                    intent: intent
+                    intent: intent, providerWriteAttempted: false
                 )
             }
             guard !turnInFlight else {
                 return recordSendFailure(
                     "Claude could not run the requested command because a provider turn is still in flight.",
                     session: session,
-                    intent: intent
+                    intent: intent, providerWriteAttempted: false
                 )
             }
             return nil
@@ -1397,7 +1437,7 @@ final class ClaudeAgentModeCoordinator {
             case .ready:
                 break
             case let .failed(message):
-                return recordSendFailure(message, session: session, intent: intent)
+                return recordSendFailure(message, session: session, intent: intent, providerWriteAttempted: false)
             case .superseded:
                 return .superseded
             }
@@ -1445,7 +1485,7 @@ final class ClaudeAgentModeCoordinator {
                     return recordSendFailure(
                         "Claude native send failed because the active turn could not be interrupted safely.",
                         session: session,
-                        intent: intent
+                        intent: intent, providerWriteAttempted: false
                     )
                 }
                 guard intentIsCurrent(intent, for: session),
@@ -1474,7 +1514,7 @@ final class ClaudeAgentModeCoordinator {
                 return recordSendFailure(
                     "Claude native send failed because the provider session is not active.",
                     session: session,
-                    intent: intent
+                    intent: intent, providerWriteAttempted: false
                 )
             }
 
@@ -1502,7 +1542,7 @@ final class ClaudeAgentModeCoordinator {
                 return recordSendFailure(
                     "Claude native send failed because the active turn could not be interrupted safely.",
                     session: session,
-                    intent: intent
+                    intent: intent, providerWriteAttempted: false
                 )
             }
             guard intentIsCurrent(intent, for: session),
@@ -1587,7 +1627,7 @@ final class ClaudeAgentModeCoordinator {
                 return recordSendFailure(
                     routeVerificationFailure("unavailable"),
                     session: session,
-                    intent: intent
+                    intent: intent, providerWriteAttempted: false
                 )
             }
 
@@ -1628,7 +1668,7 @@ final class ClaudeAgentModeCoordinator {
                 return recordSendFailure(
                     routeVerificationFailure("fence"),
                     session: session,
-                    intent: intent
+                    intent: intent, providerWriteAttempted: false
                 )
             }
 
@@ -1705,7 +1745,7 @@ final class ClaudeAgentModeCoordinator {
                         return recordSendFailure(
                             "Claude could not apply model and effort before sending: \(error.localizedDescription)",
                             session: session,
-                            intent: intent
+                            intent: intent, providerWriteAttempted: false
                         )
                     }
                     do {
@@ -1720,7 +1760,7 @@ final class ClaudeAgentModeCoordinator {
                         return recordSendFailure(
                             "Claude could not restore manual effort before sending: \(error.localizedDescription)",
                             session: session,
-                            intent: intent
+                            intent: intent, providerWriteAttempted: false
                         )
                     }
                 }
@@ -1741,7 +1781,7 @@ final class ClaudeAgentModeCoordinator {
                     return recordSendFailure(
                         "Claude effort selection changed while applying configuration. No message was sent; retry the turn.",
                         session: session,
-                        intent: intent
+                        intent: intent, providerWriteAttempted: false
                     )
                 }
                 switch application {
@@ -1751,7 +1791,7 @@ final class ClaudeAgentModeCoordinator {
                     return recordSendFailure(
                         "Claude model configuration is not current or ready. No message was sent; retry the turn.",
                         session: session,
-                        intent: intent
+                        intent: intent, providerWriteAttempted: false
                     )
                 }
                 if hasEffectiveClaudeControllerLaunchSettingsMismatch(for: session) {
@@ -1769,7 +1809,7 @@ final class ClaudeAgentModeCoordinator {
                     return recordSendFailure(
                         routeVerificationFailure("configuration-fence"),
                         session: session,
-                        intent: intent
+                        intent: intent, providerWriteAttempted: false
                     )
                 }
                 if let appliedAutoEffort {
@@ -1818,7 +1858,7 @@ final class ClaudeAgentModeCoordinator {
                         if !sessionOwnsClaudeController(controller, for: session) {
                             await controller.shutdown()
                         }
-                        return .superseded
+                        return .supersededAfterWriteAttempt
                     }
                     session.acceptClaudeHostTurn(turnID)
                     return .sent
@@ -1829,12 +1869,13 @@ final class ClaudeAgentModeCoordinator {
                         if !sessionOwnsClaudeController(controller, for: session) {
                             await controller.shutdown()
                         }
-                        return .superseded
+                        return .supersededAfterWriteAttempt
                     }
                     return recordSendFailure(
                         "Claude native command failed: \(error.localizedDescription)",
                         session: session,
-                        intent: intent
+                        intent: intent,
+                        providerWriteAttempted: true
                     )
                 }
             }
@@ -1866,7 +1907,7 @@ final class ClaudeAgentModeCoordinator {
                     hostCapabilities.scheduleSave(session)
                     guard intentIsCurrent(intent, for: session),
                           sessionOwnsClaudeController(controller, for: session)
-                    else { return .superseded }
+                    else { return .supersededAfterWriteAttempt }
                     session.acceptClaudeHostTurn(turnID)
                     return .sent
                 } catch {
@@ -1877,7 +1918,8 @@ final class ClaudeAgentModeCoordinator {
                     return recordSendFailure(
                         "Claude continuation note delivery is uncertain: \(error.localizedDescription)",
                         session: session,
-                        intent: intent
+                        intent: intent,
+                        providerWriteAttempted: true
                     )
                 }
             }
@@ -1949,12 +1991,16 @@ final class ClaudeAgentModeCoordinator {
                 }
                 let released = hostCapabilities.handoffLocalInput(session, promptDispatchID, monitoring.claim, inputProof)
                 guard !released.mustAbortDispatch else { return .superseded }
-                let providerBoundText = providerBoundUserMessage(released.text(textWithNote), instructions: instructions)
+                let oracle = session.oracleBackgroundAwareness.reserve(session: session, providerID: ObjectIdentifier(controller))
+                defer { session.oracleBackgroundAwareness.release(oracle) }
+                let ordinaryText = released.text(textWithNote)
+                let providerBoundText = providerBoundUserMessage(oracle?.decorating(ordinaryText) ?? ordinaryText, instructions: instructions)
                 let inputInbox = controllerListeners[session.tabID]?.subscription
                 inputInbox?.beginInputHandoff()
                 defer { inputInbox?.endInputHandoff() }
                 inputAttemptChanged?(true)
                 let turnID = try await controller.sendUserMessage(providerBoundText, configuration: configurationProof)
+                session.oracleBackgroundAwareness.accept(oracle)
                 recordOrdinaryDispatchAttempt()
                 if let parked {
                     var state = session.selfCompactState
@@ -1987,7 +2033,7 @@ final class ClaudeAgentModeCoordinator {
                     if !sessionOwnsClaudeController(controller, for: session) {
                         await controller.shutdown()
                     }
-                    return .superseded
+                    return .supersededAfterWriteAttempt
                 }
                 session.acceptClaudeHostTurn(turnID)
                 return .sent
@@ -2011,7 +2057,7 @@ final class ClaudeAgentModeCoordinator {
                 return recordSendFailure(
                     Self.inputNotSentMessage,
                     session: session,
-                    intent: intent
+                    intent: intent, providerWriteAttempted: false
                 )
             } catch {
                 recordOrdinaryDispatchAttempt()
@@ -2028,12 +2074,13 @@ final class ClaudeAgentModeCoordinator {
                     if !sessionOwnsClaudeController(controller, for: session) {
                         await controller.shutdown()
                     }
-                    return .superseded
+                    return .supersededAfterWriteAttempt
                 }
                 return recordSendFailure(
                     "Claude native send failed: \(error.localizedDescription)",
                     session: session,
-                    intent: intent
+                    intent: intent,
+                    providerWriteAttempted: true
                 )
             }
         }
@@ -2041,7 +2088,7 @@ final class ClaudeAgentModeCoordinator {
         return recordSendFailure(
             "Claude native send failed because launch settings changed repeatedly before dispatch.",
             session: session,
-            intent: intent
+            intent: intent, providerWriteAttempted: false
         )
     }
 
@@ -2092,9 +2139,10 @@ final class ClaudeAgentModeCoordinator {
     private func recordSendFailure(
         _ message: String,
         session: AgentTabSession,
-        intent: NativeSessionIntent
+        intent: NativeSessionIntent,
+        providerWriteAttempted: Bool
     ) -> NativeSendOutcome {
-        guard intentIsCurrent(intent, for: session) else { return .superseded }
+        guard intentIsCurrent(intent, for: session) else { return providerWriteAttempted ? .supersededAfterWriteAttempt : .superseded }
         if session.items.last?.kind != .error || session.items.last?.text != message {
             session.appendItem(
                 AgentChatItem.error(
@@ -2106,7 +2154,7 @@ final class ClaudeAgentModeCoordinator {
         session.isDirty = true
         hostCapabilities.requestUIRefresh(session, true)
         hostCapabilities.scheduleSave(session)
-        return .failed(message: message)
+        return .failed(message: message, providerWriteAttempted: providerWriteAttempted)
     }
 
     private func interruptClaudeTurnIfNeeded(
@@ -2206,6 +2254,7 @@ final class ClaudeAgentModeCoordinator {
         _ session: AgentTabSession
     ) -> DetachedClaudeController? {
         let detached = prepareClaudeCancelSync(session)
+        rotateClaudeRuntimeEpoch(for: session)
         invalidatePendingClaudeResumeTransfer(for: session)
         session.providerSessionID = nil
         session.providerCleanupHandle = nil
@@ -2261,6 +2310,7 @@ final class ClaudeAgentModeCoordinator {
         }
         let generation = UUID()
         pendingResumeTransferGenerationByTabID[session.tabID] = generation
+        pendingResumeTransferEpochByTabID[session.tabID] = oldController.contextEpoch
         let task = Task { @MainActor [self, session] in
             await cancelClaudeRunAndCaptureSessionRef(session, oldController: oldController)
         }
@@ -2282,14 +2332,79 @@ final class ClaudeAgentModeCoordinator {
             return
         }
         let sessionRef = await task.value
-        guard pendingResumeTransferGenerationByTabID[session.tabID] == generation else { return }
+        guard pendingResumeTransferGenerationByTabID[session.tabID] == generation else {
+            // Invalidated mid-await (moved to retired by a provider identity
+            // reset or context clear); drain the retired latch so
+            // hasPendingResumeTransfer cannot wedge.
+            retiredResumeTransferTasksByTabID.removeValue(forKey: session.tabID)
+            return
+        }
+        let contextEpoch = pendingResumeTransferEpochByTabID.removeValue(forKey: session.tabID)
         pendingResumeTransferTasksByTabID.removeValue(forKey: session.tabID)
         pendingResumeTransferGenerationByTabID.removeValue(forKey: session.tabID)
+        // A transfer that outlives its provider context (forced switch whose
+        // stop outlasted the managed-stop deadline, same-family switch such as
+        // Claude → Claude-compatible, or a switch-back) must not write a Claude
+        // session reference — or a destination-stamped cleanup handle — onto
+        // the new provider context. The latch is already cleared above, so this
+        // cannot wedge hasPendingResumeTransfer.
+        guard session.selectedAgent.usesClaudeNativeRuntime,
+              let contextEpoch,
+              contextEpoch == claudeRuntimeEpochByTabID[session.tabID]
+        else {
+            retiredResumeTransferTasksByTabID.removeValue(forKey: session.tabID)
+            return
+        }
         updateProviderSessionIDIfNeeded(
             sessionRef.sessionID,
             for: session
         )
     }
+
+    private func currentClaudeRuntimeEpoch(for session: AgentTabSession) -> UUID {
+        if let epoch = claudeRuntimeEpochByTabID[session.tabID] {
+            return epoch
+        }
+        let epoch = UUID()
+        claudeRuntimeEpochByTabID[session.tabID] = epoch
+        return epoch
+    }
+
+    /// Rotates the session's Claude runtime context epoch. Resume transfers
+    /// stamped with the previous epoch can no longer pass the write guard, so a
+    /// late detached-controller teardown cannot stamp its old session reference
+    /// onto the new provider context. In-memory only; never persisted.
+    func rotateClaudeRuntimeEpoch(for session: AgentTabSession) {
+        claudeRuntimeEpochByTabID[session.tabID] = UUID()
+    }
+
+    #if DEBUG
+        /// Registers a transfer the way a detached-controller teardown would, for tests that
+        /// need the completion path without a live controller.
+        func test_registerResumeTransfer(for session: AgentTabSession, controller: any NativeAgentRuntimeControlling) {
+            test_registerResumeTransfer(
+                for: session,
+                oldController: test_makeDetachedClaudeController(for: session, controller: controller)
+            )
+        }
+
+        /// Builds a detached controller the way `detachClaudeController` would: the current
+        /// context epoch is captured into the owner at this point, not at registration.
+        func test_makeDetachedClaudeController(
+            for session: AgentTabSession,
+            controller: any NativeAgentRuntimeControlling
+        ) -> DetachedClaudeController {
+            DetachedClaudeController(
+                controller: controller,
+                toolHandler: nil,
+                contextEpoch: currentClaudeRuntimeEpoch(for: session)
+            )
+        }
+
+        func test_registerResumeTransfer(for session: AgentTabSession, oldController: DetachedClaudeController) {
+            beginClaudeResumeTransferIfNeeded(for: session, oldController: oldController)
+        }
+    #endif
 
     func hasPendingResumeTransfer(
         for session: AgentTabSession
@@ -2306,6 +2421,7 @@ final class ClaudeAgentModeCoordinator {
         }
         pendingResumeTransferTasksByTabID.removeValue(forKey: session.tabID)
         pendingResumeTransferGenerationByTabID.removeValue(forKey: session.tabID)
+        pendingResumeTransferEpochByTabID.removeValue(forKey: session.tabID)
     }
 
     /// Async cleanup for a synchronously detached controller after cancel.

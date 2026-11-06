@@ -1193,6 +1193,9 @@ enum AgentSidebarDateSectionBuilder {
                 ]
             )
         #endif
+        assert(sections.allSatisfy { section in
+            !section.groups.isEmpty && section.groups.allSatisfy { !$0.rows.isEmpty }
+        })
         return sections
     }
 
@@ -1287,6 +1290,7 @@ enum AgentSidebarDateSectionBuilder {
                 ]
             )
         #endif
+        assert(sections.allSatisfy { !$0.rows.isEmpty })
         return sections
     }
 
@@ -1435,6 +1439,12 @@ struct ArchivedSessionsList: View {
                     isSelected: selectionState.selectedIdentities.contains(identity),
                     showsSelectionPresentation: selectionState.showsSelectionPresentation,
                     isInteractionEnabled: !selectionState.isMutationInFlight,
+                    tapRowID: stashed.id,
+                    tapSelectionCount: selectionState.selectedIdentities.count,
+                    tapWorkspaceMatched: AgentSidebarTapWorkspaceGate.evaluate(
+                        sidebarWorkspaceID: workspaceID,
+                        activeWorkspaceID: agentModeVM.workspaceManager?.activeWorkspaceID
+                    ).workspaceMatched,
                     commandProgressKind: selectionState.commandRowProgressOperation(
                         for: identity,
                         workspaceID: workspaceID
@@ -1444,7 +1454,8 @@ struct ArchivedSessionsList: View {
                             gesture,
                             identity: identity,
                             renderedOrder: renderedOrder,
-                            workspaceID: workspaceID
+                            workspaceID: workspaceID,
+                            rowID: stashed.id
                         )
                     },
                     onRestore: {

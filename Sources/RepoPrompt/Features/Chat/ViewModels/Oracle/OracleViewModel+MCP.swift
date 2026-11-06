@@ -151,14 +151,16 @@ extension OracleViewModel {
         modelParam: String?,
         profile: AgentModelsSettingsProfile,
         promptVM: PromptViewModel,
-        snapshotOverride: OracleSelectionSnapshot? = nil
+        snapshotOverride: OracleSelectionSnapshot? = nil,
+        additionalOracles: [String]? = nil
     ) throws -> ResolvedOracleExecution {
         let snapshot = snapshotOverride ?? .mcp(profile: profile)
         do {
             return try OracleExecutionResolver(promptViewModel: promptVM).resolve(
                 choice: modelParam.map(OracleStartChoice.oracleSend) ?? .automatic,
                 mode: mode,
-                snapshot: snapshot
+                snapshot: snapshot,
+                additionalOracles: additionalOracles
             )
         } catch {
             throw ChatToolError.invalidParams(error.localizedDescription)
@@ -861,7 +863,9 @@ extension OracleViewModel {
         implicitSessionID: UUID? = nil,
         contextBuilderScope: ContextBuilderOracleLaneScope? = nil,
         onQueryCreated: ((UUID) -> Void)? = nil,
-        onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil
+        onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil,
+        backgroundJob: OracleBackgroundInvocationRegistry.Job? = nil,
+        backgroundLaneIndex: Int = 0
     ) async throws
         -> [String: Value]
     {
@@ -1003,7 +1007,9 @@ extension OracleViewModel {
                 completionPolicy: contextBuilderScope == nil ? .interactive : .contextBuilderStrict,
                 contextBuilderScope: contextBuilderScope,
                 onQueryCreated: onQueryCreated,
-                onProgress: onProgress
+                onProgress: onProgress,
+                backgroundJob: backgroundJob,
+                backgroundLaneIndex: backgroundLaneIndex
             )
         }
         let queryId: UUID?
