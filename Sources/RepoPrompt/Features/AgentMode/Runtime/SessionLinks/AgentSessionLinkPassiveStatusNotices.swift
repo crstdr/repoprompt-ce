@@ -83,7 +83,9 @@ struct AgentSessionLinkPassiveStatusNotices {
         var hasPendingInteraction: Bool
         var supplementalNeedsUser: Bool?
 
-        var needsUser: Bool { hasPendingInteraction || supplementalNeedsUser == true }
+        var needsUser: Bool {
+            hasPendingInteraction || supplementalNeedsUser == true
+        }
 
         /// Supplemental values refresh presentation separately, never observation identity.
         static func == (lhs: Self, rhs: Self) -> Bool {
@@ -286,9 +288,9 @@ struct AgentSessionLinkPassiveStatusNotices {
         let attentionSequence: UInt64
     }
 
-    /// One first-wins request for the observer to notice this exact oversight lane.
+    /// One first-wins attention occurrence for this exact oversight lane.
     ///
-    /// `occurrence` and `requestedAt` never change. Everything else is current presentation context
+    /// `occurrence`, `reason` and `requestedAt` never change. Everything else is current presentation context
     /// refreshed by authoritative status reconciliation, so a standalone request can become richer
     /// without becoming a new request or changing failure-suppression identity.
     struct PendingAttentionRequest: Hashable {
@@ -835,6 +837,7 @@ struct AgentSessionLinkPassiveStatusNotices {
         self.linkSetRevision = linkSetRevision
 
         let currentByReference = samplesByReference(samples)
+        changed = retireNeedsUserAttention(samples: currentByReference) || changed
         let currentReferences = Set(currentByReference.keys)
         let removedReferences = Set(deliveredRunThrough.keys).subtracting(currentReferences)
             .union(Set(lastObservedStatus.keys).subtracting(currentReferences))
@@ -862,6 +865,8 @@ struct AgentSessionLinkPassiveStatusNotices {
                 changed = true
             }
             if sample.status == .unavailable {
+                sample.hasPendingInteraction = false
+                sample.supplementalNeedsUser = nil
                 // Remove public detail/attention, not the same-endpoint monotonic cache. An
                 // unavailable placeholder has NO fresh pair and cannot baseline, close, or pay;
                 // its existing Observation cache rejects a regressing first return without a resume
@@ -880,6 +885,7 @@ struct AgentSessionLinkPassiveStatusNotices {
             }
 
             let preceding = lastObservedStatus[reference]
+            changed = noteNeedsUserEntry(sample: sample, preceding: preceding, observedAt: observedAt) || changed
             if let incoming = sample.runFacts, let known = preceding?.lastKnownRunFacts,
                incoming.settledThrough < known.settledThrough || incoming.ordinaryThrough < known.ordinaryThrough
             {
@@ -1092,7 +1098,9 @@ struct AgentSessionLinkPassiveStatusNotices {
                   sample.targetSessionID == attention.targetSessionID else { return true }
             return !sample.needsUser
         }
-        for attention in retired { pendingAttentionByReference.removeValue(forKey: attention.reference) }
+        for attention in retired {
+            pendingAttentionByReference.removeValue(forKey: attention.reference)
+        }
         return !retired.isEmpty
     }
 

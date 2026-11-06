@@ -343,8 +343,13 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
 
     func testNeedsUserRowAndConditionalGuidanceAreExactInFullAndReminderBatches() throws {
         let epoch = UUID()
-        let request = attentionRequest("8B91C0E0-0000-0000-0000-00000000E572", queueEpoch: epoch,
-                                       requestedAt: Date(timeIntervalSince1970: 50), status: .waiting, reason: .needsUser)
+        let request = attentionRequest(
+            "8B91C0E0-0000-0000-0000-00000000E572",
+            queueEpoch: epoch,
+            requestedAt: Date(timeIntervalSince1970: 50),
+            status: .waiting,
+            reason: .needsUser
+        )
         let row = "<needs_user session_id=\"8B91C0E0-0000-0000-0000-00000000E572\" status=\"awaiting_user\" observed_at=\"1970-01-01T00:00:50Z\" idle_for_send=\"false\" />"
         let guidance = "`needs_user` marks a lane waiting for its user at `observed_at`."
         XCTAssertEqual(row.utf8.count, 144)
