@@ -2,6 +2,71 @@ import Foundation
 import MCP
 import RepoPromptSettingsCore
 
+/// CU-local transport fence. The network actor revokes before authority writes; submission
+/// and revocation share a lock. It stops owning route validity after instruction submission.
+final class ComputerUseRunRouteFence: @unchecked Sendable {
+    let token: AgentSessionLinkRunCatalogRouteToken
+    private let identity: MCPWindowToolDispatchIdentity
+    private let connectionIdentity: ObjectIdentifier
+    private let lock = NSLock()
+    private var valid = true
+    private var submitted = false
+
+    init(token: AgentSessionLinkRunCatalogRouteToken, identity: MCPWindowToolDispatchIdentity, connectionIdentity: ObjectIdentifier) {
+        self.token = token
+        self.identity = identity
+        self.connectionIdentity = connectionIdentity
+    }
+
+    var hasSubmitted: Bool {
+        lock.withLock { submitted }
+    }
+
+    func invalidate() {
+        lock.withLock { if !submitted { valid = false } }
+    }
+
+    func matches(_ invocation: ToolInvocationContext) -> Bool {
+        guard case .network = invocation.origin, invocation.toolName == "agent_run",
+              invocation.connectionID == token.connectionID,
+              invocation.metadata.windowID == token.observerEndpoint.windowID,
+              let authorization = invocation.dispatchAuthorization,
+              authorization.connectionID == token.connectionID,
+              authorization.connectionIdentity == connectionIdentity,
+              authorization.lifecycleGeneration == token.connectionLifecycleGeneration,
+              let window = authorization.windowIdentity,
+              window.windowID == identity.windowID,
+              window.windowStateIdentity == identity.windowStateIdentity,
+              window.serverViewModelIdentity == identity.serverViewModelIdentity,
+              window.catalogRegistrationHandle == identity.catalogRegistrationHandle,
+              window.computerUseRunRouteCandidate === self else { return false }
+        return true
+    }
+
+    @MainActor
+    func requireCurrent() throws {
+        let endpoint = token.observerEndpoint
+        guard !Task.isCancelled, lock.withLock({ valid }),
+              let window = WindowStatesManager.shared.window(withID: endpoint.windowID), !window.isClosing,
+              ObjectIdentifier(window) == identity.windowStateIdentity,
+              ObjectIdentifier(window.mcpServer) == identity.serverViewModelIdentity,
+              window.mcpServer.hasCurrentRunRouteMapping(runID: token.runID, connectionID: token.connectionID, expectedTabID: endpoint.tabID),
+              window.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint
+        else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+    }
+
+    @MainActor
+    func withInstructionSubmission<T>(_ submit: () throws -> T) throws -> T {
+        try requireCurrent()
+        return try lock.withLock {
+            guard valid, !submitted, !Task.isCancelled else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+            let result = try submit()
+            submitted = true
+            return result
+        }
+    }
+}
+
 /// Ephemeral exact-parent producer authority. Saved purpose never reconstructs this proof.
 @MainActor
 final class ComputerUseChildProof: Equatable {
@@ -50,13 +115,35 @@ final class ComputerUseChildProof: Equatable {
     }
 
     private let configuration: @MainActor () -> Configuration
+    private var runRouteFence: ComputerUseRunRouteFence?
+    var hasNetworkRunRouteFence: Bool {
+        runRouteFence != nil
+    }
 
-    static func capture(owner: AgentModeViewModel) throws -> ComputerUseChildProof {
+    static func capture(owner: AgentModeViewModel, configuration: @escaping @MainActor () -> Configuration = { currentConfiguration }) throws -> ComputerUseChildProof {
         guard let context = MCPInvocationContextBridge.current, case .network = context.origin,
-              let route = context.dispatchAuthorization?.windowIdentity?.modelRouteToken,
-              route.observerEndpoint == owner.agentSessionLinkObserverEndpoint(tabID: route.observerEndpoint.tabID),
+              let candidate = context.dispatchAuthorization?.windowIdentity?.computerUseRunRouteCandidate,
+              candidate.matches(context) else { throw MCPError.invalidParams(denied) }
+        try candidate.requireCurrent()
+        let route = candidate.token
+        guard route.observerEndpoint == owner.agentSessionLinkObserverEndpoint(tabID: route.observerEndpoint.tabID),
               let parent = owner.sessions[route.observerEndpoint.tabID], parent.runID == route.runID else { throw MCPError.invalidParams(denied) }
-        return try ComputerUseChildProof(owner: owner, parent: parent)
+        let proof = try ComputerUseChildProof(owner: owner, parent: parent, configuration: configuration)
+        proof.runRouteFence = candidate
+        return proof
+    }
+
+    func requireCurrentRoute() throws {
+        try runRouteFence?.requireCurrent()
+    }
+
+    func withInstructionSubmission<T>(_ session: AgentTabSession, _ submit: () throws -> T) throws -> T {
+        @MainActor func operation() throws -> T {
+            try markInstructionDispatch(session)
+            return try submit()
+        }
+        if let runRouteFence { return try runRouteFence.withInstructionSubmission(operation) }
+        return try operation()
     }
 
     static var enabled: Bool {
@@ -193,7 +280,7 @@ final class ComputerUseChildProof: Equatable {
     @discardableResult
     func producerSettled(retireUnacceptedStart: Bool = false) -> Task<Void, Never>? {
         producerActive = false
-        if retireUnacceptedStart, !instructionDispatchEntered { retire() }
+        if retireUnacceptedStart, !instructionDispatchEntered || runRouteFence?.hasSubmitted == false { retire() }
         if retiring {
             return finishRetirement()
         } else if child?.runState.isTerminalForCommit == true {

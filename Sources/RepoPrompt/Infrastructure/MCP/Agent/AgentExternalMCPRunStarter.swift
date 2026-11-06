@@ -191,6 +191,7 @@ enum AgentExternalMCPRunStarter {
             }
             let pendingStartFence = AgentRunStartStopFence(session: activatedSession)
             func requirePendingStart() throws {
+                try computerUseProof?.requireCurrentRoute()
                 guard agentModeVM.session(for: target.tabID, createIfNeeded: false) === activatedSession,
                       activatedSession.activeAgentSessionID == sessionID,
                       activatedSession.mcpControlContext == ownedActivation,
@@ -248,7 +249,16 @@ enum AgentExternalMCPRunStarter {
             if let startExpiry, startExpiry.expiredBeforeActivation {
                 throw startExpiry.timeoutError
             }
-            guard await agentModeVM.commitConfiguredSessionCreation(target: target) else {
+            let configuredCreationCommitted: Bool
+            if computerUseProof?.hasNetworkRunRouteFence == true, let handle = target.creationHandle {
+                // A fenced CU start retains its existing rollback claim until acceptance.
+                try agentModeVM.requireCurrentMCPWorkspaceTarget(target, expectedWorkspaceID: handle.workspaceID)
+                configuredCreationCommitted = await agentModeVM.commitConfiguredSessionCreation(handle: handle)
+                try agentModeVM.requireCurrentMCPWorkspaceTarget(target, expectedWorkspaceID: handle.workspaceID)
+            } else {
+                configuredCreationCommitted = await agentModeVM.commitConfiguredSessionCreation(target: target)
+            }
+            guard configuredCreationCommitted else {
                 throw MCPError.internalError("Failed to persist the configured agent session before starting it.")
             }
             try Task.checkCancellation()

@@ -13401,6 +13401,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     }
 
+    private func withMCPInstructionSubmission<T>(session: TabSession, workflow: AgentWorkflowDefinition?, proof: ComputerUseChildProof?, operation: () -> T) throws -> T {
+        if session.isComputerUseChild, let proof {
+            return try proof.withInstructionSubmission(session) { withMCPWorkflowOverride(session: session, workflow: workflow, operation: operation) }
+        }
+        return withMCPWorkflowOverride(session: session, workflow: workflow, operation: operation)
+    }
+
     func mcpDispatchInstruction(
         sessionID: UUID,
         text: String,
@@ -13518,7 +13525,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 guard let computerUseProof else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
                 try computerUseProof.markInstructionDispatch(session)
             }
-            submission = withMCPWorkflowOverride(session: session, workflow: workflow) {
+            submission = try withMCPInstructionSubmission(session: session, workflow: workflow, proof: computerUseProof) {
                 if let nativePreparedTurn {
                     return submitPreparedUserTurn(
                         tabID: session.tabID,
