@@ -739,6 +739,8 @@ final class AgentSessionLinkPassiveStatusNoticeTests: XCTestCase {
         let refreshedSnapshot = reducer.snapshot
         let refreshed = try XCTUnwrap(refreshedSnapshot.attentionRequests.first)
         XCTAssertEqual(refreshed.occurrence, original.occurrence)
+        XCTAssertEqual(original.reason, .requestedAttention)
+        XCTAssertEqual(refreshed.reason, original.reason)
         XCTAssertEqual(refreshed.requestedAt, requestedAt)
         XCTAssertEqual(refreshed.displayName, "Current target")
         XCTAssertEqual(refreshed.status, .idle)
