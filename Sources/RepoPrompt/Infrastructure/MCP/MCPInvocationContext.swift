@@ -14,6 +14,8 @@ struct MCPWindowToolDispatchIdentity {
     let serverViewModelIdentity: ObjectIdentifier
     let catalogRegistrationHandle: MCPDomainToolRegistrationHandle
     var modelRouteToken: AgentSessionLinkRunCatalogRouteToken?
+    /// CU-only route candidate; carries no authority on its own.
+    var computerUseRunRouteCandidate: ComputerUseRunRouteFence?
 }
 
 /// Immutable policy admission for a queued internal-management call. The manager is

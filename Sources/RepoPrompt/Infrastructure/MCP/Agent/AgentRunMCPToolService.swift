@@ -403,6 +403,8 @@ struct AgentRunMCPToolService {
     var currentSnapshotProvider: (@Sendable (_ sessionID: UUID, _ agentModeVM: AgentModeViewModel) async -> AgentRunMCPSnapshot?)?
     #if DEBUG
         var testAgentModeViewModel: AgentModeViewModel?
+        var testComputerUseConfiguration: (@MainActor () -> ComputerUseChildProof.Configuration)?
+        var testArmComputerUseChild: ((AgentTabSession, ComputerUseChildProof) async throws -> Void)?
         var testAfterTargetResolution: ((AgentModeViewModel.MCPSessionTarget) async -> Void)?
         var testBeforeExplicitTabWorktreeValidation: (() -> Void)?
         var testBeforeWorktreeBindingCommit: (() async -> Void)?
@@ -511,9 +513,18 @@ struct AgentRunMCPToolService {
         let running: Bool
     }
 
+    private func captureComputerUseProof(owner: AgentModeViewModel) throws -> ComputerUseChildProof {
+        #if DEBUG
+            if let testComputerUseConfiguration {
+                return try ComputerUseChildProof.capture(owner: owner, configuration: testComputerUseConfiguration)
+            }
+        #endif
+        return try ComputerUseChildProof.capture(owner: owner)
+    }
+
     private func executeStart(args: [String: Value]) async throws -> Value {
         let computerUse = try Self.computerUseRequested(args: args, operation: "start")
-        let computerUseProof = computerUse ? try ComputerUseChildProof.capture(owner: requireTargetWindow().agentModeViewModel) : nil
+        let computerUseProof = computerUse ? try captureComputerUseProof(owner: requireTargetWindow().agentModeViewModel) : nil
         let message = try resolveMessage(args["message"], name: "message")
         let workflow = try resolveWorkflow(args: args)
         let worktreeStartRequest = try startWorktreeCoordinator.parseRequest(args: args)
@@ -808,6 +819,7 @@ struct AgentRunMCPToolService {
                   let parentID = spawnParentSessionID,
                   let children = try await AgentSessionDataService.shared.computerUseChildIDs(for: parentID, workspace: workspace),
                   proof.parentIsCurrent, children.count <= 1 else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+            try proof.requireCurrentRoute()
             if let childID = children.first {
                 throw MCPError.invalidParams(ComputerUseChildProof.existingChildMessage(childID))
             }
@@ -830,6 +842,7 @@ struct AgentRunMCPToolService {
         }
         if let proof = computerUseProof {
             proof.creationTarget = target
+            try proof.requireCurrentRoute()
             let child = agentModeVM.session(for: target.tabID)
             guard let pinnedModel = CodexModelSpecifier(raw: String(proof.modelID.dropFirst("codexExec:".count))).baseModel else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
             child.selectedAgent = .codexExec
@@ -1125,6 +1138,7 @@ struct AgentRunMCPToolService {
                 modelRaw: selection.modelRaw,
                 selections: modelParameterSelections
             )
+            try computerUseProof?.requireCurrentRoute()
             outcome = try await startRun(
                 target,
                 message,
@@ -1650,7 +1664,12 @@ struct AgentRunMCPToolService {
         let targetWindow = try requireTargetWindow()
         let agentModeVM = resolvedAgentModeViewModel(targetWindow)
         let expectedWorkspaceID = targetWindow.workspaceManager.activeWorkspaceID
-        let computerUseProof = try? ComputerUseChildProof.capture(owner: agentModeVM)
+        var computerUseProof: ComputerUseChildProof?
+        if let raw = normalizedString(args["session_id"]), let sessionID = UUID(uuidString: raw),
+           let child = agentModeVM.mcpControlledSession(sessionID: sessionID), child.isComputerUseChild, !child.runState.isActive
+        {
+            computerUseProof = try? captureComputerUseProof(owner: agentModeVM)
+        }
         var computerUseAccepted = false
         defer {
             if computerUseProof?.child != nil {
@@ -1677,10 +1696,17 @@ struct AgentRunMCPToolService {
                   child.codexController == nil, !child.mcpFollowUpRunPending, args["workflow_id"] == nil, args["workflow_name"] == nil,
                   CodexModelSpecifier(raw: child.selectedModelRaw).baseModel == CodexModelSpecifier(raw: String(proof.modelID.dropFirst("codexExec:".count))).baseModel,
                   child.selectedReasoningEffortRaw == "high" else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+            try proof.requireCurrentRoute()
             try proof.reserve()
             proof.child = child
             child.computerUseChildProof = proof
-            try await agentModeVM.armComputerUseChild(session: child, proof: proof)
+            #if DEBUG
+                if let testArmComputerUseChild { try await testArmComputerUseChild(child, proof) }
+                else { try await agentModeVM.armComputerUseChild(session: child, proof: proof) }
+            #else
+                try await agentModeVM.armComputerUseChild(session: child, proof: proof)
+            #endif
+            try proof.requireCurrentRoute()
         }
         if let resident = try agentModeVM.mcpResidentTarget(sessionID: sessionID) {
             let shouldWait = parseBool(args["wait"]) ?? (args["timeout_seconds"] != nil)
@@ -1764,7 +1790,8 @@ struct AgentRunMCPToolService {
                             sessionID: sessionID,
                             text: text,
                             workflow: workflow,
-                            agentModeVM: agentModeVM
+                            agentModeVM: agentModeVM,
+                            computerUseProof: computerUseProof
                         )
                         if let reactivatedTarget = resolution.reactivatedTarget {
                             agentModeVM.mcpAcceptSessionTarget(reactivatedTarget)
@@ -1964,8 +1991,10 @@ struct AgentRunMCPToolService {
         sessionID: UUID,
         text: String,
         workflow: AgentWorkflowDefinition?,
-        agentModeVM: AgentModeViewModel
+        agentModeVM: AgentModeViewModel,
+        computerUseProof: ComputerUseChildProof? = nil
     ) async throws -> AgentModeViewModel.MCPInstructionDispatch {
+        try computerUseProof?.requireCurrentRoute()
         #if DEBUG
             if let testDispatchSteerInstruction {
                 return try await testDispatchSteerInstruction(sessionID, text, workflow, agentModeVM)
@@ -1976,7 +2005,7 @@ struct AgentRunMCPToolService {
             text: text,
             allowStartingRun: true,
             workflow: workflow,
-            computerUseProof: agentModeVM.mcpControlledSession(sessionID: sessionID)?.computerUseChildProof
+            computerUseProof: computerUseProof
         )
     }
 

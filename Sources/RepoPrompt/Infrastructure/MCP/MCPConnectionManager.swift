@@ -996,6 +996,7 @@ actor ServerNetworkManager {
         get { connectionLifecycleState.isRunning }
         set {
             revokeBecomeOverseerActivationProofs()
+            revokeComputerUseRunRouteFences()
             connectionLifecycleState.isRunning = newValue
         }
     }
@@ -1004,12 +1005,16 @@ actor ServerNetworkManager {
         get { connectionLifecycleState.lifecycleGeneration }
         set {
             revokeBecomeOverseerActivationProofs()
+            revokeComputerUseRunRouteFences()
             connectionLifecycleState.lifecycleGeneration = newValue
         }
     }
 
     private var isEnabledState: Bool = true {
-        willSet { revokeBecomeOverseerActivationProofs() }
+        willSet {
+            revokeBecomeOverseerActivationProofs()
+            revokeComputerUseRunRouteFences()
+        }
     }
 
     init(
@@ -1298,13 +1303,17 @@ actor ServerNetworkManager {
                 return connections[id].map { ObjectIdentifier($0 as AnyObject) }
                     != newValue[id].map { ObjectIdentifier($0 as AnyObject) }
             }
+            revokeComputerUseRunRouteFences { route in
+                connections[route.connectionID].map { ObjectIdentifier($0 as AnyObject) }
+                    != newValue[route.connectionID].map { ObjectIdentifier($0 as AnyObject) }
+            }
         }
     }
 
     private var connectionsBeingRemoved: Set<UUID> {
         get { connectionLifecycleState.removingConnections }
         _modify {
-            guard !becomeOverseerActivationProofs.isEmpty else {
+            guard !becomeOverseerActivationProofs.isEmpty || !computerUseRunRouteFences.isEmpty else {
                 yield &connectionLifecycleState.removingConnections
                 return
             }
@@ -1314,6 +1323,7 @@ actor ServerNetworkManager {
                 revokeBecomeOverseerActivationProofs {
                     oldValue.contains($0.connectionID) != newValue.contains($0.connectionID)
                 }
+                revokeComputerUseRunRouteFences { oldValue.contains($0.connectionID) != newValue.contains($0.connectionID) }
                 connectionLifecycleState.removingConnections = newValue
             }
             yield &newValue
@@ -1323,7 +1333,7 @@ actor ServerNetworkManager {
     private var executionWatchdogTerminalConnections: Set<UUID> {
         get { connectionLifecycleState.watchdogTerminalConnections }
         _modify {
-            guard !becomeOverseerActivationProofs.isEmpty else {
+            guard !becomeOverseerActivationProofs.isEmpty || !computerUseRunRouteFences.isEmpty else {
                 yield &connectionLifecycleState.watchdogTerminalConnections
                 return
             }
@@ -1333,6 +1343,7 @@ actor ServerNetworkManager {
                 revokeBecomeOverseerActivationProofs {
                     oldValue.contains($0.connectionID) != newValue.contains($0.connectionID)
                 }
+                revokeComputerUseRunRouteFences { oldValue.contains($0.connectionID) != newValue.contains($0.connectionID) }
                 connectionLifecycleState.watchdogTerminalConnections = newValue
             }
             yield &newValue
@@ -1342,7 +1353,7 @@ actor ServerNetworkManager {
     private var transportTerminalConnections: Set<UUID> {
         get { connectionLifecycleState.transportTerminalConnections }
         _modify {
-            guard !becomeOverseerActivationProofs.isEmpty else {
+            guard !becomeOverseerActivationProofs.isEmpty || !computerUseRunRouteFences.isEmpty else {
                 yield &connectionLifecycleState.transportTerminalConnections
                 return
             }
@@ -1352,6 +1363,7 @@ actor ServerNetworkManager {
                 revokeBecomeOverseerActivationProofs {
                     oldValue.contains($0.connectionID) != newValue.contains($0.connectionID)
                 }
+                revokeComputerUseRunRouteFences { oldValue.contains($0.connectionID) != newValue.contains($0.connectionID) }
                 connectionLifecycleState.transportTerminalConnections = newValue
             }
             yield &newValue
@@ -1362,7 +1374,7 @@ actor ServerNetworkManager {
     private var connectionLifecycleGenerationByID: [UUID: UInt64] {
         get { connectionLifecycleState.connectionGenerations }
         _modify {
-            guard !becomeOverseerActivationProofs.isEmpty else {
+            guard !becomeOverseerActivationProofs.isEmpty || !computerUseRunRouteFences.isEmpty else {
                 yield &connectionLifecycleState.connectionGenerations
                 return
             }
@@ -1372,6 +1384,7 @@ actor ServerNetworkManager {
                 revokeBecomeOverseerActivationProofs {
                     oldValue[$0.connectionID] != newValue[$0.connectionID]
                 }
+                revokeComputerUseRunRouteFences { oldValue[$0.connectionID] != newValue[$0.connectionID] }
                 connectionLifecycleState.connectionGenerations = newValue
             }
             yield &newValue
@@ -1730,20 +1743,32 @@ actor ServerNetworkManager {
 
     /// Per-connection restriction + routing state
     private var restrictedToolsByConnection: [UUID: Set<String>] = [:] {
-        willSet { revokeBecomeOverseerActivationProofs { restrictedToolsByConnection[$0.connectionID] != newValue[$0.connectionID] } }
+        willSet {
+            revokeBecomeOverseerActivationProofs { restrictedToolsByConnection[$0.connectionID] != newValue[$0.connectionID] }
+            revokeComputerUseRunRouteFences { restrictedToolsByConnection[$0.connectionID] != newValue[$0.connectionID] }
+        }
     }
 
     private var additionalToolsByConnection: [UUID: Set<String>] = [:] {
-        willSet { revokeBecomeOverseerActivationProofs { additionalToolsByConnection[$0.connectionID] != newValue[$0.connectionID] } }
+        willSet {
+            revokeBecomeOverseerActivationProofs { additionalToolsByConnection[$0.connectionID] != newValue[$0.connectionID] }
+            revokeComputerUseRunRouteFences { additionalToolsByConnection[$0.connectionID] != newValue[$0.connectionID] }
+        }
     }
 
     private var runPurposeByConnection: [UUID: MCPRunPurpose] = [:] {
-        willSet { revokeBecomeOverseerActivationProofs { runPurposeByConnection[$0.connectionID] != newValue[$0.connectionID] } }
+        willSet {
+            revokeBecomeOverseerActivationProofs { runPurposeByConnection[$0.connectionID] != newValue[$0.connectionID] }
+            revokeComputerUseRunRouteFences { runPurposeByConnection[$0.connectionID] != newValue[$0.connectionID] }
+        }
     }
 
     private var resolvedPresentationWindowByConnection: [UUID: Int] = [:]
     private var preassignedConnections: Set<UUID> = [] {
-        willSet { revokeBecomeOverseerActivationProofs { preassignedConnections.contains($0.connectionID) != newValue.contains($0.connectionID) } }
+        willSet {
+            revokeBecomeOverseerActivationProofs { preassignedConnections.contains($0.connectionID) != newValue.contains($0.connectionID) }
+            revokeComputerUseRunRouteFences { preassignedConnections.contains($0.connectionID) != newValue.contains($0.connectionID) }
+        }
     }
 
     /// Tracks the window count at the time each connection was established.
@@ -1872,31 +1897,52 @@ actor ServerNetworkManager {
     private var expectedAgentPIDsByClient: [String: Set<pid_t>] = [:]
     private var expectedAgentPIDsByRunID: [UUID: Set<pid_t>] = [:]
     private var runPolicyStateByRunID: [UUID: RunConnectionPolicyState] = [:] {
-        willSet { revokeBecomeOverseerActivationProofs { runPolicyStateByRunID[$0.runID] != newValue[$0.runID] } }
+        willSet {
+            revokeBecomeOverseerActivationProofs { runPolicyStateByRunID[$0.runID] != newValue[$0.runID] }
+            revokeComputerUseRunRouteFences { runPolicyStateByRunID[$0.runID] != newValue[$0.runID] }
+        }
     }
 
     private var admittedPolicyRunIDs: Set<UUID> = [] {
-        willSet { revokeBecomeOverseerActivationProofs { admittedPolicyRunIDs.contains($0.runID) != newValue.contains($0.runID) } }
+        willSet {
+            revokeBecomeOverseerActivationProofs { admittedPolicyRunIDs.contains($0.runID) != newValue.contains($0.runID) }
+            revokeComputerUseRunRouteFences { admittedPolicyRunIDs.contains($0.runID) != newValue.contains($0.runID) }
+        }
     }
 
     private var presentationWindowByRun: [UUID: Int] = [:] {
-        willSet { revokeBecomeOverseerActivationProofs { presentationWindowByRun[$0.runID] != newValue[$0.runID] } }
+        willSet {
+            revokeBecomeOverseerActivationProofs { presentationWindowByRun[$0.runID] != newValue[$0.runID] }
+            revokeComputerUseRunRouteFences { presentationWindowByRun[$0.runID] != newValue[$0.runID] }
+        }
     }
 
     private var pendingPolicyApplicationIDByConnectionID: [UUID: UUID] = [:] {
-        willSet { revokeBecomeOverseerActivationProofs { pendingPolicyApplicationIDByConnectionID[$0.connectionID] != newValue[$0.connectionID] } }
+        willSet {
+            revokeBecomeOverseerActivationProofs { pendingPolicyApplicationIDByConnectionID[$0.connectionID] != newValue[$0.connectionID] }
+            revokeComputerUseRunRouteFences { pendingPolicyApplicationIDByConnectionID[$0.connectionID] != newValue[$0.connectionID] }
+        }
     }
 
     private var pendingPolicyApplicationIDByRunID: [UUID: UUID] = [:] {
-        willSet { revokeBecomeOverseerActivationProofs { pendingPolicyApplicationIDByRunID[$0.runID] != newValue[$0.runID] } }
+        willSet {
+            revokeBecomeOverseerActivationProofs { pendingPolicyApplicationIDByRunID[$0.runID] != newValue[$0.runID] }
+            revokeComputerUseRunRouteFences { pendingPolicyApplicationIDByRunID[$0.runID] != newValue[$0.runID] }
+        }
     }
 
     private var runRoutingAuthorityGenerationByRunID: [UUID: UInt64] = [:] {
-        willSet { revokeBecomeOverseerActivationProofs { runRoutingAuthorityGenerationByRunID[$0.runID] != newValue[$0.runID] } }
+        willSet {
+            revokeBecomeOverseerActivationProofs { runRoutingAuthorityGenerationByRunID[$0.runID] != newValue[$0.runID] }
+            revokeComputerUseRunRouteFences { runRoutingAuthorityGenerationByRunID[$0.runID] != newValue[$0.runID] }
+        }
     }
 
     private var revocationFenceGenerationByRunID: [UUID: UInt64] = [:] {
-        willSet { revokeBecomeOverseerActivationProofs { revocationFenceGenerationByRunID[$0.runID] != newValue[$0.runID] } }
+        willSet {
+            revokeBecomeOverseerActivationProofs { revocationFenceGenerationByRunID[$0.runID] != newValue[$0.runID] }
+            revokeComputerUseRunRouteFences { revocationFenceGenerationByRunID[$0.runID] != newValue[$0.runID] }
+        }
     }
 
     private struct RunCatalogObservation: Equatable {
@@ -1980,12 +2026,18 @@ actor ServerNetworkManager {
 
     /// 🆕 Per-connection → windowID routing map
     private var presentationWindowByConnection: [UUID: Int] = [:] {
-        willSet { revokeBecomeOverseerActivationProofs { presentationWindowByConnection[$0.connectionID] != newValue[$0.connectionID] } }
+        willSet {
+            revokeBecomeOverseerActivationProofs { presentationWindowByConnection[$0.connectionID] != newValue[$0.connectionID] }
+            revokeComputerUseRunRouteFences { presentationWindowByConnection[$0.connectionID] != newValue[$0.connectionID] }
+        }
     }
 
     private var windowBindingTransactions: [UUID: (mutex: AsyncMutex, users: Int)] = [:]
     private var runIDByConnectionID: [UUID: UUID] = [:] {
-        willSet { revokeBecomeOverseerActivationProofs { runIDByConnectionID[$0.connectionID] != newValue[$0.connectionID] } }
+        willSet {
+            revokeBecomeOverseerActivationProofs { runIDByConnectionID[$0.connectionID] != newValue[$0.connectionID] }
+            revokeComputerUseRunRouteFences { runIDByConnectionID[$0.connectionID] != newValue[$0.connectionID] }
+        }
     }
 
     // Connection-lane ownership lives in RepoPromptDomainRuntime.
@@ -4884,6 +4936,43 @@ actor ServerNetworkManager {
             runID: runID, windowID: policy.windowID, workspaceID: workspaceID, tabID: tabID,
             routingAuthorityGeneration: routingGeneration, connectionLifecycleGeneration: lifecycleGeneration
         )
+    }
+
+    private nonisolated static func needsComputerUseRunRouteCandidate(toolName: String, arguments: [String: Value]) -> Bool {
+        guard toolName == MCPWindowToolName.agentRun else { return false }
+        let operation = AgentMCPToolHelpers.normalizedString(arguments["op"])?.lowercased() ?? "start"
+        return operation == "steer" || (operation == "start" && arguments["computer_use"] == Value.bool(true))
+    }
+
+    private var computerUseRunRouteFences: [UUID: @Sendable () -> ComputerUseRunRouteFence?] = [:]
+
+    private func revokeComputerUseRunRouteFences(where affected: (AgentSessionLinkRunCatalogRouteToken) -> Bool = { _ in true }) {
+        for (id, weakFence) in computerUseRunRouteFences {
+            guard let fence = weakFence() else { computerUseRunRouteFences.removeValue(forKey: id)
+                continue
+            }
+            if affected(fence.token) {
+                fence.invalidate()
+                computerUseRunRouteFences.removeValue(forKey: id)
+            }
+        }
+    }
+
+    private func computerUseRunRouteCandidate(
+        connectionID: UUID, identity: WindowToolDispatchIdentity,
+        context: MCPDomainAdmittedContext?, policy: MCPToolPolicyAdmissionToken?, principalRunID: UUID?
+    ) async -> ComputerUseRunRouteFence? {
+        guard let token = await cachedModelCatalogRouteToken(connectionID: connectionID), isEnabledState,
+              identity.windowID == token.observerEndpoint.windowID,
+              context.map({ $0.connectionID == connectionID && $0.windowID == token.observerEndpoint.windowID
+                      && $0.workspaceID == token.observerEndpoint.workspaceID && $0.contextID == token.observerEndpoint.tabID }) ?? true,
+              principalRunID == token.runID, isCurrentToolPolicyAdmission(policy),
+              isCurrentCatalogRouteToken(token), let connection = connections[connectionID]
+        else { return nil }
+        let fence = ComputerUseRunRouteFence(token: token, identity: identity, connectionIdentity: ObjectIdentifier(connection as AnyObject))
+        computerUseRunRouteFences = computerUseRunRouteFences.filter { $0.value() != nil }
+        computerUseRunRouteFences[UUID()] = { [weak fence] in fence }
+        return fence
     }
 
     /// Exact read-only transport route: both owners must agree across the actor hop. No
@@ -16066,8 +16155,9 @@ actor ServerNetworkManager {
                                     )
                                 }
                                 if let resolvedTool {
-                                    let toolDef = resolvedTool.definition
-                                    connectionLog("tools/call \(toolName): dispatching exact domain binding scope=\(String(describing: registrationScope))")
+                                    let toolDef: MCPDomainToolDefinition = resolvedTool.definition
+                                    let scopeDescription = String(describing: registrationScope)
+                                    connectionLog("tools/call \(toolName): dispatching exact domain binding scope=\(scopeDescription)")
 
                                     // Inject window_id from routing if tool schema declares it and caller didn't provide it.
                                     // bind_context manages its own window_id semantics and must not be auto-injected.
@@ -16174,7 +16264,7 @@ actor ServerNetworkManager {
                                     // Window-scoped bindings retain exact registry generation ownership.
                                     if case let .window(registeredWindowID) = resolvedTool.scope {
                                         let ownershipWindowID = chosenID ?? registeredWindowID
-                                        guard let windowDispatchIdentity = await self.captureWindowToolDispatchIdentity(
+                                        guard var windowDispatchIdentity = await self.captureWindowToolDispatchIdentity(
                                             windowID: ownershipWindowID,
                                             catalogRegistrationHandle: resolvedTool.registrationHandle,
                                             modelRouteToken: modelRouteToken
@@ -16184,6 +16274,14 @@ actor ServerNetworkManager {
                                                 code: "tool_execution_window_terminal",
                                                 message: "The selected window is closing or no longer owns this tool catalog."
                                             )
+                                        }
+                                        if Self.needsComputerUseRunRouteCandidate(toolName: toolName, arguments: effectiveArgs) {
+                                            let candidate: ComputerUseRunRouteFence? = await self.computerUseRunRouteCandidate(
+                                                connectionID: connectionID, identity: windowDispatchIdentity,
+                                                context: admittedDomainContext, policy: policyAdmissionToken,
+                                                principalRunID: invocationSecurityContext.principal.runID
+                                            )
+                                            windowDispatchIdentity.computerUseRunRouteCandidate = candidate
                                         }
                                         let dispatchAuthorization = await self.toolDispatchAuthorization(
                                             connectionID: connectionID,
