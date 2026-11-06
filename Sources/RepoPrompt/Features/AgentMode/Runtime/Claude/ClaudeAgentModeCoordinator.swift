@@ -553,6 +553,7 @@ final class ClaudeAgentModeCoordinator {
         session.claudeAutoCompactWindowTokens = status.autoCompactWindowTokens
         guard session.selectedAgent.usesClaudeNativeRuntime else { return false }
         let changed = ClaudeContextUsageEstimator.reconcileContextWindow(session: session, createsUsage: true)
+        guard session.contextUsageSnapshot == nil else { return changed }
         let estimator = ClaudeContextUsageEstimator(
             tokenEstimator: { TokenCalculationService.estimateTokens(for: $0) },
             contextUsageBuilder: { AgentModeViewModel.contextUsageFromClaudeProviderTokens($0, modelContextWindow: $1) }
