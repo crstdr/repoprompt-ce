@@ -177,6 +177,50 @@ final class AgentSessionLinkLaneBoardTests: XCTestCase {
         XCTAssertNil(observed.board.directRunningHelperCount)
     }
 
+    func testSupplementalNeedsUserRequiresHookOrCompleteInstructionWait() async throws {
+        let tabID = UUID()
+        let viewModel = AgentModeViewModel(testWorkspacePath: FileManager.default.currentDirectoryPath, codexControllerFactory: { _, _, _, _, _, _ in
+            preconditionFailure("Wait evidence tests must not start a provider")
+        })
+        let workspaceManager = AgentSessionLinkEndpointTestSupport.installWorkspace(on: viewModel, tabID: tabID, name: "Wait evidence")
+        defer { withExtendedLifetime(workspaceManager) {} }
+        let session = viewModel.session(for: tabID)
+        let sessionID = UUID()
+        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session, updateWorkspaceMetadata: true))
+        session.hasLoadedPersistedState = true
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        session.markCurrentBindingHydrated()
+        let target = try XCTUnwrap(viewModel.agentSessionLinkCandidates(isWindowClosing: false).first { $0.sessionID == sessionID })
+        _ = try viewModel.agentSessionLinkReadableSession(for: target).get()
+        XCTAssertTrue(session.permitsBoundOperationAndSave)
+        XCTAssertNotNil(session.quietRunFacts(capturedState: .waitingForUser))
+        func evidence() -> Bool? {
+            viewModel.agentSessionLinkRunFacts(for: target, capturedStatus: .awaitingUser)?.supplementalNeedsUser
+        }
+        XCTAssertEqual(evidence(), false)
+        session.runState = .waitingForUser
+        session.waitingPrompt = "Stale prompt alone"
+        XCTAssertEqual(evidence(), false)
+        session.instructionWaitID = UUID()
+        XCTAssertEqual(evidence(), false)
+        let wait = Task<UserInstructionResponse, Error> {
+            try await withCheckedThrowingContinuation { session.instructionContinuation = $0 }
+        }
+        try await AsyncTestWait.waitUntil("instruction continuation installed") { session.instructionContinuation != nil }
+        XCTAssertEqual(evidence(), true)
+        XCTAssertEqual(AgentPendingInteractionDescriptor.make(from: session)?.kind, .instruction)
+        session.instructionWaitID = nil
+        XCTAssertEqual(evidence(), false)
+        session.instructionContinuation?.resume(throwing: CancellationError())
+        session.instructionContinuation = nil
+        _ = await wait.result
+        session.pendingCodexHookReview = .init(tabID: tabID, runAttemptID: nil, runID: nil, executionCWD: "/tmp", hooks: [], phase: .reviewRequired, gateGeneration: 1)
+        XCTAssertNil(AgentModeViewModel.pendingInteractionKind(for: session))
+        XCTAssertEqual(evidence(), true)
+        session.beginPersistentBindingTransition()
+        XCTAssertNil(evidence(), "unknown proof must never be replaced with zero counters")
+    }
+
     func testCachedCensusDistinguishesUnavailableFromKnownZeroWithoutChangingPollWire() throws {
         let tabID = UUID()
         let viewModel = AgentModeViewModel(testWorkspacePath: FileManager.default.currentDirectoryPath, codexControllerFactory: { _, _, _, _, _, _ in

@@ -79,6 +79,9 @@ struct AgentSessionLinkPassiveStatusNotices {
         /// Proof from this exact publication only; nil never means zero.
         var runFacts: AgentRunQuietFacts?
         let managedMetadata: ManagedMetadata?
+        /// Wait evidence is separate from status identity and counters-only receipt proof.
+        var hasPendingInteraction: Bool
+        var supplementalNeedsUser: Bool?
 
         /// Supplemental values refresh presentation separately, never observation identity.
         static func == (lhs: Self, rhs: Self) -> Bool {
@@ -114,10 +117,15 @@ struct AgentSessionLinkPassiveStatusNotices {
             waitingOn: DomainAgentSessionWaitingOn? = nil,
             latestVisibleAssistantPreview: String? = nil,
             runFacts: AgentRunQuietFacts? = nil,
-            managedMetadata: ManagedMetadata? = nil
+            managedMetadata: ManagedMetadata? = nil,
+            hasPendingInteraction: Bool = false
         ) {
             self.managedMetadata = managedMetadata
-            self.runFacts = runFacts
+            self.hasPendingInteraction = hasPendingInteraction
+            supplementalNeedsUser = runFacts?.supplementalNeedsUser
+            self.runFacts = runFacts.flatMap {
+                AgentRunQuietFacts(settledThrough: $0.settledThrough, ordinaryThrough: $0.ordinaryThrough)
+            }
             self.reference = reference
             self.targetEndpoint = targetEndpoint
             self.targetSessionID = targetSessionID

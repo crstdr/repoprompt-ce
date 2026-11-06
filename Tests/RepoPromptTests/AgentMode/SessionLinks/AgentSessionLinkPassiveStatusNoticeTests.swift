@@ -7,6 +7,18 @@ final class AgentSessionLinkPassiveStatusNoticeTests: XCTestCase {
     private typealias Reducer = AgentSessionLinkPassiveStatusNotices
     private typealias Status = Reducer.Status
 
+    func testWaitEvidenceDoesNotBecomeQuietProofOrObservationIdentity() {
+        let plain = sample(0, status: .waiting, runFacts: .init(settledThrough: 8, ordinaryThrough: 7))
+        var decorated = sample(0, status: .waiting, runFacts: .init(settledThrough: 8, ordinaryThrough: 7, supplementalNeedsUser: true))
+        decorated.hasPendingInteraction = true
+        XCTAssertEqual(decorated.supplementalNeedsUser, true)
+        XCTAssertEqual(decorated.runFacts, plain.runFacts)
+        XCTAssertNil(decorated.runFacts?.supplementalNeedsUser)
+        XCTAssertEqual(decorated, plain)
+        XCTAssertEqual(Set([decorated, plain]).count, 1)
+        XCTAssertNil(AgentRunQuietFacts(settledThrough: 0, ordinaryThrough: 1, supplementalNeedsUser: true))
+    }
+
     func testEveryLiveStatusEdgeHasTheSpecifiedDeterministicEffect() {
         struct Case {
             let from: Status
