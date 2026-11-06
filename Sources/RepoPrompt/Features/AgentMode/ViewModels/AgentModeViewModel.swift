@@ -12448,6 +12448,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             retiringMCPSessionTargetDiscardSessionIDByRecoveryID.removeValue(forKey: recoveryID)
             bindingOnlyMCPSessionTargetRecoveryIDs.remove(recoveryID)
             releaseOutstandingProvisionalMCPSessionTarget(pending.target)
+            if let claim = pending.target.recoveryClaim {
+                ComputerUseChildProof.holder?.provisionalRecoveryDidComplete(claim, owner: self)
+            }
             return
         }
         let shouldStartAutomaticRetry = !pending.automaticRetryStarted

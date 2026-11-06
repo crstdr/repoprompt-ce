@@ -355,6 +355,76 @@ final class ComputerUseChildRoutingTests: XCTestCase {
         }
     }
 
+    func testRetryableRollbackReleasesHolderAfterSameClaimCompletes() async throws {
+        try await withRoute(realStarter: true) { f in
+            let retry = TestReleaseFence(name: "CU artifact deletion retry")
+            defer {
+                retry.release()
+                f.vm.test_setBeforeAutomaticMCPSessionTargetDiscardRetry(nil)
+            }
+            var deletions = 0
+            f.vm.test_setAgentSessionsDeleter { tabID, workspace in
+                deletions += 1
+                if deletions == 1 { throw CocoaError(.fileWriteUnknown) }
+                try await AgentSessionDataService.shared.deleteAgentSessions(forComposeTabID: tabID, for: workspace)
+            }
+            f.vm.test_setBeforeAutomaticMCPSessionTargetDiscardRetry { await retry.enterAndWait() }
+            var captured: ComputerUseChildProof?
+            var childID: UUID?
+            f.vm.test_afterConfiguredCreationAcknowledgement = { handle in
+                captured = handle.session.computerUseChildProof
+                childID = handle.bindingToken.bindingIdentity.sessionID
+            }
+            f.beforeAdmission = { await f.revoke() }
+            let response = try await f.transport.callTool(name: "agent_run", arguments: start)
+            XCTAssertTrue(response.rawJSON.contains(ComputerUseChildProof.denied), response.rawJSON)
+            XCTAssertEqual(f.startEntries, 1)
+            XCTAssertEqual(f.submissions, 0)
+            let entered = await retry.waitUntilEntered(timeout: 8)
+            XCTAssertTrue(entered)
+            let proof = try XCTUnwrap(captured)
+            let target = try XCTUnwrap(proof.creationTarget)
+            let claim = try XCTUnwrap(target.recoveryClaim)
+            let id = try XCTUnwrap(childID)
+            XCTAssertEqual(deletions, 1)
+            XCTAssertEqual(claim.state, .workspaceRecovered)
+            XCTAssertTrue(ComputerUseChildProof.holder === proof)
+            XCTAssertEqual(f.vm.test_pendingMCPSessionTargetDiscardCount, 1)
+            let workspace = try XCTUnwrap(f.window.workspaceManager.activeWorkspace)
+            let retained = try await AgentSessionDataService.shared.loadAgentSession(id: id, for: workspace)
+            XCTAssertNotNil(retained)
+            retry.release()
+            // Only the recovery owner's completion may release the holder; do not re-settle the proof here.
+            try await AsyncTestWait.waitUntil("Same CU recovery claim settles", timeout: 8) {
+                claim.state == .complete && f.vm.test_pendingMCPSessionTargetDiscardCount == 0
+                    && f.vm.test_outstandingProvisionalMCPSessionTargetCount == 0 && ComputerUseChildProof.holder == nil
+            }
+            XCTAssertEqual(deletions, 2)
+            let removed = try await AgentSessionDataService.shared.loadAgentSession(id: id, for: workspace)
+            XCTAssertNil(removed)
+            XCTAssertNil(f.vm.sessionIndex[id])
+            XCTAssertFalse(f.window.workspaceManager.activeWorkspace?.composeTabs.contains { $0.id == target.tabID } == true)
+            f.beforeAdmission = nil
+            f.vm.test_afterConfiguredCreationAcknowledgement = nil
+            f.server.removeTabContext(forConnectionID: f.transport.connectionID, clientName: f.transport.clientName, windowID: f.window.windowID, runID: f.runID)
+            try await f.installRoute()
+            let next = try await f.transport.callTool(name: "agent_run", arguments: start)
+            XCTAssertFalse(next.rawJSON.contains("\"isError\":true"), next.rawJSON)
+            XCTAssertEqual(f.startEntries, 2)
+            XCTAssertEqual(f.submissions, 1)
+            let retryChild = try XCTUnwrap(ComputerUseChildProof.holder?.child)
+            try await AsyncTestWait.waitUntil("Retry reaches fake native controller", timeout: 8) {
+                (retryChild.codexController as? WedgeFakeCodexController)?.startedTurnCount == 1
+            }
+            let controller = try XCTUnwrap(retryChild.codexController as? WedgeFakeCodexController)
+            await f.vm.test_codexCoordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "recovery-retry-turn"), session: retryChild, sourceController: controller)
+            await f.vm.test_codexCoordinator.test_handleCodexNativeEvent(.turnCompleted(turnID: "recovery-retry-turn", status: .completed), session: retryChild, sourceController: controller)
+            try await AsyncTestWait.waitUntil("Successful retry retires before fixture teardown", timeout: 8) {
+                ComputerUseChildProof.holder == nil && controller.shutdownCount == 1
+            }
+        }
+    }
+
     func testUnauthorizedSteerDoesNotDiscloseComputerUseDesignation() async throws {
         try await withRoute { f in
             let previousFullAccess = OverseerGlobalAutoApprove.isEnabled
