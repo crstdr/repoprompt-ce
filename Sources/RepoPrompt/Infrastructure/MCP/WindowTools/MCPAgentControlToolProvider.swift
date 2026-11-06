@@ -67,7 +67,7 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
             - `cancel_pending_send`: withdraw your queued message by its `idempotency_key` before delivery.
             - `compact`: compact one target's provider context when `idle_for_send: true`.
             - `set_waiting_on`: declare or clear your own external dependency; no target ID.
-            - `snooze_auto_wake`: pause routine status-triggered wake admission for one lane, not collection or delivery; exact attention or a real transition into waiting for its own user may bypass its snooze.
+            - `snooze_auto_wake`: pause routine status-triggered wake admission for one lane, not collection or delivery; exact attention may bypass its snooze.
             - `request_attention`: send a fixed, attributed signal through an exact inbound link; acceptance does not promise a wake or action.
             - `respond`: [manage] answer the exact current `interaction_id` only when its pending result is respondable. Manual-only prompts belong to the target's user; a mismatch applies nothing.
             - `steer`: [manage] direct that target now with a new `idempotency_key`; pending prompts block steering. ACP live steering is supported.
@@ -145,7 +145,7 @@ final class MCPAgentControlToolProvider: MCPAppToolProviding {
                     "workflow_name": .string(description: "[create_lane, send] Case-insensitive one-message workflow name; exclusive with workflow_id."),
                     "summary": .string(description: "[set_waiting_on] Your concrete external dependency; max 280 UTF-8 bytes."),
                     "clear": .boolean(description: "[set_waiting_on, snooze_auto_wake] Clear your declaration or lane snooze; exclusive with summary/duration_seconds."),
-                    "duration_seconds": .integer(description: "[snooze_auto_wake] Routine-status pause, 60...3600 seconds (default 600); extends, never shortens. Exact attention or a real transition into waiting for its own user may bypass master/lane selection and this lane’s snooze; routine status/overflow otherwise may not. Unlink, revocation, authority, readiness, and other eligibility gates remain hard. Exclusive with clear.", minimum: 60, maximum: 3600),
+                    "duration_seconds": .integer(description: "[snooze_auto_wake] Routine-status pause, 60...3600 seconds (default 600); extends, never shortens. Exact attention may bypass master/lane selection and this lane’s snooze; routine status/overflow may not. Unlink, revocation, authority, readiness, and other eligibility gates remain hard. Exclusive with clear.", minimum: 60, maximum: 3600),
                     "observer_session_id": .string(description: "[request_attention] Observer UUID only to disambiguate an exact authorized inverse link; omit only when one resolves. Grants nothing."),
                     "interaction_id": .string(description: "[respond] Exact interaction_id from the latest poll or wait; a different current prompt applies nothing."),
                     "response": .string(description: "[respond] Decision (accept, decline, cancel) for approvals and elicitations, or the answer to a single-field question."),

@@ -1993,12 +1993,9 @@ package enum MCPDomainCanonicalToolDefinitions {
         /// Revision-4 spelling retained solely as one half of its exact historical anchor pair.
         static let revisionFourSnoozeBullet = "- `snooze_auto_wake`: temporarily suppress status-triggered Auto-wake from one currently selected overseen lane. Defaults to 600 seconds; `duration_seconds` accepts 60 through 3600 and is applied as max(current deadline, now + duration_seconds), so one call leaves at most a 60-minute horizon, repeated calls may extend indefinitely, and nothing ever shortens an active snooze. `clear: true` releases it. Collection and status coalescing continue while snoozed, a turn your own user starts \u{2014} or another lane\u{2019}s wake \u{2014} may still deliver that lane, and clearing or expiry only asks RepoPrompt to re-evaluate eligibility rather than forcing a turn. An explicit attention request may bypass only that exact lane\u{2019}s snooze without clearing or shortening it; it still requires that lane to be selected by master Auto-wake or its own lane toggle, and unlink or revocation, readiness, suppression, and every other admission gate remain unchanged."
 
-        /// Shipped revision-5 pair remains an exact historical input.
-        static let revisionFiveSnoozeBullet = "- `snooze_auto_wake`: temporarily suppress status-triggered Auto-wake from one currently selected overseen lane. Defaults to 600 seconds; `duration_seconds` accepts 60 through 3600 and is applied as max(current deadline, now + duration_seconds), so one call leaves at most a 60-minute horizon, repeated calls may extend indefinitely, and nothing ever shortens an active snooze. `clear: true` releases it. Collection and status coalescing continue while snoozed, a turn your own user starts \u{2014} or another lane\u{2019}s wake \u{2014} may still deliver that lane, and clearing or expiry only asks RepoPrompt to re-evaluate eligibility rather than forcing a turn. An explicit attention request may bypass master Auto-wake, that lane\u{2019}s own toggle, and only that exact lane\u{2019}s snooze without clearing or shortening it or changing either selection setting. Admission for routine status and overflow remains governed by selection and snooze. Unlink, revocation, exact authority, readiness, bounded queue admission, failure suppression, prompt eligibility, immutable claim and budget, physical acquisition, and tombstone fences admit no exception."
-        static let snoozeBullet = revisionFiveSnoozeBullet
-            .replacingOccurrences(of: "temporarily suppress status-triggered", with: "temporarily suppress routine status-triggered")
-            .replacingOccurrences(of: "An explicit attention request may bypass", with: "An explicit attention request or a target\u{2019}s real transition into waiting for its own user may bypass")
-            .replacingOccurrences(of: "Admission for routine status", with: "Admission for other routine status")
+        /// Revision 5 keeps status/overflow admission routine while exact purposeful attention may
+        /// bypass selection and only its exact lane's snooze. Every other gate remains hard.
+        static let snoozeBullet = "- `snooze_auto_wake`: temporarily suppress status-triggered Auto-wake from one currently selected overseen lane. Defaults to 600 seconds; `duration_seconds` accepts 60 through 3600 and is applied as max(current deadline, now + duration_seconds), so one call leaves at most a 60-minute horizon, repeated calls may extend indefinitely, and nothing ever shortens an active snooze. `clear: true` releases it. Collection and status coalescing continue while snoozed, a turn your own user starts \u{2014} or another lane\u{2019}s wake \u{2014} may still deliver that lane, and clearing or expiry only asks RepoPrompt to re-evaluate eligibility rather than forcing a turn. An explicit attention request may bypass master Auto-wake, that lane\u{2019}s own toggle, and only that exact lane\u{2019}s snooze without clearing or shortening it or changing either selection setting. Admission for routine status and overflow remains governed by selection and snooze. Unlink, revocation, exact authority, readiness, bounded queue admission, failure suppression, prompt eligibility, immutable claim and budget, physical acquisition, and tombstone fences admit no exception."
         static let declarationBulletWith = declarationBulletWithout + "\n" + snoozeBullet
 
         static let fieldSummaryWithout = "**set_waiting_on**: exactly one of summary / clear: true; no session_id"
@@ -2009,12 +2006,7 @@ package enum MCPDomainCanonicalToolDefinitions {
         static let revisionThreeDurationDescription = "[snooze_auto_wake] Seconds this lane may not start an automatic wake of its own, 60 through 3600. Defaults to 600. Applied as max(current deadline, now + duration_seconds), so it never shortens an active snooze. Mutually exclusive with clear: true."
         /// Revision-4 schema spelling paired only with `revisionFourSnoozeBullet`.
         static let revisionFourDurationDescription = "[snooze_auto_wake] Seconds this lane\u{2019}s status updates may not start an automatic wake of their own, 60 through 3600. Defaults to 600. Applied as max(current deadline, now + duration_seconds), so it never shortens an active snooze. An explicit attention request may bypass only that exact lane\u{2019}s snooze, and only while the lane is selected by master Auto-wake or its own lane toggle; unlink remains a hard control. Mutually exclusive with clear: true."
-        static let revisionFiveDurationDescription = "[snooze_auto_wake] Seconds this lane\u{2019}s status updates may not start an automatic wake of their own, 60 through 3600. Defaults to 600. Applied as max(current deadline, now + duration_seconds), so it never shortens an active snooze. An explicit attention request may bypass master Auto-wake, that lane\u{2019}s own toggle, and only that exact lane\u{2019}s snooze without changing any of them. Admission for routine status and overflow remains governed by selection and snooze. Unlink, revocation, exact authority, readiness, bounded queue admission, failure suppression, prompt eligibility, immutable claim and budget, physical acquisition, and tombstone fences admit no exception. Mutually exclusive with clear: true."
-
-        static let durationDescription = revisionFiveDurationDescription
-            .replacingOccurrences(of: "status updates", with: "routine status updates")
-            .replacingOccurrences(of: "An explicit attention request may bypass", with: "An explicit attention request or a target\u{2019}s real transition into waiting for its own user may bypass")
-            .replacingOccurrences(of: "Admission for routine status", with: "Admission for other routine status")
+        static let durationDescription = "[snooze_auto_wake] Seconds this lane\u{2019}s status updates may not start an automatic wake of their own, 60 through 3600. Defaults to 600. Applied as max(current deadline, now + duration_seconds), so it never shortens an active snooze. An explicit attention request may bypass master Auto-wake, that lane\u{2019}s own toggle, and only that exact lane\u{2019}s snooze without changing any of them. Admission for routine status and overflow remains governed by selection and snooze. Unlink, revocation, exact authority, readiness, bounded queue admission, failure suppression, prompt eligibility, immutable claim and budget, physical acquisition, and tombstone fences admit no exception. Mutually exclusive with clear: true."
 
         static let sessionIDWithout = AgentSessionLinkQueuedSend.sessionIDWith
         static let sessionIDWith = sessionIDWithout.map {
@@ -2036,7 +2028,6 @@ package enum MCPDomainCanonicalToolDefinitions {
         case absent
         case revisionThree
         case revisionFour
-        case revisionFive
         case current
         case partial
     }
@@ -2169,15 +2160,6 @@ package enum MCPDomainCanonicalToolDefinitions {
     /// Its own output is recognized before those historical passes, preserving whole-pipeline
     /// idempotence without teaching older migrations about newer prose.
     private enum AgentSessionLinkTokenEfficiencyMigration {
-        static let attentionOnlySnoozeBullet = "- `snooze_auto_wake`: pause routine status-triggered wake admission for one lane, not collection or delivery; exact attention may bypass its snooze."
-        static let snoozeBullet = attentionOnlySnoozeBullet.replacingOccurrences(
-            of: "exact attention may bypass", with: "exact attention or a real transition into waiting for its own user may bypass"
-        )
-        static let attentionOnlyDuration = "[snooze_auto_wake] Routine-status pause, 60...3600 seconds (default 600); extends, never shortens. Exact attention may bypass master/lane selection and this lane\u{2019}s snooze; routine status/overflow may not. Unlink, revocation, authority, readiness, and other eligibility gates remain hard. Exclusive with clear."
-        static let durationDescription = attentionOnlyDuration
-            .replacingOccurrences(of: "Exact attention may bypass", with: "Exact attention or a real transition into waiting for its own user may bypass")
-            .replacingOccurrences(of: "routine status/overflow may not.", with: "routine status/overflow otherwise may not.")
-
         static let description = """
         Coordinate Agent sessions through direct links explicitly granted by the user.
 
@@ -2193,7 +2175,7 @@ package enum MCPDomainCanonicalToolDefinitions {
         - `cancel_pending_send`: withdraw your queued message by its `idempotency_key` before delivery.
         - `compact`: compact one target's provider context when `idle_for_send: true`.
         - `set_waiting_on`: declare or clear your own external dependency; no target ID.
-        \(snoozeBullet)
+        - `snooze_auto_wake`: pause routine status-triggered wake admission for one lane, not collection or delivery; exact attention may bypass its snooze.
         - `request_attention`: send a fixed, attributed signal through an exact inbound link; acceptance does not promise a wake or action.
         - `respond`: [manage] answer the exact current `interaction_id` only when its pending result is respondable. Manual-only prompts belong to the target's user; a mismatch applies nothing.
         - `steer`: [manage] direct that target now with a new `idempotency_key`; pending prompts block steering.
@@ -2279,7 +2261,7 @@ package enum MCPDomainCanonicalToolDefinitions {
                 "summary": stringSchema("[set_waiting_on] Your concrete external dependency; max 280 UTF-8 bytes."),
                 "clear": booleanSchema("[set_waiting_on, snooze_auto_wake] Clear your declaration or lane snooze; exclusive with summary/duration_seconds."),
                 "duration_seconds": .object([
-                    "description": .string(durationDescription),
+                    "description": .string("[snooze_auto_wake] Routine-status pause, 60...3600 seconds (default 600); extends, never shortens. Exact attention may bypass master/lane selection and this lane’s snooze; routine status/overflow may not. Unlink, revocation, authority, readiness, and other eligibility gates remain hard. Exclusive with clear."),
                     "maximum": .int(3600),
                     "minimum": .int(60),
                     "type": .string("integer")
@@ -2754,40 +2736,10 @@ package enum MCPDomainCanonicalToolDefinitions {
     private static func canonicalizeAgentSessionLink(
         _ definition: MCPDomainToolDefinition
     ) -> MCPDomainToolDefinition {
-        let definition = normalizeAttentionOnlyCompactContract(definition)
         if AgentSessionLinkDirectionGuidanceMigration.isCurrent(definition) {
             return definition
         }
         return AgentSessionLinkDirectionGuidanceMigration.apply(canonicalizeAgentSessionLinkBeforeDirectionGuidance(definition))
-    }
-
-    /// Upgrade only complete previously recognized compact definitions, never partial prose/schema pairs.
-    private static func normalizeAttentionOnlyCompactContract(_ definition: MCPDomainToolDefinition) -> MCPDomainToolDefinition {
-        typealias Compact = AgentSessionLinkTokenEfficiencyMigration
-        guard exactLineCount(Compact.attentionOnlySnoozeBullet, in: definition.description) == 1,
-              case var .object(schema) = definition.inputSchema,
-              case var .object(properties)? = schema["properties"],
-              case var .object(duration)? = properties["duration_seconds"],
-              duration["description"] == .string(Compact.attentionOnlyDuration) else { return definition }
-        duration["description"] = .string(Compact.durationDescription)
-        properties["duration_seconds"] = .object(duration)
-        schema["properties"] = .object(properties)
-        let candidate = MCPDomainToolDefinition(
-            name: definition.name,
-            description: definition.description.replacingOccurrences(of: Compact.attentionOnlySnoozeBullet, with: Compact.snoozeBullet),
-            inputSchema: .object(schema), annotations: definition.annotations, isEnabledByDefault: definition.isEnabledByDefault
-        )
-        let recognized = AgentSessionLinkDirectionGuidanceMigration.isCurrent(candidate)
-            || AgentSessionLinkWaitCursorMigration.isCurrent(candidate)
-            || AgentSessionLinkOverseerActivationGuidance.isCurrent(candidate)
-            || AgentSessionLinkOverseerActivationGuidance.isPrevious(candidate)
-            || AgentSessionLinkModelSelectionMigration.isCurrent(candidate)
-            || (candidate.description == AgentSessionLinkRefusalSubreasonMigration.description
-                && candidate.inputSchema == AgentSessionLinkLaneOperationsMigration.inputSchema)
-            || AgentSessionLinkLaneOperationsMigration.isCurrent(candidate)
-            || AgentSessionLinkStopMigration.isCurrent(candidate)
-            || AgentSessionLinkTokenEfficiencyMigration.isCurrent(candidate)
-        return recognized ? candidate : definition
     }
 
     private static func canonicalizeAgentSessionLinkBeforeDirectionGuidance(
@@ -3224,10 +3176,6 @@ package enum MCPDomainCanonicalToolDefinitions {
             canonicalizeAgentSessionLink(definition)
         }
 
-        package static func test_normalizeAttentionOnlyCompactContract(_ definition: MCPDomainToolDefinition) -> MCPDomainToolDefinition {
-            normalizeAttentionOnlyCompactContract(definition)
-        }
-
         package static func test_agentSessionLinkPreviousStopDefinition() -> MCPDomainToolDefinition {
             canonicalizeAgentSessionLinkBeforeModelSelection(test_agentSessionLinkLegacyCurrentDefinition())
         }
@@ -3434,7 +3382,6 @@ package enum MCPDomainCanonicalToolDefinitions {
             Snooze.revisionFourSnoozeBullet,
             in: definition.description
         )
-        let revisionFiveBulletCount = exactLineCount(Snooze.revisionFiveSnoozeBullet, in: definition.description)
         let currentBulletCount = exactLineCount(Snooze.snoozeBullet, in: definition.description)
 
         var durationDescription: String?
@@ -3448,7 +3395,6 @@ package enum MCPDomainCanonicalToolDefinitions {
            properties[Snooze.durationProperty] == nil,
            revisionThreeBulletCount == 0,
            revisionFourBulletCount == 0,
-           revisionFiveBulletCount == 0,
            currentBulletCount == 0
         {
             return .absent
@@ -3457,7 +3403,6 @@ package enum MCPDomainCanonicalToolDefinitions {
 
         if revisionThreeBulletCount == 1,
            revisionFourBulletCount == 0,
-           revisionFiveBulletCount == 0,
            currentBulletCount == 0,
            durationDescription == Snooze.revisionThreeDurationDescription
         {
@@ -3465,21 +3410,13 @@ package enum MCPDomainCanonicalToolDefinitions {
         }
         if revisionThreeBulletCount == 0,
            revisionFourBulletCount == 1,
-           revisionFiveBulletCount == 0,
            currentBulletCount == 0,
            durationDescription == Snooze.revisionFourDurationDescription
         {
             return .revisionFour
         }
-        if revisionThreeBulletCount == 0, revisionFourBulletCount == 0,
-           revisionFiveBulletCount == 1, currentBulletCount == 0,
-           durationDescription == Snooze.revisionFiveDurationDescription
-        {
-            return .revisionFive
-        }
         if revisionThreeBulletCount == 0,
            revisionFourBulletCount == 0,
-           revisionFiveBulletCount == 0,
            currentBulletCount == 1,
            durationDescription == Snooze.durationDescription
         {
@@ -3506,8 +3443,8 @@ package enum MCPDomainCanonicalToolDefinitions {
     /// shape, so it is documented in both property descriptions and in the field summary, and
     /// enforced by the tool service.
     ///
-    /// Additive and idempotent, keyed on the advertised operation. Exact revision-3/4/5
-    /// bullet/schema pairs migrate to the current contract; the current pair is returned untouched. One
+    /// Additive and idempotent, keyed on the advertised operation. Exact revision-3 and revision-4
+    /// bullet/schema pairs migrate to revision 5; an exact revision-5 pair is returned untouched. One
     /// without the operation must still carry every anchor this extends. Any duplicated or mixed pair
     /// fails closed rather than advertising contradictory selection and attention rules.
     private static func addAutoWakeSnooze(
@@ -3528,14 +3465,13 @@ package enum MCPDomainCanonicalToolDefinitions {
         switch contractState {
         case .current:
             return definition
-        case .revisionThree, .revisionFour, .revisionFive:
+        case .revisionThree, .revisionFour:
             guard case let .object(durationSchema)? = properties[Snooze.durationProperty] else {
                 preconditionFailure("agent_session_link canonical snooze schema is incomplete")
             }
             let historicalBullet: String = switch contractState {
             case .revisionThree: Snooze.revisionThreeSnoozeBullet
             case .revisionFour: Snooze.revisionFourSnoozeBullet
-            case .revisionFive: Snooze.revisionFiveSnoozeBullet
             case .absent, .current, .partial:
                 preconditionFailure("unreachable Auto-wake snooze migration state")
             }
@@ -3557,7 +3493,7 @@ package enum MCPDomainCanonicalToolDefinitions {
             break
         case .partial:
             preconditionFailure(
-                "agent_session_link canonical definition has no exact revision-3, revision-4, revision-5, or current snooze contract pair"
+                "agent_session_link canonical definition has no exact revision-3, revision-4, or revision-5 snooze contract pair"
             )
         }
 
