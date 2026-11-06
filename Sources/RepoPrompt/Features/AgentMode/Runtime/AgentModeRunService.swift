@@ -1567,6 +1567,17 @@ final class AgentModeRunService {
             if let oracleDrain { _ = await OracleBackgroundInvocationRegistry.awaitDrain(oracleDrain, timeout: 30) }
             return
         }
+        if session.runState == .cancelled,
+           session.activeRunOwnership == nil,
+           session.lastTerminalCommitRevision == nil
+        {
+            if intent == .userStop, origin == .explicitStop {
+                withdrawQueuedWorkForManagedStop(tabID: tabID, session: session)
+            }
+            if completion == .terminalTeardownCompleted { await providerTeardown?() }
+            if let oracleDrain { _ = await OracleBackgroundInvocationRegistry.awaitDrain(oracleDrain, timeout: 30) }
+            return
+        }
         if session.runState.isTerminalForCommit,
            let revision = session.lastTerminalCommitRevision
         {

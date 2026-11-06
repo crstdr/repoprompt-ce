@@ -552,7 +552,15 @@ final class ClaudeAgentModeCoordinator {
         }
         session.claudeAutoCompactWindowTokens = status.autoCompactWindowTokens
         guard session.selectedAgent.usesClaudeNativeRuntime else { return false }
-        return ClaudeContextUsageEstimator.reconcileContextWindow(session: session, createsUsage: true)
+        let changed = ClaudeContextUsageEstimator.reconcileContextWindow(session: session, createsUsage: true)
+        let estimator = ClaudeContextUsageEstimator(
+            tokenEstimator: { TokenCalculationService.estimateTokens(for: $0) },
+            contextUsageBuilder: { AgentModeViewModel.contextUsageFromClaudeProviderTokens($0, modelContextWindow: $1) }
+        )
+        return estimator.ingestUsageSignal(
+            promptTokens: nil, completionTokens: nil, contextUsedTokens: nil,
+            modelContextWindow: nil, session: session
+        ) || changed
     }
 
     private func scheduleIdleFailure(_ session: AgentTabSession, listener: ClaudeControllerEventListener, error: String) {
