@@ -198,6 +198,12 @@ final class AgentSessionLinkLaneBoardTests: XCTestCase {
             viewModel.agentSessionLinkRunFacts(for: target, capturedStatus: .awaitingUser)?.supplementalNeedsUser
         }
         XCTAssertEqual(evidence(), false)
+        var publishedEvidence: [Bool] = []
+        let observation = try XCTUnwrap(viewModel.agentSessionLinkInstallObservation(for: target) {
+            if let value = evidence() { publishedEvidence.append(value) }
+        })
+        defer { observation.invalidate() }
+        try await AsyncTestWait.waitUntil("initial wait evidence observed") { publishedEvidence.last == false }
         session.runState = .waitingForUser
         session.waitingPrompt = "Stale prompt alone"
         XCTAssertEqual(evidence(), false)
@@ -207,6 +213,7 @@ final class AgentSessionLinkLaneBoardTests: XCTestCase {
             try await withCheckedThrowingContinuation { session.instructionContinuation = $0 }
         }
         try await AsyncTestWait.waitUntil("instruction continuation installed") { session.instructionContinuation != nil }
+        try await AsyncTestWait.waitUntil("instruction wait mutation observed") { publishedEvidence.last == true }
         XCTAssertEqual(evidence(), true)
         XCTAssertEqual(AgentPendingInteractionDescriptor.make(from: session)?.kind, .instruction)
         session.instructionWaitID = nil
@@ -214,9 +221,15 @@ final class AgentSessionLinkLaneBoardTests: XCTestCase {
         session.instructionContinuation?.resume(throwing: CancellationError())
         session.instructionContinuation = nil
         _ = await wait.result
-        session.pendingCodexHookReview = .init(tabID: tabID, runAttemptID: nil, runID: nil, executionCWD: "/tmp", hooks: [], phase: .reviewRequired, gateGeneration: 1)
+        try await AsyncTestWait.waitUntil("instruction teardown observed") { publishedEvidence.last == false }
+        let review = AgentCodexHookReviewRequest(tabID: tabID, runAttemptID: nil, runID: nil, executionCWD: "/tmp", hooks: [], phase: .reviewRequired, gateGeneration: 1)
+        session.pendingCodexHookReview = review
+        try await AsyncTestWait.waitUntil("hook review mutation observed") { publishedEvidence.last == true }
         XCTAssertNil(AgentModeViewModel.pendingInteractionKind(for: session))
         XCTAssertEqual(evidence(), true)
+        session.pendingCodexHookReview = nil
+        try await AsyncTestWait.waitUntil("hook review teardown observed") { publishedEvidence.last == false }
+        session.pendingCodexHookReview = review
         session.beginPersistentBindingTransition()
         XCTAssertNil(evidence(), "unknown proof must never be replaced with zero counters")
     }

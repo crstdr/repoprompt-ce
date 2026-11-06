@@ -9680,8 +9680,11 @@ extension AgentSessionLinkRuntimeBridgeTests {
             }
             fixture.host.fireObservation(for: fixture.target.sessionID)
             await fixture.bridge.test_settleTargetPublications()
-            // This fixture has no running change feed; reproduce its scoped public-change refresh.
-            await fixture.bridge.test_refreshStatus(sessionIDs: [fixture.observer.sessionID, other.sessionID])
+            if !supplementary {
+                // No change feed runs in this fixture; public changes need its scoped refresh.
+                // Supplemental-only publications must refresh both observers automatically.
+                await fixture.bridge.test_refreshStatus(sessionIDs: [fixture.observer.sessionID, other.sessionID])
+            }
             let managed = try XCTUnwrap(fixture.host.publishedPassiveNoticesByEndpoint[fixture.observer.domainEndpoint])
             let watch = try XCTUnwrap(fixture.host.publishedPassiveNoticesByEndpoint[other.domainEndpoint])
             XCTAssertEqual(managed.attentionRequests.map(\.reason), [.needsUser])

@@ -141,6 +141,21 @@ final class AgentSessionLinkPassiveStatusNoticeTests: XCTestCase {
         XCTAssertEqual(derived.snapshot.attentionRequests.count, 16)
         XCTAssertTrue(derived.snapshot.attentionRequests.contains { $0.reference == sample(0, status: .waiting).reference })
         XCTAssertEqual(derived.snapshot.unacknowledgedOverflowCount, 0)
+        for entering in [0, 16] {
+            let exiting = 16 - entering
+            var lifecycle = makeReducer()
+            lifecycle.enable(samples: observed([]), linkSetRevision: 1)
+            for index in 0 ... 16 where index != entering {
+                XCTAssertEqual(requestAttention(index, reducer: &lifecycle), .accepted)
+            }
+            let samples = observed([entering]).map { value in
+                value.reference == sample(exiting, status: .waiting).reference ? sample(exiting, status: .unavailable) : value
+            }
+            lifecycle.reconcile(samples: samples, linkSetRevision: 1, deliverable: true)
+            XCTAssertEqual(lifecycle.snapshot.attentionRequests.count, 16)
+            XCTAssertEqual(lifecycle.snapshot.attentionRequests.first { $0.reference == sample(entering, status: .waiting).reference }?.reason, .needsUser)
+            XCTAssertFalse(lifecycle.snapshot.attentionRequests.contains { $0.reference == sample(exiting, status: .waiting).reference })
+        }
     }
 
     func testEveryLiveStatusEdgeHasTheSpecifiedDeterministicEffect() {

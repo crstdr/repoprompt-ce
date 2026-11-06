@@ -837,7 +837,7 @@ struct AgentSessionLinkPassiveStatusNotices {
         self.linkSetRevision = linkSetRevision
 
         let currentByReference = samplesByReference(samples)
-        changed = retireNeedsUserAttention(samples: currentByReference) || changed
+        changed = retireInactiveAttention(samples: currentByReference) || changed
         let currentReferences = Set(currentByReference.keys)
         let removedReferences = Set(deliveredRunThrough.keys).subtracting(currentReferences)
             .union(Set(lastObservedStatus.keys).subtracting(currentReferences))
@@ -1089,14 +1089,13 @@ struct AgentSessionLinkPassiveStatusNotices {
         return .inserted
     }
 
-    /// Retire before offering entries so freed slots are available within the same observation pass.
-    private mutating func retireNeedsUserAttention(samples: [DomainAgentSessionLinkReference: Sample]) -> Bool {
+    /// Retire invalid lanes and ended waits before offering entries, regardless of target ordering.
+    private mutating func retireInactiveAttention(samples: [DomainAgentSessionLinkReference: Sample]) -> Bool {
         let retired = pendingAttentionByReference.values.filter { attention in
-            guard attention.reason == .needsUser else { return false }
             guard let sample = samples[attention.reference], sample.status != .unavailable,
                   sample.targetEndpoint == attention.targetEndpoint,
                   sample.targetSessionID == attention.targetSessionID else { return true }
-            return !sample.needsUser
+            return attention.reason == .needsUser && !sample.needsUser
         }
         for attention in retired {
             pendingAttentionByReference.removeValue(forKey: attention.reference)
