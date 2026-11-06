@@ -118,6 +118,7 @@ extension AgentModeViewModel {
 
     func joinOracleBackgroundWindowDrain() async {
         let drains = sessions.values.compactMap { closeOracleBackground(for: $0) }
+        guard !AppDomainRuntimeComposition.shared.oracleBackgroundInvocations.isShuttingDown else { return }
         for drain in drains {
             await drain.value
         }
