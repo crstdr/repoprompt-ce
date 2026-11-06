@@ -25,6 +25,7 @@ final class ComputerUseChildRoutingTests: XCTestCase {
         let runID = UUID()
         var submissions = 0
         var startEntries = 0
+        var armEntries = 0
         var catalog: MCPAppToolCatalogRegistration?
         var beforeAdmission: (() async throws -> Void)?
         var beforeMetadata: (() async -> Void)?
@@ -147,7 +148,7 @@ final class ComputerUseChildRoutingTests: XCTestCase {
                 )))
             }
             service.testComputerUseConfiguration = { .init(enabled: true, modelID: "codexExec:gpt-6.1-sol-high", modelAvailable: true) }
-            if !realStarter { service.testArmComputerUseChild = { _, _ in } }
+            if !realStarter { service.testArmComputerUseChild = { [self] _, _ in armEntries += 1 } }
             service.testBeforeProviderDispatch = { [self] in await beforeStartDispatch?() }
             service.testBeforeSteerDispatch = { [self] in await beforeSteerDispatch?() }
             if !realSteer {
@@ -323,6 +324,88 @@ final class ComputerUseChildRoutingTests: XCTestCase {
                 await base.cleanup()
                 throw error
             }
+        }
+    }
+
+    func testIdleSteerRejectsRevokedRouteBeforeArming() async throws {
+        try await withRoute { f in
+            let child = try await f.controlledChild()
+            var revoked = false
+            f.beforeMetadata = {
+                await f.manager.setEnabled(false)
+                await f.manager.setEnabled(true)
+                revoked = true
+            }
+            let response = try await f.transport.callTool(name: "agent_run", arguments: [
+                "op": "steer", "session_id": child.activeAgentSessionID!.uuidString,
+                "message": "Do not arm a revoked fake task", "wait": false, "_rawJSON": true
+            ])
+            XCTAssertTrue(revoked)
+            XCTAssertTrue(response.rawJSON.contains(ComputerUseChildProof.denied), response.rawJSON)
+            XCTAssertEqual(f.armEntries, 0)
+            XCTAssertEqual(f.submissions, 0)
+            XCTAssertNil(child.computerUseChildProof)
+            XCTAssertNil(ComputerUseChildProof.holder)
+        }
+    }
+
+    func testRetryableRollbackReleasesHolderAfterSameClaimCompletes() async throws {
+        try await withRoute(realStarter: true) { f in
+            let retry = TestReleaseFence(name: "CU artifact deletion retry")
+            defer {
+                retry.release()
+                f.vm.test_setBeforeAutomaticMCPSessionTargetDiscardRetry(nil)
+            }
+            var deletions = 0
+            f.vm.test_setAgentSessionsDeleter { tabID, workspace in
+                deletions += 1
+                if deletions == 1 { throw CocoaError(.fileWriteUnknown) }
+                try await AgentSessionDataService.shared.deleteAgentSessions(forComposeTabID: tabID, for: workspace)
+            }
+            f.vm.test_setBeforeAutomaticMCPSessionTargetDiscardRetry { await retry.enterAndWait() }
+            var captured: ComputerUseChildProof?
+            var childID: UUID?
+            f.vm.test_afterConfiguredCreationAcknowledgement = { handle in
+                captured = handle.session.computerUseChildProof
+                childID = handle.bindingToken.bindingIdentity.sessionID
+            }
+            f.beforeAdmission = { await f.revoke() }
+            let response = try await f.transport.callTool(name: "agent_run", arguments: start)
+            XCTAssertTrue(response.rawJSON.contains(ComputerUseChildProof.denied), response.rawJSON)
+            XCTAssertEqual(f.startEntries, 1)
+            XCTAssertEqual(f.submissions, 0)
+            let entered = await retry.waitUntilEntered(timeout: 8)
+            XCTAssertTrue(entered)
+            let proof = try XCTUnwrap(captured)
+            let target = try XCTUnwrap(proof.creationTarget)
+            let claim = try XCTUnwrap(target.recoveryClaim)
+            let id = try XCTUnwrap(childID)
+            XCTAssertEqual(deletions, 1)
+            XCTAssertEqual(claim.state, .workspaceRecovered)
+            XCTAssertTrue(ComputerUseChildProof.holder === proof)
+            XCTAssertEqual(f.vm.test_pendingMCPSessionTargetDiscardCount, 1)
+            let workspace = try XCTUnwrap(f.window.workspaceManager.activeWorkspace)
+            let retained = try await AgentSessionDataService.shared.loadAgentSession(id: id, for: workspace)
+            XCTAssertNotNil(retained)
+            retry.release()
+            // Only the recovery owner's completion may release the holder; do not re-settle the proof here.
+            try await AsyncTestWait.waitUntil("Same CU recovery claim settles", timeout: 8) {
+                claim.state == .complete && f.vm.test_pendingMCPSessionTargetDiscardCount == 0
+                    && f.vm.test_outstandingProvisionalMCPSessionTargetCount == 0 && ComputerUseChildProof.holder == nil
+            }
+            XCTAssertEqual(deletions, 2)
+            let removed = try await AgentSessionDataService.shared.loadAgentSession(id: id, for: workspace)
+            XCTAssertNil(removed)
+            XCTAssertNil(f.vm.sessionIndex[id])
+            XCTAssertFalse(f.window.workspaceManager.activeWorkspace?.composeTabs.contains { $0.id == target.tabID } == true)
+            f.beforeAdmission = nil
+            f.vm.test_afterConfiguredCreationAcknowledgement = nil
+            f.server.removeTabContext(forConnectionID: f.transport.connectionID, clientName: f.transport.clientName, windowID: f.window.windowID, runID: f.runID)
+            try await f.installRoute()
+            let next = try await f.transport.callTool(name: "agent_run", arguments: start)
+            XCTAssertFalse(next.rawJSON.contains("\"isError\":true"), next.rawJSON)
+            XCTAssertEqual(f.startEntries, 2)
+            XCTAssertEqual(f.submissions, 1)
         }
     }
 

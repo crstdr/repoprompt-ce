@@ -1696,6 +1696,7 @@ struct AgentRunMCPToolService {
                   child.codexController == nil, !child.mcpFollowUpRunPending, args["workflow_id"] == nil, args["workflow_name"] == nil,
                   CodexModelSpecifier(raw: child.selectedModelRaw).baseModel == CodexModelSpecifier(raw: String(proof.modelID.dropFirst("codexExec:".count))).baseModel,
                   child.selectedReasoningEffortRaw == "high" else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+            try proof.requireCurrentRoute()
             try proof.reserve()
             proof.child = child
             child.computerUseChildProof = proof
