@@ -742,6 +742,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         var test_agentSessionLinkLocalInputDecoration: ((AgentSessionLinkPromptRenderResult) -> AgentSessionLinkLocalInputDecoration?)?
         /// Gates only the Read proof, retaining the production claim and synchronous handoff owners.
         var test_agentSessionLinkLocalInputReadProof: ((AgentSessionLinkLocalInputDecoration) async -> Bool)?
+        /// Routes isolated native fixtures to their real authority; final Manage fences remain production-owned.
+        var test_agentSessionLinkManagedMetadataProof: ((DomainAgentSessionLinkEndpointIdentity, [DomainAgentSessionManagedObservationRequirement]) async -> [DomainAgentSessionLinkCommitAuthorization]?)?
     #endif
 
     /// Endpoints whose prompt inventory is fenced while one or more membership writes that will change
@@ -2555,7 +2557,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     var unscopedRepromptEnabled = false
     var repromptDispatchTexts: [UUID: String] = [:]
     var repromptDispatchOriginals: [UUID: String] = [:]
-    var repromptOperation: AgentRepromptOperation?
+    /// One preparation per composer tab, so a rewrite outlives a switch to another session.
+    var repromptOperations: [UUID: AgentRepromptOperation] = [:]
+    /// The preparation owned by the visible composer.
+    var repromptOperation: AgentRepromptOperation? {
+        currentTabID.flatMap { repromptOperations[$0] }
+    }
+
     var repromptSpeculations: [UUID: RepromptSpeculation] = [:]
     var repromptAudits: [UUID: AgentAutomationTurnAudit.Reprompt] = [:]
     var repromptAvailability: ((AIModel) -> Bool)?
@@ -7775,15 +7783,29 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session.selfCompactState = agentSession.selfCompactState ?? .init()
         session.selfCompactPersistenceWarning = agentSession.selfCompactPersistenceWarning
 
+        session.contextWindowCapacity = agentSession.contextWindowCapacity
+        // A hydrated conversation has no process yet; its runtime init reports the cap that applies.
+        session.claudeAutoCompactWindowTokens = nil
         codexCoordinator.restoreCodexMetadata(from: agentSession, session: session)
         switch session.selectedAgent {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             session.contextCompactedAt = session.providerTokenUsageByTurn.last(where: { $0.contextCompacted })?.timestamp
             if session.codexContextUsage?.lastTotalTokens == nil || session.contextCompactedAt != nil {
-                session.codexContextUsage = Self.contextUsageFromClaudeProviderTokens(
+                // The stored window may be an auto-compact cap, so restored rows are bounded only by
+                // the model's verified capacity; the stored window stays the displayed window.
+                let capacity = claudeContextUsageEstimator.verifiedCapacity(reported: nil, session: session)
+                let displayedWindow = session.codexContextUsage?.modelContextWindow ?? capacity
+                if var rebuilt = Self.contextUsageFromClaudeProviderTokens(
                     session.providerTokenUsageByTurn,
-                    modelContextWindow: session.codexContextUsage?.modelContextWindow
-                )
+                    modelContextWindow: capacity
+                ) {
+                    rebuilt.modelContextWindow = displayedWindow
+                    session.codexContextUsage = rebuilt
+                } else if !session.providerTokenUsageByTurn.isEmpty, let displayedWindow {
+                    session.codexContextUsage = AgentContextUsage(modelContextWindow: displayedWindow, lastTotalTokens: nil, totalTotalTokens: nil)
+                } else {
+                    session.codexContextUsage = nil
+                }
             }
         case .codexExec, .openCode, .cursor, .grokBuild, .antigravity, .devin:
             break
@@ -19538,7 +19560,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             removePendingUIRefresh(for: tabID)
         }
         if let reactivateSourceTabID, sessions[reactivateSourceTabID] != nil {
-            await promptManager?.switchComposeTab(reactivateSourceTabID)
+            await promptManager?.switchComposeTab(reactivateSourceTabID, focusIntent: .preservesLiveText)
         }
     }
 
@@ -23645,7 +23667,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         origin: AgentModeRunService.CancellationOrigin = .explicitStop
     ) async {
         guard let session = sessions[tabID] else { return }
-        if let operation = repromptOperation, operation.sourceTabID == tabID {
+        if let operation = repromptOperations[tabID] {
             operation.invalidate(reason: "The run was stopped.")
             if !session.runState.isActive {
                 if origin == .explicitStop { _ = await awaitOracleBackgroundDrain(for: session) }
@@ -23820,8 +23842,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         requireActiveTabOwnership: Bool
     ) -> AgentComposerSubmitClaimResult {
         let target = attempt.target
-        if requireActiveTabOwnership, let operation = repromptOperation,
-           operation.sourceTabID == target.tabID, operation.phase != .completed
+        if requireActiveTabOwnership, let operation = repromptOperations[target.tabID],
+           operation.phase != .completed
         {
             return .rejected(.activeAttemptExists(activeAttemptID: operation.id))
         }
@@ -25264,6 +25286,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // Detach before clearing the provider session ID so async cleanup cannot
         // restore the old conversation or affect a replacement controller.
         claudeCoordinator.prepareForConversationResetSync(session)
+        // The cap described the process just torn down; the next process's runtime init reports its own.
+        session.claudeAutoCompactWindowTokens = nil
         session.providerSessionID = nil
         session.providerCleanupHandle = nil
         session.providerTokenUsageByTurn.removeAll()
@@ -25937,6 +25961,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // synchronization and selected immediately; existing rows keep their positions (§5.4).
         if currentTabID == createdTab.id {
             updateBindingsFromSession(creation.session)
+            promptManager.requestUserComposerActivation(tabID: createdTab.id)
         }
         return createdTab.id
     }

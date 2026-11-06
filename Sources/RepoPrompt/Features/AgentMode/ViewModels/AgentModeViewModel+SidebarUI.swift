@@ -358,7 +358,8 @@ extension AgentModeViewModel {
     }
 
     enum SidebarCollapseAllState: Equatable {
-        case hidden
+        /// Nothing in the current view can fold. The control stays in place, dimmed.
+        case unavailable
         case canCollapse
         case canExpand
     }
@@ -381,7 +382,7 @@ extension AgentModeViewModel {
             // Flat restore/owner pending: no thread tree is shown, so collapse-all is unavailable
             // rather than reporting a misleading all-collapsed state (§5.6).
             keys = []
-            state = .hidden
+            state = .unavailable
         } else if trimmedSearch.isEmpty {
             keys = collapsibleSidebarThreadKeys(
                 for: tabs,
@@ -390,7 +391,7 @@ extension AgentModeViewModel {
                 diagnosticSource: source
             )
             if keys.isEmpty {
-                state = .hidden
+                state = .unavailable
             } else {
                 let collapsedThreadKeys = effectiveCollapsedSidebarThreadKeys(
                     in: sidebarSessions(for: tabs),
@@ -401,7 +402,7 @@ extension AgentModeViewModel {
             }
         } else {
             keys = []
-            state = .hidden
+            state = .unavailable
         }
         #if DEBUG
             perfRecorder.durationEvent(

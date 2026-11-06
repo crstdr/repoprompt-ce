@@ -1056,7 +1056,8 @@ final class AgentModeRunService {
 
     private func releaseUnconsumedClaudeSupersedingProtection(
         for instructions: [AgentTabSession.ClaudeSteeringInstruction],
-        session: AgentTabSession
+        session: AgentTabSession,
+        definitiveNoWrite: Bool = true
     ) {
         let relevantInstructions = instructions.filter { $0.targetRunAttemptID == session.activeRunAttemptID }
         guard !relevantInstructions.isEmpty else { return }
@@ -1066,6 +1067,9 @@ final class AgentModeRunService {
             .intersection(session.claudeSupersedingProtectedTurnIDs)
         let protectedTurnIDs = claimedTurnIDs.union(laterProviderIDs)
         guard !protectedTurnIDs.isEmpty else { return }
+        if definitiveNoWrite {
+            dependencies.claudeCoordinator.notifySteeringSettlement(session: session, protectedIDs: protectedTurnIDs)
+        }
         let unconsumedTurnIDs = protectedTurnIDs
             .intersection(session.claudeExpectedTurnIDs)
             .intersection(session.claudeSupersedingProtectedTurnIDs)
@@ -1150,6 +1154,9 @@ final class AgentModeRunService {
                 if session.claudeSteeringFlushID == flushID {
                     session.claudeSteeringFlushTask = nil
                     session.claudeSteeringFlushID = nil
+                    if session.activeRunOwnership == ownership {
+                        self.dependencies.claudeCoordinator.recheckSteeringSettlement(session: session)
+                    }
                     // Reevaluate retained terminal obligations only after dequeued work releases.
                     if session.claudeSteeringAbandonment?.attemptID == runAttemptID {
                         session.claudeSteeringAbandonment?.notify([])
@@ -1283,9 +1290,13 @@ final class AgentModeRunService {
                     hooks.providerInput.recordPendingHandoffSendOutcome(session, true)
                     await hooks.continuation.signalMCPInstructionDelivered(session)
                 case let .failed(_, providerWriteAttempted):
-                    if providerWriteAttempted, session.claudeSteeringAbandonment?.attemptID == runAttemptID {
-                        session.claudeSteeringAbandonment?.uncertainWrite()
-                        dependencies.claudeCoordinator.notifySteeringSettlement(session: session, protectedIDs: steering.supersedingProtectedTurnIDs, inputWasAttempted: true)
+                    if providerWriteAttempted {
+                        if session.claudeSteeringAbandonment?.attemptID == runAttemptID {
+                            session.claudeSteeringAbandonment?.uncertainWrite()
+                        }
+                        if session.activeRunOwnership == ownership {
+                            dependencies.claudeCoordinator.notifySteeringSettlement(session: session, protectedIDs: steering.supersedingProtectedTurnIDs, inputWasAttempted: true)
+                        }
                     }
                     hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
                     // Re-insert the failed instruction so it's included in the restore.
@@ -1350,7 +1361,7 @@ final class AgentModeRunService {
             .map(\.draftText)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
-        releaseUnconsumedClaudeSupersedingProtection(for: instructions, session: session)
+        releaseUnconsumedClaudeSupersedingProtection(for: instructions, session: session, definitiveNoWrite: definitiveNoWrite)
         session.pendingClaudeSteeringInstructions.removeAll(where: shouldRestore)
         restoreClaudeSteeringDrafts(drafts, tabID: tabID, strategy: strategy)
         if definitiveNoWrite, let abandonment = session.claudeSteeringAbandonment {
@@ -1556,6 +1567,17 @@ final class AgentModeRunService {
             if let oracleDrain { _ = await OracleBackgroundInvocationRegistry.awaitDrain(oracleDrain, timeout: 30) }
             return
         }
+        if session.runState == .cancelled,
+           session.activeRunOwnership == nil,
+           session.lastTerminalCommitRevision == nil
+        {
+            if intent == .userStop, origin == .explicitStop {
+                withdrawQueuedWorkForManagedStop(tabID: tabID, session: session)
+            }
+            if completion == .terminalTeardownCompleted { await providerTeardown?() }
+            if let oracleDrain { _ = await OracleBackgroundInvocationRegistry.awaitDrain(oracleDrain, timeout: 30) }
+            return
+        }
         if session.runState.isTerminalForCommit,
            let revision = session.lastTerminalCommitRevision
         {
@@ -1573,6 +1595,9 @@ final class AgentModeRunService {
                     for: revision.ownership,
                     lifecycle: session.runLifecycle
                 )
+                // A provider withdrawn by an earlier publication-only cancellation may still be
+                // retiring; teardown completion must include it.
+                await providerTeardown?()
             }
             recordRunCancel(.terminalReturn, session.activeRunOwnership?.attemptID)
             if let oracleDrain { _ = await OracleBackgroundInvocationRegistry.awaitDrain(oracleDrain, timeout: 30) }

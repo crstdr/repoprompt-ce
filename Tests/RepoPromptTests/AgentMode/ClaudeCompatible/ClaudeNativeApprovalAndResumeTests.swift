@@ -2047,32 +2047,24 @@ final class ClaudeNativeTurnCorrelationTests: XCTestCase {
     }
 
     private actor InterruptGate {
-        private let entered: XCTestExpectation
+        nonisolated let entered: AsyncStream<Void>
+        private let enteredContinuation: AsyncStream<Void>.Continuation
         private var response: CheckedContinuation<[String: Any], Error>?
-        private var releasedFailure: Bool?
-        private(set) var didEnter = false
 
-        init(entered: XCTestExpectation) {
-            self.entered = entered
+        init() {
+            let pair = AsyncStream<Void>.makeStream()
+            entered = pair.stream
+            enteredContinuation = pair.continuation
         }
 
         func request() async throws -> [String: Any] {
-            didEnter = true
-            entered.fulfill()
-            // Cleanup can release the gate before a delayed request reaches it.
-            if let failed = releasedFailure {
-                if failed {
-                    throw ClaudeNativeProcessSessionController.ControllerError.controlRequestTimedOut(requestID: "test-interrupt")
-                }
-                return [:]
-            }
-            return try await withCheckedThrowingContinuation { continuation in
+            try await withCheckedThrowingContinuation { continuation in
                 response = continuation
+                enteredContinuation.yield(())
             }
         }
 
         func release(failed: Bool = false) {
-            releasedFailure = failed
             if failed {
                 response?.resume(throwing: ClaudeNativeProcessSessionController.ControllerError.controlRequestTimedOut(requestID: "test-interrupt"))
             } else { response?.resume(returning: [:]) }
@@ -2088,18 +2080,11 @@ final class ClaudeNativeTurnCorrelationTests: XCTestCase {
             let a = try await controller.sendUserMessage("A")
             try await feed(assistant(a), to: controller)
             let b = try await controller.sendUserMessage("B")
-            let entered = expectation(description: "Interrupt request enters gate: \(ordering)")
-            let gate = InterruptGate(entered: entered)
+            let gate = InterruptGate()
             await controller.test_setConfigurationControlRequest { _ in try await gate.request() }
+            var entered = gate.entered.makeAsyncIterator()
             let interrupt = Task { await controller.test_interruptRunningTurn(reason: "synthetic steer") }
-            await fulfillment(of: [entered], timeout: 2)
-            guard await gate.didEnter else {
-                await gate.release(failed: true)
-                await controller.shutdown()
-                interrupt.cancel()
-                _ = await interrupt.value
-                continue
-            }
+            await entered.next()
             if ordering == "ack-before-result" {
                 await gate.release()
                 let outcome = await interrupt.value
@@ -2135,18 +2120,11 @@ final class ClaudeNativeTurnCorrelationTests: XCTestCase {
                 let b = try await controller.sendUserMessage("B")
                 var hostIDs = [b]
                 if grouped { try await hostIDs.append(controller.sendUserMessage("C")) }
-                let entered = expectation(description: "Interrupt unowned execution: ackFirst=\(ackFirst), grouped=\(grouped)")
-                let gate = InterruptGate(entered: entered)
+                let gate = InterruptGate()
                 await controller.test_setConfigurationControlRequest { _ in try await gate.request() }
+                var entered = gate.entered.makeAsyncIterator()
                 let interrupt = Task { await controller.test_interruptRunningTurn(reason: "interrupt provider-owned work") }
-                await fulfillment(of: [entered], timeout: 2)
-                guard await gate.didEnter else {
-                    await gate.release(failed: true)
-                    await controller.shutdown()
-                    interrupt.cancel()
-                    _ = await interrupt.value
-                    continue
-                }
+                await entered.next()
                 if ackFirst {
                     await gate.release()
                     let outcome = await interrupt.value
@@ -2195,18 +2173,11 @@ final class ClaudeNativeTurnCorrelationTests: XCTestCase {
             let a = try await controller.sendUserMessage("A")
             try await feed(assistant(a), to: controller)
             let b = try await controller.sendUserMessage("B")
-            let entered = expectation(description: "Interrupt host A: ackFirst=\(ackFirst)")
-            let gate = InterruptGate(entered: entered)
+            let gate = InterruptGate()
             await controller.test_setConfigurationControlRequest { _ in try await gate.request() }
+            var entered = gate.entered.makeAsyncIterator()
             let interrupt = Task { await controller.test_interruptRunningTurn(reason: "interrupt host A") }
-            await fulfillment(of: [entered], timeout: 2)
-            guard await gate.didEnter else {
-                await gate.release(failed: true)
-                await controller.shutdown()
-                interrupt.cancel()
-                _ = await interrupt.value
-                continue
-            }
+            await entered.next()
             if ackFirst {
                 await gate.release()
                 let outcome = await interrupt.value
@@ -3406,6 +3377,117 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         }
     }
 
+    func testRevisionlessSecondCancellationJoinsWithdrawnProviderWithoutSyntheticAttempt() async throws {
+        let (h, session, controller, listener) = try await spyFixture()
+        XCTAssertNil(session.lastTerminalCommitRevision)
+        let reservation = try XCTUnwrap(h.host.claudeCoordinator.reserveEventsForHostPreparation(for: session))
+        let providerID = UUID()
+        await controller.emit(.providerTurnStarted(turnID: providerID))
+        await controller.emit(.approvalRequest(.init(
+            requestID: .claudeControl("revisionless-teardown-approval"), method: "control/can_use_tool",
+            kind: .commandExecution, threadID: "fixture", turnID: providerID.uuidString, itemID: "tool"
+        )))
+        await until("provider approval is parked in host preparation") {
+            listener.pendingApprovalIDs == ["revisionless-teardown-approval"] && listener.isBusy
+        }
+        let shutdownGate = Gate()
+        await controller.setShutdownSuspension { await shutdownGate.wait() }
+        let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
+
+        await service.cancelRun(
+            tabID: session.tabID, session: session, intent: .runtimeShutdown,
+            completion: .terminalPublished
+        )
+        await until("withdrawn controller shutdown is held") { shutdownGate.isWaiting }
+        XCTAssertNil(session.activeRunOwnership)
+        XCTAssertNil(session.lastTerminalCommitRevision)
+        XCTAssertTrue(reservation.subscription.isClosed)
+
+        var returned = false
+        let teardown = Task { @MainActor in
+            await service.cancelRun(
+                tabID: session.tabID, session: session, intent: .runtimeShutdown,
+                completion: .terminalTeardownCompleted
+            )
+            returned = true
+        }
+        for _ in 0 ..< 50 {
+            await Task.yield()
+        }
+        XCTAssertFalse(returned, "The second cancellation must join the held withdrawn provider")
+        XCTAssertNil(session.activeRunOwnership, "No attempt should be active while retirement is held")
+        XCTAssertNil(session.lastTerminalCommitRevision, "The second cancellation must not commit a synthetic attempt")
+
+        shutdownGate.open()
+        await teardown.value
+        XCTAssertTrue(returned)
+        XCTAssertNil(session.activeRunOwnership)
+        XCTAssertNil(session.lastTerminalCommitRevision, "The second cancellation must not commit after retirement")
+        let shutdownCount = await controller.shutdownCount
+        XCTAssertEqual(shutdownCount, 1)
+        await h.host.claudeCoordinator.shutdownClaudeSession(session)
+    }
+
+    func testSecondCancellationJoinsPreviouslyWithdrawnPendingProviderShutdown() async throws {
+        let (h, session, controller, listener) = try await spyFixture()
+        let predecessorID = UUID()
+        await controller.emit(.providerTurnStarted(turnID: predecessorID))
+        await until("predecessor starts") { session.activeRunOwnership != nil }
+        await controller.emit(.turnsCompleted(turnIDs: [predecessorID], status: .completed))
+        await until("predecessor settles") {
+            session.runState == .completed && !session.runLifecycle.terminalCommitInProgress && session.activeRunOwnership == nil
+        }
+        let predecessorOwnership = try XCTUnwrap(session.lastTerminalCommitRevision?.ownership)
+        let reservation = try XCTUnwrap(h.host.claudeCoordinator.reserveEventsForHostPreparation(for: session))
+        let providerID = UUID()
+        await controller.emit(.providerTurnStarted(turnID: providerID))
+        await controller.emit(.approvalRequest(.init(
+            requestID: .claudeControl("repeated-teardown-approval"), method: "control/can_use_tool",
+            kind: .commandExecution, threadID: "fixture", turnID: providerID.uuidString, itemID: "tool"
+        )))
+        await until("provider approval is parked in host preparation") {
+            listener.pendingApprovalIDs == ["repeated-teardown-approval"] && listener.isBusy
+        }
+        let shutdownGate = Gate()
+        await controller.setShutdownSuspension { await shutdownGate.wait() }
+        let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
+
+        // Publication-only cancellation withdraws the provider and detaches its listener
+        // without waiting for retirement.
+        await service.cancelRun(
+            tabID: session.tabID, session: session, intent: .runtimeShutdown,
+            completion: .terminalPublished
+        )
+        await until("withdrawn controller shutdown is held") { shutdownGate.isWaiting }
+        XCTAssertFalse(h.host.claudeCoordinator.hasPendingProviderAdoption(for: session))
+
+        var returned = false
+        let teardown = Task { @MainActor in
+            await service.cancelRun(
+                tabID: session.tabID, session: session, intent: .runtimeShutdown,
+                completion: .terminalTeardownCompleted
+            )
+            returned = true
+        }
+        for _ in 0 ..< 50 {
+            await Task.yield()
+        }
+        XCTAssertFalse(returned, "A later teardown-completed cancellation must still join the withdrawn provider")
+        let shutdownsBeforeRelease = await controller.shutdownCount
+        XCTAssertEqual(shutdownsBeforeRelease, 0)
+        XCTAssertNil(session.activeRunOwnership, "Withdrawal must not invent a provider attempt")
+        XCTAssertEqual(session.lastTerminalCommitRevision?.ownership, predecessorOwnership)
+        let calls = await controller.inputBoundaryCalls
+        XCTAssertEqual(calls.count(where: { $0 == "permission:repeated-teardown-approval:cancel" }), 1)
+
+        shutdownGate.open()
+        await teardown.value
+        XCTAssertTrue(returned)
+        let shutdownsAfterRelease = await controller.shutdownCount
+        XCTAssertEqual(shutdownsAfterRelease, 1)
+        await h.host.claudeCoordinator.shutdownClaudeSession(session)
+    }
+
     func testReplacementTransportReopensTheExistingAttemptInboxAfterEOF() async throws {
         let f = try await fixture()
         let inbox = try XCTUnwrap(f.listener.reserve())
@@ -3502,8 +3584,8 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
     }
 
     func testLargeSavedTranscriptDoesNotMultiplyLiveRoutingWork() async throws {
-        // Untimed setup follows a growing live session: compact each bounded batch using
-        // the real compactor, retaining its durable prefix and small working suffix.
+        // Seed the retention tiers left by live compaction, then let the real compactor
+        // trim and normalize once. Replaying every intermediate compaction is quadratic.
         let setupStarted = ContinuousClock.now
         var history = AgentTranscript.empty
         for index in stride(from: 0, to: 20000, by: 2) {
@@ -3513,14 +3595,19 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
                 policy: .liveSession(hidePendingQuestionToolCall: false)
             ).turns
             history.nextSequenceIndex = index + 2
-            if (index + 2).isMultiple(of: 64) || index == 19998 {
-                history = AgentTranscriptCompactor.compact(history, mode: .recomputeAll)
-            }
         }
+        // Keep 34 summary turns plus the final full turn, matching the measured live
+        // fixture's 9,999 frozen turns, 2 working rows, and 70 working units.
+        for index in history.turns.indices.dropLast() {
+            history.turns[index].retentionTier = index < 9965 ? .archived : .summary
+        }
+        history = AgentTranscriptCompactor.compact(history, mode: .recomputeAll)
         XCTAssertEqual(history.nextSequenceIndex, 20000)
-        XCTAssertLessThanOrEqual(AgentTranscriptCompactor.estimatedWorkingUnitCount(for: history), AgentTranscriptCompactor.hardMaxWorkingUnitCount)
-        XCTAssertGreaterThan(history.compactionFrontier?.frozenPrefixTurnCount ?? 0, 0)
-        print("C2 compacted setup=\(setupStarted.duration(to: .now)) seededItems=20000 turns=\(history.turns.count) workingRows=\(AgentTranscriptIO.workingSourceItems(from: history).count)")
+        XCTAssertEqual(history.turns.count, 10000)
+        XCTAssertEqual(AgentTranscriptIO.workingSourceItems(from: history).count, 2)
+        XCTAssertEqual(history.compactionFrontier?.frozenPrefixTurnCount, 9999)
+        XCTAssertEqual(AgentTranscriptCompactor.estimatedWorkingUnitCount(for: history), 70)
+        print("C2 compacted setup=\(setupStarted.duration(to: .now)) seededItems=20000 turns=\(history.turns.count) workingRows=\(AgentTranscriptIO.workingSourceItems(from: history).count) frozenPrefix=\(history.compactionFrontier?.frozenPrefixTurnCount ?? 0) workingUnits=\(AgentTranscriptCompactor.estimatedWorkingUnitCount(for: history))")
         AgentTranscriptDebugInstrumentation.configure(.init(refreshAttemptHandler: { metrics in
             print("C2 refresh tab=\(metrics.tabID) state=\(metrics.runState) path=\(metrics.incrementalPath)")
         }))
@@ -3556,11 +3643,6 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
                     deliveries[text, default: 0] += 1
                 }
             }
-            let started = ContinuousClock.now
-            try await feed(assistant("first-live"), f.controller)
-            await until("hold the adoption gap") { resume != nil }
-            let busy = await f.harness.host.preparedOversightRuntimeIsBusy()
-            XCTAssertTrue(busy)
             var frames: [[String: Any]] = []
             for i in 0 ..< 998 {
                 frames.append(["type": "system", "subtype": "task_progress", "description": "progress-\(i)"])
@@ -3571,7 +3653,16 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
             }
             frames.append(result("second-terminal"))
             XCTAssertEqual(frames.count + 1, 2000)
-            let bytes = try frames.map { try JSONSerialization.data(withJSONObject: $0) + Data([10]) }.reduce(Data(), +)
+            var bytes = Data()
+            for frame in frames {
+                try bytes.append(JSONSerialization.data(withJSONObject: frame))
+                bytes.append(10)
+            }
+            let started = ContinuousClock.now
+            try await feed(assistant("first-live"), f.controller)
+            await until("hold the adoption gap") { resume != nil }
+            let busy = await f.harness.host.preparedOversightRuntimeIsBusy()
+            XCTAssertTrue(busy)
             await f.controller.test_handleConfigurationStdoutChunk(bytes)
             await until("the whole burst is parked") { receivedCompletions == 2 }
             XCTAssertGreaterThan(f.listener.test_handoffCount, 1996, "One input burst is retained losslessly, not count-capped")
