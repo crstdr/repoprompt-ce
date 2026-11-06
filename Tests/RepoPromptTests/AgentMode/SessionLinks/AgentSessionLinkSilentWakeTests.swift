@@ -690,6 +690,7 @@ extension AgentSessionLinkRuntimeBridgeTests {
         observerSession.selectedAgent = .openCode
         observerSession.hasLoadedPersistedState = true
         observerSession.oversight.autoWakeOnUpdates = true
+        observerSession.oversight.routineWakeIntervalEnabled = false
         let observerID = try installRestoredFixtureBinding(observerSession, in: observerVM)
         let observer = try XCTUnwrap(observerVM.agentSessionLinkCandidate(tabID: observerTab, sessionID: observerID, tabName: "Observer", isWindowClosing: false))
         let host = FakeEndpointHost()
