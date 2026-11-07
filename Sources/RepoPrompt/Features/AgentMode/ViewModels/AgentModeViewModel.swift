@@ -1080,6 +1080,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     var tabDraftText: [UUID: String] = [:]
     var draftRestorationLedger = AgentComposerDraftRestorationLedger()
     private var cancellables = Set<AnyCancellable>()
+    // Derived UI availability; execution authority stays in the registry and live binding.
+    var oracleBackgroundLiveEpochs: [OracleBackgroundInvocationRegistry.Owner: UUID] = [:]
+    var oracleBackgroundRegistry: OracleBackgroundInvocationRegistry {
+        AppDomainRuntimeComposition.shared.oracleBackgroundInvocations
+    }
+
     private let listeners = ListenerRegistry()
     private(set) var isAgentModeActive = false
     /// Observation state feeding `AgentNotificationCoordinator` (see `+AttentionNotifications`).
@@ -4216,6 +4222,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func setupObservers() {
+        AppDomainRuntimeComposition.shared.oracleBackgroundInvocations.availabilityChanges
+            .sink { [weak self] owner in self?.refreshOracleBackgroundCancelTarget(owner: owner) }
+            .store(in: &cancellables)
         guard let promptManager else { return }
         installPromptManagerCascadeResolvers(promptManager)
         installAgentSessionLifecycleProjectionAuthority()

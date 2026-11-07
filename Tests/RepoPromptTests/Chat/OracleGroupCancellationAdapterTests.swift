@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import MCP
 @testable import RepoPromptApp
@@ -28,6 +29,90 @@ private final class OracleFoundationGate {
 
 @MainActor
 final class OracleGroupCancellationAdapterTests: XCTestCase {
+    func testWorkspaceDeletionClosesBackgroundOwnersAcrossWindowsWithoutActiveChat() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("OracleDeletion-\(UUID().uuidString)")
+        let runtime = MCPDomainRuntime(configuration: .init(
+            mode: .app, profileIdentifier: "oracle-deletion-\(UUID().uuidString)",
+            storageDirectory: root.appendingPathComponent("runtime"), workspaceStorageDirectory: root.appendingPathComponent("workspaces"),
+            eventDirectory: root.appendingPathComponent("events"), temporaryDirectory: root.appendingPathComponent("tmp"), externalReloadInterval: nil
+        ))
+        try await runtime.start()
+        addTeardownBlock {
+            _ = await runtime.shutdown()
+            try? FileManager.default.removeItem(at: root)
+        }
+        let windows = [-9330, -9331].map { id in
+            WindowStateCompositionFactory.make(
+                windowID: id, deferredInitialAgentSystemWorkspaceRefresh: true, sharedMCPService: MCPService(),
+                domainRuntime: runtime, loadStoredAPISettingsDataOnInit: false, automaticProviderModelDiscoveryEnabled: false
+            )
+        }
+        for window in windows {
+            await window.workspaceManager.awaitInitialized()
+        }
+        defer { windows.forEach { $0.workspaceManager.prepareForWindowClose() } }
+        let creation = try windows[0].workspaceManager.createPersistentWorkspace(name: "Oracle deletion", repoPaths: [])
+        let workspace = try await creation.publishedWorkspace()
+        for window in windows {
+            let result = await window.workspaceManager.switchWorkspace(to: workspace, saveState: false)
+            XCTAssertTrue(result.didSwitch)
+        }
+        let registry = AppDomainRuntimeComposition.shared.oracleBackgroundInvocations
+        let owners = windows.map { _ in OracleBackgroundInvocationRegistry.Owner(workspaceID: workspace.id, binding: .init(tabID: UUID(), sessionID: UUID())) }
+        let cleanupStarted = expectation(description: "both workers begin cleanup before workspace deletion")
+        cleanupStarted.expectedFulfillmentCount = 2
+        let cleanupGate = OracleFoundationGate()
+        var streams: [AsyncThrowingStream<Int, Error>.Continuation] = []
+        defer { streams.forEach { $0.finish() }
+            cleanupGate.release()
+        }
+        for (window, owner) in zip(windows, owners) {
+            let session = AgentTabSession(tabID: owner.binding.tabID)
+            session.installPersistentSessionBinding(owner.binding)
+            session.oracleBackgroundOwner = owner
+            window.agentModeViewModel.test_installLiveSession(session)
+            await AgentModeWorkspaceSwitchSessionProvider(agentModeViewModel: window.agentModeViewModel)
+                .cancelSwitchSessions(for: WorkspaceDeletionCancellationToken(workspaceID: UUID()))
+            XCTAssertFalse(registry.admissionIsClosed(for: owner), "A deletion token for another workspace must not close this window's owner")
+            let controlled = AsyncThrowingStream<Int, Error>.makeStream()
+            streams.append(controlled.continuation)
+            _ = try await registry.start(owner: owner, runID: UUID(), invocationID: UUID(), admissionIsCurrent: { true }) { job in
+                try await job.prepared(self.registryPrepared(job))
+                do { for try await _ in controlled.stream {} } catch {}
+                cleanupStarted.fulfill()
+                await cleanupGate.wait()
+            }
+            addTeardownBlock { @MainActor in
+                await registry.close(owner).value
+                try registry.remove(owner)
+            }
+        }
+        XCTAssertTrue(windows[0].workspaceManager.tabsWithActiveChat.isEmpty)
+        XCTAssertFalse(windows[0].workspaceManager.isChatBusy)
+        windows[1].workspaceManager.isChatBusy = true
+        let deletion = Task { @MainActor in
+            await windows[0].workspaceManager.deleteWorkspacesAsync(workspaceIDs: [workspace.id], closeOpenWorkspaces: true)
+        }
+        await fulfillment(of: [cleanupStarted], timeout: 3)
+        for owner in owners {
+            XCTAssertTrue(registry.admissionIsClosed(for: owner))
+            XCTAssertFalse(registry.isDrained(owner), "Deletion must wait for accepted worker cleanup")
+        }
+        let beforeDrain = await runtime.workspaceStore.snapshot()
+        XCTAssertTrue(beforeDrain.workspaces.contains { $0.document.workspaceID == workspace.id }, "Deletion must retain the workspace until cleanup drains")
+        cleanupGate.release()
+        let result = await deletion.value
+        XCTAssertEqual(result.deletedWorkspaceIDs, [workspace.id], "\(result)")
+        for owner in owners {
+            XCTAssertTrue(registry.isDrained(owner))
+        }
+        for window in windows {
+            XCTAssertNotEqual(window.workspaceManager.activeWorkspaceID, workspace.id)
+        }
+        let snapshot = await runtime.workspaceStore.snapshot()
+        XCTAssertFalse(snapshot.workspaces.contains { $0.document.workspaceID == workspace.id })
+    }
+
     func testStreamedPrimaryProgressSuppliesCancellationPartialAfterAuxiliarySettles() async throws {
         let composition = WindowStateCompositionFactory.make(
             windowID: -9325,
@@ -447,7 +532,139 @@ final class OracleGroupCancellationAdapterTests: XCTestCase {
         try await assertBackgroundCatalogChange(.workspaceSwitch)
     }
 
-    private enum BackgroundCatalogChange { case unrelatedChatDeletion, sameWorkspaceLoad, workspaceSwitch }
+    func testBackgroundWindowCleanupPreservesOtherWindowWithoutActiveChat() async throws {
+        try await assertBackgroundCatalogChange(.otherWindowWithoutChat)
+    }
+
+    func testBackgroundWindowCleanupPreservesOtherWindowWithActiveChat() async throws {
+        try await assertBackgroundCatalogChange(.otherWindowWithChat)
+    }
+
+    func testBackgroundStopTargetRejectsReleasedSessionIdentity() {
+        let owner = registryOwner(), epoch = UUID()
+        var captured: OracleBackgroundCancelTarget?
+        weak var released: AgentTabSession?
+        do {
+            let prior = AgentTabSession(tabID: owner.binding.tabID)
+            released = prior
+            captured = .init(owner: owner, epoch: epoch, session: prior)
+        }
+        XCTAssertNil(released, "A rendered target must not retain a retired session")
+        XCTAssertNil(captured?.session)
+        let successor = AgentTabSession(tabID: owner.binding.tabID)
+        XCTAssertNotEqual(captured, OracleBackgroundCancelTarget(owner: owner, epoch: epoch, session: successor), "Even address reuse cannot authorize a target after its session was released")
+    }
+
+    func testCapturedBackgroundStopRefusesCompletedSuccessorParent() async throws {
+        let fixture = try await AgentRunMCPControlledSessionContext.make(
+            workspaceNamePrefix: "Oracle successor fence", workspaceSwitchReason: "successor fence fixture",
+            clientName: "oracle-successor-fixture", unusedStartRunMessage: "No parent provider"
+        )
+        addTeardownBlock { await fixture.cleanup() }
+        let window = fixture.window, oracle = window.oracleViewModel, session = fixture.session
+        let viewModel = window.agentModeViewModel, registry = AppDomainRuntimeComposition.shared.oracleBackgroundInvocations
+        let workspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspaceID)
+        session.installRunID(UUID())
+        _ = session.beginRunAttempt(source: "background creating parent")
+        session.runState = .running
+        let runID = try XCTUnwrap(session.runID)
+        viewModel.setAgentModeActive(true)
+        viewModel.test_setCurrentTabIDOverride(session.tabID)
+        let owner = try OracleBackgroundInvocationRegistry.Owner(workspaceID: workspaceID, binding: XCTUnwrap(session.persistentSessionBindingIdentity))
+        session.oracleBackgroundOwner = owner
+        addTeardownBlock { @MainActor in
+            await registry.close(owner).value
+            try registry.remove(owner)
+            oracle.setOraclePostPackagingTransportOverrideForTesting(nil)
+        }
+        window.apiSettingsViewModel.openAIApiKey = "test-key"
+        window.apiSettingsViewModel.isOpenAIKeyValid = true
+        let preset = try ModelPreset(name: "Successor fence roster", modelStrings: [AIModel.gpt54Mini.rawValue, AIModel.gpt54.rawValue])
+        let profile = AgentModelsSettingsProfile(planningModelRaw: AIModel.gpt54Mini.rawValue)
+        let selection = OracleSelectionSnapshot(
+            origin: .mcp, agentModelsProfile: profile, modelPresets: [preset], modelPresetsExposed: true,
+            modelPresetsTemporarilyDisabled: false, chatPresets: ChatPreset.BuiltIn.all(),
+            defaultChatPresets: [.chat: ChatPreset.BuiltIn.chat, .plan: ChatPreset.BuiltIn.plan, .review: ChatPreset.BuiltIn.review]
+        )
+        let context = OracleViewModel.OracleSendTabContext(
+            tabID: session.tabID, workspaceID: workspaceID, agentModeSessionID: fixture.sessionID,
+            agentModeRunID: runID, activationPolicy: .background,
+            packaging: makeTabContext(workspaceID: workspaceID, tabID: session.tabID).packaging
+        )
+        let dispatched = expectation(description: "two successor fence streams")
+        dispatched.expectedFulfillmentCount = 2
+        var streams: [AIModel: AsyncThrowingStream<ChatStreamOutput, Error>.Continuation] = [:]
+        oracle.setOraclePostPackagingTransportOverrideForTesting { _, model in
+            let stream = AsyncThrowingStream<ChatStreamOutput, Error> { streams[model] = $0 }
+            dispatched.fulfill()
+            return (UUID(), stream)
+        }
+        defer { streams.values.forEach { $0.finish() } }
+        let args: [String: Value] = ["message": .string("fixture"), "mode": .string("chat"), "new_chat": .bool(true), "model": .string(preset.name)]
+        let prepared = try await oracle.prepareConfiguredOracleRoster(
+            args: args, promptVM: window.promptManager, tabContext: context, capturedProfile: profile,
+            selectionSnapshotOverride: selection, freezeGroupLanes: true
+        )
+        let reference = try await registry.start(owner: owner, runID: runID, invocationID: UUID(), admissionIsCurrent: { true }) { job in
+            _ = try await oracle.executePreparedOracleGroup(
+                prepared, args: args, promptVM: window.promptManager, tabContext: context,
+                callbacks: AppOracleGroupExecutionCallbacks(prepared: { _, _, _ in }, progress: { _ in }, laneProgress: { _, _, _ in }), backgroundJob: job
+            )
+        }
+        let canonicalOwner = try OracleViewModel.oracleGroupOwner(workspaceID: workspaceID, tabID: session.tabID)
+        addTeardownBlock {
+            let store = AppDomainRuntimeComposition.shared.oracleConversationStore
+            await registry.drainGroup(reference.groupID).value
+            if let saved = try await store.load(groupID: reference.groupID, owner: canonicalOwner) {
+                try await store.delete(groupID: saved.group.id, owner: canonicalOwner, expectedRevision: saved.revision)
+            }
+        }
+        await fulfillment(of: [dispatched], timeout: 3)
+        let primary = try XCTUnwrap(streams[.gpt54Mini])
+        let query = try XCTUnwrap(registry.snapshot(for: owner).invocations.first?.queries[0])
+        primary.yield(.init(text: "completed answer", reasoning: nil, tokens: ChatTokenInfo(), terminalOutcome: .completed))
+        primary.finish()
+        let answer = try await oracle.waitForContextBuilderCompletion(query.queryID)
+        XCTAssertEqual(answer, "completed answer")
+        await viewModel.test_publishNaturalCompletion(session)
+        let old = try XCTUnwrap(viewModel.composerOracleBackgroundCancelTarget(tabID: session.tabID))
+        session.installRunID(UUID())
+        _ = session.beginRunAttempt(source: "successor after Stop capture")
+        session.runState = .running
+        await viewModel.test_publishNaturalCompletion(session)
+        XCTAssertEqual(session.runState, .completed)
+        let rejected = await viewModel.cancelOracleBackground(target: old)
+        XCTAssertFalse(rejected)
+        XCTAssertFalse(registry.admissionIsClosed(for: owner))
+        let fresh = try XCTUnwrap(viewModel.ui.composer.props.backgroundStopTarget(inputText: ""))
+        XCTAssertNotEqual(fresh, old)
+        XCTAssertEqual(fresh.epoch, old.epoch)
+        let accepted = await viewModel.cancelOracleBackground(target: fresh)
+        XCTAssertTrue(accepted)
+        XCTAssertTrue(registry.isDrained(owner))
+        XCTAssertNil(session.activeRunAttemptID)
+        let saved = try await AppDomainRuntimeComposition.shared.oracleConversationStore.load(groupID: reference.groupID, owner: canonicalOwner)
+        XCTAssertEqual(saved?.turns.last?.results.map(\.status), [.completed, .cancelled])
+        XCTAssertEqual(saved?.turns.last?.results.first?.response, "completed answer")
+    }
+
+    func testIdleBackgroundOracleStopsThroughComposerTarget() async throws {
+        try await assertBackgroundCatalogChange(.idleComposerStop)
+    }
+
+    func testIdleBackgroundOracleStopsThroughWindowShortcut() async throws {
+        try await assertBackgroundCatalogChange(.idleShortcutStop)
+    }
+
+    func testIdleBackgroundStopRefusesReplacedBindingAndNewParent() async throws {
+        try await assertBackgroundCatalogChange(.idleStaleTargets)
+    }
+
+    func testBackgroundStopAvailabilityTracksLifecycleAndDraftContents() async throws {
+        try await assertBackgroundCatalogChange(.idleAvailability)
+    }
+
+    private enum BackgroundCatalogChange { case unrelatedChatDeletion, sameWorkspaceLoad, workspaceSwitch, otherWindowWithoutChat, otherWindowWithChat, idleComposerStop, idleShortcutStop, idleStaleTargets, idleAvailability }
 
     private func assertBackgroundCatalogChange(_ change: BackgroundCatalogChange) async throws {
         let fixture = try await AgentRunMCPControlledSessionContext.make(
@@ -462,6 +679,32 @@ final class OracleGroupCancellationAdapterTests: XCTestCase {
         session.runState = .running
         let runID = try XCTUnwrap(session.runID)
         let registry = AppDomainRuntimeComposition.shared.oracleBackgroundInvocations
+        let viewModel = window.agentModeViewModel
+        viewModel.setAgentModeActive(true)
+        viewModel.test_setCurrentTabIDOverride(session.tabID)
+        var staleTarget: OracleBackgroundCancelTarget?
+        var priorEpochTarget: OracleBackgroundCancelTarget?
+        if change == .idleStaleTargets {
+            let priorOwner = try OracleBackgroundInvocationRegistry.Owner(workspaceID: workspaceID, binding: XCTUnwrap(session.persistentSessionBindingIdentity))
+            session.oracleBackgroundOwner = priorOwner
+            let stream = AsyncThrowingStream<Int, Error>.makeStream()
+            _ = try await registry.start(owner: priorOwner, runID: runID, invocationID: UUID(), admissionIsCurrent: { true }) { job in
+                try await job.prepared(self.registryPrepared(job))
+                for try await _ in stream.stream {}
+            }
+            _ = session.endCurrentRunAttempt(source: "terminal before rebind")
+            session.runState = .completed
+            staleTarget = try XCTUnwrap(viewModel.composerOracleBackgroundCancelTarget(tabID: session.tabID))
+            await registry.close(priorOwner).value
+            try registry.remove(priorOwner)
+            stream.continuation.finish()
+            session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: fixture.sessionID))
+            session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            session.markCurrentBindingHydrated()
+            session.installRunID(runID)
+            _ = session.beginRunAttempt(source: "successor binding")
+            session.runState = .running
+        }
         let owner = try OracleBackgroundInvocationRegistry.Owner(
             workspaceID: workspaceID, binding: XCTUnwrap(session.persistentSessionBindingIdentity)
         )
@@ -512,6 +755,10 @@ final class OracleGroupCancellationAdapterTests: XCTestCase {
                 }), backgroundJob: job
             )
         }
+        if change == .idleAvailability {
+            XCTAssertNotNil(viewModel.ui.composer.props.cancelTarget, "An active parent still uses foreground Stop")
+            XCTAssertNil(viewModel.ui.composer.props.backgroundCancelTarget)
+        }
         let canonicalOwner = try OracleViewModel.oracleGroupOwner(workspaceID: workspaceID, tabID: session.tabID)
         addTeardownBlock {
             let store = AppDomainRuntimeComposition.shared.oracleConversationStore
@@ -529,8 +776,97 @@ final class OracleGroupCancellationAdapterTests: XCTestCase {
         await fulfillment(of: [progress], timeout: 3)
         let queries = try XCTUnwrap(registry.snapshot(for: owner).invocations.first?.queries)
         XCTAssertEqual(queries.count, 2)
+        if change == .idleComposerStop || change == .idleShortcutStop || change == .idleStaleTargets || change == .idleAvailability {
+            primaryStream.yield(.init(text: "primary answer", reasoning: nil, tokens: ChatTokenInfo(), terminalOutcome: .completed))
+            primaryStream.finish()
+            let primaryAnswer = try await oracle.waitForContextBuilderCompletion(XCTUnwrap(queries[0]).queryID)
+            XCTAssertEqual(primaryAnswer, "before primary answer")
+            let renderedIdleStop = expectation(description: "natural parent completion publishes background Stop")
+            renderedIdleStop.assertForOverFulfill = false
+            let observation = viewModel.ui.composer.$props.sink { props in
+                if props.backgroundStopTarget(inputText: "") != nil { renderedIdleStop.fulfill() }
+            }
+            await viewModel.test_publishNaturalCompletion(session)
+            await fulfillment(of: [renderedIdleStop], timeout: 3)
+            observation.cancel()
+            XCTAssertEqual(session.runState, .completed)
+            XCTAssertNotNil(viewModel.ui.composer.props.backgroundStopTarget(inputText: ""), "Real terminal publication must refresh the visible composer")
+            XCTAssertNil(session.activeRunAttemptID)
+            let target = try XCTUnwrap(viewModel.composerOracleBackgroundCancelTarget(tabID: session.tabID))
+            let props = viewModel.makeComposerProps(tabID: session.tabID)
+            XCTAssertNil(props.cancelTarget, "The completed parent must not acquire an active-run Stop")
+            XCTAssertEqual(props.backgroundStopTarget(inputText: "  \n"), target)
+            XCTAssertNil(props.backgroundStopTarget(inputText: "next parent turn"))
+            XCTAssertNil(props.backgroundStopTarget(inputText: "/goal next objective"))
+            viewModel.test_setWorkspaceSwitchInFlight(true)
+            let blocked = viewModel.makeComposerProps(tabID: session.tabID)
+            XCTAssertNil(blocked.submitTarget)
+            XCTAssertNil(blocked.backgroundStopTarget(inputText: "populated but blocked"), "A submission block must not replace a populated draft with Stop")
+            viewModel.test_setWorkspaceSwitchInFlight(false)
+            let priorAttachments = viewModel.pendingFileAttachments
+            viewModel.pendingFileAttachments = [AgentFileAttachment(source: .localFile(path: "/must-not-read.png"))]
+            XCTAssertNil(viewModel.makeComposerProps(tabID: session.tabID).backgroundStopTarget(inputText: ""))
+            viewModel.pendingFileAttachments = priorAttachments
+            let priorAgent = session.selectedAgent, priorDraft = session.draftText
+            session.selectedAgent = .codexExec
+            session.draftText = "/goal next objective"
+            let staged = viewModel.makeComposerProps(tabID: session.tabID)
+            XCTAssertNotNil(staged.stagedSlashCommand)
+            XCTAssertNil(staged.backgroundStopTarget(inputText: ""), "A staged command must preserve Send even before editor text catches up")
+            session.selectedAgent = priorAgent
+            session.draftText = priorDraft
+            if change == .idleAvailability {
+                XCTAssertEqual(viewModel.ui.composer.props.backgroundCancelTarget, target, "Acceptance must invalidate the rendered composer without an unrelated refresh")
+            } else if change == .idleStaleTargets {
+                priorEpochTarget = target
+                let replacement = AgentTabSession(tabID: session.tabID)
+                replacement.installPersistentSessionBinding(owner.binding)
+                replacement.oracleBackgroundOwner = owner
+                viewModel.test_installLiveSession(replacement)
+                let rejectedReplacement = await viewModel.cancelOracleBackground(target: target)
+                XCTAssertFalse(rejectedReplacement)
+                let freshReplacementTarget = try XCTUnwrap(viewModel.makeComposerProps(tabID: session.tabID).backgroundStopTarget(inputText: ""))
+                XCTAssertTrue(freshReplacementTarget.session === replacement)
+                viewModel.test_installLiveSession(session)
+                let rejectedPrior = try await viewModel.cancelOracleBackground(target: XCTUnwrap(staleTarget))
+                XCTAssertFalse(rejectedPrior)
+                XCTAssertFalse(registry.admissionIsClosed(for: owner))
+                session.installRunID(UUID())
+                _ = session.beginRunAttempt(source: "new parent after capture")
+                session.runState = .running
+                let rejectedActive = await viewModel.cancelOracleBackground(target: target)
+                XCTAssertFalse(rejectedActive)
+                session.runState = .waitingForUser
+                XCTAssertNil(viewModel.composerOracleBackgroundCancelTarget(tabID: session.tabID))
+                _ = session.endCurrentRunAttempt(source: "new parent completes")
+                session.runState = .completed
+                XCTAssertFalse(registry.admissionIsClosed(for: owner))
+            } else {
+                if change == .idleComposerStop {
+                    let accepted = try await viewModel.cancelOracleBackground(target: XCTUnwrap(props.backgroundStopTarget(inputText: "")))
+                    XCTAssertTrue(accepted)
+                } else {
+                    let cancelled = expectation(description: "shortcut cancels the unfinished provider")
+                    secondaryStream.onTermination = { termination in
+                        if case .cancelled = termination { cancelled.fulfill() }
+                    }
+                    XCTAssertTrue(window.stopAgentRunFromShortcut())
+                    await fulfillment(of: [cancelled], timeout: 3)
+                    let drain = try XCTUnwrap(session.oracleBackgroundDrain)
+                    await drain.value
+                }
+                XCTAssertNil(session.activeRunAttemptID, "Background Stop must never manufacture a parent attempt")
+                XCTAssertTrue(registry.isDrained(owner))
+                XCTAssertNil(viewModel.composerOracleBackgroundCancelTarget(tabID: session.tabID))
+                XCTAssertNil(viewModel.ui.composer.props.backgroundCancelTarget)
+                let document = try await AppDomainRuntimeComposition.shared.oracleConversationStore.load(groupID: reference.groupID, owner: canonicalOwner)
+                XCTAssertEqual(document?.turns.last?.results.map(\.status), [.completed, .cancelled])
+                XCTAssertEqual(document?.turns.last?.results.first?.response, "before primary answer")
+                return
+            }
+        }
         if change == .workspaceSwitch {
-            let switchProvider = ChatWorkspaceSwitchSessionProvider(workspaceManager: window.workspaceManager, oracleViewModel: oracle)
+            let switchProvider = AgentModeWorkspaceSwitchSessionProvider(agentModeViewModel: window.agentModeViewModel)
             await switchProvider.cancelSwitchSessions()
             XCTAssertTrue(registry.admissionIsClosed(for: owner))
             XCTAssertTrue(registry.isDrained(owner), "Workspace cancellation must join the accepted group before replacing its catalog")
@@ -560,14 +896,61 @@ final class OracleGroupCancellationAdapterTests: XCTestCase {
             return
         }
         let generation = oracle.workspaceChatSessionLoadGenerationForTesting
-        if change == .unrelatedChatDeletion {
+        if change == .otherWindowWithoutChat || change == .otherWindowWithChat {
+            let departing = WindowStateCompositionFactory.make(
+                windowID: -9327, deferredInitialAgentSystemWorkspaceRefresh: true,
+                sharedMCPService: MCPService(), loadStoredAPISettingsDataOnInit: false,
+                automaticProviderModelDiscoveryEnabled: false
+            )
+            await departing.workspaceManager.awaitInitialized()
+            defer { departing.workspaceManager.prepareForWindowClose() }
+            departing.workspaceManager.activeWorkspace = window.workspaceManager.activeWorkspace
+            let departingOwner = OracleBackgroundInvocationRegistry.Owner(workspaceID: workspaceID, binding: .init(tabID: UUID(), sessionID: UUID()))
+            let departingSession = AgentTabSession(tabID: departingOwner.binding.tabID)
+            departingSession.installPersistentSessionBinding(departingOwner.binding)
+            departingSession.oracleBackgroundOwner = departingOwner
+            departing.agentModeViewModel.test_installLiveSession(departingSession)
+            let controlled = AsyncThrowingStream<Int, Error>.makeStream()
+            let cleanupGate = OracleFoundationGate()
+            let cleanupStarted = expectation(description: "departing worker cleanup started")
+            defer { controlled.continuation.finish()
+                cleanupGate.release()
+            }
+            let departingReference = try await registry.start(owner: departingOwner, runID: UUID(), invocationID: UUID(), admissionIsCurrent: { true }) { job in
+                try await job.prepared(self.registryPrepared(job))
+                do { for try await _ in controlled.stream {} } catch {}
+                cleanupStarted.fulfill()
+                await cleanupGate.wait()
+            }
+            addTeardownBlock { @MainActor in
+                await registry.close(departingOwner).value
+                try registry.remove(departingOwner)
+            }
+            if change == .otherWindowWithChat { departing.workspaceManager.isChatBusy = true }
+            var cleanupReturned = false
+            let cleanup = Task { @MainActor in
+                await departing.workspaceManager.cancelActiveSessions()
+                cleanupReturned = true
+            }
+            await fulfillment(of: [cleanupStarted], timeout: 3)
+            XCTAssertFalse(cleanupReturned, "Window cleanup must join the accepted worker, not only request cancellation")
+            cleanupGate.release()
+            await cleanup.value
+            XCTAssertTrue(registry.admissionIsClosed(for: departingOwner))
+            XCTAssertTrue(registry.isDrained(departingOwner), "Departing window must join its exact owner, even with an idle parent")
+            XCTAssertFalse(registry.admissionIsClosed(for: owner), "Another window's owner must remain open")
+            XCTAssertNotEqual(departingReference.groupID, reference.groupID)
+        } else if change == .unrelatedChatDeletion {
             await oracle.deleteSession(unrelated)
             XCTAssertFalse(oracle.sessions.contains { $0.id == unrelated.id })
-        } else {
+        } else if change == .sameWorkspaceLoad {
             await oracle.loadSessionsFromWorkspace()
         }
-        XCTAssertGreaterThan(oracle.workspaceChatSessionLoadGenerationForTesting, generation)
+        if change == .unrelatedChatDeletion || change == .sameWorkspaceLoad {
+            XCTAssertGreaterThan(oracle.workspaceChatSessionLoadGenerationForTesting, generation)
+        }
         for query in queries.values {
+            if change == .idleStaleTargets || change == .idleAvailability, query == queries[0] { continue }
             XCTAssertEqual(oracle.activeQueryId(for: query.sessionID), query.queryID)
             XCTAssertTrue(oracle.backgroundOracleQueryIsCurrent(query), "Catalog refresh must not revoke an unrelated exact query")
         }
@@ -599,7 +982,7 @@ final class OracleGroupCancellationAdapterTests: XCTestCase {
         let connectionID = UUID()
         let snapshot = MCPTabContextSnapshot(
             tabID: session.tabID, windowID: window.windowID, workspaceID: workspaceID, promptText: "",
-            selection: StoredSelection(), selectedMetaPromptIDs: [], tabName: "Catalog fence fixture", runID: runID,
+            selection: StoredSelection(), selectedMetaPromptIDs: [], tabName: "Catalog fence fixture", runID: session.runID,
             activeAgentSessionID: fixture.sessionID, frozenLookupContext: .visibleWorkspace, explicitlyBound: true
         )
         let service = MCPOracleToolService(
@@ -626,6 +1009,29 @@ final class OracleGroupCancellationAdapterTests: XCTestCase {
         let collected = try await service.executeOracleChatLog(args: handle, invocationContext: invocation)
         XCTAssertEqual(collected.objectValue?["status"]?.stringValue, "completed")
         XCTAssertEqual(collected.objectValue?["oracle_results"]?.arrayValue?.compactMap { $0.objectValue?["response"]?.stringValue }, expected)
+        if change == .idleAvailability {
+            XCTAssertNil(viewModel.composerOracleBackgroundCancelTarget(tabID: session.tabID))
+            XCTAssertNil(viewModel.ui.composer.props.backgroundCancelTarget, "Last-lane settlement must invalidate the composer")
+        }
+        if change == .idleStaleTargets {
+            await registry.close(owner).value
+            try registry.reopen(owner, admissionIsCurrent: { true })
+            let stream = AsyncThrowingStream<Int, Error>.makeStream()
+            defer { stream.continuation.finish() }
+            let reopened = try await registry.start(owner: owner, runID: UUID(), invocationID: UUID(), admissionIsCurrent: { true }) { job in
+                let document = try self.registryPrepared(job)
+                try await job.prepared(document)
+                for try await _ in stream.stream {}
+                try job.recordPublishedTurn(self.registryTerminal(document))
+            }
+            let rejectedEpoch = try await viewModel.cancelOracleBackground(target: XCTUnwrap(priorEpochTarget))
+            XCTAssertFalse(rejectedEpoch)
+            XCTAssertFalse(registry.admissionIsClosed(for: owner))
+            XCTAssertTrue(registry.hasLiveOwner(owner))
+            stream.continuation.finish()
+            try await registry.join(owner: owner, reference: reopened)
+            XCTAssertEqual(registry.snapshot(for: owner).invocations.first { $0.reference == reopened }?.laneOutcomes.values.count(where: { $0 == .completed }), 2)
+        }
     }
 
     func testRegistryHandoffAndRequestCancellation() async throws {
