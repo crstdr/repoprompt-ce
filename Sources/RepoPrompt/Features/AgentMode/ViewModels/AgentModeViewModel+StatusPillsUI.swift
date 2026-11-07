@@ -25,14 +25,18 @@ extension AgentModeViewModel {
     }
 
     func syncStatusPillsUIState() {
-        ui.statusPills.update(makeStatusPillsSnapshot())
+        guard presentationWorkGate.shouldBuild() else { return }
+        let snapshot = makeStatusPillsSnapshot()
+        ui.statusPills.update(snapshot)
     }
 
     /// Preserve notify-time monitor freshness without rebuilding for unrelated endpoint updates.
     /// The link-projection publisher calls this on every mutation, and most mutations leave the
     /// pills untouched.
     func syncStatusPillsUIStateIfMonitorStale() {
-        let published = ui.statusPills.snapshot
+        // Avoid even the monitor display comparison while hidden; this is not a snapshot build.
+        guard presentationWorkGate.shouldBuild(recordBuild: false) else { return }
+        let published = ui.statusPills.latestSnapshot
         if published.currentTabID != currentTabID || published.monitor != currentMonitorPillProps() {
             syncStatusPillsUIState()
         }

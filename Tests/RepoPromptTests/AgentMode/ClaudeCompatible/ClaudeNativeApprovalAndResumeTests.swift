@@ -2429,6 +2429,25 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         await cleanup(f)
     }
 
+    func testHiddenOwnerStillReceivesAndResolvesProviderApprovalAndOutput() async throws {
+        let f = try await fixture()
+        let host = f.harness.host
+        host.presentationWorkGate.setEnabled(true)
+        host.presentationWorkGate.setVisible(false)
+        try await feed(["type": "control_request", "request_id": "hidden-permission", "request": ["subtype": "can_use_tool", "tool_name": "Bash", "input": ["command": "echo fixture"]]], f.controller)
+        await until("hidden owner receives approval") { f.session.pendingApproval != nil }
+        let approval = try XCTUnwrap(f.session.pendingApproval)
+        XCTAssertTrue(host.submitApprovalDecision(tabID: f.session.tabID, requestID: approval.id, decision: .accept))
+        await until("hidden owner resolves approval") { f.session.pendingApproval == nil }
+        try await feed(assistant("output while hidden"), f.controller)
+        try await feed(result("output while hidden"), f.controller)
+        await until("hidden turn completes") { f.session.runState == .completed && !f.session.runLifecycle.terminalCommitInProgress }
+        XCTAssertTrue(f.session.items.contains { $0.text.contains("output while hidden") })
+        host.presentationWorkGate.setVisible(true)
+        XCTAssertEqual(f.session.runState, .completed)
+        await cleanup(f)
+    }
+
     func testApprovalFirstAdoptsBeforePermissionAndStopRetiresListener() async throws {
         let f = try await fixture()
         try await feed(["type": "control_request", "request_id": "permission-first", "request": ["subtype": "can_use_tool", "tool_name": "Bash", "input": ["command": "echo fixture"]]], f.controller)

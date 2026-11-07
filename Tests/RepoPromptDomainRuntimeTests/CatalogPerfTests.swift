@@ -26,6 +26,24 @@ final class CatalogPerfTests: XCTestCase {
         XCTAssertLessThan(eventNS, hashNS, "diagnostic compares one receipt with one 1 MB hash")
     }
 
+    func testPresentationCountsAndHeartbeatThresholdRotateTogether() throws {
+        let perf = CatalogPerf()
+        let visible = UUID(), hidden = UUID()
+        perf.presentation(receiver: visible, visible: true, event: .build)
+        perf.presentation(receiver: visible, visible: true, event: .apply)
+        perf.presentation(receiver: hidden, visible: false, event: .deferred)
+        perf.heartbeat(gapMS: 249.9, expectedMS: 10)
+        perf.heartbeat(gapMS: 250, expectedMS: 10)
+        perf.heartbeat(gapMS: 251, expectedMS: 10)
+        let line = try XCTUnwrap(perf.rotate())
+        for field in ["presentation_receivers_visible=1", "presentation_receivers_hidden=1",
+                      "presentation_builds_attempted=1", "presentation_applies=1",
+                      "presentation_deferrals=1", "heartbeat_gaps_ge250=2"] {
+            XCTAssertTrue(line.contains(field), field)
+        }
+        XCTAssertNil(perf.rotate())
+    }
+
     func testIdleWindowEmitsNothing() {
         let perf = CatalogPerf()
         perf.heartbeat(gapMS: 120, expectedMS: 10)

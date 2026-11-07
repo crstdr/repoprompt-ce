@@ -95,30 +95,51 @@ final class AgentStatusPillsUIStore: ObservableObject {
     var perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     @Published private(set) var snapshot: AgentStatusPillsSnapshot
     @Published private(set) var revision: UInt64 = 0
+    var didPublishPresentation: (() -> Void)?
+    var shouldPublishPresentation: (() -> Bool)?
+    private(set) var latestSnapshot: AgentStatusPillsSnapshot
+    private var latestRevision: UInt64 = 0
+    private var isPublishing = false
 
     init(snapshot: AgentStatusPillsSnapshot = .empty) {
         self.snapshot = snapshot
+        latestSnapshot = snapshot
     }
 
     func update(_ nextSnapshot: AgentStatusPillsSnapshot) {
-        guard snapshot != nextSnapshot else {
+        if latestSnapshot != nextSnapshot {
+            latestSnapshot = nextSnapshot
+            latestRevision &+= 1
+        } else {
             #if DEBUG
                 perfRecorder.recordStoreUpdate("statusPills", published: false)
             #endif
-            return
         }
-        snapshot = nextSnapshot
-        revision &+= 1
-        #if DEBUG
-            perfRecorder.recordStoreUpdate(
-                "statusPills",
-                published: true,
-                details: [
-                    "revision": String(revision),
-                    "runState": String(describing: snapshot.runState),
-                    "tabID": perfRecorder.shortID(snapshot.currentTabID)
-                ]
-            )
-        #endif
+        // A synchronous willSet subscriber may issue a newer update. Finish this assignment
+        // before draining that latest value, and fence the separate revision publication too.
+        guard !isPublishing else { return }
+        isPublishing = true
+        defer { isPublishing = false }
+        while snapshot != latestSnapshot || revision != latestRevision {
+            if snapshot != latestSnapshot {
+                guard shouldPublishPresentation?() ?? true else { return }
+                snapshot = latestSnapshot
+                didPublishPresentation?()
+                #if DEBUG
+                    perfRecorder.recordStoreUpdate("statusPills", published: true, details: [
+                        "revision": String(latestRevision),
+                        "runState": String(describing: snapshot.runState),
+                        "tabID": perfRecorder.shortID(snapshot.currentTabID)
+                    ])
+                #endif
+                // A willSet subscriber may have requested a newer snapshot. Publish its revision
+                // only after that snapshot has actually finished assigning.
+                continue
+            }
+            if revision != latestRevision {
+                guard shouldPublishPresentation?() ?? true else { return }
+                revision = latestRevision
+            }
+        }
     }
 }

@@ -21,6 +21,22 @@ package final class CatalogPerf: @unchecked Sendable {
     private var maxLatenessMS: Double = 0
     private var gapsOver16 = 0
     private var gapsOver100 = 0
+    private var gapsAtLeast250 = 0
+    private var presentationReceivers: [UUID: Bool] = [:]
+    private var presentationCounts: [PresentationEvent: Int] = [:]
+
+    package enum PresentationEvent: String, Sendable {
+        case build, apply, deferred, catchUp
+    }
+
+    /// Receiver counts describe participants in this log window, not all open NSWindows.
+    package func presentation(receiver: UUID, visible: Bool, event: PresentationEvent) {
+        lock.lock()
+        activity += 1
+        presentationReceivers[receiver] = visible
+        presentationCounts[event, default: 0] += 1
+        lock.unlock()
+    }
     private var receivers: [UUID: Int] = [:]
     private var fullReceipts = 0
     private var metadataReceipts = 0
@@ -125,6 +141,7 @@ package final class CatalogPerf: @unchecked Sendable {
         maxLatenessMS = max(maxLatenessMS, max(0, gapMS - expectedMS))
         if gapMS > 16 { gapsOver16 += 1 }
         if gapMS > 100 { gapsOver100 += 1 }
+        if gapMS >= 250 { gapsAtLeast250 += 1 }
         lock.unlock()
     }
 
@@ -135,6 +152,7 @@ package final class CatalogPerf: @unchecked Sendable {
         let durationMS = Double(now - windowStart) / 1_000_000
         let activity = activity, sampleMS = heartbeatSampleMS, maxLate = maxLatenessMS
         let over16 = gapsOver16, over100 = gapsOver100, receivers = receivers
+        let over250 = gapsAtLeast250, displayReceivers = presentationReceivers, displayCounts = presentationCounts
         let full = fullReceipts, metadata = metadataReceipts, applications = applications
         let reconciliations = fullReconciliations, appSum = applicationSumMS, appMax = applicationMaxMS
         let publications = publications, decodes = canonicalDecodes, hits = decodeHits
@@ -146,6 +164,9 @@ package final class CatalogPerf: @unchecked Sendable {
         maxLatenessMS = 0
         gapsOver16 = 0
         gapsOver100 = 0
+        gapsAtLeast250 = 0
+        presentationReceivers = [:]
+        presentationCounts = [:]
         self.receivers = [:]
         fullReceipts = 0
         metadataReceipts = 0
@@ -168,7 +189,8 @@ package final class CatalogPerf: @unchecked Sendable {
         let publicationSummary = publications.keys.sorted().map { "\($0):\(publications[$0] ?? 0)" }.joined(separator: ",")
         let catalog = "activity=\(activity) window_ms=\(ms(durationMS)) heartbeat_sample_ms=\(ms(sampleMS)) heartbeat_max_late_ms=\(ms(maxLate)) heartbeat_gaps_gt16=\(over16) heartbeat_gaps_gt100=\(over100) receivers=\(receivers.count) receipts_full=\(full) receipts_metadata=\(metadata) receivers_full=\(receivers.values.count(where: { $0 > 0 })) receiver_full_max=\(receivers.values.max() ?? 0) applications_attempted=\(applications) reconciliations_full_attempted=\(reconciliations) application_sum_ms=\(ms(appSum)) application_max_ms=\(ms(appMax))"
         let writer = "prep_count=\(prep.count) prep_sum_ms=\(ms(prep.sumMS)) prep_max_ms=\(ms(prep.maxMS)) prep_max_bytes=\(prep.maxBytes) prep_main_thread=\(prep.mainThreadCount) write_count=\(write.count) write_sum_ms=\(ms(write.sumMS)) write_max_ms=\(ms(write.maxMS)) write_main_thread=\(write.mainThreadCount)"
-        return "\(catalog) publications=\(publicationSummary.isEmpty ? "-" : publicationSummary) canonical_decodes=\(decodes) decode_cache_hits=\(hits) decode_bytes_hashed=\(decodeBytes) document_bytes_hashed=\(documentBytes) \(writer)"
+        let display = "presentation_receivers_visible=\(displayReceivers.values.count(where: { $0 })) presentation_receivers_hidden=\(displayReceivers.values.count(where: { !$0 })) presentation_builds_attempted=\(displayCounts[.build, default: 0]) presentation_applies=\(displayCounts[.apply, default: 0]) presentation_deferrals=\(displayCounts[.deferred, default: 0]) presentation_catchups=\(displayCounts[.catchUp, default: 0]) heartbeat_gaps_ge250=\(over250)"
+        return "\(catalog) \(display) publications=\(publicationSummary.isEmpty ? "-" : publicationSummary) canonical_decodes=\(decodes) decode_cache_hits=\(hits) decode_bytes_hashed=\(decodeBytes) document_bytes_hashed=\(documentBytes) \(writer)"
     }
 
     package func emitWindow() {

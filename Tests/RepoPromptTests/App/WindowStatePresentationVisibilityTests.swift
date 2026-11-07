@@ -59,6 +59,48 @@ final class WindowStatePresentationVisibilityTests: XCTestCase {
         await state.tearDown()
     }
 
+    func testHiddenDisplayDefersButInteractionStateRemainsLiveAndRevealCatchesUp() async throws {
+        #if DEBUG
+            let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            defer { GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false) }
+            let state = WindowState()
+            let sample = SampleBox()
+            sample.visible = false
+            state.presentationVisibilitySampler = { _ in sample.visible }
+            let window = makeTestWindow()
+            state.attachWindow(window)
+            try await waitForVisibility(state, false, "hidden")
+            let vm = state.agentModeViewModel
+            vm.presentationWorkGate.setEnabled(true)
+            let builds = vm.test_statusPillsSnapshotBuildCount
+            for _ in 0 ..< 10 {
+                vm.syncStatusPillsUIState()
+            }
+            XCTAssertEqual(vm.test_statusPillsSnapshotBuildCount, builds)
+            let rowRevision = vm.ui.sessionSidebar.currentSnapshot.rowContentRevision
+            vm.syncSidebarUIState(refresh: true, reason: .sortDates)
+            XCTAssertGreaterThan(vm.ui.sessionSidebar.currentSnapshot.rowContentRevision, rowRevision)
+            vm.sessionSidebarSearchText = "search"
+            vm.syncSidebarUIState()
+            vm.toggleSidebarGroupCollapsed("test-group")
+            XCTAssertEqual(vm.ui.sessionSidebar.currentSnapshot.searchText, "search")
+            XCTAssertFalse(vm.ui.sessionSidebar.currentSnapshot.collapsedSidebarGroups.contains("test-group"))
+            // Approval/question presentation deliberately does not go through the display gate.
+            vm.runState = .waitingForApproval
+            vm.waitingPrompt = "Pending test interaction"
+            XCTAssertEqual(vm.ui.runInteraction.snapshot.runState, .waitingForApproval)
+            XCTAssertEqual(vm.ui.runInteraction.snapshot.waitingPrompt, "Pending test interaction")
+            sample.visible = true
+            NotificationCenter.default.post(name: NSWindow.didChangeOcclusionStateNotification, object: window)
+            try await waitForVisibility(state, true, "revealed")
+            XCTAssertEqual(vm.ui.statusPills.snapshot.runState, .waitingForApproval)
+            state.beginClose()
+            XCTAssertFalse(vm.presentationWorkGate.shouldBuild())
+            await state.tearDown()
+        #endif
+    }
+
     func testCloseStopsObservingPresentationVisibility() async throws {
         #if DEBUG
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()

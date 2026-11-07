@@ -547,6 +547,7 @@ class WindowStatesManager: ObservableObject {
     /// 🚀 Single, shared instance for the entire app
     static let shared = WindowStatesManager()
     let activityLedger = WindowActivityLedger()
+    lazy var hiddenWindowPresentationPreference = HiddenWindowPresentationPreference()
 
     /// App-global bundled router registry plus shared backend credential/readiness authorities.
     let modelRouterRuntime = AgentTaskRouterRuntime()
