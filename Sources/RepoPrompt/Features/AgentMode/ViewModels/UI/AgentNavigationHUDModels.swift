@@ -461,7 +461,7 @@ enum AgentNavigationHUDSnapshotBuilder {
         #if DEBUG
             agentModeVM.perfRecorder.durationEvent("hud.snapshot.oversightRoles", startMS: rolesStartMS, fields: ["rowCount": String(rows.count)])
         #endif
-        let attentionSnapshot = agentModeVM.ui.sessionSidebar.snapshot
+        let attentionSnapshot = agentModeVM.ui.sessionSidebar.currentSnapshot
         return currentWindowItems(
             rows: rows,
             currentTabID: currentTabID,

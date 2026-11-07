@@ -8,6 +8,20 @@ extension AgentModeViewModel {
         reason: SidebarRefreshReason = .explicit,
         sidebarTabs: [ComposeTabState]? = nil
     ) {
+        // Restore admission is owner bookkeeping, even when display construction is deferred.
+        guard presentationWorkGate.shouldBuild() else {
+            // Commands/navigation read these facts even while their visual copies are deferred.
+            ui.sessionSidebar.update(
+                searchText: sessionSidebarSearchText,
+                visibleSessionCount: sessionSidebarVisibleSessionCount,
+                archivedVisibleSessionCount: sessionSidebarArchivedVisibleSessionCount
+            )
+            if refresh {
+                admitSidebarRestoreCoverageForOwnerWorkspace()
+                ui.sessionSidebar.invalidateDeferredRowContent()
+            }
+            return
+        }
         #if DEBUG
             let syncStartMS = perfRecorder.timestampMSIfEnabled()
             let storeUpdateStartMS = syncStartMS
@@ -145,7 +159,7 @@ extension AgentModeViewModel {
         rowID: UUID
     ) -> AgentSidebarSelectionGestureResult {
         // Mirrors guards in `AgentSidebarSelectionState.handle` for diagnostics; keep in sync.
-        let selectionCount = ui.sessionSidebar.selectionState.selectedIdentities.count
+        let selectionCount = ui.sessionSidebar.currentSelectionState.selectedIdentities.count
         let match = AgentSidebarTapWorkspaceGate.evaluate(
             sidebarWorkspaceID: workspaceID,
             activeWorkspaceID: workspaceManager?.activeWorkspaceID
@@ -159,7 +173,7 @@ extension AgentModeViewModel {
                 rowID: rowID
             )
         }
-        let state = ui.sessionSidebar.selectionState
+        let state = ui.sessionSidebar.currentSelectionState
         if state.inFlightAction != nil {
             return AgentSidebarSelectionGestureResult(
                 disposition: .ignored,
@@ -187,14 +201,14 @@ extension AgentModeViewModel {
         return AgentSidebarSelectionGestureResult(
             disposition: disposition,
             reason: nil,
-            selectionCount: ui.sessionSidebar.selectionState.selectedIdentities.count,
+            selectionCount: ui.sessionSidebar.currentSelectionState.selectedIdentities.count,
             workspaceMatched: true,
             rowID: rowID
         )
     }
 
     func canPerformDirectSidebarCommand(workspaceID: UUID) -> Bool {
-        let selectionState = ui.sessionSidebar.selectionState
+        let selectionState = ui.sessionSidebar.currentSelectionState
         return workspaceManager?.activeWorkspaceID == workspaceID
             && !selectionState.isMutationInFlight
             && !selectionState.showsSelectionPresentation
@@ -209,7 +223,7 @@ extension AgentModeViewModel {
     ) async {
         let presentationTargets = targets.presentationTargets(for: action)
         guard workspaceManager?.activeWorkspaceID == targets.workspaceID else { return }
-        if origin == .command, ui.sessionSidebar.selectionState.showsSelectionPresentation { return }
+        if origin == .command, ui.sessionSidebar.currentSelectionState.showsSelectionPresentation { return }
         guard let token = ui.sessionSidebar.beginBulkAction(
             kind: action,
             origin: origin,
@@ -352,7 +366,7 @@ extension AgentModeViewModel {
 
     func sidebarSearchBinding() -> Binding<String> {
         Binding(
-            get: { [weak self] in self?.ui.sessionSidebar.snapshot.searchText ?? "" },
+            get: { [weak self] in self?.ui.sessionSidebar.currentSnapshot.searchText ?? "" },
             set: { [weak self] text in self?.setSessionSidebarSearchText(text) }
         )
     }
@@ -424,7 +438,7 @@ extension AgentModeViewModel {
         let keys = collapsibleSidebarThreadKeys(
             for: tabs,
             currentTabID: currentTabID,
-            searchText: ui.sessionSidebar.snapshot.searchText,
+            searchText: ui.sessionSidebar.currentSnapshot.searchText,
             diagnosticSource: "collapseAllButton.applyCollapse"
         )
         for key in keys {

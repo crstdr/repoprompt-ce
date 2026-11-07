@@ -619,6 +619,19 @@ final class AgentSidebarSearchFieldDeferralTests: XCTestCase {
         )
     }
 
+    func testHiddenContentRefreshInvalidatesWarmRowsBeforeReveal() {
+        let vm = makeViewModel()
+        let tabs = [ComposeTabState(id: id(1), name: "One")]
+        _ = vm.agentChatsSidebarSessions(for: tabs)
+        let builds = vm.test_sidebarSessionRowsBuildCount
+        vm.presentationWorkGate.setEnabled(true)
+        vm.presentationWorkGate.setVisible(false)
+        vm.syncSidebarUIState(refresh: true, reason: .sortDates)
+        _ = vm.agentChatsSidebarSessions(for: tabs)
+        XCTAssertEqual(vm.test_sidebarSessionRowsBuildCount, builds + 1)
+        vm.presentationWorkGate.close()
+    }
+
     private func makeViewModel() -> AgentModeViewModel {
         AgentModeViewModel(
             testWindowID: -991,

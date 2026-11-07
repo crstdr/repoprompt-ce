@@ -1,4 +1,7 @@
+import Combine
+import Foundation
 @_spi(TestSupport) @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import XCTest
 
 @MainActor
@@ -1098,5 +1101,272 @@ final class AgentSidebarOverseerSectionBuilderTests: XCTestCase {
         viewModel.setSidebarTab(.all)
         XCTAssertNil(project().overseerRenderedRows)
         XCTAssertFalse(viewModel.ui.sessionSidebar.snapshot.collapsedThreadKeys.contains(.session(id(101))))
+    }
+}
+
+@MainActor
+final class AgentPresentationWorkGateTests: XCTestCase {
+    func testRevealUsesLatestBindingOnceAndCloseDiscardsPendingDisplay() {
+        let perf = CatalogPerf()
+        var currentBinding = "old"
+        var displayed: [String] = []
+        let gate = AgentPresentationWorkGate(enabled: true, perf: perf) { displayed.append(currentBinding) }
+        gate.setVisible(false)
+        for _ in 0 ..< 20 {
+            XCTAssertFalse(gate.shouldBuild())
+        }
+        currentBinding = "successor"
+        gate.setVisible(true)
+        gate.setVisible(true)
+        XCTAssertEqual(displayed, ["successor"])
+        gate.setVisible(false)
+        XCTAssertFalse(gate.shouldBuild())
+        gate.close()
+        gate.setEnabled(false)
+        gate.setVisible(true)
+        XCTAssertFalse(gate.shouldBuild())
+        XCTAssertEqual(displayed, ["successor"])
+    }
+
+    func testDisablingFlushesOnceAndDefaultIsOn() throws {
+        let suite = "presentation-test-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        XCTAssertTrue(HiddenWindowPresentationPreference.readEnabled(from: defaults))
+        defaults.set(false, forKey: HiddenWindowPresentationPreference.key)
+        XCTAssertFalse(HiddenWindowPresentationPreference.readEnabled(from: defaults))
+        defaults.set(true, forKey: HiddenWindowPresentationPreference.key)
+        XCTAssertTrue(HiddenWindowPresentationPreference.readEnabled(from: defaults))
+
+        var catchUps = 0
+        let gate = AgentPresentationWorkGate(enabled: true, perf: CatalogPerf()) { catchUps += 1 }
+        gate.setVisible(false)
+        XCTAssertFalse(gate.shouldBuild())
+        gate.setEnabled(false)
+        gate.setEnabled(false)
+        XCTAssertEqual(catchUps, 1)
+        XCTAssertTrue(gate.shouldBuild())
+        gate.setEnabled(true)
+        XCTAssertFalse(gate.shouldBuild())
+        gate.setVisible(true)
+        XCTAssertEqual(catchUps, 2)
+    }
+
+    func testHiddenAttentionAndCommandFactsStayCurrentWithoutDisplayPublication() {
+        let store = AgentSessionSidebarUIStore()
+        let perf = CatalogPerf()
+        let gate = AgentPresentationWorkGate(enabled: true, perf: perf) { store.flushPresentation() }
+        store.shouldPublishPresentation = { gate.shouldBuild() }
+        gate.setVisible(false)
+        var publications = 0
+        let observation = store.$snapshot.dropFirst().sink { _ in publications += 1 }
+        let tabID = UUID()
+        XCTAssertTrue(store.markRunStateAttention(tabID: tabID, state: .failed))
+        XCTAssertEqual(store.attentionRunState(for: tabID), .failed)
+        XCTAssertEqual(store.currentSnapshot.attentionRunStateByTabID[tabID], .failed)
+        XCTAssertNil(store.snapshot.attentionRunStateByTabID[tabID])
+        XCTAssertEqual(publications, 0)
+        gate.setVisible(true)
+        XCTAssertEqual(store.snapshot.attentionRunStateByTabID[tabID], .failed)
+        XCTAssertEqual(publications, 1)
+        withExtendedLifetime(observation) {}
+    }
+
+    func testCloseDuringFirstCatchUpPublicationPreventsSelectionPublication() {
+        let store = AgentSessionSidebarUIStore()
+        let gate = AgentPresentationWorkGate(enabled: true, perf: CatalogPerf()) { store.flushPresentation() }
+        store.shouldPublishPresentation = { gate.shouldBuild(recordBuild: false) }
+        gate.setVisible(false)
+        store.update(searchText: "latest", visibleSessionCount: 3, archivedVisibleSessionCount: 4)
+        let tab = AgentSidebarSelectionIdentity.active(tabID: UUID())
+        store.selectAll(renderedOrder: [tab], workspaceID: UUID())
+        var selectionPublications = 0
+        let selection = store.$selectionState.dropFirst().sink { _ in selectionPublications += 1 }
+        let close = store.$snapshot.dropFirst().sink { _ in gate.close() }
+        gate.setVisible(true)
+        XCTAssertEqual(selectionPublications, 0)
+        XCTAssertEqual(store.currentSelectionState.selectedIdentities, [tab])
+        withExtendedLifetime((selection, close)) {}
+    }
+
+    func testCatchUpDrainsAttentionAndSelectionChangedByWillSetSubscribers() {
+        let store = AgentSessionSidebarUIStore()
+        let gate = AgentPresentationWorkGate(enabled: true, perf: CatalogPerf()) { store.flushPresentation() }
+        store.shouldPublishPresentation = { gate.shouldBuild(recordBuild: false) }
+        gate.setVisible(false)
+        let tabID = UUID()
+        store.markRunStateAttention(tabID: tabID, state: .failed)
+        let tab = AgentSidebarSelectionIdentity.active(tabID: tabID)
+        store.selectAll(renderedOrder: [tab], workspaceID: UUID())
+        var clearedAttention = false, clearedSelection = false
+        let attention = store.$snapshot.dropFirst().sink { _ in
+            guard !clearedAttention else { return }
+            clearedAttention = true
+            store.clearRunStateAttention(tabID: tabID)
+        }
+        let selection = store.$selectionState.dropFirst().sink { _ in
+            guard !clearedSelection else { return }
+            clearedSelection = true
+            store.clearSelection()
+        }
+        gate.setVisible(true)
+        XCTAssertEqual(store.snapshot, store.currentSnapshot)
+        XCTAssertEqual(store.selectionState, store.currentSelectionState)
+        XCTAssertNil(store.snapshot.attentionRunStateByTabID[tabID])
+        XCTAssertTrue(store.selectionState.selectedIdentities.isEmpty)
+        withExtendedLifetime((attention, selection)) {}
+    }
+
+    func testStatusRevisionIsFencedAfterCloseOrHideAndCaughtUpOnReveal() {
+        for closing in [false, true] {
+            let store = AgentStatusPillsUIStore()
+            let gate = AgentPresentationWorkGate(enabled: true, perf: CatalogPerf()) { store.update(store.snapshot) }
+            store.shouldPublishPresentation = { gate.shouldBuild(recordBuild: false) }
+            var revisionPublications = 0
+            let revisions = store.$revision.dropFirst().sink { _ in revisionPublications += 1 }
+            let snapshots = store.$snapshot.dropFirst().prefix(1).sink { _ in
+                if closing { gate.close() } else { gate.setVisible(false) }
+            }
+            let initial = AgentStatusPillsSnapshot.empty
+            // A distinct target is enough to request a real snapshot/revision pair.
+            let next = AgentStatusPillsSnapshot(
+                currentTabID: UUID(), selectedWorkflow: initial.selectedWorkflow,
+                stagedSlashCommand: initial.stagedSlashCommand, selectedAgent: initial.selectedAgent,
+                autoEditPermissionGuidance: initial.autoEditPermissionGuidance, runState: initial.runState,
+                autoEditEnabled: initial.autoEditEnabled, interviewFirst: initial.interviewFirst,
+                modelRouter: initial.modelRouter, autoEffort: initial.autoEffort,
+                executionLocation: initial.executionLocation, activeAgentSessionID: nil,
+                activeRunID: nil, monitor: initial.monitor
+            )
+            store.update(next)
+            XCTAssertEqual(revisionPublications, 0)
+            if !closing {
+                gate.setVisible(true)
+                XCTAssertEqual(revisionPublications, 1)
+                XCTAssertEqual(store.revision, 1)
+            }
+            withExtendedLifetime((revisions, snapshots)) {}
+        }
+    }
+
+    func testStatusRevisionSubscriberSeesLatestSnapshotAfterReentrantUpdate() {
+        let store = AgentStatusPillsUIStore()
+        let first = copyPills(.empty, tabID: UUID(), monitor: .empty)
+        let latest = copyPills(.empty, tabID: UUID(), monitor: .empty)
+        var observedTabs: [UUID?] = []
+        let revisions = store.$revision.dropFirst().sink { _ in observedTabs.append(store.snapshot.currentTabID) }
+        let snapshots = store.$snapshot.dropFirst().prefix(1).sink { _ in store.update(latest) }
+        store.update(first)
+        XCTAssertEqual(observedTabs, [latest.currentTabID])
+        XCTAssertEqual(store.snapshot, latest)
+        withExtendedLifetime((revisions, snapshots)) {}
+    }
+
+    func testMonitorFreshnessUsesRequestedValueDuringWillSet() {
+        let vm = AgentModeViewModel(testWindowID: -994, codexControllerFactory: { _, _, _, _, _, _ in
+            preconditionFailure("This test never starts a provider")
+        })
+        vm.syncStatusPillsUIState()
+        let initial = vm.ui.statusPills.snapshot
+        var monitor = initial.monitor
+        monitor.readOnlyAutoApprovalEnabled.toggle()
+        let changed = copyPills(initial, tabID: initial.currentTabID, monitor: monitor)
+        let subscription = vm.ui.statusPills.$snapshot.dropFirst().prefix(1).sink { _ in
+            vm.syncStatusPillsUIStateIfMonitorStale()
+        }
+        vm.ui.statusPills.update(changed)
+        XCTAssertEqual(vm.ui.statusPills.snapshot.monitor, initial.monitor)
+        XCTAssertEqual(vm.ui.statusPills.latestSnapshot.monitor, initial.monitor)
+        vm.presentationWorkGate.close()
+        withExtendedLifetime(subscription) {}
+    }
+
+    func testTranscriptRevealPreservesRequestForPreviouslyDisplayedSnapshot() {
+        let store = AgentTranscriptUIStore()
+        var first = AgentTranscriptUISnapshot.empty
+        first.currentTabID = UUID()
+        var second = first
+        second.currentTabID = UUID()
+        store.update(first)
+        let gate = AgentPresentationWorkGate(enabled: true, perf: CatalogPerf()) { store.update(second) }
+        store.shouldPublishPresentation = { gate.shouldBuild(recordBuild: false) }
+        gate.setVisible(false)
+        XCTAssertFalse(gate.shouldBuild())
+        let subscription = store.$snapshot.dropFirst().prefix(1).sink { _ in store.update(first) }
+        gate.setVisible(true)
+        XCTAssertEqual(store.snapshot, first)
+        withExtendedLifetime(subscription) {}
+    }
+
+    private func copyPills(_ source: AgentStatusPillsSnapshot, tabID: UUID?, monitor: AgentMonitorPillProps) -> AgentStatusPillsSnapshot {
+        AgentStatusPillsSnapshot(
+            currentTabID: tabID, selectedWorkflow: source.selectedWorkflow,
+            stagedSlashCommand: source.stagedSlashCommand, selectedAgent: source.selectedAgent,
+            autoEditPermissionGuidance: source.autoEditPermissionGuidance, runState: source.runState,
+            autoEditEnabled: source.autoEditEnabled, interviewFirst: source.interviewFirst,
+            modelRouter: source.modelRouter, autoEffort: source.autoEffort,
+            executionLocation: source.executionLocation, activeAgentSessionID: source.activeAgentSessionID,
+            activeRunID: source.activeRunID, monitor: monitor, reprompt: source.reprompt
+        )
+    }
+
+    func testProductionPreferenceTimerObservesExternalWriteAndDeletion() async throws {
+        let suite = "com.repoprompt.test.presentation.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        let preference = HiddenWindowPresentationPreference(suiteName: suite)
+        defer {
+            preference.stop()
+            defaults.removePersistentDomain(forName: suite)
+        }
+        for enabled in [false, true] {
+            let observed = expectation(description: "external preference \(enabled)")
+            let subscription = preference.changes.filter { $0 == enabled }.prefix(1).sink { _ in observed.fulfill() }
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/defaults")
+            process.arguments = enabled
+                ? ["delete", suite, HiddenWindowPresentationPreference.key]
+                : ["write", suite, HiddenWindowPresentationPreference.key, "-bool", "false"]
+            try process.run()
+            process.waitUntilExit()
+            XCTAssertEqual(process.terminationStatus, 0)
+            let result = await XCTWaiter.fulfillment(of: [observed], timeout: 5)
+            XCTAssertEqual(result, .completed)
+            withExtendedLifetime(subscription) {}
+        }
+    }
+
+    func testThirtyFiveWindowsThreeHundredChatsAvoidHiddenBuildsAndCatchUpOnce() throws {
+        for visibleCount in [2, 35] {
+            let perf = CatalogPerf()
+            var builds = Array(repeating: 0, count: 35)
+            var catchUps = Array(repeating: 0, count: 35)
+            var runtimeDeliveries = 0
+            let gates = (0 ..< 35).map { index in
+                AgentPresentationWorkGate(enabled: true, perf: perf) { catchUps[index] += 1 }
+            }
+            for (index, gate) in gates.enumerated() {
+                gate.setVisible(index < visibleCount)
+            }
+            for _ in 0 ..< 300 {
+                for (index, gate) in gates.enumerated() {
+                    // The gate is only consulted by display production, never by event delivery.
+                    runtimeDeliveries += 1
+                    if gate.shouldBuild() {
+                        builds[index] += 1
+                        gate.didApply()
+                    }
+                }
+            }
+            XCTAssertEqual(runtimeDeliveries, 35 * 300)
+            XCTAssertEqual(builds.reduce(0, +), visibleCount * 300)
+            for gate in gates {
+                gate.setVisible(true)
+            }
+            XCTAssertEqual(catchUps.reduce(0, +), 35 - visibleCount)
+            let log = try XCTUnwrap(perf.rotate())
+            XCTAssertTrue(log.contains("presentation_builds_attempted=\(visibleCount * 300)"))
+            XCTAssertTrue(log.contains("presentation_deferrals=\((35 - visibleCount) * 300)"))
+            XCTAssertTrue(log.contains("presentation_catchups=\(35 - visibleCount)"))
+        }
     }
 }

@@ -127,8 +127,28 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     }
 
+    lazy var presentationWorkGate: AgentPresentationWorkGate = {
+        let gate = AgentPresentationWorkGate(preference: WindowStatesManager.shared.hiddenWindowPresentationPreference) { [weak self] in
+            guard let self else { return }
+            syncTranscriptUIState()
+            syncSidebarUIState(refresh: true, reason: .explicit)
+            ui.sessionSidebar.flushPresentation()
+            syncStatusPillsUIState()
+        }
+        ui.sessionSidebar.shouldPublishPresentation = { [weak gate] in gate?.shouldBuild(recordBuild: false) ?? false }
+        ui.sessionSidebar.didPublishPresentation = { [weak gate] in gate?.didApply() }
+        ui.transcript.didPublishPresentation = { [weak gate] in gate?.didApply() }
+        ui.transcript.shouldPublishPresentation = { [weak gate] in gate?.shouldBuild(recordBuild: false) ?? false }
+        ui.statusPills.didPublishPresentation = { [weak gate] in gate?.didApply() }
+        ui.statusPills.shouldPublishPresentation = { [weak gate] in gate?.shouldBuild(recordBuild: false) ?? false }
+        return gate
+    }()
+
     func syncTranscriptUIState() {
-        if prepareQuietTranscriptDisplay() { ui.transcript.update(makeTranscriptUISnapshot()) }
+        if presentationWorkGate.shouldBuild(), prepareQuietTranscriptDisplay() {
+            let snapshot = makeTranscriptUISnapshot()
+            ui.transcript.update(snapshot)
+        }
         // The same publication point reports the initial selected restoration to the sidebar join and
         // propagates owner-pending transitions to the sidebar projection (§5.3/§5.5).
         synchronizeSidebarRestoreSelectedSide()

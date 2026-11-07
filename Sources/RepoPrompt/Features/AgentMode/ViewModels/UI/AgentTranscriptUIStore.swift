@@ -60,8 +60,23 @@ struct AgentTranscriptUISnapshot: Equatable {
 final class AgentTranscriptUIStore: ObservableObject {
     var perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     @Published private(set) var snapshot: AgentTranscriptUISnapshot = .empty
+    var didPublishPresentation: (() -> Void)?
+    var shouldPublishPresentation: (() -> Bool)?
+    private var latestSnapshot: AgentTranscriptUISnapshot = .empty
+    private var isPublishing = false
 
     func update(_ snapshot: AgentTranscriptUISnapshot) {
+        latestSnapshot = snapshot
+        guard !isPublishing else { return }
+        isPublishing = true
+        defer { isPublishing = false }
+        while self.snapshot != latestSnapshot {
+            guard shouldPublishPresentation?() ?? true else { return }
+            publish(latestSnapshot)
+        }
+    }
+
+    private func publish(_ snapshot: AgentTranscriptUISnapshot) {
         guard self.snapshot != snapshot else {
             #if DEBUG
                 perfRecorder.recordStoreUpdate("transcript", published: false)
@@ -84,5 +99,6 @@ final class AgentTranscriptUIStore: ObservableObject {
             )
         #endif
         self.snapshot = snapshot
+        didPublishPresentation?()
     }
 }

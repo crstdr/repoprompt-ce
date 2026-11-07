@@ -567,6 +567,7 @@ class WindowState: ObservableObject {
         }
         if !isPreparedSessionOwner { manager.detachPreparedRuntimeCarriers(from: self) }
         isClosing = true
+        agentModeViewModel.presentationWorkGate.close()
         agentModeViewModel.closeOracleBackgroundWindowAdmission()
         if !isPreparedSessionOwner { manager.activityLedger.removeWindow(windowID) }
         failUnstartedCommandsForWindowClose()
@@ -1211,6 +1212,7 @@ class WindowState: ObservableObject {
             }
             guard isPresentationVisible != visible else { return }
             isPresentationVisible = visible
+            agentModeViewModel.presentationWorkGate.setVisible(visible)
         }
     }
 
@@ -1325,7 +1327,7 @@ class WindowState: ObservableObject {
             if await MainActor.run(body: { agentModeViewModel.shouldSwallowNewSessionClick(for: activeTabID) }) {
                 return
             }
-            await agentModeViewModel.createAndActivateSessionTab()
+            _ = await agentModeViewModel.createAndActivateSessionTab()
         }
     }
 

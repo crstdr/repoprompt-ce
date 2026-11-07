@@ -90,15 +90,49 @@ struct AgentSessionSidebarSnapshot: Equatable {
 @MainActor
 final class AgentSessionSidebarUIStore: ObservableObject {
     var perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
-    @Published private(set) var snapshot = AgentSessionSidebarSnapshot(
+    private static let initialSnapshot = AgentSessionSidebarSnapshot(
         searchText: "",
         visibleSessionCount: AgentModeViewModel.sessionSidebarPageSize,
         archivedVisibleSessionCount: AgentModeViewModel.sessionSidebarArchivedPageSize
     )
+    @Published private(set) var snapshot = initialSnapshot
+    private(set) var currentSnapshot = initialSnapshot
     @Published private(set) var selectionState = AgentSidebarSelectionState()
+    private(set) var currentSelectionState = AgentSidebarSelectionState()
+    var shouldPublishPresentation: (() -> Bool)?
+    var didPublishPresentation: (() -> Void)?
+    private var isPublishingPresentation = false
+
+    /// Invalidate command-facing row caches without building a fingerprint or emitting UI state.
+    func invalidateDeferredRowContent() {
+        currentSnapshot.rowContentRevision &+= 1
+        currentSnapshot.revision &+= 1
+    }
+
+    /// Facts and command-selection state remain current while their visual copies are deferred.
+    func flushPresentation() {
+        // @Published sends in willSet. A nested command updates facts, but must not assign a
+        // published value until the outer assignment finishes (which would overwrite it).
+        guard !isPublishingPresentation else { return }
+        isPublishingPresentation = true
+        defer { isPublishingPresentation = false }
+        while snapshot != currentSnapshot || selectionState != currentSelectionState {
+            if snapshot != currentSnapshot {
+                guard shouldPublishPresentation?() ?? true else { return }
+                snapshot = currentSnapshot
+                didPublishPresentation?()
+            }
+            // The first publication can synchronously close/hide/rebind its window.
+            if selectionState != currentSelectionState {
+                guard shouldPublishPresentation?() ?? true else { return }
+                selectionState = currentSelectionState
+                didPublishPresentation?()
+            }
+        }
+    }
 
     func update(searchText: String, visibleSessionCount: Int, archivedVisibleSessionCount: Int) {
-        var next = snapshot
+        var next = currentSnapshot
         next.searchText = searchText
         next.visibleSessionCount = visibleSessionCount
         next.archivedVisibleSessionCount = archivedVisibleSessionCount
@@ -111,7 +145,7 @@ final class AgentSessionSidebarUIStore: ObservableObject {
     }
 
     func setSidebarTab(_ tab: AgentSidebarTab) {
-        var next = snapshot
+        var next = currentSnapshot
         next.sidebarTab = tab
         _ = publish(next, eventName: "sessionSidebar.tab", force: false, affectsRowContent: false)
     }
@@ -122,7 +156,7 @@ final class AgentSessionSidebarUIStore: ObservableObject {
         renderedOrder: [AgentSidebarSelectionIdentity],
         workspaceID: UUID
     ) -> AgentSidebarSelectionGestureDisposition {
-        var next = selectionState
+        var next = currentSelectionState
         let disposition = next.handle(
             gesture,
             identity: identity,
@@ -134,19 +168,19 @@ final class AgentSessionSidebarUIStore: ObservableObject {
     }
 
     func selectAll(renderedOrder: [AgentSidebarSelectionIdentity], workspaceID: UUID) {
-        var next = selectionState
+        var next = currentSelectionState
         next.selectAll(renderedOrder: renderedOrder, workspaceID: workspaceID)
         publishSelection(next, eventName: "sessionSidebar.selection.selectAll")
     }
 
     func clearSelection() {
-        var next = selectionState
+        var next = currentSelectionState
         next.clear()
         publishSelection(next, eventName: "sessionSidebar.selection.clear")
     }
 
     func reconcileSelection(renderedOrder: [AgentSidebarSelectionIdentity], workspaceID: UUID?) {
-        var next = selectionState
+        var next = currentSelectionState
         next.reconcile(renderedOrder: renderedOrder, workspaceID: workspaceID)
         publishSelection(next, eventName: "sessionSidebar.selection.reconcile")
     }
@@ -158,16 +192,16 @@ final class AgentSessionSidebarUIStore: ObservableObject {
         commandProgressPlacement: AgentSidebarCommandProgressPlacement?,
         workspaceID: UUID
     ) -> UUID? {
-        guard selectionState.inFlightAction == nil, !presentationTargets.isEmpty else { return nil }
+        guard currentSelectionState.inFlightAction == nil, !presentationTargets.isEmpty else { return nil }
         switch origin {
         case .selection:
             guard commandProgressPlacement == nil,
-                  selectionState.workspaceID == workspaceID,
-                  !selectionState.selectedIdentities.isEmpty,
-                  presentationTargets.isSubset(of: selectionState.selectedIdentities)
+                  currentSelectionState.workspaceID == workspaceID,
+                  !currentSelectionState.selectedIdentities.isEmpty,
+                  presentationTargets.isSubset(of: currentSelectionState.selectedIdentities)
             else { return nil }
         case .command:
-            guard selectionState.selectedIdentities.isEmpty,
+            guard currentSelectionState.selectedIdentities.isEmpty,
                   let commandProgressPlacement
             else { return nil }
             switch commandProgressPlacement {
@@ -184,7 +218,7 @@ final class AgentSessionSidebarUIStore: ObservableObject {
         }
 
         let token = UUID()
-        var next = selectionState
+        var next = currentSelectionState
         next.workspaceID = workspaceID
         next.notice = nil
         next.inFlightAction = AgentSidebarBulkActionOperation(
@@ -201,8 +235,8 @@ final class AgentSessionSidebarUIStore: ObservableObject {
     }
 
     func isCurrentBulkAction(token: UUID, workspaceID: UUID) -> Bool {
-        selectionState.inFlightAction?.token == token
-            && selectionState.inFlightAction?.workspaceID == workspaceID
+        currentSelectionState.inFlightAction?.token == token
+            && currentSelectionState.inFlightAction?.workspaceID == workspaceID
     }
 
     func retireCommandRowProgress(
@@ -211,7 +245,7 @@ final class AgentSessionSidebarUIStore: ObservableObject {
         workspaceID: UUID
     ) {
         guard !tabIDs.isEmpty,
-              var operation = selectionState.inFlightAction,
+              var operation = currentSelectionState.inFlightAction,
               operation.token == token,
               operation.origin == .command,
               operation.commandProgressPlacement == .row,
@@ -221,7 +255,7 @@ final class AgentSessionSidebarUIStore: ObservableObject {
         else { return }
 
         operation.commandRowProgressRetired = true
-        var next = selectionState
+        var next = currentSelectionState
         next.inFlightAction = operation
         next.revision &+= 1
         publishSelection(next, eventName: "sessionSidebar.selection.commandRowProgressRetired")
@@ -229,7 +263,7 @@ final class AgentSessionSidebarUIStore: ObservableObject {
 
     func finishBulkAction(token: UUID, workspaceID: UUID, notice: AgentSidebarBulkActionNotice?) {
         guard isCurrentBulkAction(token: token, workspaceID: workspaceID) else { return }
-        var next = selectionState
+        var next = currentSelectionState
         next.inFlightAction = nil
         if next.selectedIdentities.isEmpty { next.workspaceID = nil }
         next.notice = notice
@@ -239,24 +273,24 @@ final class AgentSessionSidebarUIStore: ObservableObject {
 
     func invalidateSelectionForWorkspaceChange() {
         var next = AgentSidebarSelectionState()
-        next.revision = selectionState.revision &+ 1
+        next.revision = currentSelectionState.revision &+ 1
         publishSelection(next, eventName: "sessionSidebar.selection.workspaceChange")
     }
 
     func dismissBulkActionNotice() {
-        guard selectionState.notice != nil else { return }
-        var next = selectionState
+        guard currentSelectionState.notice != nil else { return }
+        var next = currentSelectionState
         next.notice = nil
         next.revision &+= 1
         publishSelection(next, eventName: "sessionSidebar.selection.noticeDismiss")
     }
 
     func isThreadCollapsed(_ key: AgentSidebarThreadKey) -> Bool {
-        snapshot.collapsedThreadKeys.contains(key)
+        currentSnapshot.collapsedThreadKeys.contains(key)
     }
 
     func setThreadCollapsed(_ collapsed: Bool, for key: AgentSidebarThreadKey) {
-        var next = snapshot
+        var next = currentSnapshot
         if collapsed {
             next.collapsedThreadKeys.insert(key)
         } else {
@@ -280,7 +314,7 @@ final class AgentSessionSidebarUIStore: ObservableObject {
     }
 
     func toggleGroupCollapsed(_ group: String) {
-        var next = snapshot
+        var next = currentSnapshot
         if next.collapsedSidebarGroups.remove(group) == nil {
             next.collapsedSidebarGroups.insert(group)
         }
@@ -293,7 +327,7 @@ final class AgentSessionSidebarUIStore: ObservableObject {
     }
 
     func clearCollapsedThreads() {
-        var next = snapshot
+        var next = currentSnapshot
         next.collapsedThreadKeys.removeAll()
         _ = publish(
             next,
@@ -305,7 +339,7 @@ final class AgentSessionSidebarUIStore: ObservableObject {
 
     /// Unfolds only `eligibleKeys`, so expanding one tab leaves folds made in the other tabs alone.
     func expandAllSidebarThreads(eligibleKeys: [AgentSidebarThreadKey]) {
-        var next = snapshot
+        var next = currentSnapshot
         next.collapsedThreadKeys.subtract(eligibleKeys)
         next.defaultCollapsedThreadKeysHandled.formUnion(eligibleKeys)
         _ = publish(
@@ -317,9 +351,9 @@ final class AgentSessionSidebarUIStore: ObservableObject {
     }
 
     func seedDefaultCollapsedThreads(eligibleKeys: [AgentSidebarThreadKey]) {
-        let newKeys = eligibleKeys.filter { !snapshot.defaultCollapsedThreadKeysHandled.contains($0) }
+        let newKeys = eligibleKeys.filter { !currentSnapshot.defaultCollapsedThreadKeysHandled.contains($0) }
         guard !newKeys.isEmpty else { return }
-        var next = snapshot
+        var next = currentSnapshot
         next.collapsedThreadKeys.formUnion(newKeys)
         next.defaultCollapsedThreadKeysHandled.formUnion(newKeys)
         _ = publish(
@@ -358,12 +392,12 @@ final class AgentSessionSidebarUIStore: ObservableObject {
 
     /// Stored attention state for a tab, if any.
     func attentionRunState(for tabID: UUID) -> AgentSessionRunState? {
-        snapshot.attentionRunStateByTabID[tabID]
+        currentSnapshot.attentionRunStateByTabID[tabID]
     }
 
     /// Time when the current unseen-attention state was first marked.
     func attentionMarkedAt(for tabID: UUID) -> Date? {
-        snapshot.attentionMarkedAtByTabID[tabID]
+        currentSnapshot.attentionMarkedAtByTabID[tabID]
     }
 
     /// Mark a tab as having unseen attention-worthy run state. No-op for
@@ -376,8 +410,8 @@ final class AgentSessionSidebarUIStore: ObservableObject {
         markedAt: Date = Date()
     ) -> Bool {
         guard Self.isAttentionEligible(state) else { return false }
-        if snapshot.attentionRunStateByTabID[tabID] == state { return false }
-        var next = snapshot
+        if currentSnapshot.attentionRunStateByTabID[tabID] == state { return false }
+        var next = currentSnapshot
         next.attentionRunStateByTabID[tabID] = state
         next.attentionMarkedAtByTabID[tabID] = markedAt
         // Attention badges are read by the row view and by the collapsed-descendant
@@ -393,8 +427,8 @@ final class AgentSessionSidebarUIStore: ObservableObject {
     /// Clear the unseen-attention badge for a single tab.
     @discardableResult
     func clearRunStateAttention(tabID: UUID) -> Bool {
-        guard snapshot.attentionRunStateByTabID[tabID] != nil else { return false }
-        var next = snapshot
+        guard currentSnapshot.attentionRunStateByTabID[tabID] != nil else { return false }
+        var next = currentSnapshot
         next.attentionRunStateByTabID.removeValue(forKey: tabID)
         next.attentionMarkedAtByTabID.removeValue(forKey: tabID)
         return publish(
@@ -409,7 +443,7 @@ final class AgentSessionSidebarUIStore: ObservableObject {
     @discardableResult
     func clearRunStateAttention(for tabIDs: Set<UUID>) -> Bool {
         guard !tabIDs.isEmpty else { return false }
-        var next = snapshot
+        var next = currentSnapshot
         var changed = false
         for tabID in tabIDs {
             if next.attentionRunStateByTabID.removeValue(forKey: tabID) != nil {
@@ -433,7 +467,7 @@ final class AgentSessionSidebarUIStore: ObservableObject {
     /// changed. This is the one path that legitimately invalidates row content.
     func refresh() {
         _ = publish(
-            snapshot,
+            currentSnapshot,
             eventName: "sessionSidebar.refresh",
             force: true,
             affectsRowContent: true
@@ -441,12 +475,14 @@ final class AgentSessionSidebarUIStore: ObservableObject {
     }
 
     private func publishSelection(_ next: AgentSidebarSelectionState, eventName: String) {
-        guard next != selectionState else { return }
-        selectionState = next
+        guard next != currentSelectionState else { return }
+        currentSelectionState = next
+        let published = !isPublishingPresentation && (shouldPublishPresentation?() ?? true)
+        if published { flushPresentation() }
         #if DEBUG
             perfRecorder.recordStoreUpdate(
                 eventName,
-                published: true,
+                published: published,
                 details: [
                     "revision": String(next.revision),
                     "selectedCount": String(next.selectedIdentities.count),
@@ -490,7 +526,7 @@ final class AgentSessionSidebarUIStore: ObservableObject {
         affectsRowContent: Bool
     ) -> Bool {
         var next = proposedSnapshot
-        guard force || next != snapshot else {
+        guard force || next != currentSnapshot else {
             #if DEBUG
                 perfRecorder.recordStoreUpdate("sessionSidebar", published: false)
             #endif
@@ -498,16 +534,18 @@ final class AgentSessionSidebarUIStore: ObservableObject {
         }
         next.revision &+= 1
         if affectsRowContent { next.rowContentRevision &+= 1 }
-        snapshot = next
+        currentSnapshot = next
+        let published = !isPublishingPresentation && (shouldPublishPresentation?() ?? true)
+        if published { flushPresentation() }
         #if DEBUG
             perfRecorder.recordStoreUpdate(
                 eventName,
-                published: true,
+                published: published,
                 details: [
-                    "revision": String(snapshot.revision),
-                    "visibleSessionCount": String(snapshot.visibleSessionCount),
-                    "collapsedThreadCount": String(snapshot.collapsedThreadKeys.count),
-                    "attentionCount": String(snapshot.attentionRunStateByTabID.count)
+                    "revision": String(currentSnapshot.revision),
+                    "visibleSessionCount": String(currentSnapshot.visibleSessionCount),
+                    "collapsedThreadCount": String(currentSnapshot.collapsedThreadKeys.count),
+                    "attentionCount": String(currentSnapshot.attentionRunStateByTabID.count)
                 ]
             )
         #endif

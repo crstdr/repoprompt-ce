@@ -463,7 +463,7 @@ extension AgentModeViewModel {
         let restorePresentation = sidebarRestorePresentationKey
         let cacheKey = SidebarSessionRowsCacheKey(
             workspaceID: workspaceID,
-            rowContentRevision: ui.sessionSidebar.snapshot.rowContentRevision,
+            rowContentRevision: ui.sessionSidebar.currentSnapshot.rowContentRevision,
             tabMetadataSignatures: makeSessionSidebarTabMetadataSignatures(for: tabs),
             restorePresentation: restorePresentation
         )
@@ -546,7 +546,7 @@ extension AgentModeViewModel {
         guard searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
         let canonicalRows = sidebarSessions(for: tabs)
         guard !canonicalRows.isEmpty else { return [] }
-        let tab = ui.sessionSidebar.snapshot.sidebarTab
+        let tab = ui.sessionSidebar.currentSnapshot.sidebarTab
         if tab == .overseers {
             return sidebarOverseerPresentation(
                 canonicalRows,
@@ -809,7 +809,7 @@ extension AgentModeViewModel {
         #if DEBUG
             let startMS = perfRecorder.timestampMSIfEnabled()
         #endif
-        if ui.sessionSidebar.snapshot.sidebarTab == .overseers {
+        if ui.sessionSidebar.currentSnapshot.sidebarTab == .overseers {
             return sidebarOverseerPresentation(
                 canonicalSessions,
                 liveRelations: sidebarLiveOverseerRelations(),
@@ -818,7 +818,7 @@ extension AgentModeViewModel {
             ).orderedUniqueSessions
         }
         // The All tab passes rows through untouched; other tabs narrow them before search.
-        let sortedSessions = sidebarRows(canonicalSessions, in: ui.sessionSidebar.snapshot.sidebarTab)
+        let sortedSessions = sidebarRows(canonicalSessions, in: ui.sessionSidebar.currentSnapshot.sidebarTab)
         let source = diagnosticSource.isEmpty ? "unknown" : diagnosticSource
         let effectiveSearchText = searchText
         let searchTrimmed = effectiveSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -948,7 +948,7 @@ extension AgentModeViewModel {
         } else {
             sidebarSearchFieldsMemo.removeAll(keepingCapacity: true)
         }
-        let snapshot = ui.sessionSidebar.snapshot
+        let snapshot = ui.sessionSidebar.currentSnapshot
         return AgentSidebarOverseerSectionBuilder.build(
             rows: canonicalRows,
             relations: sidebarOverseerRelations(for: canonicalRows, liveRelations: liveRelations),
@@ -964,7 +964,7 @@ extension AgentModeViewModel {
     func sidebarRows(_ rows: [SidebarSession], in tab: AgentSidebarTab) -> [SidebarSession] {
         guard tab != .all else { return rows }
         let needsUser: Set<UUID> = tab == .active
-            ? Set(ui.sessionSidebar.snapshot.attentionRunStateByTabID.compactMap { tabID, state in
+            ? Set(ui.sessionSidebar.currentSnapshot.attentionRunStateByTabID.compactMap { tabID, state in
                 AgentSessionSidebarUIStore.needsUser(state) ? tabID : nil
             })
             : []
@@ -1031,7 +1031,7 @@ extension AgentModeViewModel {
         in rows: [SidebarSession],
         searchText: String
     ) -> Set<AgentSidebarThreadKey> {
-        let snapshot = ui.sessionSidebar.snapshot
+        let snapshot = ui.sessionSidebar.currentSnapshot
         let pendingDefaults = defaultCollapsedSidebarThreadKeys(in: rows, searchText: searchText)
             .filter { !snapshot.defaultCollapsedThreadKeysHandled.contains($0) }
         guard !pendingDefaults.isEmpty else { return snapshot.collapsedThreadKeys }
@@ -1048,7 +1048,7 @@ extension AgentModeViewModel {
             let startMS = perfRecorder.timestampMSIfEnabled()
         #endif
         let isSearching = !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        let sidebarTab = ui.sessionSidebar.snapshot.sidebarTab
+        let sidebarTab = ui.sessionSidebar.currentSnapshot.sidebarTab
         let source = diagnosticSource.isEmpty ? "unknown" : diagnosticSource
         let collapsedThreadKeys = effectiveCollapsedSidebarThreadKeys(in: rows, searchText: searchText)
         guard !rows.isEmpty else {
@@ -1092,7 +1092,7 @@ extension AgentModeViewModel {
         // run-state attention badge. If a collapsed parent hides a descendant
         // that needs attention, we surface that on the parent's collapsed-
         // count chip.
-        let attentionByTabID = ui.sessionSidebar.snapshot.attentionRunStateByTabID
+        let attentionByTabID = ui.sessionSidebar.currentSnapshot.attentionRunStateByTabID
         var subtreeAttentionCounts = rows.map { row in
             attentionByTabID[row.tabID] != nil ? 1 : 0
         }
@@ -1270,7 +1270,7 @@ extension AgentModeViewModel {
         currentTabID: UUID?,
         visibleSessionCount: Int? = nil
     ) -> Int {
-        guard ui.sessionSidebar.snapshot.sidebarTab != .overseers else { return filteredSessions.count }
+        guard ui.sessionSidebar.currentSnapshot.sidebarTab != .overseers else { return filteredSessions.count }
         #if DEBUG
             let startMS = perfRecorder.timestampMSIfEnabled()
         #endif
@@ -1360,7 +1360,7 @@ extension AgentModeViewModel {
         visibleSessionCount: Int? = nil
     ) -> [SidebarSession] {
         // The Overseers tab is small and grouped; paging would split children from their overseer.
-        guard ui.sessionSidebar.snapshot.sidebarTab != .overseers else { return filteredSessions }
+        guard ui.sessionSidebar.currentSnapshot.sidebarTab != .overseers else { return filteredSessions }
         let activeIndex = currentTabID.flatMap { tabID in filteredSessions.firstIndex { $0.tabID == tabID } }
         return Self.sidebarPageRows(
             containingUnpinned: max(0, visibleSessionCount ?? sessionSidebarVisibleSessionCount),
@@ -1453,10 +1453,10 @@ extension AgentModeViewModel {
     /// Displayed order for the selected tab. The Overseers tab's rows are already in first-occurrence
     /// display order; every other tab renders through the group/date sections.
     func sidebarDisplayOrder(_ rows: [SidebarSession], searchText: String) -> [SidebarSession] {
-        guard ui.sessionSidebar.snapshot.sidebarTab != .overseers else { return rows }
+        guard ui.sessionSidebar.currentSnapshot.sidebarTab != .overseers else { return rows }
         return Self.sidebarDisplayOrder(
             rows,
-            collapsedGroups: ui.sessionSidebar.snapshot.collapsedSidebarGroups,
+            collapsedGroups: ui.sessionSidebar.currentSnapshot.collapsedSidebarGroups,
             searchText: searchText
         )
     }
@@ -1477,7 +1477,7 @@ extension AgentModeViewModel {
 
     func toggleSidebarGroupCollapsed(_ group: String) {
         // Groups are temporarily expanded during search; do not invert a hidden saved preference.
-        guard ui.sessionSidebar.snapshot.searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        guard ui.sessionSidebar.currentSnapshot.searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         ui.sessionSidebar.toggleGroupCollapsed(group)
     }
 
@@ -1532,7 +1532,7 @@ extension AgentModeViewModel {
         return Self.nextAttentionSidebarSessionTabID(
             from: activeTabID,
             orderedTabIDs: displayed + rows.map(\.tabID).filter { !displayedSet.contains($0) },
-            needingAttention: Set(ui.sessionSidebar.snapshot.attentionRunStateByTabID.keys)
+            needingAttention: Set(ui.sessionSidebar.currentSnapshot.attentionRunStateByTabID.keys)
         )
     }
 
