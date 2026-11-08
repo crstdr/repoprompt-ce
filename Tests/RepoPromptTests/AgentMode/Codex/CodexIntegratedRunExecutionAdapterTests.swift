@@ -850,6 +850,7 @@ private final class MCPApprovalWireRecorder: @unchecked Sendable {
         lock.withLock { recordedActions }
     }
 }
+
 final class CodexContextWindowConfigurationTests: XCTestCase {
     func testPresetOverridesArePairedAndDefaultIsEmpty() {
         XCTAssertTrue(CodexContextWindowPreferences.overrides(.codexDefault).isEmpty)
