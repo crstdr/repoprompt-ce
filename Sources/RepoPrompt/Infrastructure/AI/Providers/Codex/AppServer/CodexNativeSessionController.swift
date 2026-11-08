@@ -2854,7 +2854,9 @@ final class CodexNativeSessionController {
             #if DEBUG
                 let shutdownStartMS = perfRecorder.timestampMSIfEnabled()
             #endif
+            AgentSessionLinkCatalogDiagnostics.retireStage(.clientStop, begin: true)
             await client.stop()
+            AgentSessionLinkCatalogDiagnostics.retireStage(.clientStop, begin: false)
             #if DEBUG
                 await recordLifecyclePhase(
                     .shutdown,

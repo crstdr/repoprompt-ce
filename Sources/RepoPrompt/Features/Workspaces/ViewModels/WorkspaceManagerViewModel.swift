@@ -13413,7 +13413,13 @@ class WorkspaceManagerViewModel: ObservableObject {
         if allowRetainedAgentAdmissionRecoveryRetry,
            agentAdmissionRecoveryOwnsWorkspace(workspaceID)
         {
+            if source == WorkspaceSaveSource("oversightLaneRetirement") {
+                AgentSessionLinkCatalogDiagnostics.retireStage(.saveAdmission, begin: true, workspaceID: workspaceID)
+            }
             _ = await domainAuthorityAdmissionIssue(for: workspaceID)
+            if source == WorkspaceSaveSource("oversightLaneRetirement") {
+                AgentSessionLinkCatalogDiagnostics.retireStage(.saveAdmission, begin: false, workspaceID: workspaceID)
+            }
         }
         guard !Task.isCancelled else {
             return .rejected(reason: "own_save_cancelled", category: .cancelled)
@@ -13447,8 +13453,18 @@ class WorkspaceManagerViewModel: ObservableObject {
             ownSaveDidRegisterHandlerForTesting?(workspaceID, predecessors.count)
         #endif
         do {
-            for predecessor in predecessors {
-                try await Self.awaitOwnSaveCompletion(predecessor)
+            if source == WorkspaceSaveSource("oversightLaneRetirement") {
+                AgentSessionLinkCatalogDiagnostics.retireStage(.savePredecessors, begin: true, workspaceID: workspaceID)
+            }
+            do {
+                defer {
+                    if source == WorkspaceSaveSource("oversightLaneRetirement") {
+                        AgentSessionLinkCatalogDiagnostics.retireStage(.savePredecessors, begin: false, workspaceID: workspaceID)
+                    }
+                }
+                for predecessor in predecessors {
+                    try await Self.awaitOwnSaveCompletion(predecessor)
+                }
             }
             try Task.checkCancellation()
             return await pollAndSaveStateWithOutcomeAsync(

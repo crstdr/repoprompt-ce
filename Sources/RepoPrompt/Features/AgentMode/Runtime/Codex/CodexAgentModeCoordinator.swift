@@ -12849,7 +12849,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 includesComputerUse: includesComputerUse
             )
         }
+        let retiringSessionID = session.activeAgentSessionID
+        AgentSessionLinkCatalogDiagnostics.retireStage(.codexJoin, begin: true, sessionID: retiringSessionID, tabID: session.tabID)
         await awaitCodexControllerRetirement(for: session.tabID)
+        AgentSessionLinkCatalogDiagnostics.retireStage(.codexJoin, begin: false, sessionID: retiringSessionID, tabID: session.tabID)
         if reclaimOnlyIfStillIdle {
             // Idle reclaim races live submission: a follow-up that started while
             // the retirement drained owns the tab now, and it may have reused
