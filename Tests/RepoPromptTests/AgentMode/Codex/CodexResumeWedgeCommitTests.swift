@@ -2386,7 +2386,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
             isCurrentOwner: { _ in true },
             hasActiveTools: { _ in false },
             support: { .codex },
-            dispatch: { id, _, admissible in
+            dispatch: { id, _, admissible, _ in
                 let result = await fixture.coordinator.startOversightCompaction(
                     session: fixture.session,
                     expectedThreadID: Self.oldThreadID,
