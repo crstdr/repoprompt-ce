@@ -243,6 +243,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     }
 
     private func freezeForTermination() {
+        CatalogPerfHeartbeat.shutdownStallSampling()
         // 1) Signal termination FIRST to prevent observation crashes.
         // This stops SwiftUI from trying to update views with deallocated objects
         // during the shutdown sequence (fixes EXC_BAD_ACCESS in ObservationRegistrar).
@@ -256,6 +257,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     }
 
     private func prepareForTermination() async {
+        await CatalogPerfHeartbeat.settleStallSamplingForTermination()
         if !AppLaunchConfiguration.current.suppressesWindowPersistence {
             await WindowStatesManager.shared.persistWindowSessionImmediately(reason: "appShouldTerminate")
         }
@@ -290,6 +292,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        CatalogPerfHeartbeat.shutdownStallSampling()
         print("Application is terminating...")
 
         // Defensive fallback: ensure termination flag is set and session is persisted.
