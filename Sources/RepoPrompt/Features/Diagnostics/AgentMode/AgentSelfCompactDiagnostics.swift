@@ -366,18 +366,24 @@ enum AgentSelfCompactDiagnostics {
         private let lock = NSLock()
         private var times: [UUID: ContinuousClock.Instant] = [:]
         func park(_ id: UUID) {
-            lock.lock(); defer { lock.unlock() }
+            lock.lock()
+            defer { lock.unlock() }
             times[id] = .now
         }
+
         func contains(_ id: UUID) -> Bool {
-            lock.lock(); defer { lock.unlock() }
+            lock.lock()
+            defer { lock.unlock() }
             return times[id] != nil
         }
+
         func take(_ id: UUID) -> ContinuousClock.Instant? {
-            lock.lock(); defer { lock.unlock() }
+            lock.lock()
+            defer { lock.unlock() }
             return times.removeValue(forKey: id)
         }
     }
+
     private static let parkedTimes = ParkTimes()
 
     static func parked(attempt: AgentSelfCompactAttempt, reason: String) {
@@ -401,8 +407,12 @@ enum AgentSelfCompactDiagnostics {
             let components = start.duration(to: .now).components
             return Int(components.seconds * 1000 + components.attoseconds / 1_000_000_000_000_000)
         }
-        continuation(attempt: attempt, phase: .delivered,
-                     elapsedMilliseconds: elapsed, deliverySource: source.rawValue)
+        continuation(
+            attempt: attempt,
+            phase: .delivered,
+            elapsedMilliseconds: elapsed,
+            deliverySource: source.rawValue
+        )
     }
 
     enum DeliverySource: String {

@@ -126,16 +126,32 @@ final class AgentSelfCompactNativeCompletionTests: XCTestCase {
     }
 
     #if DEBUG
-    func testNoteDispatchOutcomesPreserveParkingAndAreLogged() async {
-        let refusals: [AgentSelfCompactNativeCompletionCoordinator.NoteDispatchOutcome] = [
-            .claimRefused, .claimLost, .targetUnavailable, .staleTarget, .superseded,
-            .ownershipLost, .workspaceMismatch, .queuedProviderWork, .saveFailed, .startRefused,
-            .viewModelUnavailable, .admissibilityLost, .notReady(.targetNotIdle)
-        ]
-        for refusal in refusals {
+        func testNoteDispatchOutcomesPreserveParkingAndAreLogged() async {
+            let refusals: [AgentSelfCompactNativeCompletionCoordinator.NoteDispatchOutcome] = [
+                .claimRefused, .claimLost, .targetUnavailable, .staleTarget, .superseded,
+                .ownershipLost, .workspaceMismatch, .queuedProviderWork, .saveFailed, .startRefused,
+                .viewModelUnavailable, .admissibilityLost, .notReady(.targetNotIdle)
+            ]
+            for refusal in refusals {
+                let fake = Fake()
+                fake.shouldStartNote = false
+                fake.refusal = refusal
+                let id = fake.arm()
+                let coordinator = fake.coordinator()
+                AgentSelfCompactDiagnostics.beginCaptureForTesting()
+                XCTAssertTrue(coordinator.bindCompact(.init(requestID: id, stage: .compact), runID: fake.compactRunID, runAttemptID: fake.compactAttemptID))
+                coordinator.compactTurnSettled(revision: fake.completeRevision(status: .completed), publication: .accepted(successorEpoch: nil), teardownSettled: { true })
+                await drain()
+                let records = AgentSelfCompactDiagnostics.endCaptureForTesting()
+                XCTAssertEqual(fake.state.active?.phase, .parked, "\(refusal)")
+                XCTAssertTrue(records.contains { $0.phase == "note_dispatch" && $0.outcome == refusal.label })
+                XCTAssertTrue(records.contains { $0.phase == "parked" && $0.outcome == refusal.label })
+                coordinator.cancelRuntimeWork()
+            }
+        }
+
+        func testStartedNoteDispatchIsLogged() async {
             let fake = Fake()
-            fake.shouldStartNote = false
-            fake.refusal = refusal
             let id = fake.arm()
             let coordinator = fake.coordinator()
             AgentSelfCompactDiagnostics.beginCaptureForTesting()
@@ -143,26 +159,10 @@ final class AgentSelfCompactNativeCompletionTests: XCTestCase {
             coordinator.compactTurnSettled(revision: fake.completeRevision(status: .completed), publication: .accepted(successorEpoch: nil), teardownSettled: { true })
             await drain()
             let records = AgentSelfCompactDiagnostics.endCaptureForTesting()
-            XCTAssertEqual(fake.state.active?.phase, .parked, "\(refusal)")
-            XCTAssertTrue(records.contains { $0.phase == "note_dispatch" && $0.outcome == refusal.label })
-            XCTAssertTrue(records.contains { $0.phase == "parked" && $0.outcome == refusal.label })
+            XCTAssertTrue(records.contains { $0.phase == "note_dispatch" && $0.outcome == "started" })
+            XCTAssertEqual(fake.state.latest?.outcome, .noteAccepted)
             coordinator.cancelRuntimeWork()
         }
-    }
-
-    func testStartedNoteDispatchIsLogged() async {
-        let fake = Fake()
-        let id = fake.arm()
-        let coordinator = fake.coordinator()
-        AgentSelfCompactDiagnostics.beginCaptureForTesting()
-        XCTAssertTrue(coordinator.bindCompact(.init(requestID: id, stage: .compact), runID: fake.compactRunID, runAttemptID: fake.compactAttemptID))
-        coordinator.compactTurnSettled(revision: fake.completeRevision(status: .completed), publication: .accepted(successorEpoch: nil), teardownSettled: { true })
-        await drain()
-        let records = AgentSelfCompactDiagnostics.endCaptureForTesting()
-        XCTAssertTrue(records.contains { $0.phase == "note_dispatch" && $0.outcome == "started" })
-        XCTAssertEqual(fake.state.latest?.outcome, .noteAccepted)
-        coordinator.cancelRuntimeWork()
-    }
 
     #endif
 

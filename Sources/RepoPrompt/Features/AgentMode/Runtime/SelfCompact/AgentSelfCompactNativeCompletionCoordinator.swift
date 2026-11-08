@@ -45,6 +45,7 @@ final class AgentSelfCompactNativeCompletionCoordinator {
             }
         }
     }
+
     typealias NoteDispatch = @MainActor (
         _ requestID: UUID,
         _ stillAdmissible: @escaping @MainActor () -> Bool
