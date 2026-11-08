@@ -1097,7 +1097,7 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             let outcome = await send.value
             if drift {
                 XCTAssertFalse(outcome.didSend)
-                XCTAssertTrue(fixture.startedTurns.isEmpty, "No controller transport may follow frozen composition drift during proof")
+                XCTAssertTrue(fixture.startedTurns.isEmpty, "No controller transport may follow postacquisition composition drift")
                 XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .sending)
                 XCTAssertEqual(session.pendingHandoff.payload, payload)
                 XCTAssertFalse(session.items.contains { $0.recoveryDiagnostic?.outcome == "sent" })
