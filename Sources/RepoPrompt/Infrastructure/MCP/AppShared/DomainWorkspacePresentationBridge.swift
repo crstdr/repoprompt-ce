@@ -370,7 +370,8 @@ private extension DomainCommandOutcome {
 }
 
 @MainActor
-private enum CatalogPerfHeartbeat {
+enum CatalogPerfHeartbeat {
+    private static let stallWatchdog = CatalogPerfStallWatchdog.makeProduction()
     private static var task: Task<Void, Never>?
     private static var leases = 0
 
@@ -380,9 +381,22 @@ private enum CatalogPerfHeartbeat {
         }
     #endif
 
+    static func shutdownStallSampling() {
+        stallWatchdog.shutdown()
+    }
+
+    static func settleStallSamplingForTermination() async {
+        await stallWatchdog.settleForTermination()
+    }
+
     static func start() {
         leases += 1
         guard task == nil else { return }
+        if !AppLaunchConfiguration.isUnitTestProcess,
+           !AppLaunchConfiguration.current.suppressesNonessentialLaunchSideEffects
+        {
+            stallWatchdog.setActive(true)
+        }
         task = Task {
             let interval: UInt64 = 10_000_000
             var previous = DispatchTime.now().uptimeNanoseconds
@@ -405,6 +419,7 @@ private enum CatalogPerfHeartbeat {
     static func stop() {
         leases -= 1
         if leases == 0 {
+            stallWatchdog.setActive(false)
             task?.cancel()
             task = nil
         }
