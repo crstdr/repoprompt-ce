@@ -677,7 +677,7 @@ final class AgentSessionLinkACPRunnerPromptAdapterTests: XCTestCase {
             store: { session.selfCompactState = $0 },
             isCurrentOwner: { _ in isCurrent() },
             dispatchNote: { _, _ in XCTFail("No second note dispatch")
-                return false
+                return .startRefused
             }
         )
         defer {

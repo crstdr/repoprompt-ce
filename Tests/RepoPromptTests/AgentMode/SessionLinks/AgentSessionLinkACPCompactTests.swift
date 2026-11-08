@@ -536,7 +536,7 @@ final class AgentSessionLinkACPCompactRunnerTests: XCTestCase {
             store: { fixture.session.selfCompactState = $0 },
             isCurrentOwner: { _ in true },
             dispatchNote: { _, _ in XCTFail("Failed command must not send the note")
-                return false
+                return .startRefused
             }
         )
         fixture.session.selfCompactNativeCompletion = coordinator

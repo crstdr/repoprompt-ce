@@ -40,9 +40,16 @@ enum AgentSelfCompactParkedPrefix {
 
     @MainActor
     @discardableResult
-    static func markAccepted(_ dispatchID: AgentSelfCompactionDispatchID, session: AgentTabSession) -> Bool {
+    static func markAccepted(
+        _ dispatchID: AgentSelfCompactionDispatchID, session: AgentTabSession,
+        source: AgentSelfCompactDiagnostics.DeliverySource = .unknown
+    ) -> Bool {
         var state = session.selfCompactState
+        let attempt = state.active
         guard state.noteAccepted(dispatchID) else { return false }
+        if let attempt, AgentSelfCompactDiagnostics.wasParked(attempt) {
+            AgentSelfCompactDiagnostics.delivered(attempt: attempt, source: source)
+        }
         session.selfCompactState = state
         session.appendItem(
             AgentChatItem.selfCompactionNoteRestored(sequenceIndex: session.nextSequenceIndex)

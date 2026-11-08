@@ -309,6 +309,7 @@ struct AgentSelfCompactState: Codable, Equatable {
         else { return false }
         active?.phase = .parked
         active?.noteDispatchStarted = false
+        if let attempt = active { AgentSelfCompactDiagnostics.parked(attempt: attempt, reason: "physical_dispatch_not_attempted") }
         return true
     }
 
@@ -324,6 +325,7 @@ struct AgentSelfCompactState: Codable, Equatable {
             )
         } else {
             active?.phase = .parked
+            if let attempt = active { AgentSelfCompactDiagnostics.parked(attempt: attempt, reason: "transport_not_attempted") }
         }
         return true
     }
@@ -335,6 +337,9 @@ struct AgentSelfCompactState: Codable, Equatable {
         at date: Date = Date()
     ) {
         guard let active else { return }
+        if noteDelivery != .accepted, noteDelivery != .prepended {
+            AgentSelfCompactDiagnostics.release(attempt: active)
+        }
         latest = AgentSelfCompactSettlement(
             requestID: active.id,
             idempotencyKey: active.idempotencyKey,
@@ -388,6 +393,7 @@ struct AgentSelfCompactState: Codable, Equatable {
                 active?.acpCompletionUnverified = true
             }
             active?.phase = .parked
+            if let attempt = active { AgentSelfCompactDiagnostics.parked(attempt: attempt, reason: "runtime_teardown") }
         }
         return true
     }
