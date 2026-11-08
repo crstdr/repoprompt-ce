@@ -434,6 +434,38 @@ import RepoPromptSettingsCore
             XCTAssertEqual(state.running, 1) // Deadline does not pretend cleanup settled.
         }
 
+        func testAutomaticOffHasNoTimerOrPollingUntilActivation() async {
+            let fixture = DriverFixture()
+            let watchdog = CatalogPerfStallWatchdog(
+                automatic: true, clock: { fixture.now }, enabled: { fixture.readPreference() },
+                heartbeat: { _ in }, sample: { _ in XCTFail("unexpected sampling")
+                    return nil
+                }, publish: { _ in }
+            )
+            watchdog.setActive(true)
+            var hasTimer = await watchdog.hasTimerForTesting()
+            XCTAssertFalse(hasTimer)
+            XCTAssertEqual(fixture.preferenceReadCount, 1)
+            fixture.advance(to: 0.1, enabled: true)
+            hasTimer = await watchdog.hasTimerForTesting()
+            XCTAssertFalse(hasTimer)
+            XCTAssertEqual(fixture.preferenceReadCount, 1) // No polling discovers the new value.
+            watchdog.setActive(true)
+            hasTimer = await watchdog.hasTimerForTesting()
+            XCTAssertTrue(hasTimer)
+            XCTAssertEqual(fixture.preferenceReadCount, 2)
+            fixture.advance(to: 1, enabled: false)
+            _ = await watchdog.tickForTesting()
+            hasTimer = await watchdog.hasTimerForTesting()
+            XCTAssertFalse(hasTimer) // Opt-out also stops an already-running monitor.
+            let readsAtOptOut = fixture.preferenceReadCount
+            fixture.advance(to: 2, enabled: true)
+            hasTimer = await watchdog.hasTimerForTesting()
+            XCTAssertFalse(hasTimer)
+            XCTAssertEqual(fixture.preferenceReadCount, readsAtOptOut)
+            watchdog.shutdown()
+        }
+
         func testDefaultOffAndCancelledFakeDriverCannotPublishAfterReenable() async {
             let fixture = DriverFixture()
             let watchdog = CatalogPerfStallWatchdog(
@@ -745,6 +777,17 @@ import RepoPromptSettingsCore
             private let lock = NSLock()
             private var time: TimeInterval = 0
             private var optIn = false
+            private var preferenceReads = 0
+            var preferenceReadCount: Int {
+                lock.withLock { preferenceReads }
+            }
+
+            func readPreference() -> Bool {
+                lock.withLock { preferenceReads += 1
+                    return optIn
+                }
+            }
+
             private var ticket: CatalogPerfStallWatchdog.Ticket?
             private var continuation: CheckedContinuation<Data?, Never>?
             private var publications = 0

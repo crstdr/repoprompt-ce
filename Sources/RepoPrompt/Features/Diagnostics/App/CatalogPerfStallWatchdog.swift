@@ -3,7 +3,8 @@ import Foundation
 /// Diagnostic only: the existing CatalogPerf heartbeat and ten-second emission are unchanged.
 /// All mutable state, preference reads and timer work belong to `queue`, never MainActor.
 final class CatalogPerfStallWatchdog: @unchecked Sendable {
-    /// Private opt-in, absent means OFF. Only Cristian sets it:
+    /// Private opt-in, absent means OFF with no timer or polling. Enable takes effect at the next app activation.
+    /// Only Cristian sets it:
     /// defaults write com.pvncher.repoprompt.ce CatalogPerfStallSamplingEnabled -bool true
     static let preferenceKey = "CatalogPerfStallSamplingEnabled"
     /// The existing heartbeat lease owner constructs and retains the production monitor.
@@ -198,12 +199,17 @@ final class CatalogPerfStallWatchdog: @unchecked Sendable {
     func setActive(_ active: Bool) {
         queue.async { [self] in
             perform(state.configure(active: active, enabled: state.enabled))
-            if active, !state.terminated, timer == nil, automatic {
-                let source = DispatchSource.makeTimerSource(queue: queue)
-                source.schedule(deadline: .now(), repeating: .milliseconds(500), leeway: .milliseconds(5))
-                source.setEventHandler { [weak self] in self?.tick() }
-                timer = source
-                source.resume()
+            if active, !state.terminated {
+                let optIn = enabled()
+                configureOptIn(optIn)
+                lastPreferenceRead = clock()
+                if optIn, timer == nil, automatic {
+                    let source = DispatchSource.makeTimerSource(queue: queue)
+                    source.schedule(deadline: .now(), repeating: .milliseconds(50), leeway: .milliseconds(5))
+                    source.setEventHandler { [weak self] in self?.tick() }
+                    timer = source
+                    source.resume()
+                }
             } else if !active {
                 timer?.cancel()
                 timer = nil
@@ -256,8 +262,11 @@ final class CatalogPerfStallWatchdog: @unchecked Sendable {
     }
 
     private func configureOptIn(_ optIn: Bool, firstRead: Bool = false) {
-        if optIn != state.enabled || firstRead {
-            let interval: DispatchTimeInterval = .milliseconds(optIn ? 50 : 500)
+        if !optIn {
+            timer?.cancel()
+            timer = nil
+        } else if optIn != state.enabled || firstRead {
+            let interval: DispatchTimeInterval = .milliseconds(50)
             timer?.schedule(deadline: .now() + interval, repeating: interval, leeway: .milliseconds(5))
         }
         perform(state.configure(active: state.active, enabled: optIn))
@@ -309,6 +318,12 @@ final class CatalogPerfStallWatchdog: @unchecked Sendable {
     }
 
     #if DEBUG
+        func hasTimerForTesting() async -> Bool {
+            await withCheckedContinuation { continuation in
+                queue.async { continuation.resume(returning: self.timer != nil) }
+            }
+        }
+
         func joinForTesting() async {
             await withCheckedContinuation { continuation in
                 queue.async {
