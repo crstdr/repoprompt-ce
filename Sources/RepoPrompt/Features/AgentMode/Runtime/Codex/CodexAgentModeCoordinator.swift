@@ -8421,8 +8421,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                               computerUseActivationID == nil || (session.codexControllerFeatureState?.computerUseEnabled == true && computerUseAdmissionMessage(session: session) == nil),
                               isSelfNote || viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) == true
                         else { throw CancellationError() }
-                        // Read proof may suspend. Assert the same frozen switch evidence at this
-                        // final synchronous release fence, never re-fit it.
+                        // Read proof may suspend. Assert the same frozen switch
+                        // evidence again at this final synchronous release fence, never re-fit it.
                         guard viewModel?.providerSwitchAcquirePhysicalDispatch(session: session, dispatchID: promptDispatchID)
                             ?? (session.pendingHandoff.providerSwitchDelivery == nil)
                         else { throw CancellationError() }
