@@ -51,6 +51,21 @@ import XCTest
             }
         }
 
+        func testHeartbeatEmitterKeepsRunningWithoutCatalogEvents() async throws {
+            try await Fixture.run { f in
+                let window = f.makeWindow()
+                _ = try await f.awaitCatalogProjection(window)
+                let before = await f.runtime.workspaceStore.snapshot()
+                let emission = expectation(description: "elapsed-time heartbeat emission without catalog events")
+                let observation = CatalogPerf.shared.observeEmissionsForTesting { _ in emission.fulfill() }
+                defer { observation.cancel() }
+                await fulfillment(of: [emission], timeout: 15)
+                let after = await f.runtime.workspaceStore.snapshot()
+                XCTAssertEqual(after.publicationSequence, before.publicationSequence)
+                XCTAssertGreaterThan(DomainWorkspacePresentationBridge.heartbeatLeaseCountForTesting, 0)
+            }
+        }
+
         func testCatalogPerfCountsForeignWorkingCommits() async throws {
             CatalogPerf.shared.setSuppressAutomaticEmissionForTesting(true)
             defer {
@@ -4306,6 +4321,539 @@ import XCTest
                     XCTAssertEqual(manager.workspaces, models)
                 }
             }
+        }
+
+        private func applyCut2Catalog(_ manager: WorkspaceManagerViewModel, snapshot: DomainWorkspaceCatalogSnapshot, models: [WorkspaceModel]) throws {
+            XCTAssertNotNil(manager.applyDomainWorkspaceCatalog(snapshot, projection: .full(models), preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata).receipt)
+        }
+
+        private func commitCut2Workspace(_ edited: WorkspaceModel, fixture f: Fixture) async throws -> (DomainWorkspaceCatalogSnapshot, [WorkspaceModel]) {
+            let before = await f.runtime.workspaceStore.workspaceSnapshot(edited.id)
+            let revision = try XCTUnwrap(before).revisions.workingRevision
+            let author = DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: -9999)
+            let outcome = try await author.replaceWorkingFailClosed(edited, fileURL: f.workspaceURL(for: edited), expectedWorkspaceRevision: revision)
+            XCTAssertEqual(outcome.disposition, .applied)
+            let snapshot = await f.runtime.workspaceStore.snapshot()
+            return try (snapshot, f.decoded(snapshot))
+        }
+
+        func testCut2ZeroOneCarrierIndexesAndAdoptionMatchFullRebuild() async throws {
+            let seeds = Self.cut2Seeds()
+            try await Fixture.run(seeds: seeds) { f in
+                let initial = await f.runtime.workspaceStore.snapshot()
+                let models = try f.decoded(initial)
+                let optimized = f.makeManager(), reference = f.makeManager()
+                reference.test_forceFullCatalogCarrierIndexes = true
+                for manager in [optimized, reference] {
+                    try applyCut2Catalog(manager, snapshot: initial, models: models)
+                }
+                let zero = optimized.test_catalogCarrierZero
+                for manager in [optimized, reference] {
+                    try applyCut2Catalog(manager, snapshot: initial, models: models)
+                }
+                XCTAssertEqual(optimized.test_catalogCarrierZero, zero + 1)
+                XCTAssertTrue(optimized.test_carrierIndexesEqual(to: reference))
+                let oldGenerations = Dictionary(uniqueKeysWithValues: initial.workspaces.map { record in
+                    (record.document.workspaceID, optimized.adoptedFullDocumentGeneration(workspaceID: record.document.workspaceID, contentDigest: record.document.contentDigest))
+                })
+                var edited = seeds[1]
+                edited.composeTabs[0].activeAgentSessionID = AgentSeedCollectorTestSupport.user(900).id
+                edited.composeTabs[1] = ComposeTabState(id: AgentSeedCollectorTestSupport.user(901).id, name: "Replacement", activeAgentSessionID: AgentSeedCollectorTestSupport.user(902).id)
+                let stashed = edited.composeTabs.removeLast()
+                edited.stashedTabs = [StashedTab(tab: stashed)]
+                let (next, nextModels) = try await commitCut2Workspace(edited, fixture: f)
+                let one = optimized.test_catalogCarrierOne
+                for manager in [optimized, reference] {
+                    try applyCut2Catalog(manager, snapshot: next, models: nextModels)
+                }
+                XCTAssertEqual(optimized.test_catalogCarrierOne, one + 1)
+                XCTAssertTrue(optimized.test_carrierIndexesEqual(to: reference))
+                XCTAssertEqual(optimized.workspaces, reference.workspaces)
+                XCTAssertEqual(optimized.workspaceChooserPresentation, reference.workspaceChooserPresentation)
+                XCTAssertEqual(optimized.activeWorkspaceID, reference.activeWorkspaceID)
+                for record in next.workspaces {
+                    let id = record.document.workspaceID
+                    let generation = try XCTUnwrap(optimized.adoptedFullDocumentGeneration(workspaceID: id, contentDigest: record.document.contentDigest))
+                    XCTAssertEqual(generation, reference.adoptedFullDocumentGeneration(workspaceID: id, contentDigest: record.document.contentDigest))
+                    let old = try XCTUnwrap(oldGenerations[id] ?? nil)
+                    XCTAssertEqual(generation, old + (id == edited.id ? 1 : 0), "Adoption invalidation must remain exact")
+                }
+            }
+        }
+
+        func testCut2ActualLifecycleOverlayUsesFinalRowsAndMultipleFinalChangesFallBack() async throws {
+            for duplicateStash in [false, true] {
+                let seeds = Self.cut2Seeds()
+                try await Fixture.run(seeds: seeds) { f in
+                    let initial = await f.runtime.workspaceStore.snapshot()
+                    let models = try f.decoded(initial)
+                    let optimized = f.makeManager(), reference = f.makeManager()
+                    reference.test_forceFullCatalogCarrierIndexes = true
+                    var overlayID: UUID?
+                    for manager in [optimized, reference] {
+                        try applyCut2Catalog(manager, snapshot: initial, models: models)
+                        let index = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == seeds[2].id })
+                        manager.workspaces[index].composeTabs[0].activeAgentSessionID = AgentSeedCollectorTestSupport.user(903).id
+                        manager.workspaces[index].composeTabs[0].promptText = "Live local payload"
+                        if duplicateStash { manager.workspaces[index].stashedTabs = [StashedTab(tab: manager.workspaces[index].composeTabs[0])] }
+                        let authority = AgentSessionLifecycleAuthority()
+                        manager.setAgentSessionProjectionReconciler { projected, current, baselines in
+                            let workspace = current.first { $0.id == seeds[2].id }!
+                            let tab = workspace.composeTabs[0]
+                            let result = authority.reconcileProjection(
+                                projectedWorkspaces: projected, currentWorkspaces: current,
+                                claims: [.init(identity: .init(workspaceID: workspace.id, tabID: tab.id, sessionID: tab.activeAgentSessionID, persistentBindingGeneration: nil, bindingTransitionGeneration: 0), tab: tab, isLive: true, isActive: true, isPinned: false, hasActiveRun: false)],
+                                repairBaselines: baselines
+                            )
+                            if result.protectedWorkspaceIDs.contains(workspace.id) { overlayID = workspace.id }
+                            return result
+                        }
+                    }
+                    var edited = seeds[1]
+                    edited.lastUsed = edited.lastUsed.addingTimeInterval(1)
+                    let (next, nextModels) = try await commitCut2Workspace(edited, fixture: f)
+                    let one = optimized.test_catalogCarrierOne, fallback = optimized.test_catalogCarrierFallbacks
+                    for manager in [optimized, reference] {
+                        try applyCut2Catalog(manager, snapshot: next, models: nextModels)
+                    }
+                    XCTAssertEqual(overlayID, seeds[2].id)
+                    XCTAssertEqual(optimized.test_catalogCarrierOne - one, duplicateStash ? 0 : 1)
+                    XCTAssertEqual(optimized.test_catalogCarrierFallbacks - fallback, duplicateStash ? 1 : 0)
+                    XCTAssertEqual(optimized.workspace(withID: seeds[2].id)?.composeTabs[0].promptText, "Live local payload")
+                    XCTAssertTrue(optimized.test_carrierIndexesEqual(to: reference))
+                    XCTAssertEqual(optimized.workspaces, reference.workspaces)
+                }
+            }
+        }
+
+        func testCut2UnknownShapeDuplicateRecoveryAndMultipleChangesUseFullFallback() async throws {
+            for scenario in ["ephemeral", "unavailable", "membership", "order", "duplicates", "recovery", "stale", "multi"] {
+                let seeds = Self.cut2Seeds()
+                try await Fixture.run(seeds: seeds) { f in
+                    let initial = await f.runtime.workspaceStore.snapshot()
+                    let models = try f.decoded(initial)
+                    let optimized = f.makeManager(), reference = f.makeManager()
+                    reference.test_forceFullCatalogCarrierIndexes = true
+                    for manager in [optimized, reference] {
+                        try applyCut2Catalog(manager, snapshot: initial, models: models)
+                    }
+                    var next = initial
+                    var nextModels = models
+                    switch scenario {
+                    case "ephemeral":
+                        var local = Fixture.model(id: AgentSeedCollectorTestSupport.user(904).id, name: "Local ephemeral")
+                        local.isEphemeral = true
+                        for manager in [optimized, reference] {
+                            manager.workspaces.append(local)
+                        }
+                    case "unavailable", "membership":
+                        next = f.catalog(initial, sequence: initial.publicationSequence + 1, catalogRevision: initial.catalogRevision, dropping: [seeds[2].id], unavailable: scenario == "unavailable" ? [seeds[2].id] : [])
+                        nextModels = try f.decoded(next)
+                    case "order":
+                        next = DomainWorkspaceCatalogSnapshot(runtimeIdentity: initial.runtimeIdentity, isBootstrapped: initial.isBootstrapped, publicationSequence: initial.publicationSequence + 1, catalogRevision: initial.catalogRevision, health: initial.health, workspaces: Array(initial.workspaces.reversed()), unavailableWorkspaceIDs: initial.unavailableWorkspaceIDs)
+                        nextModels = try f.decoded(next)
+                    case "duplicates":
+                        for manager in [optimized, reference] {
+                            manager.workspaces[1] = manager.workspaces[0]
+                        }
+                    case "recovery":
+                        for manager in [optimized, reference] {
+                            var draft = try XCTUnwrap(manager.workspace(withID: seeds[2].id))
+                            draft.composeTabs[0].promptText = "Held recovery payload"
+                            try manager.workspaces[XCTUnwrap(manager.workspaces.firstIndex { $0.id == draft.id })] = draft
+                            manager.recordRecoveryBackupBlockForTesting(workspaceID: draft.id, draft: draft, stateVersion: 1, phase: .working)
+                        }
+                    case "stale":
+                        var revisions = Dictionary(uniqueKeysWithValues: initial.workspaces.map { ($0.document.workspaceID, $0.revisions) })
+                        let old = try XCTUnwrap(revisions[seeds[2].id])
+                        revisions[seeds[2].id] = DomainRevisionState(workingRevision: old.workingRevision + 1, savedRevision: old.savedRevision, dirtyRevision: old.workingRevision + 1)
+                        for manager in [optimized, reference] {
+                            XCTAssertTrue(manager.applyDomainAuthorityMetadataProjection(
+                                revisionsByWorkspaceID: revisions,
+                                digestsByWorkspaceID: Dictionary(uniqueKeysWithValues: initial.workspaces.map { ($0.document.workspaceID, $0.document.contentDigest) }),
+                                healthByWorkspaceID: Dictionary(uniqueKeysWithValues: initial.workspaces.map { ($0.document.workspaceID, $0.health) }),
+                                catalogRevision: initial.catalogRevision, publicationSequence: initial.publicationSequence,
+                                canonicalSystemWorkspaceIDs: [Fixture.defaultID]
+                            ))
+                        }
+                    case "multi":
+                        nextModels[1].lastUsed = nextModels[1].lastUsed.addingTimeInterval(1)
+                        nextModels[2].lastUsed = nextModels[2].lastUsed.addingTimeInterval(1)
+                    default: XCTFail("unhandled scenario")
+                    }
+                    let fallbacks = optimized.test_catalogCarrierFallbacks
+                    let rebuilds = optimized.test_sessionCarrierIndexRebuildCount
+                    for manager in [optimized, reference] {
+                        try applyCut2Catalog(manager, snapshot: next, models: nextModels)
+                    }
+                    XCTAssertEqual(optimized.test_catalogCarrierFallbacks, fallbacks + 1, scenario)
+                    XCTAssertEqual(optimized.test_sessionCarrierIndexRebuildCount, rebuilds + 1, scenario)
+                    XCTAssertTrue(optimized.test_carrierIndexesEqual(to: reference), scenario)
+                    XCTAssertEqual(optimized.workspaces, reference.workspaces, scenario)
+                    if scenario == "recovery" {
+                        XCTAssertEqual(optimized.workspace(withID: seeds[2].id)?.composeTabs[0].promptText, "Held recovery payload")
+                        XCTAssertNotNil(optimized.recoveryBackupBlocks[seeds[2].id])
+                    }
+                }
+            }
+        }
+
+        func testCut2ReentrantWorkspacePublicationCannotConsumeCatalogProof() async throws {
+            try await Fixture.run(seeds: Self.cut2Seeds()) { f in
+                let initial = await f.runtime.workspaceStore.snapshot()
+                let models = try f.decoded(initial)
+                let optimized = f.makeManager(), reference = f.makeManager()
+                reference.test_forceFullCatalogCarrierIndexes = true
+                for manager in [optimized, reference] {
+                    try applyCut2Catalog(manager, snapshot: initial, models: models)
+                }
+                let fallback = optimized.test_catalogCarrierFallbacks
+                var subscriptions: [AnyCancellable] = []
+                for manager in [optimized, reference] {
+                    var nested = false
+                    subscriptions.append(manager.$workspaces.dropFirst().sink { _ in
+                        guard !nested else { return }
+                        nested = true
+                        manager.workspaces = manager.workspaces
+                    })
+                }
+                defer { subscriptions.forEach { $0.cancel() } }
+                for manager in [optimized, reference] {
+                    try applyCut2Catalog(manager, snapshot: initial, models: models)
+                }
+                XCTAssertEqual(optimized.test_catalogCarrierFallbacks, fallback + 1)
+                XCTAssertTrue(optimized.test_carrierIndexesEqual(to: reference))
+                XCTAssertEqual(optimized.workspaceChooserPresentation, reference.workspaceChooserPresentation)
+            }
+        }
+
+        func testCut2Fake35Owners300TabsParityAndCounts() async throws {
+            for visible in [2, 35] {
+                _ = try await runCut2FakeWorkload(visible: visible, fullIndexes: false)
+                _ = try await runCut2FakeWorkload(visible: visible, fullIndexes: true)
+            }
+        }
+
+        func testCut2WarmedPairedMeasurements() async throws {
+            try XCTSkipUnless(ProcessInfo.processInfo.environment["RPCE_RUN_SCALE_TESTS"] == "1", "Controlled opt-in CUT2 index-only diagnostic")
+            for visible in [2, 35] {
+                var fullIndex: [Double] = [], reuseIndex: [Double] = []
+                var fullOwner: [Double] = [], reuseOwner: [Double] = []
+                var fullFanout: [Double] = [], reuseFanout: [Double] = []
+                for sample in 1 ... 5 {
+                    for full in sample.isMultiple(of: 2) ? [false, true] : [true, false] {
+                        let result = try await runCut2FakeWorkload(visible: visible, fullIndexes: full)
+                        if full { fullIndex += result.index
+                            fullOwner += result.owner
+                            fullFanout += result.fanout
+                        } else { reuseIndex += result.index
+                            reuseOwner += result.owner
+                            reuseFanout += result.fanout
+                        }
+                        print("CUT2_SAMPLE visible=\(visible) full=\(full) sample=\(sample) index_p95_ms=\(Self.cut1P95(result.index)) owner_p95_ms=\(Self.cut1P95(result.owner)) fanout_p95_ms=\(Self.cut1P95(result.fanout))")
+                    }
+                }
+                for (mode, index, owner, fanout) in [("full", fullIndex, fullOwner, fullFanout), ("reuse", reuseIndex, reuseOwner, reuseFanout)] {
+                    print("CUT2_SUMMARY visible=\(visible) mode=\(mode) index_samples=\(index.count) index_min_ms=\(index.min() ?? 0) index_p95_ms=\(Self.cut1P95(index)) index_max_ms=\(index.max() ?? 0) owner_p95_ms=\(Self.cut1P95(owner)) owner_max_ms=\(owner.max() ?? 0) fanout_samples=\(fanout.count) fanout_min_ms=\(fanout.min() ?? 0) fanout_p95_ms=\(Self.cut1P95(fanout)) fanout_max_ms=\(fanout.max() ?? 0) owner_budget_misses=\(owner.count(where: { $0 >= 10 })) fanout_budget_misses=\(fanout.count(where: { $0 >= 100 }))")
+                }
+            }
+        }
+
+        /// Both paths run identical catalog work, with no transcript analytics/seed phase.
+        private func runCut2FakeWorkload(visible: Int, fullIndexes: Bool) async throws -> (index: [Double], owner: [Double], fanout: [Double]) {
+            let seeds = Self.cut2Seeds()
+            var indexSamples: [Double] = [], ownerSamples: [Double] = [], fanoutSamples: [Double] = []
+            try await Fixture.run(seeds: seeds) { f in
+                let initial = await f.runtime.workspaceStore.snapshot()
+                let models = try f.decoded(initial)
+                XCTAssertEqual(models.count, 31)
+                XCTAssertFalse(try XCTUnwrap(models.first { $0.id == Fixture.defaultID }).isEphemeral)
+                let managers = (0 ..< 35).map { _ in f.makeManager() }
+                for manager in managers {
+                    manager.test_forceFullCatalogCarrierIndexes = fullIndexes
+                    try applyCut2Catalog(manager, snapshot: initial, models: models)
+                }
+                var edited = seeds[1]
+                edited.lastUsed = edited.lastUsed.addingTimeInterval(1)
+                let (warm, warmModels) = try await commitCut2Workspace(edited, fixture: f)
+                for manager in managers {
+                    try applyCut2Catalog(manager, snapshot: warm, models: warmModels)
+                }
+                let oldAttempts = managers.map(\.test_catalogCarrierAttempts).reduce(0, +)
+                let oldOne = managers.map(\.test_catalogCarrierOne).reduce(0, +)
+                let oldZero = managers.map(\.test_catalogCarrierZero).reduce(0, +)
+                let oldFallback = managers.map(\.test_catalogCarrierFallbacks).reduce(0, +)
+                let oldComparisons = managers.map(\.test_catalogCarrierComparisons).reduce(0, +)
+                let oldVisits = managers.map(\.test_sessionCarrierIndexMaintenanceRowsVisited).reduce(0, +)
+                let perf = CatalogPerf()
+                let gates = (0 ..< 35).map { owner -> AgentPresentationWorkGate in
+                    let gate = AgentPresentationWorkGate(enabled: true, perf: perf, catchUp: {})
+                    gate.setVisible(owner < visible)
+                    return gate
+                }
+                defer { gates.forEach { $0.close() } }
+                var receipts = 0
+                for _ in 1 ... 10 {
+                    edited.lastUsed = edited.lastUsed.addingTimeInterval(1)
+                    let start = DispatchTime.now().uptimeNanoseconds
+                    let (snapshot, nextModels) = try await commitCut2Workspace(edited, fixture: f)
+                    for (owner, manager) in managers.enumerated() {
+                        let indexStart = manager.test_sessionCarrierIndexMaintenanceNanoseconds
+                        let ownerStart = DispatchTime.now().uptimeNanoseconds
+                        let receipt = manager.applyDomainWorkspaceCatalog(snapshot, projection: .full(nextModels), preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata).receipt
+                        ownerSamples.append(Double(DispatchTime.now().uptimeNanoseconds - ownerStart) / 1_000_000)
+                        indexSamples.append(Double(manager.test_sessionCarrierIndexMaintenanceNanoseconds - indexStart) / 1_000_000)
+                        if receipt != nil { receipts += 1 }
+                        if gates[owner].shouldBuild() {
+                            _ = manager.activeWorkspace?.name
+                            gates[owner].didApply()
+                        }
+                    }
+                    fanoutSamples.append(Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000)
+                    // Rebuild oracle and comparisons stay outside the measured interval.
+                    let reference = f.makeManager()
+                    reference.test_forceFullCatalogCarrierIndexes = true
+                    try applyCut2Catalog(reference, snapshot: snapshot, models: nextModels)
+                    for manager in managers {
+                        XCTAssertEqual(manager.workspaces, nextModels)
+                        XCTAssertTrue(manager.test_carrierIndexesEqual(to: reference))
+                        XCTAssertEqual(manager.domainCatalogReconciliationGeneration, reference.domainCatalogReconciliationGeneration + UInt64(fanoutSamples.count + 1))
+                    }
+                }
+                let attempts = managers.map(\.test_catalogCarrierAttempts).reduce(0, +) - oldAttempts
+                let one = managers.map(\.test_catalogCarrierOne).reduce(0, +) - oldOne
+                let zero = managers.map(\.test_catalogCarrierZero).reduce(0, +) - oldZero
+                let fallback = managers.map(\.test_catalogCarrierFallbacks).reduce(0, +) - oldFallback
+                let comparisons = managers.map(\.test_catalogCarrierComparisons).reduce(0, +) - oldComparisons
+                let visits = managers.map(\.test_sessionCarrierIndexMaintenanceRowsVisited).reduce(0, +) - oldVisits
+                XCTAssertEqual(receipts, 350)
+                XCTAssertEqual(attempts, 350)
+                XCTAssertEqual(one, fullIndexes ? 0 : 350)
+                XCTAssertEqual(zero, 0)
+                XCTAssertEqual(fallback, fullIndexes ? 350 : 0, "Ordinary workload must actually certify, including System Default")
+                XCTAssertEqual(comparisons, 350 * 31)
+                XCTAssertEqual(visits, fullIndexes ? 350 * 903 : 350 * 30)
+                print("CUT2_COUNTS visible=\(visible) full=\(fullIndexes) receipts=\(receipts) attempts=\(attempts) zero=\(zero) one=\(one) fallbacks=\(fallback) comparisons=\(comparisons) carrierRows=\(visits) workspaceRows=31 defaultTabs=1 chatTabs=300")
+            }
+            return (indexSamples, ownerSamples, fanoutSamples)
+        }
+
+        private static func cut2Seeds() -> [WorkspaceModel] {
+            var seeds = [Fixture.model(id: Fixture.defaultID, name: "Default", isSystem: true)]
+            for workspace in 0 ..< 30 {
+                var row = Fixture.model(
+                    id: UUID(uuidString: String(format: "22222222-0000-0000-0000-%012d", workspace))!,
+                    name: "Saved \(workspace)"
+                )
+                row.composeTabs = (0 ..< 10).map { tab in
+                    ComposeTabState(
+                        id: UUID(uuidString: String(format: "33333333-0000-0000-0000-%012d", workspace * 10 + tab))!,
+                        name: "Chat \(tab)", activeChatSessionID: AgentSeedCollectorTestSupport.user(workspace * 10 + tab).id
+                    )
+                }
+                row.activeComposeTabID = row.composeTabs.first?.id
+                seeds.append(row)
+            }
+            return seeds
+        }
+
+        func testCut2OrdinaryDefaultWorkspaceGate() async throws {
+            let seeds = Self.cut2Seeds()
+            try await Fixture.run(seeds: seeds) { f in
+                let initial = await f.runtime.workspaceStore.snapshot()
+                let models = try f.decoded(initial)
+                XCTAssertEqual(models.count, 31)
+                let system = try XCTUnwrap(models.first { $0.id == Fixture.defaultID })
+                XCTAssertTrue(system.isSystemWorkspace)
+                XCTAssertFalse(system.isEphemeral, "An inherently uncovered Default means CUT2 must be dropped")
+                XCTAssertEqual(system.composeTabs.count, 1)
+                XCTAssertEqual(models.filter { !$0.isSystemWorkspace }.flatMap(\.composeTabs).count, 300)
+                let managers = (0 ..< 35).map { _ in f.makeManager() }
+                for manager in managers {
+                    XCTAssertNotNil(manager.applyDomainWorkspaceCatalog(initial, projection: .full(models), preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata).receipt)
+                    let zero = manager.test_catalogCarrierZero
+                    let fallbacks = manager.test_catalogCarrierFallbacks
+                    let comparisons = manager.test_catalogCarrierComparisons
+                    let visits = manager.test_sessionCarrierIndexMaintenanceRowsVisited
+                    XCTAssertNotNil(manager.applyDomainWorkspaceCatalog(initial, projection: .full(models), preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata).receipt)
+                    XCTAssertEqual(manager.test_catalogCarrierZero, zero + 1, "Every ordinary owner must certify all final rows including Default")
+                    XCTAssertEqual(manager.test_catalogCarrierFallbacks, fallbacks)
+                    XCTAssertEqual(manager.test_catalogCarrierComparisons, comparisons + 31)
+                    XCTAssertEqual(manager.test_sessionCarrierIndexMaintenanceRowsVisited, visits)
+                    XCTAssertEqual(manager.workspaces, models)
+                }
+                let author = DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: -9999)
+                var edited = seeds[1]
+                edited.lastUsed = edited.lastUsed.addingTimeInterval(1)
+                let before = await f.runtime.workspaceStore.workspaceSnapshot(edited.id)
+                let revision = try XCTUnwrap(before).revisions.workingRevision
+                let outcome = try await author.replaceWorkingFailClosed(edited, fileURL: f.workspaceURL(for: edited), expectedWorkspaceRevision: revision)
+                XCTAssertEqual(outcome.disposition, .applied)
+                let next = await f.runtime.workspaceStore.snapshot()
+                let nextModels = try f.decoded(next)
+                for manager in managers {
+                    let one = manager.test_catalogCarrierOne
+                    let rebuilds = manager.test_sessionCarrierIndexRebuildCount
+                    let fallbacks = manager.test_catalogCarrierFallbacks
+                    let comparisons = manager.test_catalogCarrierComparisons
+                    XCTAssertNotNil(manager.applyDomainWorkspaceCatalog(next, projection: .full(nextModels), preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata).receipt)
+                    XCTAssertEqual(manager.test_catalogCarrierOne, one + 1)
+                    XCTAssertEqual(manager.test_catalogCarrierFallbacks, fallbacks)
+                    XCTAssertEqual(manager.test_catalogCarrierComparisons, comparisons + 31)
+                    XCTAssertEqual(manager.test_sessionCarrierIndexRebuildCount, rebuilds)
+                    XCTAssertEqual(manager.workspaces, nextModels)
+                }
+                print("CUT2_GATE owners=35 workspaceRows=31 chatTabs=300 defaultTabs=1 defaultEphemeral=false zero=35 one=35 fallbacks=0 comparisons=2170")
+            }
+        }
+
+        func testCut1Fake35Owners300TabsParityAndCounts() async throws {
+            for visible in [2, 35] {
+                _ = try await runCut1FakeWorkload(visible: visible, eager: false)
+            }
+        }
+
+        func testCut1WarmedPairedMeasurements() async throws {
+            try XCTSkipUnless(ProcessInfo.processInfo.environment["RPCE_RUN_SCALE_TESTS"] == "1", "Controlled opt-in timing diagnostic")
+            for visible in [2, 35] {
+                var eagerPhases: [Double] = [], boundedPhases: [Double] = []
+                var eagerFanouts: [Double] = [], boundedFanouts: [Double] = []
+                for sample in 1 ... 5 {
+                    // Alternate order to reduce systematic first-run and thermal bias.
+                    for eager in sample.isMultiple(of: 2) ? [false, true] : [true, false] {
+                        let result = try await runCut1FakeWorkload(visible: visible, eager: eager)
+                        if eager {
+                            eagerPhases += result.phases
+                            eagerFanouts += result.fanouts
+                        } else {
+                            boundedPhases += result.phases
+                            boundedFanouts += result.fanouts
+                        }
+                        print("CUT1_SAMPLE visible=\(visible) eager=\(eager) sample=\(sample) phase_p95_ms=\(Self.cut1P95(result.phases)) phase_max_ms=\(result.phases.max() ?? 0) fanout_p95_ms=\(Self.cut1P95(result.fanouts)) fanout_max_ms=\(result.fanouts.max() ?? 0)")
+                    }
+                }
+                for (name, phases, fanouts) in [("eager", eagerPhases, eagerFanouts), ("collector", boundedPhases, boundedFanouts)] {
+                    print("CUT1_SUMMARY visible=\(visible) mode=\(name) phase_samples=\(phases.count) phase_min_ms=\(phases.min() ?? 0) phase_p95_ms=\(Self.cut1P95(phases)) phase_max_ms=\(phases.max() ?? 0) fanout_samples=\(fanouts.count) fanout_min_ms=\(fanouts.min() ?? 0) fanout_p95_ms=\(Self.cut1P95(fanouts)) fanout_max_ms=\(fanouts.max() ?? 0) phase_budget_misses=\(phases.count(where: { $0 >= 10 })) fanout_budget_misses=\(fanouts.count(where: { $0 >= 100 }))")
+                }
+            }
+        }
+
+        private static func cut1P95(_ values: [Double]) -> Double {
+            guard !values.isEmpty else { return 0 }
+            let ordered = values.sorted()
+            return ordered[Int(ceil(Double(ordered.count) * 0.95)) - 1]
+        }
+
+        /// Real authority mutations and manager admission, fake visibility/presentation scheduling.
+        /// Timings include the foreign commit and sequential fanout, not live window rendering.
+        private func runCut1FakeWorkload(visible: Int, eager: Bool) async throws -> (phases: [Double], fanouts: [Double]) {
+            typealias Support = AgentSeedCollectorTestSupport
+            var seeds = [Fixture.model(id: Fixture.defaultID, name: "Default", isSystem: true)]
+            for workspace in 0 ..< 30 {
+                let workspaceID = UUID(uuidString: String(format: "22222222-0000-0000-0000-%012d", workspace))!
+                var row = Fixture.model(id: workspaceID, name: "Saved \(workspace)")
+                row.composeTabs = (0 ..< 10).map { tab in
+                    ComposeTabState(
+                        id: UUID(uuidString: String(format: "33333333-0000-0000-0000-%012d", workspace * 10 + tab))!,
+                        name: "Chat \(tab)", activeChatSessionID: Support.user(workspace * 10 + tab).id
+                    )
+                }
+                row.activeComposeTabID = row.composeTabs.first?.id
+                seeds.append(row)
+            }
+            XCTAssertEqual(seeds.dropFirst().flatMap(\.composeTabs).count, 300)
+            var phaseSamples: [Double] = [], fanoutSamples: [Double] = []
+            try await Fixture.run(seeds: seeds) { f in
+                let initial = await f.runtime.workspaceStore.snapshot()
+                let models = try f.decoded(initial)
+                let managers = (0 ..< 35).map { _ in f.makeManager() }
+                for manager in managers {
+                    XCTAssertNotNil(manager.applyDomainWorkspaceCatalog(initial, projection: .full(models), preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata).receipt)
+                }
+                let author = DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: -9999)
+                var edited = seeds[1]
+                let warmBefore = await f.runtime.workspaceStore.workspaceSnapshot(edited.id)
+                let warmRevision = try XCTUnwrap(warmBefore).revisions.workingRevision
+                edited.lastUsed = edited.lastUsed.addingTimeInterval(1)
+                let warmOutcome = try await author.replaceWorkingFailClosed(
+                    edited, fileURL: f.workspaceURL(for: edited), expectedWorkspaceRevision: warmRevision
+                )
+                XCTAssertEqual(warmOutcome.disposition, .applied)
+                let warmSnapshot = await f.runtime.workspaceStore.snapshot()
+                let warmModels = try f.decoded(warmSnapshot)
+                for manager in managers {
+                    XCTAssertNotNil(manager.applyDomainWorkspaceCatalog(warmSnapshot, projection: .full(warmModels), preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata).receipt)
+                }
+                let perf = CatalogPerf()
+                let gates = (0 ..< 35).map { owner -> AgentPresentationWorkGate in
+                    let gate = AgentPresentationWorkGate(enabled: true, perf: perf, catchUp: {})
+                    gate.setVisible(owner < visible)
+                    return gate
+                }
+                defer { gates.forEach { $0.close() } }
+                var transcript = Support.transcript(300)
+                let tracked = Set(transcript.turns.prefix(16).compactMap { $0.request?.id })
+                // Both implementations warm their redactor/analytics code before measured rounds.
+                _ = Support.phase(transcript, tracked: tracked, eager: true)
+                _ = Support.phase(transcript, tracked: tracked, eager: false)
+                var receipts = 0
+                for round in 1 ... 10 {
+                    let snapshotBefore = await f.runtime.workspaceStore.workspaceSnapshot(edited.id)
+                    let before = try XCTUnwrap(snapshotBefore)
+                    edited.lastUsed = edited.lastUsed.addingTimeInterval(1)
+                    transcript.turns[299].request?.text += " tail \(round)"
+                    let start = DispatchTime.now().uptimeNanoseconds
+                    let outcome = try await author.replaceWorkingFailClosed(
+                        edited, fileURL: f.workspaceURL(for: edited), expectedWorkspaceRevision: before.revisions.workingRevision
+                    )
+                    let snapshot = await f.runtime.workspaceStore.snapshot()
+                    let nextModels = try f.decoded(snapshot)
+                    var phases: [Support.Phase] = []
+                    for (owner, manager) in managers.enumerated() {
+                        let receipt = manager.applyDomainWorkspaceCatalog(snapshot, projection: .full(nextModels), preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata).receipt
+                        if let receipt {
+                            receipts += 1
+                            perf.receipt(receiver: Support.user(owner).id, full: receipt.kind == .full)
+                        }
+                        if gates[owner].shouldBuild() {
+                            let phase = Support.phase(transcript, tracked: tracked, eager: eager, perf: perf)
+                            phases.append(phase)
+                            gates[owner].didApply()
+                        }
+                    }
+                    fanoutSamples.append(Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000)
+                    XCTAssertEqual(outcome.disposition, .applied)
+                    XCTAssertEqual(receipts, round * 35)
+                    XCTAssertEqual(phases.count, visible)
+                    let oracle = Support.phase(transcript, tracked: tracked, eager: !eager)
+                    for phase in phases {
+                        Support.assertEqual(phase.seed, oracle.seed)
+                        XCTAssertEqual(phase.analytics, oracle.analytics)
+                        XCTAssertEqual(phase.projections, eager ? 300 : 32)
+                        phaseSamples.append(phase.milliseconds)
+                    }
+                    for manager in managers {
+                        XCTAssertEqual(manager.workspaces, nextModels)
+                        XCTAssertEqual(manager.domainCatalogReconciliationGeneration, UInt64(round + 2))
+                    }
+                }
+                let line = try XCTUnwrap(perf.rotate())
+                let fields = Set(line.split(separator: " ").map(String.init))
+                for field in [
+                    "receivers=35 ",
+                    "receipts_full=350 ",
+                    "analytics_seed_count=\(visible * 10) ",
+                    "seed_projections=\(visible * 10 * (eager ? 300 : 32)) ",
+                    "seed_projections_max=\(eager ? 300 : 32) ",
+                    "presentation_builds_attempted=\(visible * 10) ",
+                    "presentation_applies=\(visible * 10) ",
+                    "presentation_deferrals=\((35 - visible) * 10) "
+                ] {
+                    XCTAssertTrue(fields.contains(field.trimmingCharacters(in: .whitespaces)), line)
+                }
+                print("CUT1_COUNTS visible=\(visible) eager=\(eager) \(line)")
+            }
+            return (phaseSamples, fanoutSamples)
         }
 
         // MARK: #1142 review regressions

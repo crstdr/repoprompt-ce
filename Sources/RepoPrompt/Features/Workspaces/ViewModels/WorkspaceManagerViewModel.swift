@@ -1211,6 +1211,10 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     private func rebuildSessionCarrierIndexes() {
+        #if DEBUG
+            let maintenanceStart = DispatchTime.now().uptimeNanoseconds
+            defer { test_sessionCarrierIndexMaintenanceNanoseconds += DispatchTime.now().uptimeNanoseconds - maintenanceStart }
+        #endif
         // Workspace IDs should be unique, but a corrupted index or
         // migration bug must not SIGTRAP every workspace assignment.
         // Last-wins matches the array-order lookup semantics below.
@@ -1377,11 +1381,18 @@ class WorkspaceManagerViewModel: ObservableObject {
         let replacement: WorkspaceModel
     }
 
+    private enum CatalogCarrierPublication {
+        case unchanged(count: Int)
+        case one(WorkspacePublication)
+    }
+
     private struct WorkspacePublicationFrame {
         let serial: UInt64
         let publication: WorkspacePublication?
+        let catalog: CatalogCarrierPublication?
     }
 
+    private var catalogCarrierPublication: CatalogCarrierPublication?
     private var composeTabCarrierPublication: WorkspacePublication?
     private var workspacePublicationSerial: UInt64 = 0
     private var workspacePublicationFrames: [WorkspacePublicationFrame] = []
@@ -1391,17 +1402,46 @@ class WorkspaceManagerViewModel: ObservableObject {
         var test_sessionCarrierIndexRebuildCount = 0
         /// Actual carrier/position visits in each pass of full rebuilds and structural delta updates.
         var test_sessionCarrierIndexMaintenanceRowsVisited = 0
+        var test_sessionCarrierIndexMaintenanceNanoseconds: UInt64 = 0
+        var test_forceFullCatalogCarrierIndexes = false
+        private(set) var test_catalogCarrierAttempts = 0
+        private(set) var test_catalogCarrierZero = 0
+        private(set) var test_catalogCarrierOne = 0
+        private(set) var test_catalogCarrierComparisons = 0
+        var test_catalogCarrierFallbacks: Int {
+            test_catalogCarrierAttempts - test_catalogCarrierZero - test_catalogCarrierOne
+        }
+
+        /// Compares exact positions and the first carrier for each lifecycle binding, with bucket order normalized.
+        func test_carrierIndexesEqual(to other: WorkspaceManagerViewModel) -> Bool {
+            func positions(_ values: [SessionCarrierPosition]) -> [[Int]] {
+                values.map { [$0.workspace, $0.tab, $0.isStashed ? 1 : 0] }
+                    .sorted { $0.lexicographicallyPrecedes($1) }
+            }
+            return workspaceIndexMap == other.workspaceIndexMap
+                && modelRoutingTabIndexes == other.modelRoutingTabIndexes
+                && lifecycleBindingPositions.mapValues { [$0.workspace, $0.tab] }
+                == other.lifecycleBindingPositions.mapValues { [$0.workspace, $0.tab] }
+                && lifecycleSessionPositions.mapValues { $0.mapValues { $0.map { [$0.workspace, $0.tab] } } }
+                == other.lifecycleSessionPositions.mapValues { $0.mapValues { $0.map { [$0.workspace, $0.tab] } } }
+                && sessionCarrierPositionsByTabID.mapValues(positions) == other.sessionCarrierPositionsByTabID.mapValues(positions)
+                && sessionCarrierPositionsBySessionID.mapValues(positions) == other.sessionCarrierPositionsBySessionID.mapValues(positions)
+        }
     #endif
 
     private func beginWorkspacePublication(_ next: [WorkspaceModel]) {
         workspacePublicationSerial &+= 1
         let presentation = composeTabPresentationPublication
         let carriers = composeTabCarrierPublication
+        let catalog = catalogCarrierPublication
         // willSet runs before the Published setter can notify synchronous subscribers. A nested
         // generic assignment must get its own empty frame, never borrow the outer owner's marker.
         composeTabPresentationPublication = nil
         composeTabCarrierPublication = nil
-        let publication: WorkspacePublication? = if let carriers, presentation == nil {
+        catalogCarrierPublication = nil
+        let publication: WorkspacePublication? = if catalog != nil {
+            nil
+        } else if let carriers, presentation == nil {
             carriers
         } else if let presentation, carriers == nil,
                   let index = workspaceIndexMap[presentation.workspaceID],
@@ -1417,13 +1457,24 @@ class WorkspaceManagerViewModel: ObservableObject {
         } else {
             nil
         }
-        workspacePublicationFrames.append(.init(serial: workspacePublicationSerial, publication: publication))
+        workspacePublicationFrames.append(.init(
+            serial: workspacePublicationSerial, publication: publication,
+            catalog: presentation == nil && carriers == nil ? catalog : nil
+        ))
     }
 
     private func finishWorkspacePublication(previous: [WorkspaceModel]) {
         // Pop before any manual observer can re-enter. A newer serial also invalidates an outer
         // owner's proof after an inner setter completed, even when the workspace ID stayed equal.
         let frame = workspacePublicationFrames.popLast()
+        if let frame, frame.serial == workspacePublicationSerial, let catalog = frame.catalog,
+           finishCatalogCarrierPublication(catalog, previous: previous)
+        {
+            refreshSelectionMirrorContextRevision()
+            refreshChooserRowsAfterLocalMutation(from: previous)
+            refreshAgentCreatorNameSource()
+            return
+        }
         guard let frame, frame.serial == workspacePublicationSerial,
               let publication = frame.publication,
               previous.count == publication.count, workspaces.count == publication.count,
@@ -1450,6 +1501,27 @@ class WorkspaceManagerViewModel: ObservableObject {
             refreshChooserRowsAfterLocalMutation(from: previous)
             refreshAgentCreatorNameSource()
         }
+    }
+
+    /// Consumes only a complete final-row proof from the catalog's existing comparison pass.
+    private func finishCatalogCarrierPublication(_ catalog: CatalogCarrierPublication, previous: [WorkspaceModel]) -> Bool {
+        switch catalog {
+        case let .unchanged(count):
+            guard previous.count == count, workspaces.count == count else { return false }
+            #if DEBUG
+                test_catalogCarrierZero += 1
+            #endif
+        case let .one(publication):
+            guard previous.count == publication.count, workspaces.count == publication.count,
+                  previous.indices.contains(publication.index), workspaces.indices.contains(publication.index),
+                  previous[publication.index] == publication.previous,
+                  workspaces[publication.index] == publication.replacement else { return false }
+            replaceSessionCarrierIndexes(publication)
+            #if DEBUG
+                test_catalogCarrierOne += 1
+            #endif
+        }
+        return true
     }
 
     /// A nonempty routing map proves workspace-ID uniqueness: generic rebuilds collapse duplicate
@@ -1514,6 +1586,10 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     private func replaceSessionCarrierIndexes(_ publication: WorkspacePublication) {
+        #if DEBUG
+            let maintenanceStart = DispatchTime.now().uptimeNanoseconds
+            defer { test_sessionCarrierIndexMaintenanceNanoseconds += DispatchTime.now().uptimeNanoseconds - maintenanceStart }
+        #endif
         let workspaceIndex = publication.index
         let workspaceID = publication.replacement.id
         var tabIDs: Set<UUID> = []
@@ -1597,7 +1673,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             sessionCarrierPositionsBySessionID[sessionID] = positions.isEmpty ? nil : positions
         }
         modelRoutingTabIndexes[workspaceID] = nextRouting
-        lifecycleSessionPositions[workspaceID] = nextLifecyclePositions
+        lifecycleSessionPositions[workspaceID] = nextLifecyclePositions.isEmpty ? nil : nextLifecyclePositions
 
         // Updated buckets need not be in physical order. Reduce each touched tab bucket once;
         // reducing separately for each tab/session pair would multiply duplicate-claim work.
@@ -9861,14 +9937,59 @@ class WorkspaceManagerViewModel: ObservableObject {
             projectedDigestsByWorkspaceID: digestsByWorkspaceID
         )
         let reconciledWorkspaces = recoveryOverlay.workspaces
-        for projected in reconciledWorkspaces
-            where decodedWorkspaceIDs.contains(projected.id) && !staleWorkspaceIDs.contains(projected.id)
-            && !recoveryOverlay.heldWorkspaceIDs.contains(projected.id)
-            && workspace(withID: projected.id) != projected
-        {
-            // An unrelated catalog row or unchanged cached overlay is not a new local lineage.
-            // Replacing a proposal with canonical bytes is, even at the same authority revision.
-            invalidateFullDocumentAdoption(workspaceID: projected.id)
+        let carrierSerial = workspacePublicationSerial
+        let carrierCount = workspaces.count
+        var canReuseCarriers = domainWorkspaceAuthorityClient != nil && catalogApplicationDepth > 0
+            && workspacePublicationFrames.isEmpty && composeTabCarrierPublication == nil
+            && composeTabPresentationPublication == nil && catalogCarrierPublication == nil
+            && unavailableWorkspaceIDs.isEmpty && carrierCount == reconciledWorkspaces.count
+            && workspaceIndexMap.count == carrierCount
+        var changedCarrierWorkspace: WorkspacePublication?
+        #if DEBUG
+            test_catalogCarrierAttempts += 1
+        #endif
+        for (index, projected) in reconciledWorkspaces.enumerated() {
+            guard decodedWorkspaceIDs.contains(projected.id), !staleWorkspaceIDs.contains(projected.id),
+                  !recoveryOverlay.heldWorkspaceIDs.contains(projected.id)
+            else {
+                canReuseCarriers = false
+                continue
+            }
+            // The existing adoption comparison follows all lifecycle/recovery overlays.
+            // Its result also certifies each covered final row for index reuse.
+            let current = workspace(withID: projected.id)
+            let differs = current != projected
+            #if DEBUG
+                test_catalogCarrierComparisons += 1
+            #endif
+            if canReuseCarriers {
+                if projected.isEphemeral || workspaceIndexMap[projected.id] != index
+                    || !workspaces.indices.contains(index) || workspaces[index].id != projected.id
+                {
+                    canReuseCarriers = false
+                } else if differs, let current {
+                    if changedCarrierWorkspace != nil {
+                        canReuseCarriers = false
+                    } else {
+                        changedCarrierWorkspace = WorkspacePublication(
+                            kind: .carriers, index: index, count: carrierCount,
+                            previous: current, replacement: projected
+                        )
+                    }
+                }
+            }
+            if differs {
+                // An unrelated catalog row or unchanged cached overlay is not a new local lineage.
+                // Replacing a proposal with canonical bytes is, even at the same authority revision.
+                invalidateFullDocumentAdoption(workspaceID: projected.id)
+            }
+        }
+        #if DEBUG
+            if test_forceFullCatalogCarrierIndexes { canReuseCarriers = false }
+        #endif
+        if canReuseCarriers, carrierSerial == workspacePublicationSerial {
+            catalogCarrierPublication = changedCarrierWorkspace.map(CatalogCarrierPublication.one)
+                ?? .unchanged(count: carrierCount)
         }
         workspaces = reconciledWorkspaces
         adoptRecoveryBackupMerges(recoveryOverlay.adoptedWorkspaceIDs)

@@ -18,9 +18,13 @@ struct AgentSessionLinkRetainedLocalInputIndex {
         /// existing bounded settlement path, rather than repeating it for every claim candidate.
         let escapedBody: String
 
+        static func isEligible(_ item: AgentChatItem) -> Bool {
+            item.kind == .user && item.userInputOrigin == .localComposer
+                && item.crossSessionAttribution == nil
+        }
+
         static func project(_ item: AgentChatItem) -> Content? {
-            guard item.kind == .user, item.userInputOrigin == .localComposer,
-                  item.crossSessionAttribution == nil else { return nil }
+            guard isEligible(item) else { return nil }
             let narrative = AgentSessionLinkTranscriptSanitizer.sanitizedNarrative(item.text)
             let safe = AgentSessionLinkMessageEnvelope.sanitizedBody(narrative.boundedText)
             let fullCount = narrative.fullCharacterCount
@@ -92,6 +96,51 @@ struct AgentSessionLinkRetainedLocalInputIndex {
             totalCount += 1
             rows.append(Row(itemID: item.id, timestamp: item.timestamp, content: content))
             if rows.count > capacity { rows.removeFirst() }
+        }
+    }
+
+    /// Build-local raw candidates. Occurrence keys preserve duplicate-ID suffix rows and the
+    /// last eligible tracked occurrence without projecting candidates that will be evicted.
+    struct SeedCollector {
+        private struct Candidate {
+            let occurrence: UInt64
+            let item: AgentChatItem
+        }
+
+        private let trackedIDs: Set<UUID>
+        private var totalCount: UInt64 = 0
+        private var suffix: [Candidate] = []
+        private var tracked: [UUID: Candidate] = [:]
+
+        init(trackedIDs: Set<UUID> = []) {
+            self.trackedIDs = trackedIDs
+        }
+
+        mutating func append(_ item: AgentChatItem) {
+            guard Content.isEligible(item) else { return }
+            totalCount += 1
+            let candidate = Candidate(occurrence: totalCount, item: item)
+            suffix.append(candidate)
+            if suffix.count > capacity { suffix.removeFirst() }
+            if trackedIDs.contains(item.id) { tracked[item.id] = candidate }
+        }
+
+        func finalize() -> (seed: Seed, projectionCount: Int) {
+            var contents: [UInt64: Content] = [:]
+            for candidate in suffix + Array(tracked.values) where contents[candidate.occurrence] == nil {
+                contents[candidate.occurrence] = Content.project(candidate.item)
+            }
+            let seed = Seed(
+                trackedIDs: trackedIDs,
+                trackedRows: tracked.compactMapValues { contents[$0.occurrence] },
+                totalCount: totalCount,
+                rows: suffix.compactMap { candidate in
+                    contents[candidate.occurrence].map {
+                        Seed.Row(itemID: candidate.item.id, timestamp: candidate.item.timestamp, content: $0)
+                    }
+                }
+            )
+            return (seed, contents.count)
         }
     }
 
