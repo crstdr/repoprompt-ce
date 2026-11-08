@@ -16393,13 +16393,19 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 performanceSnapshot.lastColdLoadProjectionBuildDurationMS = buildDurationMS
             }
         #endif
-        var localInputSeed = AgentSessionLinkRetainedLocalInputIndex.Seed(trackedIDs: trackedLocalInputIDs)
+        let analyticsSeedStartedAt = DispatchTime.now().uptimeNanoseconds
+        var localInputCollector = AgentSessionLinkRetainedLocalInputIndex.SeedCollector(trackedIDs: trackedLocalInputIDs)
         let analytics = AgentTranscriptAnalyticsBuilder.build(
             from: sanitizedTranscript, selectedAgent: selectedAgent,
-            visitRequest: { localInputSeed.append($0) }
+            visitRequest: { localInputCollector.append($0) }
+        )
+        let localInputResult = localInputCollector.finalize()
+        CatalogPerf.shared.transcriptAnalyticsSeed(
+            ms: Double(DispatchTime.now().uptimeNanoseconds - analyticsSeedStartedAt) / 1_000_000,
+            projections: localInputResult.projectionCount
         )
         return BuiltTranscriptPresentation(
-            localInputSeed: localInputSeed,
+            localInputSeed: localInputResult.seed,
             transcript: sanitizedTranscript,
             baseProjection: baseProjection,
             fullProjection: fullProjection,

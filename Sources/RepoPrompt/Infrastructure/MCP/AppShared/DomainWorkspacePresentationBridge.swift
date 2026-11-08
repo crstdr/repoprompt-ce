@@ -393,6 +393,7 @@ private enum CatalogPerfHeartbeat {
                 let now = DispatchTime.now().uptimeNanoseconds
                 CatalogPerf.shared.heartbeat(gapMS: Double(now - previous) / 1_000_000, expectedMS: 10)
                 previous = now
+                // Emission follows elapsed time, independent of subscription/catalog activity.
                 if now - windowStart >= 10_000_000_000 {
                     CatalogPerf.shared.emitWindow()
                     windowStart = now
