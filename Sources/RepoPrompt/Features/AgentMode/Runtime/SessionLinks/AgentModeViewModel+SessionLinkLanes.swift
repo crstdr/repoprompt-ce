@@ -318,6 +318,7 @@ extension AgentModeViewModel {
         let subtreeTabIDs = Set(promptManager.currentComposeTabs.compactMap { tab in
             tab.activeAgentSessionID.map { descendantSessionIDs.contains($0) } == true ? tab.id : nil
         }).union([endpoint.tabID])
+        if commit { AgentSessionLinkCatalogDiagnostics.retireStage(.stash, begin: true, sessionID: endpoint.sessionID, tabID: endpoint.tabID) }
         let report = await promptManager.stashComposeTabs(
             withIDs: subtreeTabIDs,
             isMutationContextCurrent: canRetire,
@@ -325,6 +326,7 @@ extension AgentModeViewModel {
             expandCascade: true,
             validateOnly: !commit
         )
+        if commit { AgentSessionLinkCatalogDiagnostics.retireStage(.stash, begin: false, sessionID: endpoint.sessionID, tabID: endpoint.tabID) }
         guard report.rejections.isEmpty else { return false }
         guard commit else {
             return workspaceManager.canAdmitLifecycleWorkspaceSave(workspaceID: endpoint.workspaceID)
@@ -341,10 +343,12 @@ extension AgentModeViewModel {
         // activation claim stays held by the bridge until it settles, so another window cannot
         // reload the pre-stash binding in the meantime — but its admission no longer gates the
         // outcome; only an uncommitted stash may report `unlinked_not_stashed`.
+        AgentSessionLinkCatalogDiagnostics.retireStage(.save, begin: true, sessionID: endpoint.sessionID, tabID: endpoint.tabID, workspaceID: endpoint.workspaceID)
         _ = await workspaceManager.pollAndSaveStateWithOutcomeAsync(
             workspaceID: endpoint.workspaceID,
             source: WorkspaceSaveSource("oversightLaneRetirement")
         )
+        AgentSessionLinkCatalogDiagnostics.retireStage(.save, begin: false, sessionID: endpoint.sessionID, tabID: endpoint.tabID, workspaceID: endpoint.workspaceID)
         return true
     }
 

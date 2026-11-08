@@ -8962,6 +8962,12 @@ final class AgentSessionLinkRuntimeBridge {
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
         targetSessionID: UUID
     ) async -> AgentSessionLaneRetireOutcome {
+        let retireStarted = ProcessInfo.processInfo.systemUptime
+        func logRetire(_ stage: AgentSessionLinkCatalogDiagnostics.RetireStage, begin: Bool) {
+            AgentSessionLinkCatalogDiagnostics.retireStage(stage, begin: begin, sessionID: targetSessionID, elapsedMS: Int((ProcessInfo.processInfo.systemUptime - retireStarted) * 1000))
+        }
+        logRetire(.request, begin: true)
+        defer { logRetire(.request, begin: false) }
         guard !isFrozenForTermination else {
             return .notRetired(sessionID: targetSessionID, reason: .shuttingDown)
         }
@@ -8970,11 +8976,13 @@ final class AgentSessionLinkRuntimeBridge {
         }
         let transaction = registerTransaction()
         defer { finishTransaction(transaction) }
+        logRetire(.authorization, begin: true)
         let authorized = await authorizeTarget(
             operation: .monitorRetireLane,
             observerEndpoint: observerEndpoint,
             targetSessionID: targetSessionID
         )
+        logRetire(.authorization, begin: false)
         let target: AuthorizedTarget
         switch authorized {
         case let .success(value): target = value
@@ -9003,8 +9011,10 @@ final class AgentSessionLinkRuntimeBridge {
         guard !host.agentSessionLinkHasActiveChildSessions(parentSessionID: targetSessionID) else {
             return .notRetired(sessionID: targetSessionID, reason: .laneInUseChildren)
         }
-        guard await !(host.agentSessionLinkHasPersistedActiveChildSessions(parentSessionID: targetSessionID))
-        else { return .notRetired(sessionID: targetSessionID, reason: .laneInUseDiskChild) }
+        logRetire(.initialChildScan, begin: true)
+        let initiallyHasPersistedChildren = await host.agentSessionLinkHasPersistedActiveChildSessions(parentSessionID: targetSessionID)
+        logRetire(.initialChildScan, begin: false)
+        guard !initiallyHasPersistedChildren else { return .notRetired(sessionID: targetSessionID, reason: .laneInUseDiskChild) }
         // Install the fence before the relationship snapshot. New Adds in either direction now
         // fail at preflight, reservation, activation and caller completion.
         guard !isFrozenForTermination else {
@@ -9015,7 +9025,10 @@ final class AgentSessionLinkRuntimeBridge {
         }
         retiringTargets.insert(endpoint)
         defer { retiringTargets.remove(endpoint) }
-        if let refusal = await retireRelationshipFence(targetSessionID: targetSessionID, lease: target.lease) {
+        logRetire(.initialFence, begin: true)
+        let initialRefusal = await retireRelationshipFence(targetSessionID: targetSessionID, lease: target.lease)
+        logRetire(.initialFence, begin: false)
+        if let refusal = initialRefusal {
             return .notRetired(sessionID: targetSessionID, reason: refusal)
         }
         #if DEBUG
@@ -9040,12 +9053,17 @@ final class AgentSessionLinkRuntimeBridge {
         }
         // Preflight performs the required-session flush, the stash cascade's claim checks, and the
         // workspace-save admission probe without mutating anything; a refusal leaves link and tab.
-        guard await host.agentSessionLinkRetireLane(
+        logRetire(.preflight, begin: true)
+        let preflightPassed = await host.agentSessionLinkRetireLane(
             endpoint: endpoint, commit: false, isStillRetirable: stillRetirable
-        ) else { return .notRetired(sessionID: targetSessionID, reason: .laneBusy) }
+        )
+        logRetire(.preflight, begin: false)
+        guard preflightPassed else { return .notRetired(sessionID: targetSessionID, reason: .laneBusy) }
         // The flush may have settled a stale persisted child header; rescan before unlinking.
-        guard await !(host.agentSessionLinkHasPersistedActiveChildSessions(parentSessionID: targetSessionID))
-        else { return .notRetired(sessionID: targetSessionID, reason: .laneInUseDiskChild) }
+        logRetire(.preflightChildScan, begin: true)
+        let preflightHasPersistedChildren = await host.agentSessionLinkHasPersistedActiveChildSessions(parentSessionID: targetSessionID)
+        logRetire(.preflightChildScan, begin: false)
+        guard !preflightHasPersistedChildren else { return .notRetired(sessionID: targetSessionID, reason: .laneInUseDiskChild) }
         // Preflight's awaits kept the grant live: re-run the cheap fence immediately before unlink.
         guard !isFrozenForTermination else {
             return .notRetired(sessionID: targetSessionID, reason: .shuttingDown)
@@ -9053,7 +9071,10 @@ final class AgentSessionLinkRuntimeBridge {
         guard stillRetirable() else {
             return .notRetired(sessionID: targetSessionID, reason: .laneBusy)
         }
-        if let refusal = await retireRelationshipFence(targetSessionID: targetSessionID, lease: target.lease) {
+        logRetire(.finalFence, begin: true)
+        let finalRefusal = await retireRelationshipFence(targetSessionID: targetSessionID, lease: target.lease)
+        logRetire(.finalFence, begin: false)
+        if let refusal = finalRefusal {
             return .notRetired(sessionID: targetSessionID, reason: refusal)
         }
         // The fence's awaits kept the grant live, so revalidate synchronously before unlinking.
@@ -9064,26 +9085,35 @@ final class AgentSessionLinkRuntimeBridge {
         guard stillRetirable(), host.agentSessionLinkRetirementReadiness(endpoint: endpoint)
         else { return .notRetired(sessionID: targetSessionID, reason: .laneBusy) }
         // Stop owns the pair-retirement lane. Wrapping it here would wait on our own barrier.
+        logRetire(.stopMonitorLink, begin: true)
         let stop = await stopMonitorLink(
             observerEndpoint: observerEndpoint,
             targetEndpoint: endpoint,
             expectedReference: target.lease.reference
         )
+        logRetire(.stopMonitorLink, begin: false)
         switch stop {
         case .failed: return .notRetired(sessionID: targetSessionID, reason: .stopFailed)
         case .alreadyStopped: return .notRetired(sessionID: targetSessionID, reason: .alreadyStopped)
         case .stopped: break
         }
+        logRetire(.inventories, begin: true)
         let remaining = await authority.relationshipInventories(forSessionID: targetSessionID)
-        guard await !(host.agentSessionLinkHasPersistedActiveChildSessions(parentSessionID: targetSessionID))
-        else { return .unlinkedNotStashed(sessionID: targetSessionID) }
+        logRetire(.inventories, begin: false)
+        logRetire(.rescan, begin: true)
+        let hasPersistedChildren = await host.agentSessionLinkHasPersistedActiveChildSessions(parentSessionID: targetSessionID)
+        logRetire(.rescan, begin: false)
+        guard !hasPersistedChildren else { return .unlinkedNotStashed(sessionID: targetSessionID) }
         guard !isFrozenForTermination, stillRetirable(),
               remaining.inbound.items.isEmpty,
               remaining.outbound.items.isEmpty
         else { return .unlinkedNotStashed(sessionID: targetSessionID) }
-        return await host.agentSessionLinkRetireLane(
+        logRetire(.hostCommit, begin: true)
+        let committed = await host.agentSessionLinkRetireLane(
             endpoint: endpoint, commit: true, isStillRetirable: stillRetirable
-        ) ? .retired(sessionID: targetSessionID) : .unlinkedNotStashed(sessionID: targetSessionID)
+        )
+        logRetire(.hostCommit, begin: false)
+        return committed ? .retired(sessionID: targetSessionID) : .unlinkedNotStashed(sessionID: targetSessionID)
     }
 
     // MARK: - Resolution preview
