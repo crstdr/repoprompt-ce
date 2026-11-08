@@ -9,6 +9,7 @@ final class AgentSelfCompactNativeCompletionTests: XCTestCase {
         var dispatchCount = 0
         var providerBoundTexts: [String] = []
         var shouldStartNote = true
+        var refusal: AgentSelfCompactNativeCompletionCoordinator.NoteDispatchOutcome = .startRefused
         var shouldAcceptNote = true
         var noteTransportFailureGate: TestReleaseFence?
         var ownerIsCurrent = true
@@ -37,23 +38,23 @@ final class AgentSelfCompactNativeCompletionTests: XCTestCase {
                 store: { self.state = $0 },
                 isCurrentOwner: { _ in self.ownerIsCurrent },
                 dispatchNote: { requestID, admissible in
-                    guard admissible(), let note = self.state.active?.note else { return false }
+                    guard admissible(), let note = self.state.active?.note else { return .superseded }
                     self.dispatchCount += 1
                     self.providerBoundTexts.append(AgentSelfCompactNoteEnvelope.frame(note))
-                    guard self.shouldStartNote else { return false }
+                    guard self.shouldStartNote else { return self.refusal }
                     self.state.active?.phase = .dispatchingNote
                     let dispatchID = AgentSelfCompactionDispatchID(requestID: requestID, stage: .note)
                     if let failureGate = self.noteTransportFailureGate {
                         XCTAssertTrue(self.state.noteWillAttempt(dispatchID))
                         await failureGate.enterAndWait()
                         XCTAssertTrue(self.state.noteTransportFailed(dispatchID))
-                        return false
+                        return .startRefused
                     }
                     if self.shouldAcceptNote {
                         XCTAssertTrue(self.state.noteWillAttempt(dispatchID))
                         XCTAssertTrue(self.state.noteAccepted(dispatchID))
                     }
-                    return true
+                    return .started
                 },
                 sleep: { duration in
                     self.slept.append(duration)
@@ -123,6 +124,47 @@ final class AgentSelfCompactNativeCompletionTests: XCTestCase {
             XCTAssertEqual(state.active?.noteDispatchStarted, false)
         }
     }
+
+    #if DEBUG
+        func testNoteDispatchOutcomesPreserveParkingAndAreLogged() async {
+            let refusals: [AgentSelfCompactNativeCompletionCoordinator.NoteDispatchOutcome] = [
+                .claimRefused, .claimLost, .targetUnavailable, .staleTarget, .superseded,
+                .ownershipLost, .workspaceMismatch, .queuedProviderWork, .saveFailed, .startRefused,
+                .viewModelUnavailable, .admissibilityLost, .notReady(.targetNotIdle)
+            ]
+            for refusal in refusals {
+                let fake = Fake()
+                fake.shouldStartNote = false
+                fake.refusal = refusal
+                let id = fake.arm()
+                let coordinator = fake.coordinator()
+                AgentSelfCompactDiagnostics.beginCaptureForTesting()
+                XCTAssertTrue(coordinator.bindCompact(.init(requestID: id, stage: .compact), runID: fake.compactRunID, runAttemptID: fake.compactAttemptID))
+                coordinator.compactTurnSettled(revision: fake.completeRevision(status: .completed), publication: .accepted(successorEpoch: nil), teardownSettled: { true })
+                await drain()
+                let records = AgentSelfCompactDiagnostics.endCaptureForTesting()
+                XCTAssertEqual(fake.state.active?.phase, .parked, "\(refusal)")
+                XCTAssertTrue(records.contains { $0.phase == "note_dispatch" && $0.outcome == refusal.label })
+                XCTAssertTrue(records.contains { $0.phase == "parked" && $0.outcome == refusal.label })
+                coordinator.cancelRuntimeWork()
+            }
+        }
+
+        func testStartedNoteDispatchIsLogged() async {
+            let fake = Fake()
+            let id = fake.arm()
+            let coordinator = fake.coordinator()
+            AgentSelfCompactDiagnostics.beginCaptureForTesting()
+            XCTAssertTrue(coordinator.bindCompact(.init(requestID: id, stage: .compact), runID: fake.compactRunID, runAttemptID: fake.compactAttemptID))
+            coordinator.compactTurnSettled(revision: fake.completeRevision(status: .completed), publication: .accepted(successorEpoch: nil), teardownSettled: { true })
+            await drain()
+            let records = AgentSelfCompactDiagnostics.endCaptureForTesting()
+            XCTAssertTrue(records.contains { $0.phase == "note_dispatch" && $0.outcome == "started" })
+            XCTAssertEqual(fake.state.latest?.outcome, .noteAccepted)
+            coordinator.cancelRuntimeWork()
+        }
+
+    #endif
 
     func testClaudeCompletionSendsVerbatimFramedNoteOnce() async {
         let fake = Fake()

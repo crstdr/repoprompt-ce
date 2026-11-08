@@ -2427,7 +2427,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
             store: { fixture.session.selfCompactState = $0 },
             isCurrentOwner: { _ in true },
             dispatchNote: { id, admissible in
-                guard admissible() else { return false }
+                guard admissible() else { return .startRefused }
                 fixture.session.selfCompactState.active?.phase = .dispatchingNote
                 let outcome = await fixture.coordinator.sendCodexNativeMessage(
                     session: fixture.session,
@@ -2435,7 +2435,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
                     attachments: [],
                     selfCompactDispatchID: .init(requestID: id, stage: .note)
                 )
-                return outcome.didSend
+                return outcome.didSend ? .started : .startRefused
             }
         )
         defer { completion.cancelRuntimeWork() }

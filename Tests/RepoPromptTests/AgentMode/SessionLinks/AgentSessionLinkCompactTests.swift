@@ -1270,7 +1270,7 @@ final class AgentSessionLinkCompactClaudeDispatchTests: XCTestCase {
             store: { session.selfCompactState = $0 },
             isCurrentOwner: { _ in false },
             dispatchNote: { _, _ in XCTFail("No second note dispatch")
-                return false
+                return .startRefused
             }
         )
 

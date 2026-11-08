@@ -621,14 +621,14 @@ final class AgentSelfCompactACPSettleTests: XCTestCase {
                 store: { self.state = $0 },
                 isCurrentOwner: { _ in true },
                 dispatchNote: { requestID, admissible in
-                    guard admissible(), let note = self.state.active?.note else { return false }
+                    guard admissible(), let note = self.state.active?.note else { return .startRefused }
                     self.dispatchCount += 1
                     self.providerBoundTexts.append(AgentSelfCompactNoteEnvelope.frame(note))
                     self.state.active?.phase = .dispatchingNote
                     let dispatchID = AgentSelfCompactionDispatchID(requestID: requestID, stage: .note)
                     XCTAssertTrue(self.state.noteWillAttempt(dispatchID))
                     XCTAssertTrue(self.state.noteAccepted(dispatchID))
-                    return true
+                    return .started
                 },
                 sleep: { duration in
                     self.slept.append(duration)

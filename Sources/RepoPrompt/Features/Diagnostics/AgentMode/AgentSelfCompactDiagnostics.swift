@@ -11,6 +11,7 @@ enum AgentSelfCompactDiagnostics {
         case settle = "selfcompact-settle"
         case compactAttempt = "selfcompact-compact-attempt"
         case runCancel = "selfcompact-run-cancel"
+        case continuation = "selfcompact-continuation"
     }
 
     // MARK: - Settle vocabularies
@@ -197,6 +198,11 @@ enum AgentSelfCompactDiagnostics {
         var currentAttempt: String?
         var taskPresent: Bool?
         var taskIsCancelled: Bool?
+        var elapsedMilliseconds: Int?
+        var windowVisible: Bool?
+        var pendingInteraction: Bool?
+        var computerUseArmed: Bool?
+        var deliverySource: String?
 
         var renderedLine: String {
             var fields = [
@@ -228,6 +234,12 @@ enum AgentSelfCompactDiagnostics {
             if let currentAttempt { fields.append("current_attempt=\(currentAttempt)") }
             if let taskPresent { fields.append("task_present=\(taskPresent)") }
             if let taskIsCancelled { fields.append("task_is_cancelled=\(taskIsCancelled)") }
+            if let elapsedMilliseconds { fields.append("elapsed_ms=\(elapsedMilliseconds)") }
+            else if event == .continuation, phase == ContinuationPhase.delivered.rawValue { fields.append("elapsed_ms=unavailable") }
+            if let windowVisible { fields.append("window_visible=\(windowVisible)") }
+            if let pendingInteraction { fields.append("pending_interaction=\(pendingInteraction)") }
+            if let computerUseArmed { fields.append("computer_use_armed=\(computerUseArmed)") }
+            if let deliverySource { fields.append("delivery_source=\(deliverySource)") }
             return fields.joined(separator: " ")
         }
     }
@@ -322,6 +334,91 @@ enum AgentSelfCompactDiagnostics {
             taskIsCancelled: taskIsCancelled
         )
         emit(record)
+    }
+
+    enum ContinuationPhase: String {
+        case compactConfirmed = "compact_confirmed"
+        case teardown
+        case noteAttempt = "note_attempt"
+        case refusalContext = "refusal_context"
+        case noteDispatch = "note_dispatch"
+        case parked
+        case superseded
+        case delivered
+        case released
+        case deadlinePark = "deadline_park"
+    }
+
+    static func continuation(
+        attempt: AgentSelfCompactAttempt, phase: ContinuationPhase, outcome: String? = nil,
+        elapsedMilliseconds: Int? = nil, windowVisible: Bool? = nil,
+        pendingInteraction: Bool? = nil, computerUseArmed: Bool? = nil, deliverySource: String? = nil
+    ) {
+        emit(Record(
+            event: .continuation, request: hashedID(attempt.id), tab: hashedID(attempt.owner?.tabID),
+            run: hashedID(attempt.owner?.runID), phase: phase.rawValue, outcome: outcome,
+            elapsedMilliseconds: elapsedMilliseconds, windowVisible: windowVisible,
+            pendingInteraction: pendingInteraction, computerUseArmed: computerUseArmed, deliverySource: deliverySource
+        ))
+    }
+
+    private final class ParkTimes: @unchecked Sendable {
+        private let lock = NSLock()
+        private var times: [UUID: ContinuousClock.Instant] = [:]
+        func park(_ id: UUID) {
+            lock.lock()
+            defer { lock.unlock() }
+            times[id] = .now
+        }
+
+        func contains(_ id: UUID) -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return times[id] != nil
+        }
+
+        func take(_ id: UUID) -> ContinuousClock.Instant? {
+            lock.lock()
+            defer { lock.unlock() }
+            return times.removeValue(forKey: id)
+        }
+    }
+
+    private static let parkedTimes = ParkTimes()
+
+    static func parked(attempt: AgentSelfCompactAttempt, reason: String) {
+        parkedTimes.park(attempt.id)
+        continuation(attempt: attempt, phase: .parked, outcome: reason)
+    }
+
+    static func wasParked(_ attempt: AgentSelfCompactAttempt) -> Bool {
+        attempt.noteWasPrepended == true || parkedTimes.contains(attempt.id)
+    }
+
+    static func release(attempt: AgentSelfCompactAttempt) {
+        guard let start = parkedTimes.take(attempt.id) else { return }
+        let components = start.duration(to: .now).components
+        let elapsed = Int(components.seconds * 1000 + components.attoseconds / 1_000_000_000_000_000)
+        continuation(attempt: attempt, phase: .released, outcome: "settled", elapsedMilliseconds: elapsed)
+    }
+
+    static func delivered(attempt: AgentSelfCompactAttempt, source: DeliverySource) {
+        let elapsed = parkedTimes.take(attempt.id).map { start in
+            let components = start.duration(to: .now).components
+            return Int(components.seconds * 1000 + components.attoseconds / 1_000_000_000_000_000)
+        }
+        continuation(
+            attempt: attempt,
+            phase: .delivered,
+            elapsedMilliseconds: elapsed,
+            deliverySource: source.rawValue
+        )
+    }
+
+    enum DeliverySource: String {
+        case inputPrefix = "input_prefix"
+        case notificationWake = "notification_wake"
+        case unknown
     }
 
     private static func supportName(_ support: AgentSessionLinkCompactSupport) -> String {

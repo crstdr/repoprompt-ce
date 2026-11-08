@@ -1899,7 +1899,11 @@ final class ClaudeAgentModeCoordinator {
                 do {
                     let turnID = try await controller.sendUserMessage(text)
                     state = session.selfCompactState
+                    let acceptedAttempt = state.active
                     if state.noteAccepted(dispatchID) {
+                        if let acceptedAttempt, AgentSelfCompactDiagnostics.wasParked(acceptedAttempt) {
+                            AgentSelfCompactDiagnostics.delivered(attempt: acceptedAttempt, source: .unknown)
+                        }
                         session.appendItem(AgentChatItem.selfCompactionNoteRestored(sequenceIndex: session.nextSequenceIndex))
                         hostCapabilities.requestUIRefresh(session, true)
                     }
@@ -2004,7 +2008,11 @@ final class ClaudeAgentModeCoordinator {
                 recordOrdinaryDispatchAttempt()
                 if let parked {
                     var state = session.selfCompactState
+                    let acceptedAttempt = state.active
                     if state.noteAccepted(parked.dispatchID) {
+                        if let acceptedAttempt, AgentSelfCompactDiagnostics.wasParked(acceptedAttempt) {
+                            AgentSelfCompactDiagnostics.delivered(attempt: acceptedAttempt, source: .unknown)
+                        }
                         session.appendItem(AgentChatItem.selfCompactionNoteRestored(sequenceIndex: session.nextSequenceIndex))
                         hostCapabilities.requestUIRefresh(session, true)
                     }

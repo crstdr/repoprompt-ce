@@ -377,7 +377,7 @@ final class AgentSelfCompactTerminalSchedulerTests: XCTestCase {
             load: { fake.state },
             store: { fake.state = $0 },
             isCurrentOwner: { _ in true },
-            dispatchNote: { _, _ in false }
+            dispatchNote: { _, _ in .startRefused }
         )
         let bindAfterPreparation = Task { @MainActor in
             await gate.wait()

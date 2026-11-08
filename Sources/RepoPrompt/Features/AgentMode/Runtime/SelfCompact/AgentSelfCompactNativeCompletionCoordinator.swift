@@ -10,10 +10,46 @@ import Foundation
 @MainActor
 final class AgentSelfCompactNativeCompletionCoordinator {
     typealias State = AgentSelfCompactState
+    enum NoteDispatchOutcome: Equatable {
+        case started
+        case claimRefused
+        case claimLost
+        case targetUnavailable
+        case staleTarget
+        case superseded
+        case admissibilityLost
+        case ownershipLost
+        case workspaceMismatch
+        case queuedProviderWork
+        case notReady(AgentSessionLinkDeliveryReadiness.BlockReason)
+        case saveFailed
+        case startRefused
+        case viewModelUnavailable
+
+        var label: String {
+            switch self {
+            case .started: "started"
+            case .claimRefused: "claim_refused"
+            case .claimLost: "claim_lost"
+            case .targetUnavailable: "target_unavailable"
+            case .staleTarget: "stale_target"
+            case .superseded: "superseded"
+            case .admissibilityLost: "admissibility_lost"
+            case .ownershipLost: "ownership_lost"
+            case .workspaceMismatch: "workspace_mismatch"
+            case .queuedProviderWork: "queued_provider_work"
+            case let .notReady(reason): "not_ready_\(reason.rawValue)"
+            case .saveFailed: "save_failed"
+            case .startRefused: "start_refused"
+            case .viewModelUnavailable: "view_model_unavailable"
+            }
+        }
+    }
+
     typealias NoteDispatch = @MainActor (
         _ requestID: UUID,
         _ stillAdmissible: @escaping @MainActor () -> Bool
-    ) async -> Bool
+    ) async -> NoteDispatchOutcome
 
     private let load: @MainActor () -> State
     private let store: @MainActor (State) -> Void
@@ -76,6 +112,10 @@ final class AgentSelfCompactNativeCompletionCoordinator {
                 // consume it first instead.
                 current.active?.acpCompletionUnverified = true
                 current.active?.phase = .parked
+                if let attempt = current.active {
+                    AgentSelfCompactDiagnostics.continuation(attempt: attempt, phase: .deadlinePark)
+                    AgentSelfCompactDiagnostics.parked(attempt: attempt, reason: "deadline")
+                }
             }
             store(current)
         }
@@ -139,6 +179,7 @@ final class AgentSelfCompactNativeCompletionCoordinator {
         guard revision.successorKind == nil else {
             revokeLateConfirmation(requestID: attempt.id)
             state.active?.phase = .parked
+            if attempt.phase != .parked { AgentSelfCompactDiagnostics.parked(attempt: attempt, reason: "successor_claimed") }
             store(state)
             return
         }
@@ -164,6 +205,7 @@ final class AgentSelfCompactNativeCompletionCoordinator {
             store(state)
             return
         }
+        AgentSelfCompactDiagnostics.continuation(attempt: attempt, phase: .compactConfirmed, outcome: attempt.admittedSupport == .codex ? "codex" : "claude_code")
         state.active?.acpCompletionUnverified = nil
         state.active?.compactTurnSucceeded = true
         state.active?.phase = .awaitingNoteBoundary
@@ -241,6 +283,8 @@ final class AgentSelfCompactNativeCompletionCoordinator {
             state.settle(.cancelled, noteDelivery: .notSent, completionVerified: false)
         } else {
             state.active?.phase = .parked
+            AgentSelfCompactDiagnostics.continuation(attempt: attempt, phase: .superseded)
+            AgentSelfCompactDiagnostics.parked(attempt: attempt, reason: "ordinary_input")
         }
         store(state)
     }
@@ -275,7 +319,7 @@ final class AgentSelfCompactNativeCompletionCoordinator {
             assistantOrToolRowCount: assistantOrToolRowCount
         )
         guard instant else {
-            parkACPUnverified(requestID)
+            parkACPUnverified(requestID, reason: "acp_unverified_immediate")
             return
         }
         var state = load()
@@ -288,7 +332,7 @@ final class AgentSelfCompactNativeCompletionCoordinator {
         holdTask = Task { @MainActor [self] in
             await sleep(AgentSelfCompactInstantReturn.settleDuration)
             guard !Task.isCancelled else { return }
-            parkACPUnverified(requestID)
+            parkACPUnverified(requestID, reason: "acp_settle_timeout")
         }
     }
 
@@ -309,6 +353,7 @@ final class AgentSelfCompactNativeCompletionCoordinator {
             store(state)
             return
         }
+        AgentSelfCompactDiagnostics.continuation(attempt: attempt, phase: .compactConfirmed, outcome: "acp")
         state.active?.acpCompletionUnverified = nil
         state.active?.compactTurnSucceeded = true
         state.active?.phase = .awaitingNoteBoundary
@@ -319,7 +364,7 @@ final class AgentSelfCompactNativeCompletionCoordinator {
         }
     }
 
-    private func parkACPUnverified(_ requestID: UUID) {
+    private func parkACPUnverified(_ requestID: UUID, reason: String) {
         var state = load()
         guard state.active?.id == requestID, state.active?.noteDispatchStarted != true else { return }
         switch state.active?.phase {
@@ -330,6 +375,7 @@ final class AgentSelfCompactNativeCompletionCoordinator {
         }
         state.active?.acpCompletionUnverified = true
         state.active?.phase = .parked
+        if let attempt = state.active { AgentSelfCompactDiagnostics.parked(attempt: attempt, reason: reason) }
         store(state)
     }
 
@@ -354,6 +400,7 @@ final class AgentSelfCompactNativeCompletionCoordinator {
         owner: AgentSelfCompactOwner,
         teardownSettled: @escaping @MainActor () -> Bool
     ) async {
+        let boundaryStart = now()
         for _ in 0 ..< 600 {
             guard !runtimeCancelled, load().active?.id == requestID,
                   load().active?.phase == .awaitingNoteBoundary
@@ -378,27 +425,44 @@ final class AgentSelfCompactNativeCompletionCoordinator {
             store(state)
             return
         }
+        let elapsed = boundaryStart.duration(to: now()).components
+        let elapsedMilliseconds = Int(elapsed.seconds * 1000 + elapsed.attoseconds / 1_000_000_000_000_000)
         guard teardownSettled() else {
+            if let attempt = state.active {
+                AgentSelfCompactDiagnostics.continuation(attempt: attempt, phase: .teardown, outcome: "timed_out", elapsedMilliseconds: elapsedMilliseconds)
+                AgentSelfCompactDiagnostics.parked(attempt: attempt, reason: "teardown_timeout")
+            }
             state.active?.phase = .parked
             store(state)
             return
         }
+        if let attempt = state.active {
+            AgentSelfCompactDiagnostics.continuation(attempt: attempt, phase: .teardown, outcome: "settled", elapsedMilliseconds: elapsedMilliseconds)
+        }
         state.active?.phase = .noteDispatchPending
         store(state)
-        let didStart = await dispatchNote(requestID) { [self] in
+        let dispatchAttempt = state.active
+        let outcome = await dispatchNote(requestID) { [self] in
             let current = load().active
             return !runtimeCancelled && current?.id == requestID
                 && (current?.phase == .noteDispatchPending || current?.phase == .dispatchingNote)
                 && current?.noteDispatchStarted == false
                 && isCurrentOwner(owner)
         }
+        if let attempt = dispatchAttempt {
+            AgentSelfCompactDiagnostics.continuation(attempt: attempt, phase: .noteDispatch, outcome: outcome.label)
+        }
         state = load()
         guard !runtimeCancelled, state.active?.id == requestID else { return }
-        if !didStart, state.active?.noteDispatchStarted == false {
+        if outcome != .started, state.active?.noteDispatchStarted == false {
+            let alreadyParked = state.active?.phase == .parked
             if !isCurrentOwner(owner) {
                 state.settle(.cancelled, noteDelivery: .notSent, completionVerified: false)
             } else {
                 state.active?.phase = .parked
+                if !alreadyParked, let attempt = state.active {
+                    AgentSelfCompactDiagnostics.parked(attempt: attempt, reason: outcome.label)
+                }
             }
             store(state)
         }

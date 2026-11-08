@@ -413,7 +413,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
                 load: { session.selfCompactState }, store: { session.selfCompactState = $0 },
                 isCurrentOwner: { _ in true },
                 dispatchNote: { requestID, admissible in
-                    guard admissible() else { return false }
+                    guard admissible() else { return .startRefused }
                     session.selfCompactState.active?.phase = .dispatchingNote
                     let fence = AgentRunStartStopFence(session: session)
                     if exit == "entryStop" { session.stopState.invalidateScheduledStarts() }
@@ -432,7 +432,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
                         },
                         selfCompactDispatchID: .init(requestID: requestID, stage: .note), stopFence: fence
                     )
-                    return true
+                    return .started
                 }
             )
             session.selfCompactNativeCompletion = completion
@@ -520,7 +520,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             let completion = AgentSelfCompactNativeCompletionCoordinator(
                 load: { session.selfCompactState }, store: { session.selfCompactState = $0 },
                 isCurrentOwner: { _ in true }, dispatchNote: { _, _ in XCTFail("No note may dispatch")
-                    return false
+                    return .startRefused
                 }
             )
             defer { completion.cancelRuntimeWork() }
