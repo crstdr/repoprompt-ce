@@ -227,7 +227,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         let attemptID = UUID()
         let completion = AgentSelfCompactNativeCompletionCoordinator(
             load: { session.selfCompactState }, store: { session.selfCompactState = $0 },
-            isCurrentOwner: { _ in true }, dispatchNote: { _, _ in false }
+            isCurrentOwner: { _ in true }, dispatchNote: { _, _ in .startRefused }
         )
         defer { completion.cancelRuntimeWork() }
         XCTAssertTrue(completion.bindCompact(.init(requestID: noteID.requestID, stage: .compact), runID: runID, runAttemptID: attemptID))
