@@ -8,6 +8,40 @@ package final class CatalogPerf: @unchecked Sendable {
     private let lock = NSLock()
     #if DEBUG
         private var suppressAutomaticEmission = false
+        private var emissionObservers: [UUID: @Sendable (WindowRecords?) -> Void] = [:]
+
+        package final class EmissionObservation: Sendable {
+            private let owner: CatalogPerf
+            private let id: UUID
+
+            fileprivate init(owner: CatalogPerf, id: UUID) {
+                self.owner = owner
+                self.id = id
+            }
+
+            package func cancel() {
+                owner.removeEmissionObserver(id)
+            }
+
+            deinit { cancel() }
+        }
+
+        /// Observes completed emission rotations. The lease unregisters on cancellation or release.
+        package func observeEmissionsForTesting(
+            _ observer: @escaping @Sendable (WindowRecords?) -> Void
+        ) -> EmissionObservation {
+            let id = UUID()
+            lock.lock()
+            emissionObservers[id] = observer
+            lock.unlock()
+            return EmissionObservation(owner: self, id: id)
+        }
+
+        private func removeEmissionObserver(_ id: UUID) {
+            lock.lock()
+            emissionObservers.removeValue(forKey: id)
+            lock.unlock()
+        }
 
         package func setSuppressAutomaticEmissionForTesting(_ suppress: Bool) {
             lock.lock()
@@ -37,6 +71,7 @@ package final class CatalogPerf: @unchecked Sendable {
         presentationCounts[event, default: 0] += 1
         lock.unlock()
     }
+
     private var receivers: [UUID: Int] = [:]
     private var fullReceipts = 0
     private var metadataReceipts = 0
@@ -51,6 +86,9 @@ package final class CatalogPerf: @unchecked Sendable {
     private var documentBytesHashed = 0
     private var preparation = Timing()
     private var persistence = Timing()
+    private var analyticsSeed = Timing()
+    private var seedProjections = 0
+    private var seedProjectionsMax = 0
 
     private struct Timing {
         var count = 0
@@ -135,6 +173,15 @@ package final class CatalogPerf: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// Measures elapsed time from analytics collection through synchronous seed finalization.
+    package func transcriptAnalyticsSeed(ms: Double, projections: Int) {
+        lock.lock()
+        analyticsSeed.record(ms: ms, bytes: 0, onMainThread: Thread.isMainThread)
+        seedProjections += projections
+        seedProjectionsMax = max(seedProjectionsMax, projections)
+        lock.unlock()
+    }
+
     package func heartbeat(gapMS: Double, expectedMS: Double) {
         lock.lock()
         heartbeatSampleMS += gapMS
@@ -145,8 +192,22 @@ package final class CatalogPerf: @unchecked Sendable {
         lock.unlock()
     }
 
-    /// A sample can straddle a rotation boundary; splitting one observation is acceptable.
+    package struct WindowRecords: Sendable {
+        package let core: String
+        package let analyticsSeed: String
+
+        package var records: [String] {
+            [core, analyticsSeed]
+        }
+    }
+
+    /// Combined view for in-process diagnostics; the logger emits the two bounded records.
     package func rotate() -> String? {
+        rotateRecords()?.records.joined(separator: " ")
+    }
+
+    /// A sample can straddle a rotation boundary; splitting one observation is acceptable.
+    package func rotateRecords() -> WindowRecords? {
         lock.lock()
         let now = DispatchTime.now().uptimeNanoseconds
         let durationMS = Double(now - windowStart) / 1_000_000
@@ -157,7 +218,8 @@ package final class CatalogPerf: @unchecked Sendable {
         let reconciliations = fullReconciliations, appSum = applicationSumMS, appMax = applicationMaxMS
         let publications = publications, decodes = canonicalDecodes, hits = decodeHits
         let decodeBytes = decodeBytesHashed, documentBytes = documentBytesHashed
-        let prep = preparation, write = persistence
+        let prep = preparation, write = persistence, analytics = analyticsSeed
+        let projections = seedProjections, projectionsMax = seedProjectionsMax
         windowStart = now
         self.activity = 0
         heartbeatSampleMS = 0
@@ -181,8 +243,13 @@ package final class CatalogPerf: @unchecked Sendable {
         documentBytesHashed = 0
         preparation = Timing()
         persistence = Timing()
+        analyticsSeed = Timing()
+        seedProjections = 0
+        seedProjectionsMax = 0
         lock.unlock()
-        guard activity > 0 else { return nil }
+        // Ordinary idle windows stay silent. A >=250ms heartbeat gap reports independently of
+        // catalog/presentation activity.
+        guard activity > 0 || analytics.count > 0 || over250 > 0 else { return nil }
         func ms(_ value: Double) -> String {
             String(format: "%.3f", value)
         }
@@ -190,7 +257,9 @@ package final class CatalogPerf: @unchecked Sendable {
         let catalog = "activity=\(activity) window_ms=\(ms(durationMS)) heartbeat_sample_ms=\(ms(sampleMS)) heartbeat_max_late_ms=\(ms(maxLate)) heartbeat_gaps_gt16=\(over16) heartbeat_gaps_gt100=\(over100) receivers=\(receivers.count) receipts_full=\(full) receipts_metadata=\(metadata) receivers_full=\(receivers.values.count(where: { $0 > 0 })) receiver_full_max=\(receivers.values.max() ?? 0) applications_attempted=\(applications) reconciliations_full_attempted=\(reconciliations) application_sum_ms=\(ms(appSum)) application_max_ms=\(ms(appMax))"
         let writer = "prep_count=\(prep.count) prep_sum_ms=\(ms(prep.sumMS)) prep_max_ms=\(ms(prep.maxMS)) prep_max_bytes=\(prep.maxBytes) prep_main_thread=\(prep.mainThreadCount) write_count=\(write.count) write_sum_ms=\(ms(write.sumMS)) write_max_ms=\(ms(write.maxMS)) write_main_thread=\(write.mainThreadCount)"
         let display = "presentation_receivers_visible=\(displayReceivers.values.count(where: { $0 })) presentation_receivers_hidden=\(displayReceivers.values.count(where: { !$0 })) presentation_builds_attempted=\(displayCounts[.build, default: 0]) presentation_applies=\(displayCounts[.apply, default: 0]) presentation_deferrals=\(displayCounts[.deferred, default: 0]) presentation_catchups=\(displayCounts[.catchUp, default: 0]) heartbeat_gaps_ge250=\(over250)"
-        return "\(catalog) \(display) publications=\(publicationSummary.isEmpty ? "-" : publicationSummary) canonical_decodes=\(decodes) decode_cache_hits=\(hits) decode_bytes_hashed=\(decodeBytes) document_bytes_hashed=\(documentBytes) \(writer)"
+        let transcript = "analytics_seed_count=\(analytics.count) analytics_seed_sum_ms=\(ms(analytics.sumMS)) analytics_seed_max_ms=\(ms(analytics.maxMS)) analytics_seed_main_thread=\(analytics.mainThreadCount) seed_projections=\(projections) seed_projections_max=\(projectionsMax)"
+        let core = "\(catalog) \(display) publications=\(publicationSummary.isEmpty ? "-" : publicationSummary) canonical_decodes=\(decodes) decode_cache_hits=\(hits) decode_bytes_hashed=\(decodeBytes) document_bytes_hashed=\(documentBytes) \(writer)"
+        return WindowRecords(core: core, analyticsSeed: transcript)
     }
 
     package func emitWindow() {
@@ -200,8 +269,19 @@ package final class CatalogPerf: @unchecked Sendable {
             lock.unlock()
             if suppressed { return }
         #endif
-        if let line = rotate() {
-            Self.logger.notice("\(line, privacy: .public)")
+        let rotation = rotateRecords()
+        if let rotation {
+            for record in rotation.records {
+                Self.logger.notice("\(record, privacy: .public)")
+            }
         }
+        #if DEBUG
+            lock.lock()
+            let observers = Array(emissionObservers.values)
+            lock.unlock()
+            for observer in observers {
+                observer(rotation)
+            }
+        #endif
     }
 }

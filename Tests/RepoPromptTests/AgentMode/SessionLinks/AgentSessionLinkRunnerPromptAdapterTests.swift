@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import XCTest
 
 /// Headless runner adapter, driven through the real `HeadlessAgentModeRunner`.
@@ -783,6 +784,225 @@ func agentSessionLinkEvidenceBytes(_ value: Any) throws -> Data {
         return ["type": String(reflecting: type(of: value)), "children": children]
     }
     return try JSONSerialization.data(withJSONObject: tree(value), options: [.sortedKeys])
+}
+
+/// Eager oracle uses the original Seed.append path, independently of the collector.
+enum AgentSeedCollectorTestSupport {
+    typealias Index = AgentSessionLinkRetainedLocalInputIndex
+
+    static func user(_ number: Int, text: String? = nil) -> AgentChatItem {
+        AgentChatItem(
+            id: UUID(uuidString: String(format: "11111111-0000-0000-0000-%012d", number))!,
+            timestamp: Date(timeIntervalSince1970: 1000 + Double(number)),
+            kind: .user, text: text ?? "Input \(number) <&> " + String(repeating: "narrative ", count: 100),
+            sequenceIndex: number, userInputOrigin: .localComposer
+        )
+    }
+
+    static func transcript(_ count: Int) -> AgentTranscript {
+        AgentTranscript(turns: (0 ..< count).map { number in
+            let item = user(number)
+            return AgentTranscriptTurn(
+                id: item.id, request: AgentTranscriptRequestAnchor(from: item),
+                startedAt: item.timestamp
+            )
+        })
+    }
+
+    static func assertEqual(_ actual: Index.Seed, _ expected: Index.Seed, file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertEqual(actual.trackedIDs, expected.trackedIDs, file: file, line: line)
+        XCTAssertEqual(actual.totalCount, expected.totalCount, file: file, line: line)
+        XCTAssertEqual(actual.trackedRows, expected.trackedRows, file: file, line: line)
+        XCTAssertEqual(actual.rows.map(\.itemID), expected.rows.map(\.itemID), file: file, line: line)
+        XCTAssertEqual(actual.rows.map(\.timestamp), expected.rows.map(\.timestamp), file: file, line: line)
+        XCTAssertEqual(actual.rows.map(\.content), expected.rows.map(\.content), file: file, line: line)
+    }
+
+    struct Phase {
+        let analytics: AgentTranscriptAnalyticsSnapshot
+        let seed: Index.Seed
+        let projections: Int
+        let milliseconds: Double
+    }
+
+    static func phase(_ transcript: AgentTranscript, tracked: Set<UUID>, eager: Bool, perf: CatalogPerf? = nil) -> Phase {
+        let start = DispatchTime.now().uptimeNanoseconds
+        var seed = Index.Seed(trackedIDs: tracked)
+        var collector = Index.SeedCollector(trackedIDs: tracked)
+        let analytics = AgentTranscriptAnalyticsBuilder.build(from: transcript, selectedAgent: .claudeCode) { item in
+            if eager { seed.append(item) } else { collector.append(item) }
+        }
+        let projections: Int
+        if eager {
+            projections = Int(seed.totalCount)
+        } else {
+            let result = collector.finalize()
+            seed = result.seed
+            projections = result.projectionCount
+        }
+        let milliseconds = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+        perf?.transcriptAnalyticsSeed(ms: milliseconds, projections: projections)
+        return Phase(analytics: analytics, seed: seed, projections: projections, milliseconds: milliseconds)
+    }
+}
+
+final class AgentSessionLinkSeedCollectorTests: XCTestCase {
+    private typealias Support = AgentSeedCollectorTestSupport
+    private typealias Index = AgentSessionLinkRetainedLocalInputIndex
+
+    func testEagerParityAndProjectionBoundAcrossHistorySizes() {
+        for count in [0, 16, 17, 300] {
+            let transcript = Support.transcript(count)
+            for tracked in [
+                Set<UUID>(),
+                Set(transcript.turns.prefix(16).compactMap { $0.request?.id }),
+                Set(transcript.turns.suffix(16).compactMap { $0.request?.id })
+            ] {
+                let eager = Support.phase(transcript, tracked: tracked, eager: true)
+                let bounded = Support.phase(transcript, tracked: tracked, eager: false)
+                Support.assertEqual(bounded.seed, eager.seed)
+                XCTAssertEqual(bounded.analytics, eager.analytics)
+                XCTAssertEqual(bounded.seed.totalCount, UInt64(count))
+                XCTAssertLessThanOrEqual(bounded.projections, min(count, 16 + tracked.count))
+                if count == 300, tracked == Set(transcript.turns.prefix(16).compactMap { $0.request?.id }) {
+                    XCTAssertEqual(bounded.projections, 32)
+                }
+            }
+        }
+    }
+
+    func testEligibilityNilTextUnicodeTruncationAndDuplicateOccurrenceParity() throws {
+        let hugeGrapheme = "e" + String(repeating: "\u{301}", count: 5000)
+        var items = [
+            Support.user(0, text: ""),
+            Support.user(1, text: " \u{0}\u{B}"),
+            Support.user(2, text: hugeGrapheme),
+            Support.user(3, text: String(repeating: "👩🏽‍💻<&>", count: 700)),
+            Support.user(4, text: "api_key=private-value " + NSHomeDirectory() + String(repeating: "X", count: 9000))
+        ]
+        var assistant = Support.user(5)
+        assistant.kind = .assistant
+        var unknown = Support.user(6)
+        unknown.userInputOrigin = nil
+        var attributed = Support.user(7)
+        attributed.crossSessionAttribution = AgentCrossSessionAttribution(sourceSessionID: UUID(), sourceName: nil, linkID: UUID())
+        items += [assistant, unknown, attributed]
+        items += (8 ..< 26).map { Support.user($0) }
+        var duplicate = items[0]
+        duplicate.text = "duplicate first occurrence"
+        items.append(duplicate)
+        duplicate.text = "duplicate last occurrence"
+        items.append(duplicate)
+        let tracked = Set(items.prefix(5).map(\.id))
+        var eager = Index.Seed(trackedIDs: tracked)
+        var collector = Index.SeedCollector(trackedIDs: tracked)
+        for item in items {
+            eager.append(item)
+            collector.append(item)
+        }
+        let result = collector.finalize()
+        Support.assertEqual(result.seed, eager)
+        XCTAssertEqual(result.seed.totalCount, UInt64(items.count - 3))
+        XCTAssertEqual(result.seed.rows.suffix(2).map(\.content.text), ["duplicate first occurrence", "duplicate last occurrence"])
+        XCTAssertEqual(result.seed.trackedRows[duplicate.id]?.text, "duplicate last occurrence")
+        XCTAssertNil(try XCTUnwrap(result.seed.trackedRows[items[1].id]).text)
+        XCTAssertNil(try XCTUnwrap(result.seed.trackedRows[items[2].id]).text)
+        XCTAssertTrue(try XCTUnwrap(result.seed.trackedRows[items[3].id]).truncated)
+        XCTAssertLessThanOrEqual(result.projectionCount, 16 + tracked.count)
+        // Duplicate suffix IDs are compared at the seed boundary, never passed to install.
+    }
+
+    func testEmptyContentAndLastEligibleTrackedOccurrenceOutsideSuffix() throws {
+        let empty = Support.user(0, text: "")
+        var duplicate = Support.user(1, text: "first")
+        var items = [empty, duplicate]
+        duplicate = AgentChatItem(
+            id: duplicate.id, timestamp: duplicate.timestamp.addingTimeInterval(1), kind: .user,
+            text: "last eligible", sequenceIndex: duplicate.sequenceIndex, userInputOrigin: .localComposer
+        )
+        items.append(duplicate)
+        duplicate.userInputOrigin = nil
+        duplicate.text = "ineligible later copy"
+        items.append(duplicate)
+        items += (100 ..< 400).map { Support.user($0) }
+        let absentID = Support.user(2).id
+        let tracked: Set<UUID> = [empty.id, duplicate.id, absentID]
+        var eager = Index.Seed(trackedIDs: tracked)
+        var collector = Index.SeedCollector(trackedIDs: tracked)
+        for item in items {
+            eager.append(item)
+            collector.append(item)
+        }
+        let result = collector.finalize()
+        Support.assertEqual(result.seed, eager)
+        XCTAssertEqual(result.seed.totalCount, 303)
+        XCTAssertEqual(result.projectionCount, 18)
+        XCTAssertNil(try XCTUnwrap(result.seed.trackedRows[empty.id]).text)
+        XCTAssertEqual(result.seed.trackedRows[duplicate.id]?.text, "last eligible")
+        XCTAssertTrue(result.seed.trackedIDs.contains(absentID))
+        XCTAssertNil(result.seed.trackedRows[absentID], "absence remains deletion/ineligibility evidence")
+    }
+
+    func testTrackedCanonicalEditAndAbsencePreserveSettlementIdentity() throws {
+        var index = Index()
+        let oldest = Support.user(0)
+        let newer = (1 ... 20).map { Support.user($0) }
+        for item in newer {
+            index.settle(item, at: item.sequenceIndex)
+        }
+        index.settle(oldest, at: 0)
+        let before = try XCTUnwrap(index.records.last)
+        let epoch = index.epoch
+        var edited = oldest
+        edited.text = "Canonical edit <&>"
+        var collector = Index.SeedCollector(trackedIDs: Set(index.records.map(\.itemID)))
+        for item in [edited] + newer {
+            collector.append(item)
+        }
+        index.install(collector.finalize().seed)
+        let after = try XCTUnwrap(index.records.last)
+        XCTAssertEqual(after.ordinal, before.ordinal)
+        XCTAssertNotEqual(after.contentVersion, before.contentVersion)
+        XCTAssertEqual(after.content?.text, edited.text)
+        var deleted = Index.SeedCollector(trackedIDs: Set(index.records.map(\.itemID)))
+        for item in newer {
+            deleted.append(item)
+        }
+        index.install(deleted.finalize().seed)
+        XCTAssertNil(index.records.last?.content)
+        XCTAssertEqual(index.epoch, epoch)
+        XCTAssertEqual(index.producedThrough, 21)
+        index.invalidateStructure()
+        index.install(collector.finalize().seed)
+        XCTAssertEqual(index.producedThrough, 21)
+        XCTAssertEqual(index.droppedThrough, 5)
+        XCTAssertEqual(index.records.map(\.ordinal), Array(6 ... 21).map(UInt64.init))
+    }
+
+    #if DEBUG
+        func testProductionPresentationRecordsFinalizedSeedPhase() throws {
+            let transcript = Support.transcript(300)
+            let tracked = Set(transcript.turns.prefix(16).compactMap { $0.request?.id })
+            CatalogPerf.shared.setSuppressAutomaticEmissionForTesting(true)
+            defer { _ = CatalogPerf.shared.rotate()
+                CatalogPerf.shared.setSuppressAutomaticEmissionForTesting(false)
+            }
+            _ = CatalogPerf.shared.rotate()
+            let built = AgentModeViewModel.buildTranscriptPresentation(
+                from: transcript, sourceItems: [], selectedAgent: .claudeCode,
+                previousPerformanceSnapshot: .empty, trackedLocalInputIDs: tracked
+            )
+            let expected = Support.phase(built.transcript, tracked: tracked, eager: true)
+            Support.assertEqual(built.localInputSeed, expected.seed)
+            XCTAssertEqual(built.analyticsSnapshot, expected.analytics)
+            let rotation = try XCTUnwrap(CatalogPerf.shared.rotateRecords())
+            XCTAssertTrue(rotation.core.contains("activity=0 "), rotation.core)
+            let line = rotation.analyticsSeed
+            XCTAssertTrue(line.contains("analytics_seed_count=1 "), line)
+            XCTAssertTrue(line.contains("seed_projections=32 "), line)
+            XCTAssertTrue(line.hasSuffix("seed_projections_max=32"), line)
+        }
+    #endif
 }
 
 /// Fake-only checks of retained provenance, isolated disclosure and the final release boundary.

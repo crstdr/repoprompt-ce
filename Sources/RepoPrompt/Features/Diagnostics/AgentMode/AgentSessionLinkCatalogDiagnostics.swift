@@ -74,6 +74,22 @@ enum AgentSessionLinkCatalogDiagnostics {
     )
     private static let logger = Logger(logHandle)
 
+    enum RetireStage: String {
+        case request, authorization, initialChildScan, initialFence, preflight, preflightChildScan, finalFence
+        case stopMonitorLink, inventories, rescan, hostCommit
+        case stash, save, approvals, mcpControl, runCancel, acp, codex, claude, routing, worktree
+        case codexJoin, clientStop, stashPublish, saveAdmission, savePredecessors, response
+    }
+
+    static func retireStage(_ stage: RetireStage, begin: Bool, sessionID: UUID? = nil, tabID: UUID? = nil, workspaceID: UUID? = nil, elapsedMS: Int? = nil) {
+        let phase = begin ? "begin" : "end"
+        let session = hashedID(sessionID)
+        let tab = hashedID(tabID)
+        let workspace = hashedID(workspaceID)
+        let elapsed = elapsedMS.map(String.init) ?? "unknown"
+        logger.notice("event=retire-stage stage=\(stage.rawValue, privacy: .public) phase=\(phase, privacy: .public) session=\(session, privacy: .public) tab=\(tab, privacy: .public) workspace=\(workspace, privacy: .public) elapsed_ms=\(elapsed, privacy: .public)")
+    }
+
     typealias LaneCreationAddFailureBranch = WorkspaceRestoreLaneAddFailureBranch
 
     static func laneCreationAddFailed(

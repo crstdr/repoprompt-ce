@@ -1222,17 +1222,15 @@ final class WorkspaceRestorationTitleTests: XCTestCase {
             publications.append((title, viewModel.hasPendingOwnerAdoption(forWorkspaceID: target.id)))
         }
         defer { observation.cancel() }
-        var paneOwners: [AgentTranscriptPaneTarget.Owner] = []
-        let paneObservation = viewModel.ui.transcript.$snapshot.sink { paneOwners.append($0.paneTarget.owner) }
-        defer { paneObservation.cancel() }
-        var atQueued: (pending: Bool, number: Int?, displayed: String, label: String)?
+        var atQueued: (pending: Bool, number: Int?, displayed: String, label: String, paneOwner: AgentTranscriptPaneTarget.Owner)?
         let token = window.workspaceManager.addWorkspaceDidSwitchListener(label: "issue1112QueuedProbe") { workspace in
             guard workspace?.id == target.id else { return }
             atQueued = (
                 viewModel.hasPendingOwnerAdoption(forWorkspaceID: target.id),
                 window.workspaceInstanceNumber,
                 window.displayedWindowTitle,
-                window.workspaceDisplayName
+                window.workspaceDisplayName,
+                viewModel.transcriptPaneTargetOwner()
             )
         }
         defer { window.workspaceManager.removeWorkspaceDidSwitchListener(token) }
@@ -1249,12 +1247,9 @@ final class WorkspaceRestorationTitleTests: XCTestCase {
         let installed = try XCTUnwrap(viewModel.currentPaneOwner)
         XCTAssertEqual(installed.workspaceID, target.id)
         XCTAssertTrue(naturalTitle?.hasPrefix(target.name) == true, "\(String(describing: naturalTitle))")
-        // The emitted pane target carries the adoption's end: awaiting the target owner, then installed.
-        let awaiting = try XCTUnwrap(
-            paneOwners.firstIndex(of: .awaitingOwner(workspaceID: target.id)),
-            "\(paneOwners)"
-        )
-        XCTAssertTrue(paneOwners[awaiting...].contains(.owner(installed)), "\(paneOwners)")
+        // Hidden windows may coalesce display snapshots; qualification reads current owner facts.
+        XCTAssertEqual(queued.paneOwner, .awaitingOwner(workspaceID: target.id))
+        XCTAssertEqual(viewModel.transcriptPaneTargetOwner(), .owner(installed))
     }
 
     /// The exact overseer role comes from the real link authority for this workspace's selected tab

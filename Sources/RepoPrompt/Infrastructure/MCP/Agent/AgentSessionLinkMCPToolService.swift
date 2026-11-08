@@ -701,7 +701,10 @@ struct AgentSessionLinkMCPToolService {
         if case .notRetired(_, .denied) = outcome {
             throw Self.denialError(targetSessionID: targetSessionID)
         }
-        return AgentSessionLaneMCPToolService.render(outcome)
+        AgentSessionLinkCatalogDiagnostics.retireStage(.response, begin: true, sessionID: targetSessionID)
+        let response = AgentSessionLaneMCPToolService.render(outcome)
+        AgentSessionLinkCatalogDiagnostics.retireStage(.response, begin: false, sessionID: targetSessionID)
+        return response
     }
 
     private func executeList(args: [String: Value]) async throws -> Value {

@@ -1158,6 +1158,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         ) async -> AgentRunTerminalPublicationResult)?
     #endif
     weak var preparedSessionRuntimes: (any PreparedAgentSessionRuntimeRegistry)?
+    var providerSwitchExactOwnerProbe: (@MainActor (TabSession) -> Bool)?
     private var hasPreparedForWindowClose = false
     private var windowClosePreparationTask: Task<Void, Never>?
     private static let uiRefreshCoalesceDelayNanos: UInt64 = 75_000_000
@@ -8807,10 +8808,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             context.pendingEpochTransition = nil
         }
         session.mcpControlContext = context
-        session.mcpFollowUpRunPendingUpdatedAt = Date()
         // An accepted epoch belongs to this binding even if Stop won during the actor hop.
         // Retain it unconsumed for the next start; never leave the store ahead of its owner.
         guard stopFence.permitsStart(of: session), !Task.isCancelled else { return }
+        session.mcpFollowUpRunPendingUpdatedAt = Date()
         if !session.mcpFollowUpRunPending {
             session.mcpFollowUpRunPending = true
             handleObservedMCPStateChange(for: session)
@@ -16392,13 +16393,19 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 performanceSnapshot.lastColdLoadProjectionBuildDurationMS = buildDurationMS
             }
         #endif
-        var localInputSeed = AgentSessionLinkRetainedLocalInputIndex.Seed(trackedIDs: trackedLocalInputIDs)
+        let analyticsSeedStartedAt = DispatchTime.now().uptimeNanoseconds
+        var localInputCollector = AgentSessionLinkRetainedLocalInputIndex.SeedCollector(trackedIDs: trackedLocalInputIDs)
         let analytics = AgentTranscriptAnalyticsBuilder.build(
             from: sanitizedTranscript, selectedAgent: selectedAgent,
-            visitRequest: { localInputSeed.append($0) }
+            visitRequest: { localInputCollector.append($0) }
+        )
+        let localInputResult = localInputCollector.finalize()
+        CatalogPerf.shared.transcriptAnalyticsSeed(
+            ms: Double(DispatchTime.now().uptimeNanoseconds - analyticsSeedStartedAt) / 1_000_000,
+            projections: localInputResult.projectionCount
         )
         return BuiltTranscriptPresentation(
-            localInputSeed: localInputSeed,
+            localInputSeed: localInputResult.seed,
             transcript: sanitizedTranscript,
             baseProjection: baseProjection,
             fullProjection: fullProjection,
@@ -17939,6 +17946,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             #endif
             let capturedSession = capturedSessionsByTabID[tabID] ?? nil
             let boundID = capturedBoundSessionIDByTabID[tabID] ?? nil
+            func logStashCleanup(_ stage: AgentSessionLinkCatalogDiagnostics.RetireStage, begin: Bool) {
+                if reason == .stash {
+                    AgentSessionLinkCatalogDiagnostics.retireStage(stage, begin: begin, sessionID: boundID, tabID: tabID)
+                }
+            }
             if let session = capturedSession {
                 if sessions[tabID] == nil {
                     removePendingUIRefresh(for: tabID)
@@ -17949,30 +17961,46 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 cancelPendingQuestion(for: session)
                 cancelPendingApproval(for: session)
                 cancelPendingApplyEditsReview(for: session, reason: "Cancelled because tab is closing")
+                logStashCleanup(.approvals, begin: true)
                 await teardownApplyEditsApprovalSessionSync(for: session, cleanupScope: true)
+                logStashCleanup(.approvals, begin: false)
                 cancelPendingInstruction(for: session)
+                logStashCleanup(.mcpControl, begin: true)
                 await teardownMCPControl(for: session, cleanupSessionStore: true)
+                logStashCleanup(.mcpControl, begin: false)
 
                 // Cancel agent run
                 if session.runState.isActive {
+                    logStashCleanup(.runCancel, begin: true)
                     await runService.cancelRun(tabID: tabID, session: session, caller: .composeTabTeardown)
+                    logStashCleanup(.runCancel, begin: false)
                 }
 
                 // All compose-tab removal reasons detach the live TabSession owner from `sessions`.
                 // Release retained ACP runtimes before that controller handle can become unreachable.
+                logStashCleanup(.acp, begin: true)
                 await cleanupACPStateForDeletedSession(session)
+                logStashCleanup(.acp, begin: false)
+                logStashCleanup(.codex, begin: true)
                 await codexCoordinator.shutdownCodexSession(session)
+                logStashCleanup(.codex, begin: false)
+                logStashCleanup(.claude, begin: true)
                 await claudeCoordinator.shutdownClaudeSession(session)
+                logStashCleanup(.claude, begin: false)
             }
             if sessions[tabID] == nil {
+                logStashCleanup(.routing, begin: true)
                 await cleanupMCPRunRoutingIfPresent(
                     boundSessionID: boundID,
                     liveSession: capturedSession,
                     reason: "compose_tab_close"
                 )
+                logStashCleanup(.routing, begin: false)
             }
             if sessions[tabID] == nil {
+                logStashCleanup(.worktree, begin: true)
                 await releaseSessionWorktreeOwnership(sessionID: boundID)
+                logStashCleanup(.worktree, begin: false)
             }
             let currentRemovalWorkspace = workspaceManager?.workspaces.first(where: { $0.id == workspaceID })
             let projectionStillRemoved = currentRemovalWorkspace.map { workspace in
