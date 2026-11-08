@@ -4476,20 +4476,20 @@ class PromptViewModel: ObservableObject {
         let previousActiveID = manager.workspaces[index].activeComposeTabID
         // Publish the active/stashed transition once through the workspace owner. The retained
         // catalog can be large; unrelated carrier positions are unchanged by this local edit.
-		if reason == .stash {
-			for tabID in tabsBeingClosed {
-				AgentSessionLinkCatalogDiagnostics.retireStage(.stashPublish, begin: true, tabID: tabID, workspaceID: workspace.id)
-			}
-		}
-		let published = manager.replaceComposeTabCarriers(
+        if reason == .stash {
+            for tabID in tabsBeingClosed {
+                AgentSessionLinkCatalogDiagnostics.retireStage(.stashPublish, begin: true, tabID: tabID, workspaceID: workspace.id)
+            }
+        }
+        let published = manager.replaceComposeTabCarriers(
             workspaceID: workspace.id, composeTabs: tabs, stashedTabs: stashedTabs
-		)
-		if reason == .stash {
-			for tabID in tabsBeingClosed {
-				AgentSessionLinkCatalogDiagnostics.retireStage(.stashPublish, begin: false, tabID: tabID, workspaceID: workspace.id)
-			}
-		}
-		guard published else {
+        )
+        if reason == .stash {
+            for tabID in tabsBeingClosed {
+                AgentSessionLinkCatalogDiagnostics.retireStage(.stashPublish, begin: false, tabID: tabID, workspaceID: workspace.id)
+            }
+        }
+        guard published else {
             return rejection(.mutationContextChanged, message: "The workspace changed before tab removal.")
         }
         report.removedComposeTabIDs.formUnion(tabsBeingClosed)
