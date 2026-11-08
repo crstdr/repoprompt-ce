@@ -7,7 +7,7 @@ import RepoPromptDomainRuntime
 final class AgentPresentationWorkGate {
     private let receiver = UUID()
     private let perf: CatalogPerf
-    private var visible = true
+    private(set) var visible = true
     private var enabled: Bool
     private var dirty = false
     private var closed = false

@@ -1371,7 +1371,7 @@ extension AgentModeViewModel {
         )
         if let noteID = carry.dispatchID {
             if accepted {
-                AgentSelfCompactParkedPrefix.markAccepted(noteID, session: session)
+                AgentSelfCompactParkedPrefix.markAccepted(noteID, session: session, source: .notificationWake)
             } else {
                 var state = session.selfCompactState
                 _ = state.noteDefinitivelyNotAttempted(noteID)

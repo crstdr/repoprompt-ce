@@ -8475,7 +8475,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         }
                         if let noteDispatchID {
                             var state = session.selfCompactState
+                            let acceptedAttempt = state.active
                             if state.noteAccepted(noteDispatchID) {
+                                if let acceptedAttempt, AgentSelfCompactDiagnostics.wasParked(acceptedAttempt) {
+                                    AgentSelfCompactDiagnostics.delivered(attempt: acceptedAttempt, source: .unknown)
+                                }
                                 session.appendItem(AgentChatItem.selfCompactionNoteRestored(sequenceIndex: session.nextSequenceIndex))
                                 viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
                             }
@@ -8555,7 +8559,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     session.oracleBackgroundAwareness.accept(oracleAwareness)
                     if let parkedNote {
                         var state = session.selfCompactState
+                        let acceptedAttempt = state.active
                         if state.noteAccepted(parkedNote.dispatchID) {
+                            if let acceptedAttempt, AgentSelfCompactDiagnostics.wasParked(acceptedAttempt) {
+                                AgentSelfCompactDiagnostics.delivered(attempt: acceptedAttempt, source: .unknown)
+                            }
                             session.appendItem(AgentChatItem.selfCompactionNoteRestored(sequenceIndex: session.nextSequenceIndex))
                             viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
                         }
