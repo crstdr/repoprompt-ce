@@ -475,7 +475,9 @@ public struct AgentTranscriptRecoveryDiagnostic: Codable, Sendable, Equatable {
         var result: [AgentTranscriptRecoveryDiagnostic] = []
         for diagnostic in diagnostics where seenRowIDs.insert(diagnostic.id).inserted {
             result.append(diagnostic)
-            if result.count >= maximumPerTurn { break }
+            if result.count >= maximumPerTurn {
+                break
+            }
         }
         return result
     }
@@ -559,6 +561,7 @@ public struct AgentTranscriptTurnSummary: Codable, Sendable, Equatable {
 struct AgentTranscriptFullRenderGroupedHistoryCache: Equatable {
     let detailedToolTailLimit: Int
     let collapseDigest: String
+    let activityRevision: UUID
     let summary: AgentTranscriptGroupedHistorySummary
 }
 
@@ -601,7 +604,14 @@ public struct AgentTranscriptProviderResponseSpan: Codable, Identifiable, Sendab
     public var startedAt: Date
     public var lastActivityAt: Date?
     public var completedAt: Date?
-    public var activities: [AgentTranscriptActivity]
+    public var activities: [AgentTranscriptActivity] {
+        didSet {
+            activityRevision = UUID()
+        }
+    }
+
+    /// In-memory change marker; never encoded or used for durable equality.
+    var activityRevision = UUID()
     /// Durable for compacted turns; rebuildable cache for full turns.
     public var collapsedSummary: AgentTranscriptGroupedHistorySummary?
     public var quietLocal: AgentTranscriptQuietLocalSpan?
