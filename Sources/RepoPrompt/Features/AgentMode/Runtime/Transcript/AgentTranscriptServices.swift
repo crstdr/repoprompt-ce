@@ -5892,7 +5892,9 @@ enum AgentTranscriptReplyClassifier {
     static func replyActivityIDs(in activities: [AgentTranscriptActivity], startsAfterUser: Bool = false) -> Set<UUID> {
         var state: State = startsAfterUser ? .awaitingReply : .inactive
         var ids = Set<UUID>()
-        for activity in activities where state.consume(activity) { ids.insert(activity.id) }
+        for activity in activities where state.consume(activity) {
+            ids.insert(activity.id)
+        }
         return ids
     }
 }
@@ -6371,8 +6373,10 @@ enum AgentTranscriptProjectionBuilder {
         if let frozenLimit = normalizedFrozenDetailedToolTailLimit(for: turn) {
             guard frozenLimit == detailedToolTailLimit else { return false }
             return turn.responseSpans.allSatisfy { span in
-                (span.fullRenderGroupedHistoryCache?.detailedToolTailLimit == detailedToolTailLimit
-                    && span.fullRenderGroupedHistoryCache?.activityRevision == span.activityRevision)
+                (
+                    span.fullRenderGroupedHistoryCache?.detailedToolTailLimit == detailedToolTailLimit
+                        && span.fullRenderGroupedHistoryCache?.activityRevision == span.activityRevision
+                )
                     || span.fullRenderGroupedHistoryCache == nil
             }
         }
@@ -7129,7 +7133,9 @@ enum AgentTranscriptProjectionBuilder {
             if lhs.spanIndex != rhs.spanIndex { return lhs.spanIndex < rhs.spanIndex }
             return lhs.activityIndex < rhs.activityIndex
         }
-        for entry in ordered { orderedBySpan[entry.spanID, default: []].append(entry.activity) }
+        for entry in ordered {
+            orderedBySpan[entry.spanID, default: []].append(entry.activity)
+        }
         var visibleAssistants = Set<UUID>()
         if turn.responseSpans.count > 1 {
             for span in turn.responseSpans {
@@ -7144,7 +7150,9 @@ enum AgentTranscriptProjectionBuilder {
                         end = content.count
                     } else if toolIndices.count > detailedToolTailLimit {
                         end = toolIndices[toolIndices.count - detailedToolTailLimit]
-                        while end > 0, content[end - 1].kind != .standaloneTool, content[end - 1].kind != .activityCluster { end -= 1 }
+                        while end > 0, content[end - 1].kind != .standaloneTool, content[end - 1].kind != .activityCluster {
+                            end -= 1
+                        }
                     }
                 }
                 if turn.request == nil, end > 0, shouldBufferLeadingAssistant(in: content.prefix(end)), let id = content.first?.activityID {
@@ -7164,7 +7172,8 @@ enum AgentTranscriptProjectionBuilder {
                 continue
             }
             if turn.responseSpans.count > 1,
-               let slot = updateReplySpanToolState(&spanToolStates[entry.spanID, default: ReplySpanToolState()], activity: activity, turn: turn) {
+               let slot = updateReplySpanToolState(&spanToolStates[entry.spanID, default: ReplySpanToolState()], activity: activity, turn: turn)
+            {
                 toolSlots[activity.id] = slot
             }
             buckets[activity.id] = bucket
@@ -7856,7 +7865,8 @@ enum AgentTranscriptProjectionBuilder {
             }
             var end = index + 1
             while end < isCompanionLeaf.count, isCompanionLeaf[end],
-                  replyBuckets.isEmpty || replyBuckets[end] == replyBuckets[index] {
+                  replyBuckets.isEmpty || replyBuckets[end] == replyBuckets[index]
+            {
                 end += 1
             }
             if end - index >= 2 {
@@ -8037,7 +8047,7 @@ enum AgentTranscriptProjectionBuilder {
         let groupedPrefix = bufferedLeadingDescriptor == nil ? collapsedPrefix : collapsedPrefix.dropFirst()
         var breaks = hasReplyBuckets ? Array(collapsedPrefix.indices.dropFirst().filter { collapsedPrefix[$0 - 1].replyBucket != collapsedPrefix[$0].replyBucket }) : []
         if replyPresentation { breaks.append(contentsOf: conclusionCuts.filter { $0 > 0 && $0 < collapsedPrefix.count }) }
-        if bufferedLeadingDescriptor != nil, (!protectBufferedNarration || bufferedLeadingDescriptor?.isReply == true), !conclusionCuts.contains(1) {
+        if bufferedLeadingDescriptor != nil, !protectBufferedNarration || bufferedLeadingDescriptor?.isReply == true, !conclusionCuts.contains(1) {
             breaks.removeAll { $0 == 1 }
         }
         breaks = Array(Set(breaks)).sorted()
@@ -8598,7 +8608,8 @@ enum AgentTranscriptProjectionBuilder {
             guard !(context.excludingQuiet && turn.quietLocal != nil && activity.quietCheckInWakeID != nil) else { continue }
             if isSuppressedActivity(activity) {
                 if context.replyPresentation, !repliesPreclassified,
-                   activity.itemKind == .toolCall || activity.itemKind == .toolResult {
+                   activity.itemKind == .toolCall || activity.itemKind == .toolResult
+                {
                     _ = context.replyState.consume(activity)
                 }
                 continue
@@ -8625,7 +8636,8 @@ enum AgentTranscriptProjectionBuilder {
             case .standaloneTool:
                 if let first = standaloneToolActivities.first,
                    first.toolExecution?.stableExecutionID == activity.toolExecution?.stableExecutionID,
-                   context.activityReplyBuckets[first.id] == context.activityReplyBuckets[activity.id] {
+                   context.activityReplyBuckets[first.id] == context.activityReplyBuckets[activity.id]
+                {
                     standaloneToolActivities.append(activity)
                 } else {
                     flushStandaloneToolActivities()
