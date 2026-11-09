@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 
 struct WorkspaceSaveSource: Equatable, Hashable, ExpressibleByStringLiteral, CustomStringConvertible {
@@ -16,6 +17,14 @@ struct WorkspaceSaveSource: Equatable, Hashable, ExpressibleByStringLiteral, Cus
         rawValue
     }
 
+    var catalogPerfCategory: CatalogSaveSourceCategory {
+        if self == .pollTimer { return .pollSave }
+        if rawValue.hasPrefix("agentSessionLifecycle") { return .lifecycleAdmissionSave }
+        if self == .organizerEdit { return .organizerEdit }
+        return .other
+    }
+
+    static let organizerEdit = WorkspaceSaveSource("organizerEdit")
     static let pollTimer = WorkspaceSaveSource("pollTimer")
     static let pollAndSaveState = WorkspaceSaveSource("pollAndSaveState")
     static let pollAndSaveStateAsync = WorkspaceSaveSource("pollAndSaveStateAsync")

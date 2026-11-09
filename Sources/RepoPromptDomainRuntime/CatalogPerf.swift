@@ -49,6 +49,7 @@ package final class CatalogPerf: @unchecked Sendable {
             lock.unlock()
         }
     #endif
+    private var attribution = CatalogAttributionWindow()
     private var activity = 0
     private var windowStart = DispatchTime.now().uptimeNanoseconds
     private var heartbeatSampleMS: Double = 0
@@ -134,6 +135,31 @@ package final class CatalogPerf: @unchecked Sendable {
         if full { fullReconciliations += 1 }
         applicationSumMS += elapsedMS
         applicationMaxMS = max(applicationMaxMS, elapsedMS)
+        attribution.phase(.application, elapsedMS: elapsedMS)
+        lock.unlock()
+    }
+
+    package func saveSource(_ source: CatalogSaveSourceCategory) {
+        lock.lock()
+        attribution.source(source)
+        lock.unlock()
+    }
+
+    package func metadataGateFailure(_ reason: CatalogMetadataGateFailure) {
+        lock.lock()
+        attribution.failure(reason)
+        lock.unlock()
+    }
+
+    package func receiverPhase(_ phase: CatalogReceiverPhase, elapsedMS: Double) {
+        lock.lock()
+        attribution.phase(phase, elapsedMS: elapsedMS)
+        lock.unlock()
+    }
+
+    package func eventPair(_ outcome: CatalogEventPairOutcome) {
+        lock.lock()
+        attribution.pair(outcome)
         lock.unlock()
     }
 
@@ -201,14 +227,21 @@ package final class CatalogPerf: @unchecked Sendable {
         }
     }
 
-    /// Combined view for in-process diagnostics; the logger emits the two bounded records.
+    /// Compatibility view of core/analytics; emission also includes optional attribution.
     package func rotate() -> String? {
         rotateRecords()?.records.joined(separator: " ")
     }
 
     /// A sample can straddle a rotation boundary; splitting one observation is acceptable.
     package func rotateRecords() -> WindowRecords? {
+        rotateEmissionRecords().records
+    }
+
+    /// One boundary for both records; attribution alone never forces an ordinary core line.
+    package func rotateEmissionRecords() -> (records: WindowRecords?, attribution: String?) {
         lock.lock()
+        let attributionWindow = attribution
+        attribution = CatalogAttributionWindow()
         let now = DispatchTime.now().uptimeNanoseconds
         let durationMS = Double(now - windowStart) / 1_000_000
         let activity = activity, sampleMS = heartbeatSampleMS, maxLate = maxLatenessMS
@@ -249,7 +282,8 @@ package final class CatalogPerf: @unchecked Sendable {
         lock.unlock()
         // Ordinary idle windows stay silent. A >=250ms heartbeat gap reports independently of
         // catalog/presentation activity.
-        guard activity > 0 || analytics.count > 0 || over250 > 0 else { return nil }
+        let detail = attributionWindow.record()
+        guard activity > 0 || analytics.count > 0 || over250 > 0 else { return (nil, detail) }
         func ms(_ value: Double) -> String {
             String(format: "%.3f", value)
         }
@@ -259,7 +293,7 @@ package final class CatalogPerf: @unchecked Sendable {
         let display = "presentation_receivers_visible=\(displayReceivers.values.count(where: { $0 })) presentation_receivers_hidden=\(displayReceivers.values.count(where: { !$0 })) presentation_builds_attempted=\(displayCounts[.build, default: 0]) presentation_applies=\(displayCounts[.apply, default: 0]) presentation_deferrals=\(displayCounts[.deferred, default: 0]) presentation_catchups=\(displayCounts[.catchUp, default: 0]) heartbeat_gaps_ge250=\(over250)"
         let transcript = "analytics_seed_count=\(analytics.count) analytics_seed_sum_ms=\(ms(analytics.sumMS)) analytics_seed_max_ms=\(ms(analytics.maxMS)) analytics_seed_main_thread=\(analytics.mainThreadCount) seed_projections=\(projections) seed_projections_max=\(projectionsMax)"
         let core = "\(catalog) \(display) publications=\(publicationSummary.isEmpty ? "-" : publicationSummary) canonical_decodes=\(decodes) decode_cache_hits=\(hits) decode_bytes_hashed=\(decodeBytes) document_bytes_hashed=\(documentBytes) \(writer)"
-        return WindowRecords(core: core, analyticsSeed: transcript)
+        return (WindowRecords(core: core, analyticsSeed: transcript), detail)
     }
 
     package func emitWindow() {
@@ -269,11 +303,15 @@ package final class CatalogPerf: @unchecked Sendable {
             lock.unlock()
             if suppressed { return }
         #endif
-        let rotation = rotateRecords()
+        let emission = rotateEmissionRecords()
+        let rotation = emission.records
         if let rotation {
             for record in rotation.records {
                 Self.logger.notice("\(record, privacy: .public)")
             }
+        }
+        if let detail = emission.attribution {
+            Self.logger.notice("\(detail, privacy: .public)")
         }
         #if DEBUG
             lock.lock()

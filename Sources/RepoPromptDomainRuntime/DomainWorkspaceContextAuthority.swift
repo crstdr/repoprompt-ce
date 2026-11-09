@@ -241,6 +241,7 @@ actor DomainWorkspaceContextAuthority {
     private let persistence: DomainPersistenceCoordinator
     private let metrics: DomainRuntimeMetricsSink
     private var records: [UUID: WorkspaceRecord] = [:]
+    private var catalogEventPairTracker = CatalogEventPairTracker()
     private var workspaceIDsByReadName: [String: Set<UUID>] = [:]
     private var workspaceLocationGenerations: [UUID: UInt64] = [:]
     private var unreadableLocationIDs: Set<UUID> = []
@@ -428,6 +429,7 @@ actor DomainWorkspaceContextAuthority {
     @discardableResult
     private func removeCanonicalRecord(_ id: UUID) -> WorkspaceRecord? {
         guard let previous = records.removeValue(forKey: id) else { return nil }
+        _ = catalogEventPairTracker.observe(kind: .workspaceDeleted, workspaceID: id, digest: nil)
         removeReadName(Self.readNameKey(previous.document.metadata.name), workspaceID: id)
         workspaceLocationGenerations.removeValue(forKey: id)
         unreadableLocationIDs.remove(id)
@@ -2718,6 +2720,13 @@ actor DomainWorkspaceContextAuthority {
     ) {
         publicationSequence &+= 1
         CatalogPerf.shared.publication(kind)
+        if let workspaceID,
+           let outcome = catalogEventPairTracker.observe(
+               kind: kind, workspaceID: workspaceID, digest: records[workspaceID]?.document.contentDigest
+           )
+        {
+            CatalogPerf.shared.eventPair(outcome)
+        }
         if let workspaceID, var record = records[workspaceID] {
             let operation: DomainWorkspaceTransitionDiagnostic.Operation = switch kind {
             case .savedDocumentCommitted: .savedCommit

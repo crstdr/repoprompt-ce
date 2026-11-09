@@ -20,6 +20,21 @@ import XCTest
     final class NewWindowInitialSelectionTests: XCTestCase {
         private typealias Fixture = NewWindowInitialSelectionFixture
 
+        func testLocalWorkspacePublicationDoesNotRecordCatalogCarrierTime() async throws {
+            CatalogPerf.shared.setSuppressAutomaticEmissionForTesting(true)
+            defer {
+                _ = CatalogPerf.shared.rotate()
+                CatalogPerf.shared.setSuppressAutomaticEmissionForTesting(false)
+            }
+            try await Fixture.run { f in
+                let manager = f.makeManager(withAuthority: false)
+                _ = CatalogPerf.shared.rotate()
+                manager.workspaces = [Fixture.model(id: Fixture.aardvarkID, name: "Local edit")]
+                manager.workspaces[0].name = "Another local edit"
+                XCTAssertNil(CatalogPerf.shared.rotateEmissionRecords().attribution)
+            }
+        }
+
         func testHeartbeatLeaseReleasedOnBridgeDeinit() async throws {
             try await Fixture.run { f in
                 let window = f.makeWindow()
@@ -7766,5 +7781,16 @@ final class WorkspaceChooserPublicationTests: XCTestCase {
         XCTAssertTrue(fired)
         XCTAssertEqual(emitted, [newest])
         XCTAssertEqual(owner.presentation, newest)
+    }
+}
+
+final class WorkspaceSaveSourceCatalogPerfTests: XCTestCase {
+    func testAllowlistedSourceCategories() {
+        XCTAssertEqual(WorkspaceSaveSource.pollTimer.catalogPerfCategory, .pollSave)
+        XCTAssertEqual(WorkspaceSaveSource("agentSessionLifecycleAdmission").catalogPerfCategory, .lifecycleAdmissionSave)
+        XCTAssertEqual(WorkspaceSaveSource("agentSessionLifecycleExistingTabAdmission").catalogPerfCategory, .lifecycleAdmissionSave)
+        XCTAssertEqual(WorkspaceSaveSource.organizerEdit.catalogPerfCategory, .organizerEdit)
+        XCTAssertEqual(WorkspaceSaveSource.pollAndSaveState.catalogPerfCategory, .other)
+        XCTAssertEqual(WorkspaceSaveSource.directUnknown.catalogPerfCategory, .other)
     }
 }

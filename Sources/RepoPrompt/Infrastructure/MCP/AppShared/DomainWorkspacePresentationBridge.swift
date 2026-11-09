@@ -888,14 +888,25 @@ final class DomainWorkspacePresentationBridge {
         let baselineGeneration = acceptedReconciliationGeneration
             .flatMap { $0 == manager.domainCatalogReconciliationGeneration ? $0 : nil }
         var cacheIsTrusted = baselineGeneration != nil && !manager.requiresFullCatalogReconciliation
-        if let baselineGeneration, Set(projectedModels.keys) == Set(nextDigests.keys), projectedDigests == nextDigests,
-           records.allSatisfy({ record in
-               guard let generation = manager.adoptedFullDocumentGeneration(
-                   workspaceID: record.document.workspaceID, contentDigest: record.document.contentDigest
-               ) else { return false }
-               return projectedAdoptionGenerations[record.document.workspaceID] == generation
-           })
-        {
+        // Observe the same short-circuit proof as the metadata fast path, without another pass.
+        let metadataFailure: CatalogMetadataGateFailure? = if baselineGeneration == nil {
+            acceptedReconciliationGeneration == nil ? .noAcceptedGeneration : .baselineGenerationMismatch
+        } else if Set(projectedModels.keys) != Set(nextDigests.keys) {
+            .membershipMismatch
+        } else if projectedDigests != nextDigests {
+            .digestMismatch
+        } else if !records.allSatisfy({ record in
+            guard let generation = manager.adoptedFullDocumentGeneration(
+                workspaceID: record.document.workspaceID, contentDigest: record.document.contentDigest
+            ) else { return false }
+            return projectedAdoptionGenerations[record.document.workspaceID] == generation
+        }) {
+            .adoptionWitnessMismatch
+        } else {
+            nil
+        }
+        if let metadataFailure { CatalogPerf.shared.metadataGateFailure(metadataFailure) }
+        if let baselineGeneration, metadataFailure == nil {
             switch manager.applyDomainWorkspaceCatalog(
                 snapshot,
                 projection: .metadata(baselineGeneration: baselineGeneration),
