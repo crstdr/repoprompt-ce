@@ -87,6 +87,73 @@ package final class CatalogPerf: @unchecked Sendable {
     private var preparation = Timing()
     private var persistence = Timing()
     private var analyticsSeed = Timing()
+    // Path timing and retained visible-row size are independent fixed distributions.
+    private var transcriptBuilds = Array(repeating: TranscriptTiming(), count: 5)
+    private var transcriptSizes = Array(repeating: TranscriptTiming(), count: 5)
+    private var transcriptMutationGaps = Array(repeating: 0, count: 6)
+    private var transcriptMutationFirst = 0
+    private var transcriptAutomaticRequests = 0
+    private var transcriptCoalesced = 0
+    private var transcriptExecuted = 0
+    private var transcriptDropped = 0
+
+    package enum TranscriptBuilderPath: Int, Sendable {
+        case automatic, catchUp, save, terminal, other
+    }
+
+    package enum TranscriptRequestDisposition: Sendable {
+        case coalesced, executed, dropped
+    }
+
+    /// Count requests when settled, so each rotation reconciles without inventing outcomes
+    /// for scheduled work that crosses the window boundary. Coalesced includes terminal folds;
+    /// dropped includes scheduled tasks cancelled because a synchronous consumer drained them.
+    package func transcriptRequestSettled(_ disposition: TranscriptRequestDisposition) {
+        lock.lock()
+        transcriptAutomaticRequests += 1
+        switch disposition {
+        case .coalesced: transcriptCoalesced += 1
+        case .executed: transcriptExecuted += 1
+        case .dropped: transcriptDropped += 1
+        }
+        lock.unlock()
+    }
+
+    private struct TranscriptTiming {
+        var count = 0
+        var sumMS = 0.0
+        var maxMS = 0.0
+        var buckets = Array(repeating: 0, count: 5)
+
+        mutating func record(_ ms: Double) {
+            count += 1
+            sumMS += ms
+            maxMS = max(maxMS, ms)
+            let index = ms < 4 ? 0 : ms < 16 ? 1 : ms < 100 ? 2 : ms < 500 ? 3 : 4
+            buckets[index] += 1
+        }
+    }
+
+    /// Each path is timed independently; size is the already-computed canonical visible row count.
+    package func transcriptBuilder(ms: Double, retainedRows: Int, path: TranscriptBuilderPath) {
+        let index = retainedRows < 100 ? 0 : retainedRows < 500 ? 1 : retainedRows < 2000 ? 2 : retainedRows < 5000 ? 3 : 4
+        lock.lock()
+        if path == .automatic { transcriptSizes[index].record(max(0, ms)) }
+        transcriptBuilds[path.rawValue].record(max(0, ms))
+        lock.unlock()
+    }
+
+    /// Per-session inter-arrival of canonical mutation callbacks scheduling a refresh, including idle gaps.
+    package func transcriptMutationCadence(gapMS: Double?) {
+        lock.lock()
+        if let gapMS {
+            let index = gapMS < 16 ? 0 : gapMS < 33 ? 1 : gapMS < 100 ? 2 : gapMS < 250 ? 3 : gapMS < 1000 ? 4 : 5
+            transcriptMutationGaps[index] += 1
+        } else {
+            transcriptMutationFirst += 1
+        }
+        lock.unlock()
+    }
     private var seedProjections = 0
     private var seedProjectionsMax = 0
 
@@ -195,13 +262,22 @@ package final class CatalogPerf: @unchecked Sendable {
     package struct WindowRecords: Sendable {
         package let core: String
         package let analyticsSeed: String
+        package let transcriptDerivation: String?
+        private let emitLegacy: Bool
+
+        fileprivate init(core: String, analyticsSeed: String, transcriptDerivation: String?, emitLegacy: Bool) {
+            self.core = core
+            self.analyticsSeed = analyticsSeed
+            self.transcriptDerivation = transcriptDerivation
+            self.emitLegacy = emitLegacy
+        }
 
         package var records: [String] {
-            [core, analyticsSeed]
+            (emitLegacy ? [core, analyticsSeed] : []) + (transcriptDerivation.map { [$0] } ?? [])
         }
     }
 
-    /// Combined view for in-process diagnostics; the logger emits the two bounded records.
+    /// Combined view for in-process diagnostics; the logger emits each bounded record separately.
     package func rotate() -> String? {
         rotateRecords()?.records.joined(separator: " ")
     }
@@ -220,6 +296,17 @@ package final class CatalogPerf: @unchecked Sendable {
         let decodeBytes = decodeBytesHashed, documentBytes = documentBytesHashed
         let prep = preparation, write = persistence, analytics = analyticsSeed
         let projections = seedProjections, projectionsMax = seedProjectionsMax
+        let builds = transcriptBuilds, mutationGaps = transcriptMutationGaps
+        let mutationFirst = transcriptMutationFirst, automaticRequests = transcriptAutomaticRequests
+        let coalesced = transcriptCoalesced, executed = transcriptExecuted, dropped = transcriptDropped, sizes = transcriptSizes
+        transcriptCoalesced = 0
+        transcriptExecuted = 0
+        transcriptDropped = 0
+        transcriptSizes = Array(repeating: TranscriptTiming(), count: 5)
+        transcriptBuilds = Array(repeating: TranscriptTiming(), count: 5)
+        transcriptMutationGaps = Array(repeating: 0, count: 6)
+        transcriptMutationFirst = 0
+        transcriptAutomaticRequests = 0
         windowStart = now
         self.activity = 0
         heartbeatSampleMS = 0
@@ -249,7 +336,8 @@ package final class CatalogPerf: @unchecked Sendable {
         lock.unlock()
         // Ordinary idle windows stay silent. A >=250ms heartbeat gap reports independently of
         // catalog/presentation activity.
-        guard activity > 0 || analytics.count > 0 || over250 > 0 else { return nil }
+        let emitLegacy = activity > 0 || analytics.count > 0 || over250 > 0
+        guard emitLegacy || automaticRequests > 0 || mutationFirst > 0 || mutationGaps.contains(where: { $0 > 0 }) || builds.contains(where: { $0.count > 0 }) else { return nil }
         func ms(_ value: Double) -> String {
             String(format: "%.3f", value)
         }
@@ -259,7 +347,31 @@ package final class CatalogPerf: @unchecked Sendable {
         let display = "presentation_receivers_visible=\(displayReceivers.values.count(where: { $0 })) presentation_receivers_hidden=\(displayReceivers.values.count(where: { !$0 })) presentation_builds_attempted=\(displayCounts[.build, default: 0]) presentation_applies=\(displayCounts[.apply, default: 0]) presentation_deferrals=\(displayCounts[.deferred, default: 0]) presentation_catchups=\(displayCounts[.catchUp, default: 0]) heartbeat_gaps_ge250=\(over250)"
         let transcript = "analytics_seed_count=\(analytics.count) analytics_seed_sum_ms=\(ms(analytics.sumMS)) analytics_seed_max_ms=\(ms(analytics.maxMS)) analytics_seed_main_thread=\(analytics.mainThreadCount) seed_projections=\(projections) seed_projections_max=\(projectionsMax)"
         let core = "\(catalog) \(display) publications=\(publicationSummary.isEmpty ? "-" : publicationSummary) canonical_decodes=\(decodes) decode_cache_hits=\(hits) decode_bytes_hashed=\(decodeBytes) document_bytes_hashed=\(documentBytes) \(writer)"
-        return WindowRecords(core: core, analyticsSeed: transcript)
+        // Saturate the rendering and mark it so an overloaded window cannot be mistaken for evidence.
+        var saturated = false
+        func bounded(_ value: Int) -> String {
+            if value > 999_999 { saturated = true }
+            return String(min(value, 999_999))
+        }
+        func boundedMS(_ value: Double) -> String {
+            if !value.isFinite || value > 999_999 { saturated = true; return "999999" }
+            return String(Int(min(999_999, max(0, value)).rounded()))
+        }
+        func timingRows(_ timings: [TranscriptTiming]) -> String {
+            timings.map { timing in
+                ([bounded(timing.count), boundedMS(timing.sumMS), boundedMS(timing.maxMS)]
+                    + timing.buckets.map { bounded($0) }).joined(separator: ",")
+            }.joined(separator: "/")
+        }
+        let rows = timingRows(builds)
+        let gaps = mutationGaps.map { bounded($0) }.joined(separator: ",")
+        let requests = bounded(automaticRequests), first = bounded(mutationFirst)
+        let dispositions = [coalesced, executed, dropped].map { bounded($0) }.joined(separator: ",")
+        let sizeCounts = timingRows(sizes)
+        let derivation = automaticRequests > 0 || mutationFirst > 0 || mutationGaps.contains(where: { $0 > 0 }) || builds.contains(where: { $0.count > 0 })
+            ? "transcript_derivation v=1 requests=\(requests) first=\(first) gaps=\(gaps) coalesced_executed_dropped=\(dispositions) automatic_by_size=\(sizeCounts) builds_by_path=\(rows) saturated=\(saturated ? 1 : 0)"
+            : nil
+        return WindowRecords(core: core, analyticsSeed: transcript, transcriptDerivation: derivation, emitLegacy: emitLegacy)
     }
 
     package func emitWindow() {
