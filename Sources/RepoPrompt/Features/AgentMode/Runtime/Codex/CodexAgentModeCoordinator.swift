@@ -4519,7 +4519,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             resetCodexWatchdogState(session)
             resetCodexResumeTimeoutState(for: session)
             session.codexOversizedResumeTarget = nil
-            session.codexConversationID = nil
+            session.clearCodexConversationIdentity()
             session.codexRolloutPath = nil
             session.providerCleanupHandle = nil
             session.codexContextUsage = nil
@@ -12662,8 +12662,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         clearCodexRecoveryAttempt(for: session.runID)
         resetCodexResumeTimeoutState(for: session)
         session.codexOversizedResumeTarget = nil
-        session.codexConversationID = nil
-        session.codexContextWindowSelection = nil
+        session.clearCodexConversationIdentity()
         session.codexRolloutPath = nil
         session.providerCleanupHandle = nil
         session.codexContextUsage = nil
