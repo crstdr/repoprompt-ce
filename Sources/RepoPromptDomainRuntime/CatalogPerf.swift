@@ -263,9 +263,17 @@ package final class CatalogPerf: @unchecked Sendable {
         package let core: String
         package let analyticsSeed: String
         package let transcriptDerivation: String?
+        private let emitLegacy: Bool
+
+        fileprivate init(core: String, analyticsSeed: String, transcriptDerivation: String?, emitLegacy: Bool) {
+            self.core = core
+            self.analyticsSeed = analyticsSeed
+            self.transcriptDerivation = transcriptDerivation
+            self.emitLegacy = emitLegacy
+        }
 
         package var records: [String] {
-            [core, analyticsSeed] + (transcriptDerivation.map { [$0] } ?? [])
+            (emitLegacy ? [core, analyticsSeed] : []) + (transcriptDerivation.map { [$0] } ?? [])
         }
     }
 
@@ -328,7 +336,8 @@ package final class CatalogPerf: @unchecked Sendable {
         lock.unlock()
         // Ordinary idle windows stay silent. A >=250ms heartbeat gap reports independently of
         // catalog/presentation activity.
-        guard activity > 0 || analytics.count > 0 || over250 > 0 || automaticRequests > 0 || mutationFirst > 0 || mutationGaps.contains(where: { $0 > 0 }) || builds.contains(where: { $0.count > 0 }) else { return nil }
+        let emitLegacy = activity > 0 || analytics.count > 0 || over250 > 0
+        guard emitLegacy || automaticRequests > 0 || mutationFirst > 0 || mutationGaps.contains(where: { $0 > 0 }) || builds.contains(where: { $0.count > 0 }) else { return nil }
         func ms(_ value: Double) -> String {
             String(format: "%.3f", value)
         }
@@ -362,7 +371,7 @@ package final class CatalogPerf: @unchecked Sendable {
         let derivation = automaticRequests > 0 || mutationFirst > 0 || mutationGaps.contains(where: { $0 > 0 }) || builds.contains(where: { $0.count > 0 })
             ? "transcript_derivation v=1 requests=\(requests) first=\(first) gaps=\(gaps) coalesced_executed_dropped=\(dispositions) automatic_by_size=\(sizeCounts) builds_by_path=\(rows) saturated=\(saturated ? 1 : 0)"
             : nil
-        return WindowRecords(core: core, analyticsSeed: transcript, transcriptDerivation: derivation)
+        return WindowRecords(core: core, analyticsSeed: transcript, transcriptDerivation: derivation, emitLegacy: emitLegacy)
     }
 
     package func emitWindow() {

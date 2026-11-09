@@ -135,6 +135,17 @@ final class CatalogPerfTests: XCTestCase {
         XCTAssertNil(perf.rotateRecords(), "Both records must come from one rotation/reset")
     }
 
+    func testTranscriptOnlyWindowDoesNotEmitLegacyRecords() throws {
+        let perf = CatalogPerf()
+        perf.transcriptMutationCadence(gapMS: nil)
+        perf.transcriptRequestSettled(.coalesced)
+        let rotation = try XCTUnwrap(perf.rotateRecords())
+        let transcript = try XCTUnwrap(rotation.transcriptDerivation)
+        XCTAssertEqual(rotation.records, [transcript])
+        XCTAssertTrue(transcript.hasPrefix("transcript_derivation "))
+        XCTAssertNil(perf.rotateRecords())
+    }
+
     func testTranscriptDerivationBucketsAndRotationBudget() throws {
         let perf = CatalogPerf()
         perf.transcriptMutationCadence(gapMS: nil)
