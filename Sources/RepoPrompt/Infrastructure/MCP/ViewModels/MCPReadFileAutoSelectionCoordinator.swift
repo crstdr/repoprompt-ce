@@ -597,8 +597,8 @@ final class MCPReadFileAutoSelectionCoordinator {
         self.overdueReportSink = overdueReportSink
     }
 
-    /// Canonical waits have no timeout. Mirror waits are cancelled at `mirrorWaitTimeout` (10 s), before this
-    /// threshold, so only a wait that outlives the freshness timeout is reported. The watch is stored with the
+    /// Canonical waits have no timeout. With the default timeouts, mirror waits are cancelled at
+    /// `mirrorWaitTimeout` (10 s), before this threshold, so only a wait that outlives the freshness timeout is reported. The watch is stored with the
     /// waiter and stopped where the waiter is settled.
     private func overdueReport(stage: String, key: ContextKey, target: UInt64) -> OverdueWaitReporter.Watch {
         let (windowID, tabID, generation) = (key.windowID, key.tabID, key.bindingGeneration)
@@ -709,8 +709,6 @@ final class MCPReadFileAutoSelectionCoordinator {
         guard !Task.isCancelled else { return .cancelled }
         let target = canonicalLanes[key]?.acceptedSequence ?? 0
         guard target > 0 else { return .completed }
-        let (windowID, tabID, generation) = (key.windowID, key.tabID, key.bindingGeneration)
-        let requirementLabel = requirement.rawValue
         emitCanonicalDiagnostic(
             .drainHighWaterCaptured,
             for: key,

@@ -16,24 +16,28 @@ package enum MCPDomainToolAdmissionLimits {
 /// Protocol-neutral, cancellation-safe admission keyed by the physical state resource.
 /// Connection lanes provide client ordering; this controller bounds cross-connection work.
 package final class MCPDomainToolResourceAdmissionController: @unchecked Sendable {
-    package enum AdmissionError: Error, Equatable {
+    // swiftformat:disable:next redundantSendable
+    package enum AdmissionError: Error, Equatable, Sendable {
         case closed
     }
 
-    package struct Snapshot: Equatable {
+    // swiftformat:disable:next redundantSendable
+    package struct Snapshot: Equatable, Sendable {
         package let activeLeaseCount: Int
         package let waiterCount: Int
         package let isClosed: Bool
     }
 
-    package enum Resource: Hashable {
+    // swiftformat:disable:next redundantSendable
+    package enum Resource: Hashable, Sendable {
         case appWide
         case window(Int)
         case repository(String)
     }
 
     /// Opaque identifiers for the call that waits for, or holds, a lease. Logged only when a wait is overdue.
-    package struct WaitContext: Equatable {
+    // swiftformat:disable:next redundantSendable
+    package struct WaitContext: Equatable, Sendable {
         package let tool: String
         package let connection: String
         package let run: String?

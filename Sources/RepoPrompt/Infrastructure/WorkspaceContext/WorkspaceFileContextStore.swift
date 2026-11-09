@@ -1070,6 +1070,7 @@ actor WorkspaceFileContextStore {
         typealias ScopedIngressBarrierTaskOutput = WorkspaceIngressBarrierSample
     #endif
 
+    /// Internal (not private) so the overdue-report tests can drive it directly.
     final class ScopedIngressBarrierJoin: @unchecked Sendable {
         private struct Waiter {
             let continuation: CheckedContinuation<ScopedIngressBarrierTaskOutput?, Never>
