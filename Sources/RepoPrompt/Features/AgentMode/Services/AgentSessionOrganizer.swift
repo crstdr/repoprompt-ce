@@ -432,7 +432,7 @@ final class OpenWindowsAgentSessionOrganizer: AgentSessionOrganizingBackend {
         }
         writer.promptManager.loadComposeTabsFromWorkspace(published)
         manager.markWorkspaceDirty()
-        let persistence = await manager.pollAndSaveStateWithOutcomeAsync(workspaceID: workspaceID)
+        let persistence = await manager.pollAndSaveStateWithOutcomeAsync(workspaceID: workspaceID, source: .organizerEdit)
         let workingCommitted: Bool = if case let .rejected(rejection) = persistence { rejection.workingCommitted } else { false }
         guard (persistence.acceptedForLifecycleAdmission && persistence.workspaceID == workspaceID) || workingCommitted else {
             return .init(failure: "group_persistence_rejected", localChanges: true)
@@ -677,7 +677,7 @@ final class OpenWindowsAgentSessionOrganizer: AgentSessionOrganizingBackend {
             }
             window.promptManager.loadComposeTabsFromWorkspace(published.workspace)
             manager.markWorkspaceDirty()
-            let persistence = await manager.pollAndSaveStateWithOutcomeAsync(workspaceID: workspaceID)
+            let persistence = await manager.pollAndSaveStateWithOutcomeAsync(workspaceID: workspaceID, source: .organizerEdit)
             guard persistence.acceptedForLifecycleAdmission, persistence.workspaceID == workspaceID else {
                 for (id, _) in changed {
                     outcome.failures[id] = .init(reason: "persistence_rejected", localChanges: true)

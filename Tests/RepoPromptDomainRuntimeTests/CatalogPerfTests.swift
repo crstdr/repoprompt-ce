@@ -231,6 +231,82 @@ final class CatalogPerfTests: XCTestCase {
         }
     #endif
 
+    func testAttributionIsIndependentBoundedAndResetsWithCore() throws {
+        let perf = CatalogPerf()
+        for _ in 0 ..< 350 {
+            for source in CatalogSaveSourceCategory.allCases { perf.saveSource(source) }
+            for failure in CatalogMetadataGateFailure.allCases { perf.metadataGateFailure(failure) }
+            for phase in CatalogReceiverPhase.allCases where phase != .application {
+                perf.receiverPhase(phase, elapsedMS: 8.125)
+            }
+            perf.application(elapsedMS: 8.125, full: true)
+            for pair in CatalogEventPairOutcome.allCases { perf.eventPair(pair) }
+        }
+        let emitted = perf.rotateEmissionRecords()
+        let core = try XCTUnwrap(emitted.records)
+        let detail = try XCTUnwrap(emitted.attribution)
+        XCTAssertEqual(core.records.count, 2)
+        XCTAssertTrue(core.core.hasPrefix("activity=350 "))
+        XCTAssertTrue(core.core.contains("application_sum_ms=2843.750 "))
+        XCTAssertFalse(core.core.contains("catalog_detail"))
+        XCTAssertFalse(detail.contains("activity="))
+        for field in ["source_poll_save=350", "gate_digest_mismatch=350", "pair_same_digest=350"] {
+            XCTAssertTrue(detail.split(separator: " ").contains(Substring(field)), detail)
+        }
+        for phase in CatalogReceiverPhase.allCases {
+            XCTAssertTrue(detail.contains("\(phase.rawValue)_count=350 "), detail)
+            XCTAssertTrue(detail.contains("\(phase.rawValue)_sum_ms=2843.750 "), detail)
+            XCTAssertTrue(detail.contains("\(phase.rawValue)_max_ms=8.125"), detail)
+        }
+        // Fixed allowlists and numeric values only: no identities, digests, paths or content.
+        XCTAssertNil(detail.range(of: #"[^a-z0-9_= .]"#, options: .regularExpression))
+        XCTAssertLessThanOrEqual(detail.utf8.count + 64, 1024)
+        XCTAssertNil(perf.rotateEmissionRecords().attribution)
+        XCTAssertNil(perf.rotateRecords())
+
+        perf.saveSource(.other)
+        let companionOnly = perf.rotateEmissionRecords()
+        XCTAssertNil(companionOnly.records, "New counters must not force an ordinary core line")
+        XCTAssertNotNil(companionOnly.attribution)
+        XCTAssertNil(perf.rotateEmissionRecords().attribution)
+    }
+
+    func testEventPairsUseLastWorkingEventAndDropDeletedLineage() {
+        var tracker = CatalogEventPairTracker()
+        let workspace = UUID(), other = UUID()
+        XCTAssertNil(tracker.observe(kind: .workingStateCommitted, workspaceID: workspace, digest: "first"))
+        XCTAssertNil(tracker.observe(kind: .workingStateCommitted, workspaceID: workspace, digest: "latest"))
+        XCTAssertNil(tracker.observe(kind: .operationDeduplicated, workspaceID: workspace, digest: "ignored"))
+        XCTAssertEqual(tracker.observe(kind: .savedDocumentCommitted, workspaceID: workspace, digest: "latest"), .sameDigest)
+        XCTAssertEqual(tracker.observe(kind: .savedDocumentCommitted, workspaceID: workspace, digest: "latest"), .savedWithoutWorking)
+        _ = tracker.observe(kind: .workingStateCommitted, workspaceID: workspace, digest: "first")
+        _ = tracker.observe(kind: .workingStateCommitted, workspaceID: other, digest: "other")
+        XCTAssertEqual(tracker.observe(kind: .savedDocumentCommitted, workspaceID: workspace, digest: "second"), .differentDigest)
+        _ = tracker.observe(kind: .workspaceDeleted, workspaceID: other, digest: nil)
+        XCTAssertEqual(tracker.observe(kind: .savedDocumentCommitted, workspaceID: other, digest: "other"), .savedWithoutWorking)
+    }
+
+    func testAttributionAndDerivationCompanionsCoexistWithoutLegacyActivity() throws {
+        let perf = CatalogPerf()
+        perf.saveSource(.pollSave)
+        perf.transcriptRequestSettled(.executed)
+        let both = perf.rotateEmissionRecords()
+        let records = try XCTUnwrap(both.records)
+        XCTAssertEqual(records.records.count, 1)
+        XCTAssertTrue(records.records[0].hasPrefix("transcript_derivation v=1 "))
+        XCTAssertFalse(records.records.contains { $0.contains("activity=") || $0.contains("analytics_seed_count=") })
+        let detail = try XCTUnwrap(both.attribution)
+        XCTAssertTrue(detail.contains("source_poll_save=1 "))
+        XCTAssertFalse(detail.contains("activity="))
+        let empty = perf.rotateEmissionRecords()
+        XCTAssertNil(empty.records)
+        XCTAssertNil(empty.attribution)
+        perf.transcriptRequestSettled(.coalesced)
+        let derivationOnly = perf.rotateEmissionRecords()
+        XCTAssertEqual(derivationOnly.records?.records.count, 1)
+        XCTAssertNil(derivationOnly.attribution)
+    }
+
     func testIdleWindowEmitsNothing() {
         let perf = CatalogPerf()
         perf.heartbeat(gapMS: 120, expectedMS: 10)

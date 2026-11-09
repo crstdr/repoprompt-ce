@@ -184,9 +184,13 @@ final class WorkspaceFileDecodeCache: @unchecked Sendable {
         documentBytes: Data,
         catalogPerf: Bool = false
     ) throws -> (workspace: WorkspaceModel, normalizationRequiresSave: Bool) {
+        let hashStart = catalogPerf ? DispatchTime.now().uptimeNanoseconds : nil
         let digest = Data(SHA256.hash(data: documentBytes))
             .map { String(format: "%02x", $0) }
             .joined()
+        if let hashStart {
+            CatalogPerf.shared.receiverPhase(.hash, elapsedMS: Double(DispatchTime.now().uptimeNanoseconds - hashStart) / 1_000_000)
+        }
         if let cached = shared.cachedDecode(for: digest) {
             if catalogPerf { CatalogPerf.shared.canonicalDecode(bytesHashed: documentBytes.count, cacheHit: true) }
             return cached
@@ -199,6 +203,12 @@ final class WorkspaceFileDecodeCache: @unchecked Sendable {
         // synthesized identities).
         let recorder = WorkspaceDecodeSynthesis.Recorder()
         let decoded = try WorkspaceDecodeSynthesis.$recorder.withValue(recorder) {
+            let decodeStart = catalogPerf ? DispatchTime.now().uptimeNanoseconds : nil
+            defer {
+                if let decodeStart {
+                    CatalogPerf.shared.receiverPhase(.decode, elapsedMS: Double(DispatchTime.now().uptimeNanoseconds - decodeStart) / 1_000_000)
+                }
+            }
             var workspace = try JSONDecoder().decode(WorkspaceModel.self, from: documentBytes)
             let decodedRequiresSave = workspace.normalizationRequiresSave
             let normalized = workspace.normalizeComposeTabInvariants()
@@ -1387,6 +1397,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     private struct WorkspacePublicationFrame {
+        let startedAt: UInt64?
         let serial: UInt64
         let publication: WorkspacePublication?
         let catalog: CatalogCarrierPublication?
@@ -1396,6 +1407,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     private var composeTabCarrierPublication: WorkspacePublication?
     private var workspacePublicationSerial: UInt64 = 0
     private var workspacePublicationFrames: [WorkspacePublicationFrame] = []
+    private var workspacePublicationTimingDepth = 0
 
     #if DEBUG
         var test_sessionCarrierRowsVisited = 0
@@ -1430,6 +1442,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     #endif
 
     private func beginWorkspacePublication(_ next: [WorkspaceModel]) {
+        workspacePublicationTimingDepth += 1
         workspacePublicationSerial &+= 1
         let presentation = composeTabPresentationPublication
         let carriers = composeTabCarrierPublication
@@ -1458,6 +1471,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             nil
         }
         workspacePublicationFrames.append(.init(
+            startedAt: catalogApplicationDepth > 0 ? DispatchTime.now().uptimeNanoseconds : nil,
             serial: workspacePublicationSerial, publication: publication,
             catalog: presentation == nil && carriers == nil ? catalog : nil
         ))
@@ -1467,6 +1481,14 @@ class WorkspaceManagerViewModel: ObservableObject {
         // Pop before any manual observer can re-enter. A newer serial also invalidates an outer
         // owner's proof after an inner setter completed, even when the workspace ID stayed equal.
         let frame = workspacePublicationFrames.popLast()
+        // Count only outer frames; nested publication time is already included in this interval.
+        let isOutermost = workspacePublicationTimingDepth == 1
+        defer {
+            workspacePublicationTimingDepth -= 1
+            if let startedAt = frame?.startedAt, isOutermost {
+                CatalogPerf.shared.receiverPhase(.carrierPublication, elapsedMS: Double(DispatchTime.now().uptimeNanoseconds - startedAt) / 1_000_000)
+            }
+        }
         if let frame, frame.serial == workspacePublicationSerial, let catalog = frame.catalog,
            finishCatalogCarrierPublication(catalog, previous: previous)
         {
@@ -9558,12 +9580,23 @@ class WorkspaceManagerViewModel: ObservableObject {
                 return .invalidCatalog("model_set_mismatch")
             }
         case let .metadata(baselineGeneration):
-            guard domainCatalogReconciliationGeneration > 0,
-                  baselineGeneration == domainCatalogReconciliationGeneration,
-                  !requiresFullCatalogReconciliation,
-                  acceptedCatalogMembership?.available == membership,
-                  acceptedCatalogMembership?.unavailable == snapshot.unavailableWorkspaceIDs
-            else { return .fullProjectionRequired }
+            let failure: CatalogMetadataGateFailure? = if domainCatalogReconciliationGeneration == 0 {
+                .noAcceptedGeneration
+            } else if baselineGeneration != domainCatalogReconciliationGeneration {
+                .baselineGenerationMismatch
+            } else if requiresFullCatalogReconciliation {
+                .requiresFullReconciliation
+            } else if acceptedCatalogMembership?.available != membership {
+                .membershipMismatch
+            } else if acceptedCatalogMembership?.unavailable != snapshot.unavailableWorkspaceIDs {
+                .unavailableMembershipMismatch
+            } else {
+                nil
+            }
+            if let failure {
+                CatalogPerf.shared.metadataGateFailure(failure)
+                return .fullProjectionRequired
+            }
         }
         return nil
     }
@@ -13305,6 +13338,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         #if DEBUG
             await ownedWorkingConvergenceWillSaveHandlerForTesting?(workspaceID)
         #endif
+        CatalogPerf.shared.saveSource(source.catalogPerfCategory)
         let outcome = await domainWorkspaceAuthorityClient.saveCommittedWorkingRevision(
             workspaceID: workspaceID,
             expectedWorkspaceRevision: provenance.workingRevision
@@ -16708,6 +16742,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         guard !agentAdmissionRecoveryOwnsWorkspace(workspaceID) else {
             return .failure(WorkspacePersistenceFailure(category: .durabilityUncertain))
         }
+        CatalogPerf.shared.saveSource(source.catalogPerfCategory)
         // Publications at or before this point are included in the model this save persists.
         let publicationGenerationAtStart = workingPublicationGenerationByWorkspaceID[workspaceID, default: 0]
         if domainWorkspaceAuthorityClient != nil {
