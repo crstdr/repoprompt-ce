@@ -455,13 +455,16 @@ final class DomainWorkspacePresentationBridge {
     private var catalogRefreshTask: Task<Void, Never>?
     private var catalogRefreshID: UUID?
 
+    private let catalogDecodePrewarmer: WorkspaceCatalogDecodePrewarmer?
     private let trustedDigestReuse: Bool
     private let omittedEphemeralWitness: Bool
 
     init(
         workspaceManager: WorkspaceManagerViewModel, client: DomainWorkspaceAuthorityClient,
-        trustedDigestReuse: Bool = false, omittedEphemeralWitness: Bool = false
+        trustedDigestReuse: Bool = false, omittedEphemeralWitness: Bool = false,
+        catalogDecodePrewarmer: WorkspaceCatalogDecodePrewarmer? = nil
     ) {
+        self.catalogDecodePrewarmer = catalogDecodePrewarmer
         self.omittedEphemeralWitness = omittedEphemeralWitness
         self.trustedDigestReuse = trustedDigestReuse
         self.workspaceManager = workspaceManager
@@ -654,6 +657,11 @@ final class DomainWorkspacePresentationBridge {
             }
         }
 
+        func projectCatalogPreparingForTesting(_ snapshot: DomainWorkspaceCatalogSnapshot) async {
+            guard let runID = subscriptionRunID, let manager = workspaceManager else { return }
+            await projectResolvingStaleness(snapshot, attempt: manager.beginDomainCatalogAttempt(), runID: runID)
+        }
+
         func projectCatalogForTesting(_ snapshot: DomainWorkspaceCatalogSnapshot) -> DomainCatalogRejection? {
             guard let runID = subscriptionRunID, let manager = workspaceManager else { return .closing }
             return project(snapshot, attempt: manager.beginDomainCatalogAttempt(), runID: runID)
@@ -789,6 +797,25 @@ final class DomainWorkspacePresentationBridge {
         await projectResolvingStaleness(snapshot, attempt: attempt, runID: runID)
     }
 
+    /// Preparation is only a residency hint; project must re-read every admission/adoption witness.
+    private func incrementalPrewarmInput(_ snapshot: DomainWorkspaceCatalogSnapshot) -> WorkspaceCatalogDecodeInput? {
+        guard snapshot.isBootstrapped, let manager = workspaceManager,
+              let generation = acceptedReconciliationGeneration,
+              generation == manager.domainCatalogReconciliationGeneration,
+              !manager.requiresFullCatalogReconciliation else { return nil }
+        var ids = Set<UUID>()
+        var changed: DomainWorkspaceDocument?
+        for record in snapshot.workspaces {
+            let document = record.document
+            guard ids.insert(document.workspaceID).inserted else { return nil }
+            if projectedDigests[document.workspaceID] != document.contentDigest {
+                if let changed, changed.contentDigest != document.contentDigest { return nil }
+                changed = document
+            }
+        }
+        return changed.map(WorkspaceCatalogDecodeInput.init)
+    }
+
     /// A floor raised between read and apply (or a competing transaction) gets exactly one
     /// current-snapshot refetch per triggering operation; no loop, timer or delay.
     private func projectResolvingStaleness(
@@ -796,6 +823,23 @@ final class DomainWorkspacePresentationBridge {
         attempt: DomainCatalogAttempt,
         runID: UUID
     ) async {
+        if let prewarmer = catalogDecodePrewarmer, isCurrentRun(runID),
+           let input = incrementalPrewarmInput(snapshot)
+        {
+            let admission = prewarmer.admit(input)
+            CatalogPerf.shared.prewarm(admission.outcome)
+            if let task = admission.task {
+                let start = DispatchTime.now().uptimeNanoseconds
+                // Cancellation never cancels shared work. The run fence, not task completion, admits application.
+                await task.value
+                guard isCurrentRun(runID) else { return }
+                let ms = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+                CatalogPerf.shared.receiverPhase(.prewarmWait, elapsedMS: ms)
+                #if DEBUG
+                    prewarmer.measurements.wait(ms)
+                #endif
+            }
+        }
         /// A covering accepted reconciliation (e.g. a newer retry/event/reload) needs nothing further.
         func isUncoveredFreshnessRejection(
             _ rejection: DomainCatalogRejection?, _ snapshot: DomainWorkspaceCatalogSnapshot

@@ -205,7 +205,9 @@ enum WindowStateCompositionFactory {
             DomainWorkspacePresentationBridge(
                 workspaceManager: workspaceManager, client: $0,
                 trustedDigestReuse: AppLaunchConfiguration.current.catalogPublicationTrustedDigestReuseEnabled,
-                omittedEphemeralWitness: AppLaunchConfiguration.current.catalogPublicationOmittedEphemeralWitnessEnabled
+                omittedEphemeralWitness: AppLaunchConfiguration.current.catalogPublicationOmittedEphemeralWitnessEnabled,
+                catalogDecodePrewarmer: AppLaunchConfiguration.current.catalogColdDecodePrewarmEnabled
+                    ? WorkspaceFileDecodeCache.shared.catalogPrewarmer : nil
             )
         }
         if let bridge = domainWorkspacePresentationBridge {

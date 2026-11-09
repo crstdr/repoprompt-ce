@@ -22,6 +22,13 @@ struct AppLaunchConfiguration {
         bundleURL: Bundle.main.bundleURL
     )
 
+    static let catalogColdDecodePrewarmEnabledKey = "catalogColdDecodePrewarmEnabled"
+    let catalogColdDecodePrewarmEnabled: Bool
+
+    static func resolveCatalogColdDecodePrewarm(storedValue: Any?) -> Bool {
+        storedValue as? Bool ?? false
+    }
+
     static let catalogPublicationTrustedDigestReuseKey = "catalogPublicationTrustedDigestReuseEnabled"
     let catalogPublicationTrustedDigestReuseEnabled: Bool
     static let catalogPublicationOmittedEphemeralWitnessKey = "catalogPublicationOmittedEphemeralWitnessEnabled"
@@ -106,6 +113,9 @@ struct AppLaunchConfiguration {
             let allowsStressAgentSessionPersistence = false
         #endif
 
+        catalogColdDecodePrewarmEnabled = !Self.isUnitTestProcess && Self.resolveCatalogColdDecodePrewarm(
+            storedValue: UserDefaults.standard.object(forKey: Self.catalogColdDecodePrewarmEnabledKey)
+        )
         catalogPublicationTrustedDigestReuseEnabled = Self.isUnitTestProcess
             ? true
             : Self.resolveCatalogPublicationTrustedDigestReuse(

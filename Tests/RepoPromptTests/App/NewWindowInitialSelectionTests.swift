@@ -81,6 +81,117 @@ import XCTest
             }
         }
 
+        private actor ColdDecodeGate {
+            var open = false
+            var waiter: CheckedContinuation<Void, Never>?
+            func wait() async {
+                if !open { await withCheckedContinuation { waiter = $0 } }
+            }
+
+            func release() {
+                open = true
+                waiter?.resume()
+                waiter = nil
+            }
+        }
+
+        func testColdDecodePrewarmStoppedJoinedBridgesCannotApply() async throws {
+            try await Fixture.run(seeds: Fixture.standardSeeds) { f in
+                let gate = ColdDecodeGate()
+                let entered = expectation(description: "worker entered")
+                let prewarmer = WorkspaceCatalogDecodePrewarmer(beforeWork: { entered.fulfill()
+                    await gate.wait()
+                })
+                let managers = [f.makeManager(), f.makeManager()]
+                let bridges = managers.enumerated().map { index, manager in
+                    DomainWorkspacePresentationBridge(
+                        workspaceManager: manager, client: .init(store: f.runtime.workspaceStore, windowID: -30000 - index),
+                        trustedDigestReuse: true, catalogDecodePrewarmer: prewarmer
+                    )
+                }
+                let observers = bridges.map { DomainWorkspaceProjectionObserver(bridge: $0) }
+                bridges.forEach { $0.start() }
+                let initial = await f.runtime.workspaceStore.snapshot()
+                for observer in observers {
+                    let checkpoint = await observer.waitForProjection(
+                        afterGeneration: 0,
+                        through: initial.publicationSequence,
+                        requireCatalogApplication: true,
+                        timeout: .seconds(5)
+                    )
+                    XCTAssertNotNil(checkpoint)
+                }
+                XCTAssertTrue(prewarmer.measurements.snapshot().starts.isEmpty, "Startup must not prewarm")
+                let before = managers.map(\.workspaces)
+                WorkspaceFileDecodeCache.shared.removeAllForTesting()
+                _ = CatalogPerf.shared.rotateEmissionRecords()
+                var edited = Fixture.model(id: Fixture.aardvarkID, name: "Aardvark")
+                edited.currentPromptText = "New canonical content"
+                let record = try XCTUnwrap(initial.workspaces.first { $0.document.workspaceID == edited.id })
+                let result = try await DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: -39999)
+                    .replaceWorkingFailClosed(edited, fileURL: f.workspaceURL(for: edited), expectedWorkspaceRevision: record.revisions.workingRevision)
+                XCTAssertEqual(result.disposition, .applied)
+                await fulfillment(of: [entered], timeout: 2)
+                let clock = ContinuousClock()
+                let deadline = clock.now.advanced(by: .seconds(2))
+                var joined = false
+                while !joined, clock.now < deadline {
+                    let detail = CatalogPerf.shared.rotateEmissionRecords().attribution ?? ""
+                    joined = detail.contains("prewarm_joined=1 ")
+                    if !joined { try await Task.sleep(for: .milliseconds(1)) }
+                }
+                XCTAssertTrue(joined, "Both bridge tasks must be waiting on the shared flight")
+                bridges.forEach { $0.stop() }
+                XCTAssertTrue(bridges.allSatisfy { $0.projectionObservationStateForTesting.runID == nil })
+                XCTAssertEqual(managers.map(\.workspaces), before)
+                await gate.release()
+                for bridge in bridges {
+                    await bridge.stopAndJoinForTesting()
+                }
+                await prewarmer.awaitIdleForTesting()
+                XCTAssertEqual(managers.map(\.workspaces), before, "Worker completion cannot apply stopped runs")
+            }
+        }
+
+        func testColdDecodePrewarmDuplicateIDsUseExistingRejection() async throws {
+            try await Fixture.run(seeds: Fixture.standardSeeds) { f in
+                let prewarmer = WorkspaceCatalogDecodePrewarmer()
+                let manager = f.makeManager()
+                let bridge = DomainWorkspacePresentationBridge(
+                    workspaceManager: manager, client: .init(store: f.runtime.workspaceStore, windowID: -40000),
+                    trustedDigestReuse: true, catalogDecodePrewarmer: prewarmer
+                )
+                let observer = DomainWorkspaceProjectionObserver(bridge: bridge)
+                bridge.start()
+                let initial = await f.runtime.workspaceStore.snapshot()
+                let checkpoint = await observer.waitForProjection(
+                    afterGeneration: 0,
+                    through: initial.publicationSequence,
+                    requireCatalogApplication: true,
+                    timeout: .seconds(5)
+                )
+                XCTAssertNotNil(checkpoint)
+                let first = try XCTUnwrap(initial.workspaces.first)
+                let model = try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(document: first.document)
+                var changed = model
+                changed.name += " changed"
+                let document = try DomainWorkspaceDocument.decode(documentBytes: JSONEncoder().encode(changed), fileURL: first.document.fileURL)
+                var json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(first)) as? [String: Any])
+                json["document"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(document))
+                let record = try JSONDecoder().decode(DomainWorkspaceSnapshot.self, from: JSONSerialization.data(withJSONObject: json))
+                let duplicate = DomainWorkspaceCatalogSnapshot(
+                    runtimeIdentity: initial.runtimeIdentity, isBootstrapped: true,
+                    publicationSequence: initial.publicationSequence + 1, catalogRevision: initial.catalogRevision + 1,
+                    health: initial.health, workspaces: [record, record], unavailableWorkspaceIDs: []
+                )
+                await bridge.projectCatalogPreparingForTesting(duplicate)
+                XCTAssertTrue(prewarmer.measurements.snapshot().starts.isEmpty)
+                XCTAssertEqual(manager.workspaces.first { $0.id == model.id }?.name, model.name)
+                await bridge.stopAndJoinForTesting()
+                await prewarmer.awaitIdleForTesting()
+            }
+        }
+
         func testTrustedDigest35ReceiversEightMiBParityWithVisibleAndHiddenOwners() async throws {
             let seeds = Fixture.standardSeeds
             var edited = Fixture.model(id: Fixture.aardvarkID, name: "Aardvark")

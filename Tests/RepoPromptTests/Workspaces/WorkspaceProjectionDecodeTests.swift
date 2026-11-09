@@ -107,6 +107,14 @@ import XCTest
             XCTAssertEqual(sample.normalizationMutationCount, 1)
         }
 
+        func testColdDecodeLaunchKeyIsTrueOnlyAndTestsDefaultOff() {
+            XCTAssertFalse(AppLaunchConfiguration.resolveCatalogColdDecodePrewarm(storedValue: nil))
+            XCTAssertFalse(AppLaunchConfiguration.resolveCatalogColdDecodePrewarm(storedValue: "true"))
+            XCTAssertFalse(AppLaunchConfiguration.resolveCatalogColdDecodePrewarm(storedValue: false))
+            XCTAssertTrue(AppLaunchConfiguration.resolveCatalogColdDecodePrewarm(storedValue: true))
+            XCTAssertFalse(AppLaunchConfiguration.current.catalogColdDecodePrewarmEnabled)
+        }
+
         func testConcurrentLossyDecodePreservesIndependentValues() async throws {
             let fixture = WorkspaceProjectionDecodeFixture(workload: .ordinary)
             var json = try XCTUnwrap(JSONSerialization.jsonObject(with: fixture.bytes(revision: 1)) as? [String: Any])
