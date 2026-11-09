@@ -113,6 +113,7 @@ private struct WorkspaceFileCachedLoadResult {
 
 final class WorkspaceFileDecodeCache: @unchecked Sendable {
     static let shared = WorkspaceFileDecodeCache()
+    let catalogPrewarmer = WorkspaceCatalogDecodePrewarmer()
 
     private let lock = NSLock()
     private var cachedWorkspacesByKey: [WorkspaceFileDecodeCacheKey: WorkspaceModel] = [:]
@@ -254,7 +255,7 @@ final class WorkspaceFileDecodeCache: @unchecked Sendable {
         }
     }
 
-    func catalogPrewarmEligibility(_ input: WorkspaceCatalogDecodeInput) -> WorkspaceCatalogDecodeOutcome? {
+    func catalogPrewarmEligibility(_ input: WorkspaceCatalogDecodeInput) -> CatalogPrewarmOutcome? {
         lock.withLock {
             if cachedDecodesByDigest[input.digest] != nil { return .resident }
             if decodeCacheEntryLimit <= 0 || input.bytes.count > decodeCacheByteLimit { return .noncacheable }
@@ -262,10 +263,15 @@ final class WorkspaceFileDecodeCache: @unchecked Sendable {
         }
     }
 
-    func prewarmCatalogDocument(_ input: WorkspaceCatalogDecodeInput) -> WorkspaceCatalogDecodeOutcome {
+    func prewarmCatalogDocument(_ input: WorkspaceCatalogDecodeInput) -> CatalogPrewarmOutcome {
         if let outcome = catalogPrewarmEligibility(input) { return outcome }
         do {
-            let decoded = try Self.decodeUncached(input.bytes, digest: input.digest)
+            let decoded: (workspace: WorkspaceModel, normalizationRequiresSave: Bool, synthesized: Bool)
+            do {
+                let start = DispatchTime.now().uptimeNanoseconds
+                defer { CatalogPerf.shared.receiverPhase(.prewarmDecode, elapsedMS: Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000) }
+                decoded = try Self.decodeUncached(input.bytes, digest: input.digest)
+            }
             guard !decoded.synthesized else { return .synthesized }
             storeDecoded(
                 decoded.workspace,

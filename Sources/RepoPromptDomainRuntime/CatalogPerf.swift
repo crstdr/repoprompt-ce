@@ -218,6 +218,12 @@ package final class CatalogPerf: @unchecked Sendable {
         lock.unlock()
     }
 
+    package func prewarm(_ outcome: CatalogPrewarmOutcome) {
+        lock.lock()
+        attribution.prewarm(outcome)
+        lock.unlock()
+    }
+
     package func receiverPhase(_ phase: CatalogReceiverPhase, elapsedMS: Double) {
         lock.lock()
         attribution.phase(phase, elapsedMS: elapsedMS)

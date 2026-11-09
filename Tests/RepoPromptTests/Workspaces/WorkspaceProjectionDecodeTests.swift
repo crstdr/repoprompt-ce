@@ -1392,6 +1392,103 @@ import XCTest
             ))
         }
 
+        private actor Gate {
+            var open = false
+            var waiter: CheckedContinuation<Void, Never>?
+            func wait(onEntry: @Sendable () -> Void = {}) async {
+                if !open { onEntry()
+                    await withCheckedContinuation { waiter = $0 }
+                }
+            }
+
+            func release() {
+                open = true
+                waiter?.resume()
+                waiter = nil
+            }
+        }
+
+        func testSingleFlightJoinsAndCancelledWaiterDoesNotCancelSharedWork() async throws {
+            let gate = Gate()
+            let entered = expectation(description: "worker entered")
+            let prewarmer = WorkspaceCatalogDecodePrewarmer(beforeWork: { await gate.wait { entered.fulfill() } })
+            let firstInput = try input()
+            let first = prewarmer.admit(firstInput)
+            let task = try XCTUnwrap(first.task)
+            XCTAssertEqual(first.outcome, .started)
+            await fulfillment(of: [entered], timeout: 2)
+            let joins = (0 ..< 34).map { _ in prewarmer.admit(firstInput) }
+            XCTAssertTrue(joins.allSatisfy { $0.outcome == .joined && $0.task != nil })
+            let other = try input(WorkspaceProjectionDecodeFixture(workload: .ordinary).bytes(revision: 2))
+            XCTAssertEqual(prewarmer.admit(other).outcome, .busy)
+            let oversized = try input(Data(repeating: 0, count: 16 * 1024 * 1024 + 1))
+            XCTAssertEqual(prewarmer.admit(oversized).outcome, .oversized)
+            let cancelled = Task { await task.value
+                return Task.isCancelled
+            }
+            cancelled.cancel()
+            await gate.release()
+            await task.value
+            for join in joins {
+                await join.task?.value
+            }
+            let remainedCancelled = await cancelled.value
+            XCTAssertTrue(remainedCancelled)
+            await prewarmer.awaitIdleForTesting()
+            XCTAssertEqual(cache.jsonDecodeCountsForTesting(firstInput.digest).worker, 1)
+            XCTAssertEqual(cache.jsonDecodeCountsForTesting(firstInput.digest).main, 0)
+            XCTAssertNil(prewarmer.admit(firstInput).task, "Resident fast path must not suspend")
+            let next = prewarmer.admit(other)
+            XCTAssertEqual(next.outcome, .started, "Completed flight must release its slot")
+            await next.task?.value
+            await prewarmer.awaitIdleForTesting()
+        }
+
+        func testWorkerReprobeAndImmediateRetirement() async throws {
+            let gate = Gate()
+            let entered = expectation(description: "worker entered")
+            let prewarmer = WorkspaceCatalogDecodePrewarmer(beforeWork: { await gate.wait { entered.fulfill() } })
+            let value = try input()
+            let admitted = prewarmer.admit(value)
+            await fulfillment(of: [entered], timeout: 2)
+            XCTAssertEqual(cache.prewarmCatalogDocument(value), .stored)
+            await gate.release()
+            await admitted.task?.value
+            await prewarmer.awaitIdleForTesting()
+            XCTAssertEqual(cache.jsonDecodeCountsForTesting(value.digest).worker, 0)
+            let immediate = WorkspaceCatalogDecodePrewarmer()
+            for revision in 2 ... 20 {
+                let next = try input(WorkspaceProjectionDecodeFixture(workload: .ordinary).bytes(revision: revision))
+                let admission = immediate.admit(next)
+                XCTAssertEqual(admission.outcome, .started)
+                await admission.task?.value
+            }
+            await immediate.awaitIdleForTesting()
+        }
+
+        func testDetachedDiagnosticsRebindAndFailureRetirement() async throws {
+            let recorder = WorkspaceProjectionDecodeDiagnostics.Recorder()
+            let context = WorkspaceProjectionDecodeDiagnostics.Context(
+                recorder: recorder, contentOrdinal: 1, consumerOrdinal: 1,
+                revision: 1, schemaVersion: 1, onMainActor: true
+            )
+            let prewarmer = WorkspaceCatalogDecodePrewarmer()
+            let value = try input()
+            let admission = WorkspaceProjectionDecodeDiagnostics.contextTaskLocal.withValue(context) { prewarmer.admit(value) }
+            await admission.task?.value
+            await prewarmer.awaitIdleForTesting()
+            let sample = try XCTUnwrap(recorder.snapshot().samples.first)
+            XCTAssertNil(sample.mainActorNanoseconds)
+            XCTAssertEqual(sample.normalizationCount, 2)
+            let failure = try input(Data("{".utf8))
+            for _ in 0 ..< 2 {
+                await prewarmer.admit(failure).task?.value
+            }
+            await prewarmer.awaitIdleForTesting()
+            XCTAssertNil(cache.catalogPrewarmEligibility(failure))
+            XCTAssertEqual(cache.jsonDecodeCountsForTesting(failure.digest).worker, 2)
+        }
+
         func testPureWarmPreservesCountersAndServesRawProjection() async throws {
             let input = try input()
             XCTAssertNil(cache.catalogPrewarmEligibility(input))
