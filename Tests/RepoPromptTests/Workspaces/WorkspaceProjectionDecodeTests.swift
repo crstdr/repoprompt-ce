@@ -212,6 +212,80 @@ import XCTest
             cache.removeAllForTesting()
         }
 
+        func testAuthorityDocumentCodableRejectsSameIDCachePoisoningAndPreservesKeys() throws {
+            let fixture = WorkspaceProjectionDecodeFixture(workload: .ordinary)
+            let bytes = try fixture.bytes(revision: 1)
+            let url = URL(fileURLWithPath: "/tmp/catalog-digest.json")
+            let good = try DomainWorkspaceDocument.decode(documentBytes: bytes, fileURL: url)
+            let encoded = try JSONEncoder().encode(good)
+            let restored = try JSONDecoder().decode(DomainWorkspaceDocument.self, from: encoded)
+            XCTAssertEqual(restored, good)
+            var object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+            XCTAssertEqual(Set(object.keys), ["workspaceID", "fileURL", "documentBytes", "contentDigest", "metadata"])
+            let changed = try DomainWorkspaceDocument.decode(documentBytes: fixture.bytes(revision: 2), fileURL: url)
+            XCTAssertEqual(changed.workspaceID, good.workspaceID)
+            object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(changed)) as? [String: Any])
+            object["contentDigest"] = good.contentDigest
+            do {
+                let forged = try JSONDecoder().decode(DomainWorkspaceDocument.self, from: JSONSerialization.data(withJSONObject: object))
+                // If validation regresses, populate the cold claimed key before the honest raw lookup.
+                _ = try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(document: forged)
+                XCTFail("A forged digest must be rejected before it can enter the cache")
+            } catch {
+                XCTAssertEqual(error as? DomainWorkspaceDocumentError, .digestMismatch)
+            }
+            XCTAssertEqual(try fixture.decode(bytes), fixture.model(revision: 1), "Forged claims never enter the shared cache")
+            XCTAssertEqual(try fixture.decode(changed.documentBytes), fixture.model(revision: 2))
+        }
+
+        func testTypedAndRawShareCacheButOnlyRawHashesOnHits() throws {
+            CatalogPerf.shared.setSuppressAutomaticEmissionForTesting(true)
+            defer {
+                _ = CatalogPerf.shared.rotate()
+                CatalogPerf.shared.setSuppressAutomaticEmissionForTesting(false)
+            }
+            let fixture = WorkspaceProjectionDecodeFixture(workload: .ordinary)
+            let bytes = try fixture.bytes(revision: 1)
+            let document = try DomainWorkspaceDocument.decode(documentBytes: bytes, fileURL: URL(fileURLWithPath: "/tmp/typed.json"))
+            _ = CatalogPerf.shared.rotate()
+            let typed = try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(document: document, catalogPerf: true)
+            _ = try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(document: document, catalogPerf: true)
+            let on = CatalogPerf.shared.rotateEmissionRecords()
+            XCTAssertTrue(on.records?.core.contains("decode_bytes_hashed=0 ") == true)
+            XCTAssertTrue(on.attribution?.contains("receiver_hash_count=0 ") == true)
+            XCTAssertTrue(on.attribution?.contains("receiver_decode_count=1 ") == true)
+            let raw = try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(documentBytes: bytes, fileURL: document.fileURL, catalogPerf: true)
+            let off = CatalogPerf.shared.rotateEmissionRecords()
+            XCTAssertTrue(off.records?.core.contains("decode_bytes_hashed=\(bytes.count) ") == true)
+            XCTAssertTrue(off.attribution?.contains("receiver_hash_count=1 ") == true)
+            XCTAssertEqual(raw, typed)
+            XCTAssertEqual(raw.normalizationRequiresSave, typed.normalizationRequiresSave)
+            XCTAssertEqual(raw.composeTabsDecodeWasLossy, typed.composeTabsDecodeWasLossy)
+            let stats = WorkspaceFileDecodeCache.shared.digestDecodeStatsForTesting()
+            XCTAssertEqual(stats.misses, 1)
+            XCTAssertEqual(stats.hits, 2)
+        }
+
+        func testTypedSynthesizedDocumentsAndFailuresAreNotCached() throws {
+            let id = UUID()
+            let bytes = Data("{\"id\":\"\(id.uuidString)\",\"name\":\"Legacy\",\"repoPaths\":[]}".utf8)
+            let document = try DomainWorkspaceDocument.decode(documentBytes: bytes, fileURL: URL(fileURLWithPath: "/tmp/typed-legacy.json"))
+            let first = try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(document: document)
+            let second = try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(document: document)
+            XCTAssertNotEqual(first.composeTabs.first?.id, second.composeTabs.first?.id)
+            XCTAssertEqual(WorkspaceFileDecodeCache.shared.digestDecodeStatsForTesting().entries, 0)
+            let bad = DomainWorkspaceDocument(workspaceID: id, fileURL: document.fileURL, documentBytes: Data("{".utf8), metadata: document.metadata)
+            XCTAssertThrowsError(try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(document: bad))
+            XCTAssertEqual(WorkspaceFileDecodeCache.shared.digestDecodeStatsForTesting().entries, 0)
+        }
+
+        func testCatalogDigestLaunchResolverDoesNotRequireDefaultsIO() {
+            XCTAssertTrue(AppLaunchConfiguration.resolveCatalogPublicationTrustedDigestReuse(storedValue: nil))
+            XCTAssertTrue(AppLaunchConfiguration.resolveCatalogPublicationTrustedDigestReuse(storedValue: true))
+            XCTAssertFalse(AppLaunchConfiguration.resolveCatalogPublicationTrustedDigestReuse(storedValue: false))
+            XCTAssertTrue(AppLaunchConfiguration.resolveCatalogPublicationTrustedDigestReuse(storedValue: "not a boolean"))
+        }
+
         /// A second decode of identical bytes must hit the cache and return an
         /// equal model — including across different file URLs (content, not
         /// location, is the key).
@@ -497,6 +571,22 @@ import XCTest
         override func tearDown() async throws {
             WorkspaceFileDecodeCache.shared.removeAllForTesting()
             try? FileManager.default.removeItem(at: temporaryRoot)
+        }
+
+        func testTypedAndRawLossyProjectionPreserveTheSameBackupBytes() throws {
+            let original = try document(mutating: { $0 = corruptingTab(at: 1, in: $0) })
+            for typed in [false, true] {
+                let directory = temporaryRoot.appendingPathComponent(typed ? "typed" : "raw")
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                let url = directory.appendingPathComponent("workspace.json")
+                let decoded: WorkspaceModel = if typed {
+                    try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(document: DomainWorkspaceDocument.decode(documentBytes: original, fileURL: url))
+                } else {
+                    try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(documentBytes: original, fileURL: url)
+                }
+                XCTAssertEqual(decoded.composeTabsDroppedDuringDecode, 1)
+                XCTAssertEqual(try Data(contentsOf: WorkspaceUnreadableDocumentBackup.backupURL(for: url, documentBytes: original)), original)
+            }
         }
 
         func testCleanDocumentDecodesAllTabsWithoutLossFlag() throws {

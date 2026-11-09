@@ -180,6 +180,22 @@ package struct DomainWorkspaceDocument: Codable, Equatable {
         self.metadata = metadata
     }
 
+    private enum CodingKeys: String, CodingKey {
+        case workspaceID, fileURL, documentBytes, contentDigest, metadata
+    }
+
+    package init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        workspaceID = try values.decode(UUID.self, forKey: .workspaceID)
+        fileURL = try values.decode(URL.self, forKey: .fileURL)
+        documentBytes = try values.decode(Data.self, forKey: .documentBytes)
+        metadata = try values.decode(DomainWorkspaceMetadata.self, forKey: .metadata)
+        let claimedDigest = try values.decode(String.self, forKey: .contentDigest)
+        let digest = DomainContentDigest.sha256(documentBytes)
+        guard digest == claimedDigest else { throw DomainWorkspaceDocumentError.digestMismatch }
+        contentDigest = digest
+    }
+
     package static func decode(documentBytes: Data, fileURL: URL) throws -> DomainWorkspaceDocument {
         let metadata = try DomainWorkspaceDocumentDecoder.decodeMetadata(from: documentBytes)
         return DomainWorkspaceDocument(
@@ -305,6 +321,7 @@ package struct DomainWorkspaceSnapshotSubscription {
 }
 
 package enum DomainWorkspaceDocumentError: Error, Equatable {
+    case digestMismatch
     case invalidTopLevel
     case missingWorkspaceID
     case futureSchema(Int)

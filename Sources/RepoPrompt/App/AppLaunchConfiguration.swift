@@ -22,6 +22,14 @@ struct AppLaunchConfiguration {
         bundleURL: Bundle.main.bundleURL
     )
 
+    static let catalogPublicationTrustedDigestReuseKey = "catalogPublicationTrustedDigestReuseEnabled"
+    let catalogPublicationTrustedDigestReuseEnabled: Bool
+
+    static func resolveCatalogPublicationTrustedDigestReuse(storedValue: Any?) -> Bool {
+        // Malformed values keep the default; the rollback command writes an explicit Boolean.
+        storedValue as? Bool ?? true
+    }
+
     let isUITestSession: Bool
     let suppressesWindowRestore: Bool
     let suppressesWindowPersistence: Bool
@@ -92,6 +100,11 @@ struct AppLaunchConfiguration {
             let allowsStressAgentSessionPersistence = false
         #endif
 
+        catalogPublicationTrustedDigestReuseEnabled = Self.isUnitTestProcess
+            ? true
+            : Self.resolveCatalogPublicationTrustedDigestReuse(
+                storedValue: UserDefaults.standard.object(forKey: Self.catalogPublicationTrustedDigestReuseKey)
+            )
         self.isUITestSession = isUITestSession
         suppressesWindowRestore = isDeterministicUITestLaunch
         suppressesWindowPersistence = isDeterministicUITestLaunch

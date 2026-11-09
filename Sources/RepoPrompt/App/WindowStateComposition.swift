@@ -202,7 +202,10 @@ enum WindowStateCompositionFactory {
             workspaceManager: workspaceManager
         )
         let domainWorkspacePresentationBridge = domainWorkspaceClient.map {
-            DomainWorkspacePresentationBridge(workspaceManager: workspaceManager, client: $0)
+            DomainWorkspacePresentationBridge(
+                workspaceManager: workspaceManager, client: $0,
+                trustedDigestReuse: AppLaunchConfiguration.current.catalogPublicationTrustedDigestReuseEnabled
+            )
         }
         if let bridge = domainWorkspacePresentationBridge {
             // Weak captures: the Bridge already holds the manager weakly; no retain cycle or new owner.

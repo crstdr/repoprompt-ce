@@ -81,6 +81,129 @@ import XCTest
             }
         }
 
+        func testTrustedDigest35ReceiversEightMiBParityWithVisibleAndHiddenOwners() async throws {
+            let seeds = Fixture.standardSeeds
+            var edited = Fixture.model(id: Fixture.aardvarkID, name: "Aardvark")
+            edited.composeTabs = (0 ..< 99).map { index in
+                ComposeTabState(id: UUID(), name: "Open \(index)", activeChatSessionID: UUID())
+            }
+            edited.activeComposeTabID = edited.composeTabs[0].id
+            edited.stashedTabs = (0 ..< 1330).map { index in
+                StashedTab(tab: ComposeTabState(id: UUID(), name: "Stashed \(index)", activeChatSessionID: index < 201 ? UUID() : nil))
+            }
+            edited.composeTabs[0].promptText = String(repeating: "x", count: 8 * 1024 * 1024)
+            XCTAssertEqual(edited.composeTabs.count + edited.stashedTabs.count(where: { $0.tab.activeChatSessionID != nil }), 300)
+            XCTAssertGreaterThanOrEqual(try JSONEncoder().encode(edited).count, 8 * 1024 * 1024)
+            CatalogPerf.shared.setSuppressAutomaticEmissionForTesting(true)
+            defer {
+                _ = CatalogPerf.shared.rotate()
+                CatalogPerf.shared.setSuppressAutomaticEmissionForTesting(false)
+            }
+            for visible in [2, 35] {
+                var countsByMode: [[String: String]] = []
+                var finalByMode: [[WorkspaceModel]] = []
+                for reuse in [false, true] {
+                    try await Fixture.run(seeds: seeds) { f in
+                        let managers = (0 ..< 35).map { _ in f.makeManager() }
+                        let bridges = managers.enumerated().map { index, manager in
+                            DomainWorkspacePresentationBridge(
+                                workspaceManager: manager,
+                                client: DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: -20000 - index),
+                                trustedDigestReuse: reuse
+                            )
+                        }
+                        let observers = bridges.map { DomainWorkspaceProjectionObserver(bridge: $0) }
+                        let displayPerf = CatalogPerf()
+                        let gates = (0 ..< 35).map { index -> AgentPresentationWorkGate in
+                            let gate = AgentPresentationWorkGate(enabled: true, perf: displayPerf, catchUp: {})
+                            gate.setVisible(index < visible)
+                            return gate
+                        }
+                        defer { gates.forEach { $0.close() } }
+                        let clock = ContinuousClock()
+                        @MainActor func settle(_ sequence: UInt64, before deadline: ContinuousClock.Instant) async throws {
+                            for observer in observers {
+                                let remaining = clock.now.duration(to: deadline)
+                                XCTAssertGreaterThan(remaining, .zero)
+                                let checkpoint = await observer.waitForProjection(
+                                    afterGeneration: 0, through: sequence, requireCatalogApplication: true,
+                                    timeout: max(.milliseconds(1), remaining)
+                                )
+                                _ = try XCTUnwrap(checkpoint)
+                            }
+                        }
+                        @MainActor func buildVisibleDisplays() {
+                            for (index, gate) in gates.enumerated() where gate.shouldBuild() {
+                                _ = managers[index].workspace(withID: edited.id)?.name
+                                gate.didApply()
+                            }
+                        }
+                        do {
+                            bridges.forEach { $0.start() }
+                            let initial = await f.runtime.workspaceStore.snapshot()
+                            try await settle(initial.publicationSequence, before: clock.now.advanced(by: .seconds(5)))
+                            WorkspaceFileDecodeCache.shared.removeAllForTesting()
+                            _ = CatalogPerf.shared.rotate()
+                            let start = clock.now
+                            let deadline = start.advanced(by: .seconds(5))
+                            let writer = DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: -9999)
+                            let record = try XCTUnwrap(initial.workspaces.first { $0.document.workspaceID == edited.id })
+                            let working = try await writer.replaceWorkingFailClosed(
+                                edited, fileURL: f.workspaceURL(for: edited), expectedWorkspaceRevision: record.revisions.workingRevision
+                            )
+                            XCTAssertEqual(working.disposition, .applied)
+                            let afterWorking = await f.runtime.workspaceStore.snapshot()
+                            try await settle(afterWorking.publicationSequence, before: deadline)
+                            buildVisibleDisplays()
+                            let changed = try XCTUnwrap(afterWorking.workspaces.first { $0.document.workspaceID == edited.id })
+                            let saved = await writer.saveCommittedWorkingRevision(workspaceID: edited.id, expectedWorkspaceRevision: changed.revisions.workingRevision)
+                            XCTAssertEqual(saved.disposition, .applied)
+                            let final = await f.runtime.workspaceStore.snapshot()
+                            try await settle(final.publicationSequence, before: deadline)
+                            buildVisibleDisplays()
+                            let elapsed = start.duration(to: clock.now)
+                            XCTAssertLessThan(elapsed, .seconds(5), "Completion budget, not a speed-ratio assertion")
+                            let emission = CatalogPerf.shared.rotateEmissionRecords()
+                            let core = try XCTUnwrap(emission.records?.core)
+                            let detail = try XCTUnwrap(emission.attribution)
+                            let fields = Dictionary(uniqueKeysWithValues: core.split(separator: " ").map {
+                                let parts = $0.split(separator: "=", maxSplits: 1)
+                                return (String(parts[0]), String(parts[1]))
+                            })
+                            let compared = ["receipts_full", "receipts_metadata", "applications_attempted", "canonical_decodes", "decode_cache_hits"]
+                            countsByMode.append(fields.filter { compared.contains($0.key) })
+                            XCTAssertEqual(fields["receivers"], "35")
+                            XCTAssertTrue(detail.contains("receiver_hash_count=\(reuse ? 0 : 35) "), detail)
+                            XCTAssertEqual(Int(fields["decode_bytes_hashed"] ?? ""), reuse ? 0 : changed.document.documentBytes.count * 35)
+                            XCTAssertTrue(detail.contains("pair_same_digest=1 "), detail)
+                            let models = try f.decoded(final)
+                            finalByMode.append(managers[0].workspaces)
+                            for manager in managers {
+                                // The same synchronous accessor serves hidden-window MCP readers.
+                                XCTAssertEqual(manager.workspace(withID: edited.id)?.stashedTabs.count, 1330)
+                                XCTAssertEqual(manager.workspaces, models)
+                                XCTAssertTrue(manager.hasAcceptedDomainCatalogForRestoration)
+                                XCTAssertTrue(manager.test_carrierIndexesEqual(to: managers[0]))
+                                XCTAssertNotNil(manager.adoptedFullDocumentGeneration(workspaceID: edited.id, contentDigest: changed.document.contentDigest))
+                                XCTAssertEqual(manager.domainCatalogReconciliationGeneration, managers[0].domainCatalogReconciliationGeneration)
+                            }
+                            print("CATALOG_DIGEST_FAKE receivers=35 visible=\(visible) reuse=\(reuse) encoded_bytes=\(changed.document.documentBytes.count) elapsed=\(elapsed) \(core)")
+                        } catch {
+                            for bridge in bridges {
+                                await bridge.stopAndJoinForTesting()
+                            }
+                            throw error
+                        }
+                        for bridge in bridges {
+                            await bridge.stopAndJoinForTesting()
+                        }
+                    }
+                }
+                XCTAssertEqual(countsByMode[0], countsByMode[1])
+                XCTAssertEqual(finalByMode[0], finalByMode[1])
+            }
+        }
+
         func testCatalogPerfCountsForeignWorkingCommits() async throws {
             CatalogPerf.shared.setSuppressAutomaticEmissionForTesting(true)
             defer {
@@ -129,7 +252,8 @@ import XCTest
                     XCTAssertEqual(Int(fields["canonical_decodes"] ?? ""), 10)
                     // The fork's synchronous projection also decodes once per receiver after initial acceptance.
                     XCTAssertEqual(Int(fields["decode_cache_hits"] ?? ""), (receiverCount - 1) * 10 + receiverCount)
-                    XCTAssertGreaterThan(Int(fields["decode_bytes_hashed"] ?? "") ?? 0, 0)
+                    // Production composition uses the launch-default ON path; bytes count actual lookup hashes, not decode requests.
+                    XCTAssertEqual(Int(fields["decode_bytes_hashed"] ?? ""), 0)
                 }
             }
         }
