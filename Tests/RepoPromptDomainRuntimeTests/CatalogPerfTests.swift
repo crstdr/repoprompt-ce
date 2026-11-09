@@ -135,6 +135,66 @@ final class CatalogPerfTests: XCTestCase {
         XCTAssertNil(perf.rotateRecords(), "Both records must come from one rotation/reset")
     }
 
+    func testTranscriptOnlyWindowDoesNotEmitLegacyRecords() throws {
+        let perf = CatalogPerf()
+        perf.transcriptMutationCadence(gapMS: nil)
+        perf.transcriptRequestSettled(.coalesced)
+        let rotation = try XCTUnwrap(perf.rotateRecords())
+        let transcript = try XCTUnwrap(rotation.transcriptDerivation)
+        XCTAssertEqual(rotation.records, [transcript])
+        XCTAssertTrue(transcript.hasPrefix("transcript_derivation "))
+        XCTAssertNil(perf.rotateRecords())
+    }
+
+    func testTranscriptDerivationBucketsAndRotationBudget() throws {
+        let perf = CatalogPerf()
+        perf.transcriptMutationCadence(gapMS: nil)
+        for gap in [0.0, 16, 33, 100, 250, 1000] {
+            perf.transcriptMutationCadence(gapMS: gap)
+        }
+        for outcome: CatalogPerf.TranscriptRequestDisposition in [.coalesced, .executed, .dropped] {
+            perf.transcriptRequestSettled(outcome)
+        }
+        for (size, duration) in [(0, 1.0), (100, 4), (500, 16), (2000, 100), (5000, 500)] {
+            perf.transcriptBuilder(ms: duration, retainedRows: size, path: .automatic)
+        }
+        let rotation = try XCTUnwrap(perf.rotateRecords())
+        let record = try XCTUnwrap(rotation.transcriptDerivation)
+        XCTAssertTrue(record.contains("requests=3 first=1 gaps=1,1,1,1,1,1 coalesced_executed_dropped=1,1,1"), record)
+        XCTAssertTrue(record.contains("automatic_by_size=1,1,1,1,0,0,0,0/1,4,4,0,1,0,0,0/1,16,16,0,0,1,0,0/1,100,100,0,0,0,1,0/1,500,500,0,0,0,0,1 builds_by_path=5,621,500,1,1,1,1,1"), record)
+        XCTAssertFalse(record.contains("activity="))
+        XCTAssertLessThanOrEqual(record.utf8.count + 64, 1024)
+        XCTAssertNil(perf.rotateRecords())
+    }
+
+    func testTranscriptInstrumentationOverheadDiagnostic() {
+        let perf = CatalogPerf()
+        let iterations = 100_000
+        let start = DispatchTime.now().uptimeNanoseconds
+        for _ in 0 ..< iterations {
+            perf.transcriptMutationCadence(gapMS: 10)
+            perf.transcriptRequestSettled(.coalesced)
+            perf.transcriptBuilder(ms: 2, retainedRows: 100, path: .automatic)
+        }
+        let ns = Double(DispatchTime.now().uptimeNanoseconds - start) / Double(iterations)
+        print("TRANSCRIPT_DIAGNOSTIC three_recordings_ns=\(ns)")
+    }
+
+    func testTranscriptPathDistributionsAndSettledRequestsReconcile() throws {
+        let perf = CatalogPerf()
+        let paths: [CatalogPerf.TranscriptBuilderPath] = [.automatic, .catchUp, .save, .terminal, .other]
+        for (index, path) in paths.enumerated() {
+            perf.transcriptBuilder(ms: Double(index + 1), retainedRows: 0, path: path)
+        }
+        for outcome: CatalogPerf.TranscriptRequestDisposition in [.coalesced, .executed, .dropped, .dropped] {
+            perf.transcriptRequestSettled(outcome)
+        }
+        let line = try XCTUnwrap(perf.rotateRecords()?.transcriptDerivation)
+        XCTAssertTrue(line.contains("requests=4 "), line)
+        XCTAssertTrue(line.contains("coalesced_executed_dropped=1,1,2"), line)
+        XCTAssertTrue(line.contains("builds_by_path=1,1,1,1,0,0,0,0/1,2,2,1,0,0,0,0/1,3,3,1,0,0,0,0/1,4,4,0,1,0,0,0/1,5,5,0,1,0,0,0"), line)
+    }
+
     #if DEBUG
         func testEmissionObservationsAreScopedAndInstanceLocal() throws {
             let perf = CatalogPerf(), other = CatalogPerf()
@@ -224,6 +284,27 @@ final class CatalogPerfTests: XCTestCase {
         XCTAssertEqual(tracker.observe(kind: .savedDocumentCommitted, workspaceID: workspace, digest: "second"), .differentDigest)
         _ = tracker.observe(kind: .workspaceDeleted, workspaceID: other, digest: nil)
         XCTAssertEqual(tracker.observe(kind: .savedDocumentCommitted, workspaceID: other, digest: "other"), .savedWithoutWorking)
+    }
+
+    func testAttributionAndDerivationCompanionsCoexistWithoutLegacyActivity() throws {
+        let perf = CatalogPerf()
+        perf.saveSource(.pollSave)
+        perf.transcriptRequestSettled(.executed)
+        let both = perf.rotateEmissionRecords()
+        let records = try XCTUnwrap(both.records)
+        XCTAssertEqual(records.records.count, 1)
+        XCTAssertTrue(records.records[0].hasPrefix("transcript_derivation v=1 "))
+        XCTAssertFalse(records.records.contains { $0.contains("activity=") || $0.contains("analytics_seed_count=") })
+        let detail = try XCTUnwrap(both.attribution)
+        XCTAssertTrue(detail.contains("source_poll_save=1 "))
+        XCTAssertFalse(detail.contains("activity="))
+        let empty = perf.rotateEmissionRecords()
+        XCTAssertNil(empty.records)
+        XCTAssertNil(empty.attribution)
+        perf.transcriptRequestSettled(.coalesced)
+        let derivationOnly = perf.rotateEmissionRecords()
+        XCTAssertEqual(derivationOnly.records?.records.count, 1)
+        XCTAssertNil(derivationOnly.attribution)
     }
 
     func testIdleWindowEmitsNothing() {
