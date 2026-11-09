@@ -210,31 +210,17 @@ final class WorkspaceFileDecodeCache: @unchecked Sendable {
             return cached
         }
         if catalogPerf { CatalogPerf.shared.canonicalDecode(bytesHashed: bytesHashed, cacheHit: false) }
-        // The decode is only memoizable when it is a pure function of the
-        // bytes: custom decoders and normalization synthesize UUID()/Date()
-        // fallbacks for missing fields, and those results must stay
-        // per-document (identical bytes at two files must keep independent
-        // synthesized identities).
-        let recorder = WorkspaceDecodeSynthesis.Recorder()
-        let decoded = try WorkspaceDecodeSynthesis.$recorder.withValue(recorder) {
-            let decodeStart = catalogPerf ? DispatchTime.now().uptimeNanoseconds : nil
+        let decoded: (workspace: WorkspaceModel, normalizationRequiresSave: Bool, synthesized: Bool)
+        do {
+            let start = catalogPerf ? DispatchTime.now().uptimeNanoseconds : nil
             defer {
-                if let decodeStart {
-                    CatalogPerf.shared.receiverPhase(.decode, elapsedMS: Double(DispatchTime.now().uptimeNanoseconds - decodeStart) / 1_000_000)
+                if let start {
+                    CatalogPerf.shared.receiverPhase(.decode, elapsedMS: Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000)
                 }
             }
-            var workspace = try JSONDecoder().decode(WorkspaceModel.self, from: documentBytes)
-            let decodedRequiresSave = workspace.normalizationRequiresSave
-            let normalized = workspace.normalizeComposeTabInvariants()
-            let normalizationRequiresSave = decodedRequiresSave
-                || normalized || workspace.normalizationRequiresSave
-            workspace.normalizationRequiresSave = normalizationRequiresSave
-            return (
-                workspace: workspace,
-                normalizationRequiresSave: normalizationRequiresSave
-            )
+            decoded = try decodeUncached(documentBytes, digest: digest)
         }
-        if !recorder.occurred {
+        if !decoded.synthesized {
             shared.storeDecoded(
                 decoded.workspace,
                 normalizationRequiresSave: decoded.normalizationRequiresSave,
@@ -243,6 +229,52 @@ final class WorkspaceFileDecodeCache: @unchecked Sendable {
             )
         }
         return (decoded.workspace, decoded.normalizationRequiresSave)
+    }
+
+    private static func decodeUncached(
+        _ bytes: Data, digest: String
+    ) throws -> (workspace: WorkspaceModel, normalizationRequiresSave: Bool, synthesized: Bool) {
+        #if DEBUG
+            shared.lock.withLock {
+                if shared.jsonDecodes[digest] != nil || shared.jsonDecodes.count < 128 {
+                    if Thread.isMainThread { shared.jsonDecodes[digest, default: (0, 0)].main += 1 }
+                    else { shared.jsonDecodes[digest, default: (0, 0)].worker += 1 }
+                }
+            }
+        #endif
+        // UUID/date/tab fallbacks must remain independent on every decode.
+        let recorder = WorkspaceDecodeSynthesis.Recorder()
+        return try WorkspaceDecodeSynthesis.$recorder.withValue(recorder) {
+            var workspace = try JSONDecoder().decode(WorkspaceModel.self, from: bytes)
+            let decodedRequiresSave = workspace.normalizationRequiresSave
+            let normalized = workspace.normalizeComposeTabInvariants()
+            let requiresSave = decodedRequiresSave || normalized || workspace.normalizationRequiresSave
+            workspace.normalizationRequiresSave = requiresSave
+            return (workspace, requiresSave, recorder.occurred)
+        }
+    }
+
+    func catalogPrewarmEligibility(_ input: WorkspaceCatalogDecodeInput) -> WorkspaceCatalogDecodeOutcome? {
+        lock.withLock {
+            if cachedDecodesByDigest[input.digest] != nil { return .resident }
+            if decodeCacheEntryLimit <= 0 || input.bytes.count > decodeCacheByteLimit { return .noncacheable }
+            return nil
+        }
+    }
+
+    func prewarmCatalogDocument(_ input: WorkspaceCatalogDecodeInput) -> WorkspaceCatalogDecodeOutcome {
+        if let outcome = catalogPrewarmEligibility(input) { return outcome }
+        do {
+            let decoded = try Self.decodeUncached(input.bytes, digest: input.digest)
+            guard !decoded.synthesized else { return .synthesized }
+            storeDecoded(
+                decoded.workspace,
+                normalizationRequiresSave: decoded.normalizationRequiresSave,
+                digest: input.digest,
+                inputByteCount: input.bytes.count
+            )
+            return catalogPrewarmEligibility(input) == .resident ? .stored : .evicted
+        } catch { return .failed }
     }
 
     private func cachedDecode(
@@ -338,9 +370,16 @@ final class WorkspaceFileDecodeCache: @unchecked Sendable {
     }
 
     #if DEBUG
+        private var jsonDecodes: [String: (main: Int, worker: Int)] = [:]
+
+        func jsonDecodeCountsForTesting(_ digest: String) -> (main: Int, worker: Int) {
+            lock.withLock { jsonDecodes[digest] ?? (0, 0) }
+        }
+
         func removeAllForTesting() {
             lock.lock()
             defer { lock.unlock() }
+            jsonDecodes.removeAll()
             cachedWorkspacesByKey.removeAll()
             scheduledNormalizationSaveKeys.removeAll()
             cachedDecodesByDigest.removeAll()

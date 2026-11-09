@@ -1371,3 +1371,59 @@ import XCTest
         }
     }
 #endif
+
+#if DEBUG
+    @MainActor
+    final class WorkspaceCatalogDecodePrewarmTests: XCTestCase {
+        private let cache = WorkspaceFileDecodeCache.shared
+
+        override func setUp() async throws {
+            cache.removeAllForTesting()
+        }
+
+        func input(_ bytes: Data? = nil) throws -> WorkspaceCatalogDecodeInput {
+            let original = try DomainWorkspaceDocument.decode(
+                documentBytes: WorkspaceProjectionDecodeFixture(workload: .ordinary).bytes(revision: 1),
+                fileURL: URL(fileURLWithPath: "/synthetic-prewarm/workspace.json")
+            )
+            return WorkspaceCatalogDecodeInput(DomainWorkspaceDocument(
+                workspaceID: original.workspaceID, fileURL: original.fileURL,
+                documentBytes: bytes ?? original.documentBytes, metadata: original.metadata
+            ))
+        }
+
+        func testPureWarmPreservesCountersAndServesRawProjection() async throws {
+            let input = try input()
+            XCTAssertNil(cache.catalogPrewarmEligibility(input))
+            let outcome = await Task.detached { self.cache.prewarmCatalogDocument(input) }.value
+            XCTAssertEqual(outcome, .stored)
+            XCTAssertEqual(cache.catalogPrewarmEligibility(input), .resident)
+            XCTAssertEqual(cache.digestDecodeStatsForTesting().hits, 0)
+            XCTAssertEqual(cache.digestDecodeStatsForTesting().misses, 0)
+            let model = try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(
+                documentBytes: input.bytes, fileURL: URL(fileURLWithPath: "/synthetic-prewarm/workspace.json")
+            )
+            XCTAssertEqual(model, WorkspaceProjectionDecodeFixture(workload: .ordinary).model(revision: 1))
+            XCTAssertEqual(cache.digestDecodeStatsForTesting().hits, 1)
+            XCTAssertEqual(cache.jsonDecodeCountsForTesting(input.digest).worker, 1)
+            XCTAssertEqual(cache.jsonDecodeCountsForTesting(input.digest).main, 0)
+        }
+
+        func testFailureSynthesisAndCapacityAreNotShared() throws {
+            let invalid = try input(Data("{".utf8))
+            XCTAssertEqual(cache.prewarmCatalogDocument(invalid), .failed)
+            var json = try XCTUnwrap(JSONSerialization.jsonObject(with: input().bytes) as? [String: Any])
+            json.removeValue(forKey: "dateModified")
+            let legacy = try input(JSONSerialization.data(withJSONObject: json))
+            XCTAssertEqual(cache.prewarmCatalogDocument(legacy), .synthesized)
+            XCTAssertEqual(cache.prewarmCatalogDocument(legacy), .synthesized)
+            XCTAssertEqual(cache.digestDecodeStatsForTesting().entries, 0)
+            let limits = cache.decodeCacheLimitsForTesting()
+            defer { cache.setDecodeCacheLimitsForTesting(maxEntries: limits.maxEntries, maxInputBytes: limits.maxInputBytes) }
+            cache.setDecodeCacheLimitsForTesting(maxEntries: 0, maxInputBytes: 1)
+            let ordinary = try input()
+            XCTAssertEqual(cache.prewarmCatalogDocument(ordinary), .noncacheable)
+            XCTAssertEqual(cache.jsonDecodeCountsForTesting(ordinary.digest).main, 0)
+        }
+    }
+#endif
