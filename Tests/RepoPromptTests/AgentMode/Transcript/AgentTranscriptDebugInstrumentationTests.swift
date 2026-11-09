@@ -1,6 +1,7 @@
 #if DEBUG
     import Foundation
     @testable import RepoPromptApp
+    import RepoPromptDomainRuntime
     import XCTest
 
     final class AgentTranscriptDebugInstrumentationTests: XCTestCase {
@@ -49,6 +50,26 @@
                 rowIdentityDrift: true, blockIdentityDrift: true
             )])
             XCTAssertEqual(next.baseProjection, first.baseProjection)
+        }
+
+        func testBuilderRecordsEachDiagnosticPath() throws {
+            let perf = CatalogPerf()
+            let rows = [AgentChatItem.user("request", sequenceIndex: 0)]
+            let transcript = AgentTranscriptIO.buildTranscript(from: rows, terminalState: .completed)
+            let paths: [CatalogPerf.TranscriptBuilderPath] = [.automatic, .catchUp, .save, .terminal, .other]
+            for path in paths {
+                _ = AgentModeViewModel.buildTranscriptPresentation(
+                    from: transcript, sourceItems: rows, selectedAgent: .claudeCode,
+                    previousPerformanceSnapshot: .empty, diagnosticPath: path, diagnosticRecorder: perf
+                )
+            }
+            let record = try XCTUnwrap(perf.rotateRecords()?.transcriptDerivation)
+            let field = try XCTUnwrap(record.split(separator: " ").first { $0.hasPrefix("builds_by_path=") })
+            let values = field.dropFirst("builds_by_path=".count).split(separator: "/")
+            XCTAssertEqual(values.count, paths.count)
+            for row in values {
+                XCTAssertEqual(row.split(separator: ",").first, "1", record)
+            }
         }
 
         func testMetricsRemainLazyUntilAHandlerIsConfigured() {
