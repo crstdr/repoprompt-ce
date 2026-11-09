@@ -107,12 +107,14 @@ import XCTest
             XCTAssertEqual(sample.normalizationMutationCount, 1)
         }
 
-        func testColdDecodeLaunchKeyIsTrueOnlyAndTestsDefaultOff() {
-            XCTAssertFalse(AppLaunchConfiguration.resolveCatalogColdDecodePrewarm(storedValue: nil))
-            XCTAssertFalse(AppLaunchConfiguration.resolveCatalogColdDecodePrewarm(storedValue: "true"))
-            XCTAssertFalse(AppLaunchConfiguration.resolveCatalogColdDecodePrewarm(storedValue: NSNumber(value: 1)))
-            XCTAssertFalse(AppLaunchConfiguration.resolveCatalogColdDecodePrewarm(storedValue: NSNumber(value: 0)))
+        func testColdDecodeLaunchKeyDefaultsOnWithBooleanFalseKillSwitchAndTestsOff() {
+            XCTAssertTrue(AppLaunchConfiguration.resolveCatalogColdDecodePrewarm(storedValue: nil))
+            XCTAssertTrue(AppLaunchConfiguration.resolveCatalogColdDecodePrewarm(storedValue: "true"))
+            XCTAssertTrue(AppLaunchConfiguration.resolveCatalogColdDecodePrewarm(storedValue: NSNumber(value: 1)))
+            XCTAssertTrue(AppLaunchConfiguration.resolveCatalogColdDecodePrewarm(storedValue: NSNumber(value: 0)))
             XCTAssertTrue(AppLaunchConfiguration.resolveCatalogColdDecodePrewarm(storedValue: NSNumber(value: true)))
+            XCTAssertFalse(AppLaunchConfiguration.resolveCatalogColdDecodePrewarm(storedValue: NSNumber(value: false)))
+            XCTAssertTrue(AppLaunchConfiguration.resolveCatalogColdDecodePrewarm(storedValue: "false"))
             XCTAssertFalse(AppLaunchConfiguration.resolveCatalogColdDecodePrewarm(storedValue: false))
             XCTAssertTrue(AppLaunchConfiguration.resolveCatalogColdDecodePrewarm(storedValue: true))
             XCTAssertFalse(AppLaunchConfiguration.current.catalogColdDecodePrewarmEnabled)

@@ -1167,7 +1167,9 @@ Use `./conductor build` to package the debug app, then `./conductor smoke --laun
 
 ## Catalog cold-decode experiment
 
-`catalogColdDecodePrewarmEnabled` is a launch-read, Boolean-only experiment key; absent, numeric and malformed values stay OFF. Tests inject the prewarmer without changing defaults. Startup/full reconciliation/refetch remain synchronous.
+`catalogColdDecodePrewarmEnabled` defaults ON for dogfooding; only an explicit Boolean false disables it. Absent, numeric and malformed values remain ON. Unit-test launches stay OFF; tests inject the prewarmer without changing defaults. Startup/full reconciliation/refetch remain synchronous.
+
+Rollback for default release packaging (`version.env`): `defaults write com.pvncher.repoprompt.ce catalogColdDecodePrewarmEnabled -bool false`, then restart the app. Default debug packaging uses `com.repoprompt.ce.debug` (`Scripts/package_app.sh`); packaging overrides must use their effective bundle identifier. This key is read only at launch.
 
 Run the sandboxed 35-receiver, 300-chat, 8 MiB-prompt fixture with OFF/OFF noise and alternating OFF/ON arms (including concurrent refresh overload):
 

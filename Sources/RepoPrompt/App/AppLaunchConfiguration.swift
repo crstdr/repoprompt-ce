@@ -28,7 +28,7 @@ struct AppLaunchConfiguration {
 
     static func resolveCatalogColdDecodePrewarm(storedValue: Any?) -> Bool {
         guard let value = storedValue as? NSNumber,
-              CFGetTypeID(value) == CFBooleanGetTypeID() else { return false }
+              CFGetTypeID(value) == CFBooleanGetTypeID() else { return true }
         return value.boolValue
     }
 
