@@ -452,7 +452,13 @@ final class DomainWorkspacePresentationBridge {
     private var catalogRefreshTask: Task<Void, Never>?
     private var catalogRefreshID: UUID?
 
-    init(workspaceManager: WorkspaceManagerViewModel, client: DomainWorkspaceAuthorityClient) {
+    private let trustedDigestReuse: Bool
+
+    init(
+        workspaceManager: WorkspaceManagerViewModel, client: DomainWorkspaceAuthorityClient,
+        trustedDigestReuse: Bool = false
+    ) {
+        self.trustedDigestReuse = trustedDigestReuse
         self.workspaceManager = workspaceManager
         self.client = client
     }
@@ -941,7 +947,7 @@ final class DomainWorkspacePresentationBridge {
                 nextModels[workspaceID] = current
             } else {
                 do {
-                    nextModels[workspaceID] = try manager.decodeDomainWorkspaceCatalogRecord(record, catalogPerf: true)
+                    nextModels[workspaceID] = try manager.decodeDomainWorkspaceCatalogRecord(record, catalogPerf: true, trustedDigestReuse: trustedDigestReuse)
                 } catch {
                     failedIDs.insert(workspaceID)
                 }

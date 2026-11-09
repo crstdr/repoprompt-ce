@@ -191,11 +191,25 @@ final class WorkspaceFileDecodeCache: @unchecked Sendable {
         if let hashStart {
             CatalogPerf.shared.receiverPhase(.hash, elapsedMS: Double(DispatchTime.now().uptimeNanoseconds - hashStart) / 1_000_000)
         }
+        return try decodeWorkspace(documentBytes: documentBytes, digest: digest, bytesHashed: documentBytes.count, catalogPerf: catalogPerf)
+    }
+
+    /// Every document constructor/decoder binds this immutable digest to these exact bytes.
+    fileprivate static func decodeWorkspace(
+        document: DomainWorkspaceDocument,
+        catalogPerf: Bool = false
+    ) throws -> (workspace: WorkspaceModel, normalizationRequiresSave: Bool) {
+        try decodeWorkspace(documentBytes: document.documentBytes, digest: document.contentDigest, bytesHashed: 0, catalogPerf: catalogPerf)
+    }
+
+    private static func decodeWorkspace(
+        documentBytes: Data, digest: String, bytesHashed: Int, catalogPerf: Bool
+    ) throws -> (workspace: WorkspaceModel, normalizationRequiresSave: Bool) {
         if let cached = shared.cachedDecode(for: digest) {
-            if catalogPerf { CatalogPerf.shared.canonicalDecode(bytesHashed: documentBytes.count, cacheHit: true) }
+            if catalogPerf { CatalogPerf.shared.canonicalDecode(bytesHashed: bytesHashed, cacheHit: true) }
             return cached
         }
-        if catalogPerf { CatalogPerf.shared.canonicalDecode(bytesHashed: documentBytes.count, cacheHit: false) }
+        if catalogPerf { CatalogPerf.shared.canonicalDecode(bytesHashed: bytesHashed, cacheHit: false) }
         // The decode is only memoizable when it is a pure function of the
         // bytes: custom decoders and normalization synthesize UUID()/Date()
         // fallbacks for missing fields, and those results must stay
@@ -9612,15 +9626,17 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     /// Shared identity-checked record decode for catalog projection and scoped restore classification.
-    func decodeDomainWorkspaceCatalogRecord(_ record: DomainWorkspaceSnapshot, catalogPerf: Bool = false) throws -> WorkspaceModel {
+    func decodeDomainWorkspaceCatalogRecord(
+        _ record: DomainWorkspaceSnapshot, catalogPerf: Bool = false, trustedDigestReuse: Bool = false
+    ) throws -> WorkspaceModel {
         #if DEBUG
             if let error = catalogRecordDecodeFailureForTesting?(record.document.workspaceID) { throw error }
         #endif
-        let model = try Self.decodeDomainWorkspaceProjection(
-            documentBytes: record.document.documentBytes,
-            fileURL: record.document.fileURL,
-            catalogPerf: catalogPerf
-        )
+        let model = try trustedDigestReuse
+            ? Self.decodeDomainWorkspaceProjection(document: record.document, catalogPerf: catalogPerf)
+            : Self.decodeDomainWorkspaceProjection(
+                documentBytes: record.document.documentBytes, fileURL: record.document.fileURL, catalogPerf: catalogPerf
+            )
         guard model.id == record.document.workspaceID else {
             throw NSError(domain: "WorkspaceChooserCatalog", code: 2, userInfo: [
                 NSLocalizedDescriptionKey: "Decoded workspace identity does not match authoritative record identity."
@@ -17867,6 +17883,25 @@ class WorkspaceManagerViewModel: ObservableObject {
         #else
             let workspace = try WorkspaceFileDecodeCache.decodeWorkspace(documentBytes: documentBytes, catalogPerf: catalogPerf).workspace
         #endif
+        return finishDomainWorkspaceProjection(workspace, documentBytes: documentBytes, fileURL: fileURL)
+    }
+
+    nonisolated static func decodeDomainWorkspaceProjection(
+        document: DomainWorkspaceDocument, catalogPerf: Bool = false
+    ) throws -> WorkspaceModel {
+        #if DEBUG
+            let workspace = try WorkspaceProjectionDecodeDiagnostics.measure(inputBytes: document.documentBytes.count) {
+                try WorkspaceFileDecodeCache.decodeWorkspace(document: document, catalogPerf: catalogPerf).workspace
+            }
+        #else
+            let workspace = try WorkspaceFileDecodeCache.decodeWorkspace(document: document, catalogPerf: catalogPerf).workspace
+        #endif
+        return finishDomainWorkspaceProjection(workspace, documentBytes: document.documentBytes, fileURL: document.fileURL)
+    }
+
+    private nonisolated static func finishDomainWorkspaceProjection(
+        _ workspace: WorkspaceModel, documentBytes: Data, fileURL: URL
+    ) -> WorkspaceModel {
         // The domain authority re-writes this document from the projected value, so the original
         // bytes must be preserved here, before any projection consumer can commit a lossy copy.
         WorkspaceUnreadableDocumentBackup.preserveIfNeeded(
