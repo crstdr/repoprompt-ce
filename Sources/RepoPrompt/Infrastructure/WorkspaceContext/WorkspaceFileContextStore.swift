@@ -1071,13 +1071,25 @@ actor WorkspaceFileContextStore {
     #endif
 
     private final class ScopedIngressBarrierJoin: @unchecked Sendable {
+        let rootID: UUID
         private let lock = NSLock()
         private var isCompleted = false
         private var completedOutput: ScopedIngressBarrierTaskOutput?
         private var waiters: [UUID: CheckedContinuation<ScopedIngressBarrierTaskOutput?, Never>] = [:]
 
+        init(rootID: UUID) {
+            self.rootID = rootID
+        }
+
         func value() async -> ScopedIngressBarrierTaskOutput? {
             let waiterID = UUID()
+            let rootID = rootID
+            let overdueReport = OverdueWaitReporter.begin(
+                event: "root_ingress",
+                threshold: MCPTimeoutPolicy.workspaceFreshnessWaitTimeout,
+                fields: { "root=\(rootID.uuidString.prefix(8))" }
+            )
+            defer { overdueReport.cancel() }
             return await withTaskCancellationHandler {
                 await withCheckedContinuation { continuation in
                     lock.lock()
@@ -10638,7 +10650,7 @@ actor WorkspaceFileContextStore {
         }
 
         if flightState.active != nil {
-            let join = ScopedIngressBarrierJoin()
+            let join = ScopedIngressBarrierJoin(rootID: rootID)
             #if DEBUG
                 let enqueuedAtNanoseconds = debugNowNanoseconds()
                 scopedIngressBarrierSuccessorCountsByRootID[rootID, default: 0] += 1
@@ -10655,7 +10667,7 @@ actor WorkspaceFileContextStore {
             return scopedIngressBarrierSample(from: output)
         }
 
-        let join = ScopedIngressBarrierJoin()
+        let join = ScopedIngressBarrierJoin(rootID: rootID)
         launchScopedIngressBarrier(
             rootID: rootID,
             target: target,

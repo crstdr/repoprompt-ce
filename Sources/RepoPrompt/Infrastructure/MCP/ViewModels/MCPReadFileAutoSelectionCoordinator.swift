@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptFoundation
+import RepoPromptShared
 import RepoPromptWorkspaceCore
 
 /// Window-scoped response-lane coordinator for Agent Mode `read_file` and eligible `file_search`
@@ -671,6 +672,17 @@ final class MCPReadFileAutoSelectionCoordinator {
         guard !Task.isCancelled else { return .cancelled }
         let target = canonicalLanes[key]?.acceptedSequence ?? 0
         guard target > 0 else { return .completed }
+        let (windowID, tabID, generation) = (key.windowID, key.tabID, key.bindingGeneration)
+        let requirementLabel = requirement.rawValue
+        let overdueReport = OverdueWaitReporter.begin(
+            event: "selection_drain",
+            threshold: MCPTimeoutPolicy.workspaceFreshnessWaitTimeout,
+            fields: {
+                "window=\(windowID) tab=\(tabID.uuidString.prefix(8)) generation=\(generation)"
+                    + " requirement=\(requirementLabel) sequence=\(target)"
+            }
+        )
+        defer { overdueReport.cancel() }
         emitCanonicalDiagnostic(
             .drainHighWaterCaptured,
             for: key,
