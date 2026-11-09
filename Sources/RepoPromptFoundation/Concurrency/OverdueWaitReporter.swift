@@ -4,9 +4,9 @@ import os
 
 /// Diagnostics only: logs a wait that has outlived a threshold, so a hang names what it is waiting on.
 /// The timer runs on a dedicated dispatch queue, not the Swift cooperative pool, so it still fires when
-/// that pool is starved and leaves nothing scheduled once cancelled. It is created only for waits that
-/// are already suspended, never changes their outcome, and must be cancelled by the caller when the
-/// wait ends.
+/// that pool is starved and leaves nothing scheduled once cancelled. It never changes the wait's outcome.
+/// Start it only once the waiter is registered, and cancel it where the waiter is settled, not only where
+/// its task resumes: a settled waiter whose task cannot run yet must not keep reporting.
 package enum OverdueWaitReporter {
     package static let defaultRepeatInterval: Duration = .seconds(300)
 
@@ -20,8 +20,13 @@ package enum OverdueWaitReporter {
         fileprivate final class Flag: @unchecked Sendable {
             private let lock = NSLock()
             private var value = false
-            var isCancelled: Bool { lock.withLock { value } }
-            func cancel() { lock.withLock { value = true } }
+            var isCancelled: Bool {
+                lock.withLock { value }
+            }
+
+            func cancel() {
+                lock.withLock { value = true }
+            }
         }
 
         private let timer: DispatchSourceTimer
@@ -48,10 +53,9 @@ package enum OverdueWaitReporter {
         threshold: Duration,
         repeatInterval: Duration = defaultRepeatInterval,
         fields: @escaping @Sendable () -> String?,
-        report: @escaping @Sendable (String) -> Void = { line in
-            logger.notice("\(line, privacy: .public)")
-        }
+        report: (@Sendable (String) -> Void)? = nil
     ) -> Watch {
+        let report = report ?? { line in logger.notice("\(line, privacy: .public)") }
         let started = ContinuousClock.now
         let timer = DispatchSource.makeTimerSource(queue: queue)
         let thresholdNanoseconds = nanoseconds(threshold)
@@ -70,12 +74,14 @@ package enum OverdueWaitReporter {
         return Watch(timer: timer, flag: flag)
     }
 
+    /// Clamped, so an enormous duration cannot overflow.
     private static func nanoseconds(_ duration: Duration) -> Int {
         let components = duration.components
-        return Int(clamping: components.seconds * 1_000_000_000 + components.attoseconds / 1_000_000_000)
+        let seconds = min(max(components.seconds, 0), Int64(Int.max) / 1_000_000_000 - 1)
+        return Int(seconds * 1_000_000_000 + components.attoseconds / 1_000_000_000)
     }
 
-    private static func milliseconds(_ duration: Duration) -> Int64 {
+    package static func milliseconds(_ duration: Duration) -> Int64 {
         let components = duration.components
         return components.seconds * 1000 + components.attoseconds / 1_000_000_000_000_000
     }

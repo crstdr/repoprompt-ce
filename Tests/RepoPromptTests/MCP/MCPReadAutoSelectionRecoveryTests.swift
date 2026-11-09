@@ -424,6 +424,63 @@ final class MCPReadAutoSelectionRecoveryTests: XCTestCase {
 
     /// Recovery tests replace file application with callbacks, but enqueue still receives
     /// authority captured from a genuinely activated catalog rather than a fabricated ticket.
+    func testDrainCompletionAndInvalidationStopOverdueReports() async throws {
+        for invalidate in [false, true] {
+            let authority = try await makeAuthority()
+            let gate = RecoveryCancellationIgnoringGate()
+            let waiterRegistered = RecoveryMainActorSignal()
+            let reports = OverdueSettlementReports()
+            let key = contextKey(authority: authority)
+            var current: MCPReadFileAutoSelectionCoordinator.ContextKey? = key
+            let coordinator = MCPReadFileAutoSelectionCoordinator(
+                isContextCurrent: { $0 == current },
+                applyCanonical: { _, _ in .unchanged },
+                applyMirror: { _ in .converged },
+                overdueThreshold: .milliseconds(30),
+                overdueRepeatInterval: .milliseconds(60),
+                overdueReportSink: { reports.append($0) }
+            )
+            coordinator.setCanonicalApplyGateForTesting { await gate.enter() }
+
+            XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/A.swift"]), authority: authority, for: key))
+            guard await gate.waitUntilEntered() else {
+                await failWait("canonical worker to enter", gates: [gate])
+                coordinator.invalidate(context: key)
+                return
+            }
+            let drain = Task { @MainActor in
+                await coordinator.drain(
+                    .canonicalSelection,
+                    for: key,
+                    onCanonicalWaiterRegistered: { waiterRegistered.signal() }
+                )
+            }
+            guard await waiterRegistered.wait() else {
+                drain.cancel()
+                await failWait("canonical drain waiter registration", gates: [gate])
+                coordinator.invalidate(context: key)
+                return
+            }
+            try await reports.waitForFirstReport()
+            XCTAssertTrue(
+                reports.all[0].contains("event=selection_drain") && reports.all[0].contains("stage=canonical"),
+                "\(reports.all)"
+            )
+
+            if invalidate {
+                current = nil
+                coordinator.invalidate(context: key)
+            } else {
+                await gate.release()
+            }
+            let result = await drain.value
+            XCTAssertEqual(result, invalidate ? .invalidated : .completed)
+            try await reports.assertSettled(after: .milliseconds(60), atCancel: reports.count)
+            await gate.release()
+            coordinator.invalidate(context: key)
+        }
+    }
+
     private func makeAuthority() async throws -> MCPFrozenFileToolAuthority {
         let files = WorkspaceFilesViewModel()
         let keyManager = KeyManager(

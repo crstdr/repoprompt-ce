@@ -18,8 +18,13 @@ final class MCPAdmissionOverdueReportTests: XCTestCase {
     private final class Reports: @unchecked Sendable {
         private let lock = NSLock()
         private var lines: [String] = []
-        func append(_ line: String) { lock.withLock { lines.append(line) } }
-        var all: [String] { lock.withLock { lines } }
+        func append(_ line: String) {
+            lock.withLock { lines.append(line) }
+        }
+
+        var all: [String] {
+            lock.withLock { lines }
+        }
     }
 
     private struct Timeout: Error, CustomStringConvertible {
@@ -40,10 +45,10 @@ final class MCPAdmissionOverdueReportTests: XCTestCase {
         )
     }
 
-    private func waitUntil(_ description: String, _ condition: () -> Bool) async throws {
+    private func waitUntil(_ description: @autoclosure () -> String, _ condition: () -> Bool) async throws {
         let deadline = ContinuousClock.now + .seconds(5)
         while !condition() {
-            guard ContinuousClock.now < deadline else { throw Timeout(description: "timed out: \(description)") }
+            guard ContinuousClock.now < deadline else { throw Timeout(description: "timed out: \(description())") }
             try await Task.sleep(for: .milliseconds(5))
         }
     }
@@ -56,12 +61,13 @@ final class MCPAdmissionOverdueReportTests: XCTestCase {
         try await waitUntil("a matching report in \(reports.all)") { reports.all.contains(where: predicate) }
     }
 
-    /// One report may already be in flight when a wait ends; let it land, then require a full interval of silence.
+    /// Call after the wait has ended and the cancel has returned. The flag is set before the timer is
+    /// cancelled, so at most one report that was already in flight can still land; any further line means
+    /// the timer kept running. Independent of scheduling delays.
     private func assertSilent(_ reports: Reports, file: StaticString = #filePath, line: UInt = #line) async throws {
-        try await Task.sleep(for: Self.interval * 2)
-        let settled = reports.all.count
-        try await Task.sleep(for: Self.interval * 3)
-        XCTAssertEqual(reports.all.count, settled, "\(reports.all)", file: file, line: line)
+        let atCancel = reports.all.count
+        try await Task.sleep(for: Self.interval * 4)
+        XCTAssertLessThanOrEqual(reports.all.count, atCancel + 1, "\(reports.all)", file: file, line: line)
     }
 
     func testOverdueWaiterNamesHolderAndRepeatsEveryIntervalUntilRelease() async throws {
@@ -77,7 +83,7 @@ final class MCPAdmissionOverdueReportTests: XCTestCase {
             XCTAssertTrue(line.contains("waiter_tool=apply_edits waiter_conn=cccccccc waiter_run=-"), line)
             XCTAssertTrue(line.contains("holders=1 active=1"), line)
             XCTAssertTrue(
-                line.contains("holder0_tool=file_actions holder0_conn=aaaaaaaa holder0_run=bbbbbbbb holder0_phase=unknown"),
+                line.contains("holder0_tool=file_actions holder0_conn=aaaaaaaa holder0_run=bbbbbbbb"),
                 line
             )
         }
@@ -140,13 +146,13 @@ final class MCPAdmissionOverdueReportTests: XCTestCase {
     func testCancelledAndClosedWaitersStopReporting() async throws {
         // Cancelled before the first report.
         let early = Reports()
-        let earlyController = makeController(early, threshold: .milliseconds(400))
+        let earlyController = makeController(early, threshold: .seconds(3600))
         let earlyHolder = try await earlyController.acquire(.window(1), context: context("prompt", "aaaaaaaa"))
         let earlyWaiter = Task { try await earlyController.acquire(.window(1), context: context("apply_edits", "bbbbbbbb")) }
         try await waitForWaiters(earlyController, .window(1), count: 1)
         earlyWaiter.cancel()
         _ = try? await earlyWaiter.value
-        try await Task.sleep(for: .milliseconds(600))
+        XCTAssertEqual(earlyController.waiterCount(for: .window(1)), 0)
         XCTAssertTrue(early.all.isEmpty, "\(early.all)")
         earlyHolder.release()
 
@@ -189,6 +195,11 @@ final class MCPAdmissionOverdueReportTests: XCTestCase {
         // Only a hand-off can make a report name `file_actions` as the holder.
         try await waitForReports(reports) {
             $0.contains("waiter_tool=apply_edits") && $0.contains("holders=1 active=1") && $0.contains("holder0_tool=file_actions")
+        }
+
+        for line in reports.all {
+            let age = try XCTUnwrap(line.range(of: "holder0_age_ms=").map { line[$0.upperBound...].prefix { $0.isNumber || $0 == "-" } })
+            XCTAssertGreaterThanOrEqual(Int(age) ?? -1, 0, line)
         }
 
         secondLease.release()

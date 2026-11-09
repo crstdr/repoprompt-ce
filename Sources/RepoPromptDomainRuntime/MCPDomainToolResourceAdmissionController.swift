@@ -1,5 +1,4 @@
 import Foundation
-import os
 import RepoPromptFoundation
 
 package enum MCPDomainToolAdmissionLimits {
@@ -17,24 +16,24 @@ package enum MCPDomainToolAdmissionLimits {
 /// Protocol-neutral, cancellation-safe admission keyed by the physical state resource.
 /// Connection lanes provide client ordering; this controller bounds cross-connection work.
 package final class MCPDomainToolResourceAdmissionController: @unchecked Sendable {
-    package enum AdmissionError: Error, Equatable, Sendable {
+    package enum AdmissionError: Error, Equatable {
         case closed
     }
 
-    package struct Snapshot: Equatable, Sendable {
+    package struct Snapshot: Equatable {
         package let activeLeaseCount: Int
         package let waiterCount: Int
         package let isClosed: Bool
     }
 
-    package enum Resource: Hashable, Sendable {
+    package enum Resource: Hashable {
         case appWide
         case window(Int)
         case repository(String)
     }
 
     /// Opaque identifiers for the call that waits for, or holds, a lease. Logged only when a wait is overdue.
-    package struct WaitContext: Equatable, Sendable {
+    package struct WaitContext: Equatable {
         package let tool: String
         package let connection: String
         package let run: String?
@@ -92,7 +91,7 @@ package final class MCPDomainToolResourceAdmissionController: @unchecked Sendabl
     private var holdersByLeaseID: [UUID: Holder] = [:]
     private let overdueThreshold: Duration?
     private let overdueRepeatInterval: Duration
-    private let overdueReport: @Sendable (String) -> Void
+    private let overdueReport: (@Sendable (String) -> Void)?
 
     /// A non-nil `overdueThreshold` logs waiters that carry a `WaitContext` once they have waited that long.
     package init(
@@ -105,12 +104,8 @@ package final class MCPDomainToolResourceAdmissionController: @unchecked Sendabl
         self.limit = limit
         self.overdueThreshold = overdueThreshold
         self.overdueRepeatInterval = overdueRepeatInterval
-        self.overdueReport = overdueReport ?? { line in
-            Self.logger.notice("\(line, privacy: .public)")
-        }
+        self.overdueReport = overdueReport
     }
-
-    private static let logger = Logger(subsystem: "com.pvncher.repoprompt.ce", category: "MCPWaitDiagnostics")
 
     package func acquire(
         _ resource: Resource,
@@ -321,9 +316,9 @@ package final class MCPDomainToolResourceAdmissionController: @unchecked Sendabl
     /// holders on each interval; with no tracked holder it reports `holders=untracked`, the
     /// lost-wakeup or untracked-holder shape.
     private func overdueFields(waiterID: UUID, resource: Resource, waiter: WaitContext) -> String? {
-        let now = ContinuousClock.now
-        return lock.withLock {
+        lock.withLock {
             guard resourceByWaiterID[waiterID] != nil else { return nil }
+            let now = ContinuousClock.now
             let active = activeCountByResource[resource] ?? 0
             let tracked = holdersByLeaseID.values
                 .filter { $0.resource == resource }
@@ -335,10 +330,9 @@ package final class MCPDomainToolResourceAdmissionController: @unchecked Sendabl
                 fields += " untracked_holders=\(active - tracked.count)"
             }
             for (index, holder) in tracked.enumerated() {
-                let age = holder.acquiredAt.duration(to: now).components
                 fields += " holder\(index)_tool=\(holder.context.tool) holder\(index)_conn=\(holder.context.connection)"
-                    + " holder\(index)_run=\(holder.context.run ?? "-") holder\(index)_phase=unknown"
-                    + " holder\(index)_age_ms=\(age.seconds * 1000 + age.attoseconds / 1_000_000_000_000_000)"
+                    + " holder\(index)_run=\(holder.context.run ?? "-")"
+                    + " holder\(index)_age_ms=\(OverdueWaitReporter.milliseconds(holder.acquiredAt.duration(to: now)))"
             }
             return fields
         }

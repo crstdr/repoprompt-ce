@@ -1062,43 +1062,45 @@ actor WorkspaceFileContextStore {
     }
 
     #if DEBUG
-        private struct ScopedIngressBarrierTaskOutput {
+        struct ScopedIngressBarrierTaskOutput {
             let sample: WorkspaceIngressBarrierSample
             let completedAtNanoseconds: UInt64
         }
     #else
-        private typealias ScopedIngressBarrierTaskOutput = WorkspaceIngressBarrierSample
+        typealias ScopedIngressBarrierTaskOutput = WorkspaceIngressBarrierSample
     #endif
 
-    private final class ScopedIngressBarrierJoin: @unchecked Sendable {
+    final class ScopedIngressBarrierJoin: @unchecked Sendable {
+        private struct Waiter {
+            let continuation: CheckedContinuation<ScopedIngressBarrierTaskOutput?, Never>
+            let overdueReport: OverdueWaitReporter.Watch
+        }
+
         let rootID: UUID
+        private let overdueThreshold: Duration
+        private let overdueRepeatInterval: Duration
+        private let overdueReport: (@Sendable (String) -> Void)?
         private let lock = NSLock()
         private var isCompleted = false
         private var completedOutput: ScopedIngressBarrierTaskOutput?
-        private var waiters: [UUID: CheckedContinuation<ScopedIngressBarrierTaskOutput?, Never>] = [:]
+        private var waiters: [UUID: Waiter] = [:]
 
-        init(rootID: UUID) {
+        /// Callers bound by `workspaceFreshnessWaitTimeout` cancel their wait at that timeout, so only a wait
+        /// that outlives it (or has no caller timeout) is overdue.
+        init(
+            rootID: UUID,
+            overdueThreshold: Duration = MCPTimeoutPolicy.workspaceFreshnessWaitTimeout + .seconds(5),
+            overdueRepeatInterval: Duration = OverdueWaitReporter.defaultRepeatInterval,
+            overdueReport: (@Sendable (String) -> Void)? = nil
+        ) {
             self.rootID = rootID
+            self.overdueThreshold = overdueThreshold
+            self.overdueRepeatInterval = overdueRepeatInterval
+            self.overdueReport = overdueReport
         }
 
         func value() async -> ScopedIngressBarrierTaskOutput? {
-            lock.lock()
-            if isCompleted {
-                let output = completedOutput
-                lock.unlock()
-                return output
-            }
-            lock.unlock()
             let waiterID = UUID()
-            let rootID = rootID
-            // Callers bound by `workspaceFreshnessWaitTimeout` cancel this wait at that timeout; only a
-            // wait that outlives it, or has no caller timeout, is overdue.
-            let overdueReport = OverdueWaitReporter.begin(
-                event: "root_ingress",
-                threshold: MCPTimeoutPolicy.workspaceFreshnessWaitTimeout + .seconds(5),
-                fields: { "root=\(rootID.uuidString.prefix(8))" }
-            )
-            defer { overdueReport.cancel() }
             return await withTaskCancellationHandler {
                 await withCheckedContinuation { continuation in
                     lock.lock()
@@ -1110,7 +1112,18 @@ actor WorkspaceFileContextStore {
                         lock.unlock()
                         continuation.resume(returning: output)
                     } else {
-                        waiters[waiterID] = continuation
+                        let rootID = rootID
+                        // Stored with the waiter, so settlement stops it even if the task cannot resume yet.
+                        waiters[waiterID] = Waiter(
+                            continuation: continuation,
+                            overdueReport: OverdueWaitReporter.begin(
+                                event: "root_ingress",
+                                threshold: overdueThreshold,
+                                repeatInterval: overdueRepeatInterval,
+                                fields: { "root=\(rootID.uuidString.prefix(8))" },
+                                report: overdueReport
+                            )
+                        )
                         lock.unlock()
                     }
                 }
@@ -1120,7 +1133,7 @@ actor WorkspaceFileContextStore {
         }
 
         func complete(with output: ScopedIngressBarrierTaskOutput?) {
-            let continuations: [CheckedContinuation<ScopedIngressBarrierTaskOutput?, Never>]
+            let settled: [Waiter]
             lock.lock()
             guard !isCompleted else {
                 lock.unlock()
@@ -1128,18 +1141,21 @@ actor WorkspaceFileContextStore {
             }
             isCompleted = true
             completedOutput = output
-            continuations = Array(waiters.values)
+            settled = Array(waiters.values)
             waiters.removeAll(keepingCapacity: false)
             lock.unlock()
-            continuations.forEach { $0.resume(returning: output) }
+            for waiter in settled {
+                waiter.overdueReport.cancel()
+                waiter.continuation.resume(returning: output)
+            }
         }
 
         private func cancelWaiter(id waiterID: UUID) {
-            let continuation: CheckedContinuation<ScopedIngressBarrierTaskOutput?, Never>?
             lock.lock()
-            continuation = waiters.removeValue(forKey: waiterID)
+            let waiter = waiters.removeValue(forKey: waiterID)
             lock.unlock()
-            continuation?.resume(returning: nil)
+            waiter?.overdueReport.cancel()
+            waiter?.continuation.resume(returning: nil)
         }
     }
 
