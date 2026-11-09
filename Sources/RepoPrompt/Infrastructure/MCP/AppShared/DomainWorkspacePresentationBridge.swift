@@ -441,6 +441,9 @@ final class DomainWorkspacePresentationBridge {
     private var lastPublicationSequence: UInt64 = 0
     private var projectedDigests: [UUID: String] = [:]
     private var projectedModels: [UUID: WorkspaceModel] = [:]
+    /// Successfully decoded authority ephemerals intentionally omitted by the accepted full apply.
+    /// Digests and reconciliation lineage are owned by the existing accepted cache fields.
+    private var omittedEphemeralWorkspaceIDs: Set<UUID> = []
     /// Cached models can contain local edits beyond their canonical digest. A point adoption can
     /// discard those edits without reconciling the catalog, so each row keeps its owner generation.
     private var projectedAdoptionGenerations: [UUID: UInt64] = [:]
@@ -453,11 +456,13 @@ final class DomainWorkspacePresentationBridge {
     private var catalogRefreshID: UUID?
 
     private let trustedDigestReuse: Bool
+    private let omittedEphemeralWitness: Bool
 
     init(
         workspaceManager: WorkspaceManagerViewModel, client: DomainWorkspaceAuthorityClient,
-        trustedDigestReuse: Bool = false
+        trustedDigestReuse: Bool = false, omittedEphemeralWitness: Bool = false
     ) {
+        self.omittedEphemeralWitness = omittedEphemeralWitness
         self.trustedDigestReuse = trustedDigestReuse
         self.workspaceManager = workspaceManager
         self.client = client
@@ -498,6 +503,7 @@ final class DomainWorkspacePresentationBridge {
         acceptedReconciliationGeneration = nil
         projectedDigests.removeAll(keepingCapacity: false)
         projectedModels.removeAll(keepingCapacity: false)
+        omittedEphemeralWorkspaceIDs.removeAll(keepingCapacity: false)
         projectedAdoptionGenerations.removeAll(keepingCapacity: false)
         #if DEBUG
             projectionCheckpoint = nil
@@ -646,6 +652,11 @@ final class DomainWorkspacePresentationBridge {
             for task in retired {
                 await task.value
             }
+        }
+
+        func projectCatalogForTesting(_ snapshot: DomainWorkspaceCatalogSnapshot) -> DomainCatalogRejection? {
+            guard let runID = subscriptionRunID, let manager = workspaceManager else { return .closing }
+            return project(snapshot, attempt: manager.beginDomainCatalogAttempt(), runID: runID)
         }
 
         func awaitCatalogRefreshForTesting() async {
@@ -897,11 +908,18 @@ final class DomainWorkspacePresentationBridge {
         // Observe the same short-circuit proof as the metadata fast path, without another pass.
         let metadataFailure: CatalogMetadataGateFailure? = if baselineGeneration == nil {
             acceptedReconciliationGeneration == nil ? .noAcceptedGeneration : .baselineGenerationMismatch
-        } else if Set(projectedModels.keys) != Set(nextDigests.keys) {
+        } else if omittedEphemeralWitness
+            ? (
+                !Set(projectedModels.keys).isDisjoint(with: omittedEphemeralWorkspaceIDs)
+                    || Set(projectedModels.keys).union(omittedEphemeralWorkspaceIDs) != Set(nextDigests.keys)
+            )
+            : Set(projectedModels.keys) != Set(nextDigests.keys)
+        {
             .membershipMismatch
         } else if projectedDigests != nextDigests {
             .digestMismatch
         } else if !records.allSatisfy({ record in
+            if omittedEphemeralWitness, omittedEphemeralWorkspaceIDs.contains(record.document.workspaceID) { return true }
             guard let generation = manager.adoptedFullDocumentGeneration(
                 workspaceID: record.document.workspaceID, contentDigest: record.document.contentDigest
             ) else { return false }
@@ -915,7 +933,10 @@ final class DomainWorkspacePresentationBridge {
         if let baselineGeneration, metadataFailure == nil {
             switch manager.applyDomainWorkspaceCatalog(
                 snapshot,
-                projection: .metadata(baselineGeneration: baselineGeneration),
+                projection: .metadata(
+                    baselineGeneration: baselineGeneration,
+                    omittedWorkspaceIDs: omittedEphemeralWitness ? omittedEphemeralWorkspaceIDs : []
+                ),
                 preferredActiveWorkspaceID: nil,
                 rootMapPolicy: .snapshotMetadata,
                 attempt: attempt
@@ -977,7 +998,15 @@ final class DomainWorkspacePresentationBridge {
         // pre-application overlay with a newly observed owner generation.
         var acceptedModels: [UUID: WorkspaceModel] = [:]
         var acceptedGenerations: [UUID: UInt64] = [:]
+        var omittedIDs: Set<UUID> = []
         for record in records {
+            let id = record.document.workspaceID
+            if omittedEphemeralWitness, !failedIDs.contains(id),
+               record.document.metadata.isEphemeral, nextModels[id]?.isEphemeral == true,
+               manager.workspace(withID: id) == nil
+            {
+                omittedIDs.insert(id)
+            }
             let workspaceID = record.document.workspaceID
             guard nextModels[workspaceID] != nil,
                   let generation = manager.adoptedFullDocumentGeneration(workspaceID: workspaceID, contentDigest: record.document.contentDigest),
@@ -987,6 +1016,7 @@ final class DomainWorkspacePresentationBridge {
             acceptedGenerations[workspaceID] = generation
         }
         projectedModels = acceptedModels
+        omittedEphemeralWorkspaceIDs = omittedIDs
         projectedAdoptionGenerations = acceptedGenerations
         commitAccepted(receipt, digests: nextDigests, runID: runID)
         return nil

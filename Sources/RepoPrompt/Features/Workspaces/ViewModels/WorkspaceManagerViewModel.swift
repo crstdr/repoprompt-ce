@@ -1161,7 +1161,7 @@ enum DomainCatalogCompleteness: Equatable {
 enum DomainCatalogProjection {
     case full([WorkspaceModel])
     /// Valid only against the manager's current accepted reconciliation generation.
-    case metadata(baselineGeneration: UInt64)
+    case metadata(baselineGeneration: UInt64, omittedWorkspaceIDs: Set<UUID> = [])
 }
 
 /// Bridge callers take canonical roots from snapshot metadata; manager reload/cleanup callers keep
@@ -9428,9 +9428,21 @@ class WorkspaceManagerViewModel: ObservableObject {
         func map<Value>(_ value: (DomainWorkspaceSnapshot) -> Value) -> [UUID: Value] {
             Dictionary(uniqueKeysWithValues: records.map { ($0.document.workspaceID, value($0)) })
         }
-        let revisions = map(\.revisions)
-        let digests = map(\.document.contentDigest)
-        let health = map(\.health)
+        let omittedIDs: Set<UUID> = if case let .metadata(_, ids) = projection { ids } else { [] }
+        var revisions: [UUID: DomainRevisionState] = [:]
+        var digests: [UUID: String] = [:]
+        var metadataDigests: [UUID: String] = [:]
+        var health: [UUID: DomainAuthorityHealth] = [:]
+        for record in records {
+            let id = record.document.workspaceID
+            // Whole-catalog acceptance includes intentionally omitted authority members.
+            digests[id] = record.document.contentDigest
+            if !omittedIDs.contains(id) {
+                revisions[id] = record.revisions
+                health[id] = record.health
+                if !omittedIDs.isEmpty { metadataDigests[id] = record.document.contentDigest }
+            }
+        }
         catalogApplicationDepth += 1
         defer { catalogApplicationDepth -= 1 }
         let kind: DomainCatalogApplicationReceipt.Kind
@@ -9451,7 +9463,9 @@ class WorkspaceManagerViewModel: ObservableObject {
         case .metadata:
             kind = .metadata
             applied = applyDomainAuthorityMetadataProjection(
-                revisionsByWorkspaceID: revisions, digestsByWorkspaceID: digests, healthByWorkspaceID: health,
+                revisionsByWorkspaceID: revisions,
+                digestsByWorkspaceID: omittedIDs.isEmpty ? digests : metadataDigests,
+                healthByWorkspaceID: health,
                 catalogRevision: snapshot.catalogRevision, publicationSequence: snapshot.publicationSequence,
                 canonicalSystemWorkspaceIDs: Set(records.compactMap { record in
                     record.document.metadata.isSystemWorkspace && !record.document.metadata.isEphemeral
@@ -9584,7 +9598,23 @@ class WorkspaceManagerViewModel: ObservableObject {
         guard snapshot.isBootstrapped else { return .invalidCatalog("not_bootstrapped") }
         // Competing complete-catalog transactions are never partially accepted; callers refetch.
         if catalogApplicationDepth > 0 { return .reentrant }
-        let recordIDs = snapshot.workspaces.map(\.document.workspaceID)
+        var recordIDs: [UUID] = []
+        recordIDs.reserveCapacity(snapshot.workspaces.count)
+        let omittedIDs: Set<UUID> = if case let .metadata(_, ids) = projection { ids } else { [] }
+        // Qualify omissions in the existing record pass; absence alone is never decode evidence.
+        var qualifiedOmissions: Set<UUID> = []
+        for record in snapshot.workspaces {
+            let id = record.document.workspaceID
+            recordIDs.append(id)
+            if omittedIDs.contains(id), record.document.metadata.isEphemeral,
+               !snapshot.unavailableWorkspaceIDs.contains(id), workspace(withID: id) == nil,
+               domainWorkspaceRevisionsByID[id] == nil, domainWorkspaceDigestsByID[id] == nil,
+               domainWorkspaceFileURLsByID[id] == nil, canonicalRootStateByWorkspaceID[id] == nil,
+               rootTargets[id] == nil, pendingRootProposals[id] == nil
+            {
+                qualifiedOmissions.insert(id)
+            }
+        }
         let membership = Set(recordIDs)
         guard membership.count == recordIDs.count else { return .invalidCatalog("duplicate_record_id") }
         switch projection {
@@ -9593,7 +9623,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             guard modelIDs.count == recordIDs.count, Set(modelIDs) == membership else {
                 return .invalidCatalog("model_set_mismatch")
             }
-        case let .metadata(baselineGeneration):
+        case let .metadata(baselineGeneration, omittedWorkspaceIDs):
             let failure: CatalogMetadataGateFailure? = if domainCatalogReconciliationGeneration == 0 {
                 .noAcceptedGeneration
             } else if baselineGeneration != domainCatalogReconciliationGeneration {
@@ -9604,6 +9634,8 @@ class WorkspaceManagerViewModel: ObservableObject {
                 .membershipMismatch
             } else if acceptedCatalogMembership?.unavailable != snapshot.unavailableWorkspaceIDs {
                 .unavailableMembershipMismatch
+            } else if qualifiedOmissions != omittedWorkspaceIDs {
+                .membershipMismatch
             } else {
                 nil
             }
@@ -9648,6 +9680,21 @@ class WorkspaceManagerViewModel: ObservableObject {
     #if DEBUG
         private var catalogRecordDecodeFailureForTesting: ((UUID) -> Error?)?
         var beforeAuthorityRestoreSavedReadForTesting: ((UUID?) async -> Void)?
+
+        func catalogOmissionStateForTesting(_ id: UUID) -> [String: Bool] {
+            [
+                "revision": domainWorkspaceRevisionsByID[id] != nil,
+                "digest": domainWorkspaceDigestsByID[id] != nil,
+                "fileURL": domainWorkspaceFileURLsByID[id] != nil,
+                "roots": canonicalRootStateByWorkspaceID[id] != nil,
+                "rootTarget": rootTargets[id] != nil,
+                "member": acceptedCatalogMembership?.available.contains(id) == true
+            ]
+        }
+
+        func setCatalogFileURLForTesting(_ url: URL?, workspaceID: UUID) {
+            domainWorkspaceFileURLsByID[workspaceID] = url
+        }
 
         /// Injects a decode error for selected records on every catalog decode path of this manager.
         func setCatalogRecordDecodeFailureForTesting(_ failure: ((UUID) -> Error?)?) {
