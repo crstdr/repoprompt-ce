@@ -43,6 +43,10 @@ package final class CatalogPerf: @unchecked Sendable {
             lock.unlock()
         }
 
+        package func attributionSnapshotForTesting() -> String? {
+            lock.withLock { attribution.record() }
+        }
+
         package func setSuppressAutomaticEmissionForTesting(_ suppress: Bool) {
             lock.lock()
             suppressAutomaticEmission = suppress
@@ -215,6 +219,12 @@ package final class CatalogPerf: @unchecked Sendable {
     package func metadataGateFailure(_ reason: CatalogMetadataGateFailure) {
         lock.lock()
         attribution.failure(reason)
+        lock.unlock()
+    }
+
+    package func prewarm(_ outcome: CatalogPrewarmOutcome) {
+        lock.lock()
+        attribution.prewarm(outcome)
         lock.unlock()
     }
 

@@ -1164,3 +1164,18 @@ Use `./conductor build` to package the debug app, then `./conductor smoke --laun
 - Style, guardrail, build, smoke, or packaging evidence when applicable.
 - For performance work: measurement protocol, retained evidence, sample validity, and timing comparison.
 - Any coverage deliberately omitted, removed, moved to diagnostics, or replaced by a guardrail, with justification.
+
+## Catalog cold-decode experiment
+
+`catalogColdDecodePrewarmEnabled` defaults ON for dogfooding; only an explicit Boolean false disables it. Absent, numeric and malformed values remain ON. Unit-test launches stay OFF; tests inject the prewarmer without changing defaults. Startup/full reconciliation/refetch remain synchronous.
+
+Rollback for default release packaging (`version.env`): `defaults write com.pvncher.repoprompt.ce catalogColdDecodePrewarmEnabled -bool false`, then restart the app. Default debug packaging uses `com.repoprompt.ce.debug` (`Scripts/package_app.sh`); packaging overrides must use their effective bundle identifier. This key is read only at launch.
+
+Run the sandboxed 35-receiver, 300-chat, 8 MiB-prompt fixture with OFF/OFF noise and alternating OFF/ON arms (including concurrent refresh overload):
+
+```sh
+RPCE_RUN_SCALE_TESTS=1 ./conductor test --filter 'NewWindowInitialSelectionTests/testColdDecodePrewarm35Receivers' --scratch catalog-decode-opt --swiftc-flag=-O --async --request-key catalog-decode-opt
+./conductor job wait --request-key catalog-decode-opt
+```
+
+This is optimized DEBUG, not packaged Release/WMO. Record effective compiler flags. The fixture checks actual changed-digest JSON calls/thread identity, state and receipt parity, and the existing 5-second per-scenario budget. `CATALOG_PREWARM_METRIC working_only=true` captures attribution before saved-phase work without resetting whole-pair count checks. Report start delay, first/minimum wait and `max wait − (worker JSON + working apply sum + working hash sum)` per arm; raw waits also include serialized receiver resumption. RSS/footprint peaks are sampled off-main every millisecond, with before/settled/receiver-release boundaries; compare peak-minus-before deltas, not absolute cross-arm peaks. These are headless receivers, not 35 rendered windows.

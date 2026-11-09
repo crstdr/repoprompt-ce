@@ -231,6 +231,25 @@ final class CatalogPerfTests: XCTestCase {
         }
     #endif
 
+    func testPrewarmAttributionIsAbsentWhenUnusedAndDoesNotForceCoreEmission() throws {
+        let perf = CatalogPerf()
+        perf.receiverPhase(.hash, elapsedMS: 1)
+        let off = try XCTUnwrap(perf.rotateEmissionRecords().attribution)
+        XCTAssertFalse(off.contains("prewarm"))
+        perf.prewarm(.started)
+        perf.receiverPhase(.prewarmDecode, elapsedMS: 2)
+        #if DEBUG
+            let snapshot = perf.attributionSnapshotForTesting()
+        #endif
+        let on = perf.rotateEmissionRecords()
+        #if DEBUG
+            XCTAssertEqual(snapshot, on.attribution, "Reading working attribution must not reset the pair counters")
+        #endif
+        XCTAssertNil(on.records)
+        XCTAssertTrue(try XCTUnwrap(on.attribution).contains("prewarm_started=1"))
+        XCTAssertNil(perf.rotateEmissionRecords().attribution)
+    }
+
     func testAttributionIsIndependentBoundedAndResetsWithCore() throws {
         let perf = CatalogPerf()
         for _ in 0 ..< 350 {
@@ -241,6 +260,7 @@ final class CatalogPerfTests: XCTestCase {
             }
             perf.application(elapsedMS: 8.125, full: true)
             for pair in CatalogEventPairOutcome.allCases { perf.eventPair(pair) }
+            for outcome in CatalogPrewarmOutcome.allCases { perf.prewarm(outcome) }
         }
         let emitted = perf.rotateEmissionRecords()
         let core = try XCTUnwrap(emitted.records)
@@ -260,7 +280,8 @@ final class CatalogPerfTests: XCTestCase {
         }
         // Fixed allowlists and numeric values only: no identities, digests, paths or content.
         XCTAssertNil(detail.range(of: #"[^a-z0-9_= .]"#, options: .regularExpression))
-        XCTAssertLessThanOrEqual(detail.utf8.count + 64, 1024)
+        // Includes the fixed prewarm outcome and two timing distributions.
+        XCTAssertLessThanOrEqual(detail.utf8.count + 64, 1536)
         XCTAssertNil(perf.rotateEmissionRecords().attribution)
         XCTAssertNil(perf.rotateRecords())
 

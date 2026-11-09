@@ -8,7 +8,8 @@ import RepoPromptShared
     enum WorkspaceProjectionDecodeDiagnostics {
         static let normalizationVersion = 1
 
-        struct Context {
+        // swiftformat:disable:next redundantSendable
+        struct Context: Sendable {
             let recorder: Recorder
             let contentOrdinal: Int
             let consumerOrdinal: Int
@@ -130,6 +131,25 @@ import RepoPromptShared
                 succeeded = true
                 return result
             }
+        }
+    }
+
+    /// Bounded test-only scheduling samples; no paths or workspace identifiers.
+    final class WorkspaceCatalogPrewarmMeasurements: @unchecked Sendable {
+        private let lock = NSLock()
+        private var starts: [Double] = []
+        private var waits: [Double] = []
+
+        func start(_ ms: Double) {
+            lock.withLock { if starts.count < 128 { starts.append(ms) } }
+        }
+
+        func wait(_ ms: Double) {
+            lock.withLock { if waits.count < 128 { waits.append(ms) } }
+        }
+
+        func snapshot() -> (starts: [Double], waits: [Double]) {
+            lock.withLock { (starts, waits) }
         }
     }
 #endif

@@ -107,6 +107,38 @@ import XCTest
             XCTAssertEqual(sample.normalizationMutationCount, 1)
         }
 
+        func testColdDecodeLaunchKeyDefaultsOnWithBooleanFalseKillSwitchAndTestsOff() {
+            XCTAssertTrue(AppLaunchConfiguration.resolveCatalogColdDecodePrewarm(storedValue: nil))
+            XCTAssertTrue(AppLaunchConfiguration.resolveCatalogColdDecodePrewarm(storedValue: "true"))
+            XCTAssertTrue(AppLaunchConfiguration.resolveCatalogColdDecodePrewarm(storedValue: NSNumber(value: 1)))
+            XCTAssertTrue(AppLaunchConfiguration.resolveCatalogColdDecodePrewarm(storedValue: NSNumber(value: 0)))
+            XCTAssertTrue(AppLaunchConfiguration.resolveCatalogColdDecodePrewarm(storedValue: NSNumber(value: true)))
+            XCTAssertFalse(AppLaunchConfiguration.resolveCatalogColdDecodePrewarm(storedValue: NSNumber(value: false)))
+            XCTAssertTrue(AppLaunchConfiguration.resolveCatalogColdDecodePrewarm(storedValue: "false"))
+            XCTAssertFalse(AppLaunchConfiguration.resolveCatalogColdDecodePrewarm(storedValue: false))
+            XCTAssertTrue(AppLaunchConfiguration.resolveCatalogColdDecodePrewarm(storedValue: true))
+            XCTAssertFalse(AppLaunchConfiguration.current.catalogColdDecodePrewarmEnabled)
+        }
+
+        func testConcurrentLossyDecodePreservesIndependentValues() async throws {
+            let fixture = WorkspaceProjectionDecodeFixture(workload: .ordinary)
+            var json = try XCTUnwrap(JSONSerialization.jsonObject(with: fixture.bytes(revision: 1)) as? [String: Any])
+            json["composeTabs"] = ["unreadable"]
+            let bytes = try JSONSerialization.data(withJSONObject: json)
+            let tasks = (0 ..< 8).map { _ in
+                Task.detached {
+                    let model = try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(
+                        documentBytes: bytes, fileURL: URL(fileURLWithPath: "/synthetic-concurrent/workspace.json")
+                    )
+                    return model.composeTabsDecodeWasLossy && model.normalizationRequiresSave
+                }
+            }
+            for task in tasks {
+                let preserved = try await task.value
+                XCTAssertTrue(preserved)
+            }
+        }
+
         func testMeasurementMatrix() throws {
             try XCTSkipUnless(
                 ProcessInfo.processInfo.environment["RPCE_RUN_SCALE_TESTS"] == "1",
@@ -571,6 +603,19 @@ import XCTest
         override func tearDown() async throws {
             WorkspaceFileDecodeCache.shared.removeAllForTesting()
             try? FileManager.default.removeItem(at: temporaryRoot)
+        }
+
+        func testPurePrewarmDefersLossyBackupToProjection() throws {
+            let original = try document(mutating: { $0 = corruptingTab(at: 1, in: $0) })
+            let url = temporaryRoot.appendingPathComponent("workspace.json")
+            let document = try DomainWorkspaceDocument.decode(documentBytes: original, fileURL: url)
+            let backup = WorkspaceUnreadableDocumentBackup.backupURL(for: url, documentBytes: original)
+            XCTAssertEqual(WorkspaceFileDecodeCache.shared.prewarmCatalogDocument(.init(document)), .stored)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: backup.path))
+            let projected = try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(document: document)
+            XCTAssertEqual(projected.composeTabsDroppedDuringDecode, 1)
+            XCTAssertEqual(try Data(contentsOf: backup), original)
+            XCTAssertEqual(WorkspaceFileDecodeCache.shared.digestDecodeStatsForTesting().hits, 1)
         }
 
         func testTypedAndRawLossyProjectionPreserveTheSameBackupBytes() throws {
@@ -1349,6 +1394,159 @@ import XCTest
         private func backups() throws -> [URL] {
             try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
                 .filter { $0.lastPathComponent.hasPrefix(WorkspaceUnreadableDocumentBackup.fileNamePrefix) }
+        }
+    }
+#endif
+
+#if DEBUG
+    @MainActor
+    final class WorkspaceCatalogDecodePrewarmTests: XCTestCase {
+        private let cache = WorkspaceFileDecodeCache.shared
+
+        override func setUp() async throws {
+            cache.removeAllForTesting()
+        }
+
+        func input(_ bytes: Data? = nil) throws -> WorkspaceCatalogDecodeInput {
+            let original = try DomainWorkspaceDocument.decode(
+                documentBytes: WorkspaceProjectionDecodeFixture(workload: .ordinary).bytes(revision: 1),
+                fileURL: URL(fileURLWithPath: "/synthetic-prewarm/workspace.json")
+            )
+            return WorkspaceCatalogDecodeInput(DomainWorkspaceDocument(
+                workspaceID: original.workspaceID, fileURL: original.fileURL,
+                documentBytes: bytes ?? original.documentBytes, metadata: original.metadata
+            ))
+        }
+
+        private actor Gate {
+            var open = false
+            var waiter: CheckedContinuation<Void, Never>?
+            func wait(onEntry: @Sendable () -> Void = {}) async {
+                if !open { onEntry()
+                    await withCheckedContinuation { waiter = $0 }
+                }
+            }
+
+            func release() {
+                open = true
+                waiter?.resume()
+                waiter = nil
+            }
+        }
+
+        func testSingleFlightJoinsAndCancelledWaiterDoesNotCancelSharedWork() async throws {
+            let gate = Gate()
+            let entered = expectation(description: "worker entered")
+            let prewarmer = WorkspaceCatalogDecodePrewarmer(beforeWork: { await gate.wait { entered.fulfill() } })
+            let firstInput = try input()
+            let first = prewarmer.admit(firstInput)
+            let task = try XCTUnwrap(first.task)
+            XCTAssertEqual(first.outcome, .started)
+            await fulfillment(of: [entered], timeout: 2)
+            let joins = (0 ..< 34).map { _ in prewarmer.admit(firstInput) }
+            XCTAssertTrue(joins.allSatisfy { $0.outcome == .joined && $0.task != nil })
+            let other = try input(WorkspaceProjectionDecodeFixture(workload: .ordinary).bytes(revision: 2))
+            XCTAssertEqual(prewarmer.admit(other).outcome, .busy)
+            let oversized = try input(Data(repeating: 0, count: 16 * 1024 * 1024 + 1))
+            XCTAssertEqual(prewarmer.admit(oversized).outcome, .oversized)
+            let cancelled = Task { await task.value
+                return Task.isCancelled
+            }
+            cancelled.cancel()
+            await gate.release()
+            await task.value
+            for join in joins {
+                await join.task?.value
+            }
+            let remainedCancelled = await cancelled.value
+            XCTAssertTrue(remainedCancelled)
+            await prewarmer.awaitIdleForTesting()
+            XCTAssertEqual(cache.jsonDecodeCountsForTesting(firstInput.digest).worker, 1)
+            XCTAssertEqual(cache.jsonDecodeCountsForTesting(firstInput.digest).main, 0)
+            XCTAssertNil(prewarmer.admit(firstInput).task, "Resident fast path must not suspend")
+            let next = prewarmer.admit(other)
+            XCTAssertEqual(next.outcome, .started, "Completed flight must release its slot")
+            await next.task?.value
+            await prewarmer.awaitIdleForTesting()
+        }
+
+        func testWorkerReprobeAndImmediateRetirement() async throws {
+            let gate = Gate()
+            let entered = expectation(description: "worker entered")
+            let prewarmer = WorkspaceCatalogDecodePrewarmer(beforeWork: { await gate.wait { entered.fulfill() } })
+            let value = try input()
+            let admitted = prewarmer.admit(value)
+            await fulfillment(of: [entered], timeout: 2)
+            XCTAssertEqual(cache.prewarmCatalogDocument(value), .stored)
+            await gate.release()
+            await admitted.task?.value
+            await prewarmer.awaitIdleForTesting()
+            XCTAssertEqual(cache.jsonDecodeCountsForTesting(value.digest).worker, 0)
+            let immediate = WorkspaceCatalogDecodePrewarmer()
+            for revision in 2 ... 20 {
+                let next = try input(WorkspaceProjectionDecodeFixture(workload: .ordinary).bytes(revision: revision))
+                let admission = immediate.admit(next)
+                XCTAssertEqual(admission.outcome, .started)
+                await admission.task?.value
+            }
+            await immediate.awaitIdleForTesting()
+        }
+
+        func testDetachedDiagnosticsRebindAndFailureRetirement() async throws {
+            let recorder = WorkspaceProjectionDecodeDiagnostics.Recorder()
+            let context = WorkspaceProjectionDecodeDiagnostics.Context(
+                recorder: recorder, contentOrdinal: 1, consumerOrdinal: 1,
+                revision: 1, schemaVersion: 1, onMainActor: true
+            )
+            let prewarmer = WorkspaceCatalogDecodePrewarmer()
+            let value = try input()
+            let admission = WorkspaceProjectionDecodeDiagnostics.contextTaskLocal.withValue(context) { prewarmer.admit(value) }
+            await admission.task?.value
+            await prewarmer.awaitIdleForTesting()
+            let sample = try XCTUnwrap(recorder.snapshot().samples.first)
+            XCTAssertNil(sample.mainActorNanoseconds)
+            XCTAssertEqual(sample.normalizationCount, 2)
+            let failure = try input(Data("{".utf8))
+            for _ in 0 ..< 2 {
+                await prewarmer.admit(failure).task?.value
+            }
+            await prewarmer.awaitIdleForTesting()
+            XCTAssertNil(cache.catalogPrewarmEligibility(failure))
+            XCTAssertEqual(cache.jsonDecodeCountsForTesting(failure.digest).worker, 2)
+        }
+
+        func testPureWarmPreservesCountersAndServesRawProjection() async throws {
+            let input = try input()
+            XCTAssertNil(cache.catalogPrewarmEligibility(input))
+            let outcome = await Task.detached { self.cache.prewarmCatalogDocument(input) }.value
+            XCTAssertEqual(outcome, .stored)
+            XCTAssertEqual(cache.catalogPrewarmEligibility(input), .resident)
+            XCTAssertEqual(cache.digestDecodeStatsForTesting().hits, 0)
+            XCTAssertEqual(cache.digestDecodeStatsForTesting().misses, 0)
+            let model = try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(
+                documentBytes: input.bytes, fileURL: URL(fileURLWithPath: "/synthetic-prewarm/workspace.json")
+            )
+            XCTAssertEqual(model, WorkspaceProjectionDecodeFixture(workload: .ordinary).model(revision: 1))
+            XCTAssertEqual(cache.digestDecodeStatsForTesting().hits, 1)
+            XCTAssertEqual(cache.jsonDecodeCountsForTesting(input.digest).worker, 1)
+            XCTAssertEqual(cache.jsonDecodeCountsForTesting(input.digest).main, 0)
+        }
+
+        func testFailureSynthesisAndCapacityAreNotShared() throws {
+            let invalid = try input(Data("{".utf8))
+            XCTAssertEqual(cache.prewarmCatalogDocument(invalid), .failed)
+            var json = try XCTUnwrap(JSONSerialization.jsonObject(with: input().bytes) as? [String: Any])
+            json.removeValue(forKey: "dateModified")
+            let legacy = try input(JSONSerialization.data(withJSONObject: json))
+            XCTAssertEqual(cache.prewarmCatalogDocument(legacy), .synthesized)
+            XCTAssertEqual(cache.prewarmCatalogDocument(legacy), .synthesized)
+            XCTAssertEqual(cache.digestDecodeStatsForTesting().entries, 0)
+            let limits = cache.decodeCacheLimitsForTesting()
+            defer { cache.setDecodeCacheLimitsForTesting(maxEntries: limits.maxEntries, maxInputBytes: limits.maxInputBytes) }
+            cache.setDecodeCacheLimitsForTesting(maxEntries: 0, maxInputBytes: 1)
+            let ordinary = try input()
+            XCTAssertEqual(cache.prewarmCatalogDocument(ordinary), .noncacheable)
+            XCTAssertEqual(cache.jsonDecodeCountsForTesting(ordinary.digest).main, 0)
         }
     }
 #endif

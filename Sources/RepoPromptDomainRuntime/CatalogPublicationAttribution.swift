@@ -18,10 +18,17 @@ package enum CatalogMetadataGateFailure: String, CaseIterable, Sendable {
 }
 
 package enum CatalogReceiverPhase: String, CaseIterable, Sendable {
+    case prewarmDecode = "receiver_prewarm_decode"
+    case prewarmWait = "receiver_prewarm_wait"
     case hash = "receiver_hash"
     case decode = "receiver_decode"
     case application = "catalog_apply"
     case carrierPublication = "carrier_publication"
+}
+
+package enum CatalogPrewarmOutcome: String, CaseIterable, Sendable {
+    case started, joined, oversized, busy
+    case resident, noncacheable, stored, evicted, synthesized, failed
 }
 
 package enum CatalogEventPairOutcome: String, CaseIterable, Sendable {
@@ -68,6 +75,11 @@ struct CatalogAttributionWindow {
     private var failures: [CatalogMetadataGateFailure: Int] = [:]
     private var phases: [CatalogReceiverPhase: Timing] = [:]
     private var pairs: [CatalogEventPairOutcome: Int] = [:]
+    private var prewarms: [CatalogPrewarmOutcome: Int] = [:]
+
+    mutating func prewarm(_ outcome: CatalogPrewarmOutcome) {
+        prewarms[outcome, default: 0] += 1
+    }
 
     mutating func source(_ source: CatalogSaveSourceCategory) { sources[source, default: 0] += 1 }
     mutating func failure(_ reason: CatalogMetadataGateFailure) { failures[reason, default: 0] += 1 }
@@ -82,7 +94,7 @@ struct CatalogAttributionWindow {
     }
 
     func record() -> String? {
-        guard !sources.isEmpty || !failures.isEmpty || !phases.isEmpty || !pairs.isEmpty else { return nil }
+        guard !sources.isEmpty || !failures.isEmpty || !phases.isEmpty || !pairs.isEmpty || !prewarms.isEmpty else { return nil }
         // Saturate only the log representation; cardinality and numeric width stay bounded even
         // when observations accumulate without a heartbeat lease. Core counters are unaffected.
         func count(_ value: Int) -> String { String(min(9_999_999, value)) }
@@ -95,10 +107,16 @@ struct CatalogAttributionWindow {
             fields.append("gate_\(failure.rawValue)=\(count(failures[failure, default: 0]))")
         }
         for phase in CatalogReceiverPhase.allCases {
+            if (phase == .prewarmDecode || phase == .prewarmWait), phases[phase] == nil { continue }
             let timing = phases[phase] ?? Timing()
             fields.append("\(phase.rawValue)_count=\(count(timing.count))")
             fields.append("\(phase.rawValue)_sum_ms=\(ms(timing.sumMS))")
             fields.append("\(phase.rawValue)_max_ms=\(ms(timing.maxMS))")
+        }
+        if !prewarms.isEmpty {
+            for outcome in CatalogPrewarmOutcome.allCases {
+                fields.append("prewarm_\(outcome.rawValue)=\(count(prewarms[outcome, default: 0]))")
+            }
         }
         for pair in CatalogEventPairOutcome.allCases {
             fields.append("\(pair.rawValue)=\(count(pairs[pair, default: 0]))")

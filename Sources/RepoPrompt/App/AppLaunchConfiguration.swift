@@ -1,3 +1,4 @@
+import CoreFoundation
 import Foundation
 
 struct AppLaunchConfiguration {
@@ -21,6 +22,15 @@ struct AppLaunchConfiguration {
         processInfo: .processInfo,
         bundleURL: Bundle.main.bundleURL
     )
+
+    static let catalogColdDecodePrewarmEnabledKey = "catalogColdDecodePrewarmEnabled"
+    let catalogColdDecodePrewarmEnabled: Bool
+
+    static func resolveCatalogColdDecodePrewarm(storedValue: Any?) -> Bool {
+        guard let value = storedValue as? NSNumber,
+              CFGetTypeID(value) == CFBooleanGetTypeID() else { return true }
+        return value.boolValue
+    }
 
     static let catalogPublicationTrustedDigestReuseKey = "catalogPublicationTrustedDigestReuseEnabled"
     let catalogPublicationTrustedDigestReuseEnabled: Bool
@@ -106,6 +116,9 @@ struct AppLaunchConfiguration {
             let allowsStressAgentSessionPersistence = false
         #endif
 
+        catalogColdDecodePrewarmEnabled = !Self.isUnitTestProcess && Self.resolveCatalogColdDecodePrewarm(
+            storedValue: UserDefaults.standard.object(forKey: Self.catalogColdDecodePrewarmEnabledKey)
+        )
         catalogPublicationTrustedDigestReuseEnabled = Self.isUnitTestProcess
             ? true
             : Self.resolveCatalogPublicationTrustedDigestReuse(
