@@ -1,5 +1,5 @@
 import Foundation
-import RepoPromptFoundation
+import RepoPromptShared
 
 package enum MCPDomainToolAdmissionLimits {
     package static let exclusiveConnection = 1
