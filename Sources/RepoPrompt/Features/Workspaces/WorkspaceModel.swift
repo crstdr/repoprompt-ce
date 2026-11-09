@@ -399,11 +399,16 @@ struct WorkspaceModel: Codable, Identifiable, Equatable {
     }
 
     private static let decodeLogger = Logger(subsystem: "com.repoprompt.workspace", category: "decode")
+    private static let composeTabsDecodeWarningLock = NSLock()
     private static var composeTabsDecodeWarningEmitted = false
 
     private static func logComposeTabsDecodeFailure(error: Error, workspaceID: UUID, droppedCount: Int, keptCount: Int) {
-        guard !composeTabsDecodeWarningEmitted else { return }
-        composeTabsDecodeWarningEmitted = true
+        let shouldLog = composeTabsDecodeWarningLock.withLock {
+            guard !composeTabsDecodeWarningEmitted else { return false }
+            composeTabsDecodeWarningEmitted = true
+            return true
+        }
+        guard shouldLog else { return }
         let message = "Failed to decode \(droppedCount) composeTabs entr\(droppedCount == 1 ? "y" : "ies") for workspace \(workspaceID.uuidString); kept \(keptCount). Error: \(error.localizedDescription)"
         decodeLogger.error("\(message, privacy: .public)")
     }

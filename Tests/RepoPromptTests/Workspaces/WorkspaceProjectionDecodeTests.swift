@@ -107,6 +107,25 @@ import XCTest
             XCTAssertEqual(sample.normalizationMutationCount, 1)
         }
 
+        func testConcurrentLossyDecodePreservesIndependentValues() async throws {
+            let fixture = WorkspaceProjectionDecodeFixture(workload: .ordinary)
+            var json = try XCTUnwrap(JSONSerialization.jsonObject(with: fixture.bytes(revision: 1)) as? [String: Any])
+            json["composeTabs"] = ["unreadable"]
+            let bytes = try JSONSerialization.data(withJSONObject: json)
+            let tasks = (0 ..< 8).map { _ in
+                Task.detached {
+                    let model = try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(
+                        documentBytes: bytes, fileURL: URL(fileURLWithPath: "/synthetic-concurrent/workspace.json")
+                    )
+                    return model.composeTabsDecodeWasLossy && model.normalizationRequiresSave
+                }
+            }
+            for task in tasks {
+                let preserved = try await task.value
+                XCTAssertTrue(preserved)
+            }
+        }
+
         func testMeasurementMatrix() throws {
             try XCTSkipUnless(
                 ProcessInfo.processInfo.environment["RPCE_RUN_SCALE_TESTS"] == "1",
