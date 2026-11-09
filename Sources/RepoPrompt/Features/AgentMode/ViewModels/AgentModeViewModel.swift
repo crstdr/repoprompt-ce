@@ -15370,6 +15370,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
         )
         if reason == .liveMutation, let mutation {
+            let now = DispatchTime.now().uptimeNanoseconds
+            let gap = session.lastTranscriptMutationCallbackUptime.map { Double(now - $0) / 1_000_000 }
+            session.lastTranscriptMutationCallbackUptime = now
+            CatalogPerf.shared.transcriptMutationCadence(gapMS: gap)
             if var pendingSummary = session.pendingSourceItemsMutationSummary {
                 pendingSummary.merge(mutation)
                 session.pendingSourceItemsMutationSummary = pendingSummary
@@ -15384,6 +15388,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         #endif
 
         if session.terminalCommitInProgress, case .metadataRange? = mutation {
+            if reason == .liveMutation { CatalogPerf.shared.transcriptRequestSettled(.coalesced) }
             EditFlowPerf.end(
                 EditFlowPerf.Stage.Transcript.scheduleRefresh,
                 scheduleSignpost,
@@ -15406,11 +15411,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             #if DEBUG || EDIT_FLOW_PERF
                 session.transcriptPerformanceSnapshot.refreshImmediateCount += 1
             #endif
-            refreshDerivedTranscriptState(for: session, reason: reason)
+            if reason == .liveMutation { CatalogPerf.shared.transcriptRequestSettled(.executed) }
+            refreshDerivedTranscriptState(for: session, reason: reason, automaticLive: reason == .liveMutation)
             return
         }
 
         if session.derivedTranscriptRefreshTask != nil {
+            CatalogPerf.shared.transcriptRequestSettled(.coalesced)
             EditFlowPerf.end(
                 EditFlowPerf.Stage.Transcript.scheduleRefresh,
                 scheduleSignpost,
@@ -15432,6 +15439,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session.derivedTranscriptRefreshGeneration &+= 1
         let scheduledGeneration = session.derivedTranscriptRefreshGeneration
         session.derivedTranscriptRefreshTask = Task { @MainActor [weak self, weak session] in
+            var disposition = CatalogPerf.TranscriptRequestDisposition.dropped
+            defer { CatalogPerf.shared.transcriptRequestSettled(disposition) }
             guard let self, let session else { return }
             guard !Task.isCancelled else { return }
             guard sessions[session.tabID] === session else { return }
@@ -15439,14 +15448,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let scheduledReason = session.pendingDerivedTranscriptRefreshReason ?? .liveMutation
             session.pendingDerivedTranscriptRefreshReason = nil
             session.derivedTranscriptRefreshTask = nil
-            refreshDerivedTranscriptState(for: session, reason: scheduledReason)
+            disposition = .executed
+            refreshDerivedTranscriptState(for: session, reason: scheduledReason, automaticLive: true)
         }
     }
 
     func refreshDerivedTranscriptState(
         for session: TabSession,
         reason: DerivedTranscriptRefreshReason = .manualRefresh,
-        publishActivePresentation: Bool = true
+        publishActivePresentation: Bool = true,
+        automaticLive: Bool = false,
+        diagnosticPath: CatalogPerf.TranscriptBuilderPath? = nil
     ) {
         session.derivedTranscriptRefreshGeneration &+= 1
         session.derivedTranscriptRefreshTask?.cancel()
@@ -15679,7 +15691,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             isCompressedHistoryRevealed: session.isCompressedHistoryRevealed,
             isColdLoad: reason == .coldLoad,
             trustedIncrementalFinalTurnStartSequenceIndex: trustedIncrementalFinalTurnStartSequenceIndex,
-            quietDisplayCandidate: session.quietDisplayCandidate
+            quietDisplayCandidate: session.quietDisplayCandidate,
+            diagnosticPath: diagnosticPath ?? (automaticLive ? .automatic : (reason == .saveSession ? .save : .other))
         )
         let fullDetailTurnEnvelopeChanged = AgentTranscriptIO.fullDetailTurnEnvelopeChanged(
             from: existingTranscript,
@@ -15976,7 +15989,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         refreshDerivedTranscriptState(
             for: session,
             reason: scheduledReason,
-            publishActivePresentation: publishActivePresentation
+            publishActivePresentation: publishActivePresentation,
+            diagnosticPath: .catchUp
         )
         return true
     }
@@ -16105,8 +16119,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         isCompressedHistoryRevealed: Bool = false,
         isColdLoad: Bool = false,
         trustedIncrementalFinalTurnStartSequenceIndex: Int? = nil,
-        quietDisplayCandidate: AgentRunQuietLedger.DisplayCandidate? = nil
+        quietDisplayCandidate: AgentRunQuietLedger.DisplayCandidate? = nil,
+        diagnosticPath: CatalogPerf.TranscriptBuilderPath = .other,
+        diagnosticRecorder: CatalogPerf = .shared
     ) -> BuiltTranscriptPresentation {
+        let diagnosticStart = DispatchTime.now().uptimeNanoseconds
         let processingContext = AgentToolResultProcessingContext()
         #if DEBUG || EDIT_FLOW_PERF
             let buildStartedAt = CFAbsoluteTimeGetCurrent()
@@ -16405,6 +16422,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             ms: Double(DispatchTime.now().uptimeNanoseconds - analyticsSeedStartedAt) / 1_000_000,
             projections: localInputResult.projectionCount
         )
+        let diagnosticElapsed = DispatchTime.now().uptimeNanoseconds - diagnosticStart
+        diagnosticRecorder.transcriptBuilder(
+            ms: Double(diagnosticElapsed) / 1_000_000,
+            retainedRows: canonicalVisibleRowCount,
+            path: diagnosticPath
+        )
         return BuiltTranscriptPresentation(
             localInputSeed: localInputResult.seed,
             transcript: sanitizedTranscript,
@@ -16598,7 +16621,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         _ transcript: AgentTranscript,
         sourceItems: [AgentChatItem]? = nil,
         to session: TabSession,
-        isColdLoad: Bool = false
+        isColdLoad: Bool = false,
+        diagnosticPath: CatalogPerf.TranscriptBuilderPath = .other
     ) -> BuiltTranscriptPresentation {
         let canonicalSourceItems = sourceItems ?? session.items
         let projectionProtection = transcriptProjectionProtection(
@@ -16620,7 +16644,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             projectionProtection: projectionProtection,
             isCompressedHistoryRevealed: session.isCompressedHistoryRevealed,
             isColdLoad: isColdLoad,
-            quietDisplayCandidate: session.quietDisplayCandidate
+            quietDisplayCandidate: session.quietDisplayCandidate,
+            diagnosticPath: diagnosticPath
         )
         applyBuiltTranscriptPresentation(
             builtPresentation,
@@ -18440,7 +18465,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
            session.derivedTranscriptRefreshTask != nil || session.pendingDerivedTranscriptRefreshReason != nil
         {
             let scheduledReason = session.pendingDerivedTranscriptRefreshReason ?? .liveMutation
-            refreshDerivedTranscriptState(for: session, reason: scheduledReason)
+            refreshDerivedTranscriptState(for: session, reason: scheduledReason, diagnosticPath: .save)
             projectionProtection = transcriptProjectionProtection(
                 for: session,
                 transcript: session.transcript
@@ -18475,7 +18500,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let appliedPresentation = applyTranscriptPresentation(
                 transcriptSnapshot,
                 sourceItems: workingItemsSnapshot,
-                to: session
+                to: session,
+                diagnosticPath: .save
             )
             builtPresentation = appliedPresentation
             persistableSnapshot = PersistableTranscriptSnapshot(
@@ -23553,7 +23579,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
         }
         if finalizedCount > 0 {
-            refreshDerivedTranscriptState(for: session, reason: .manualRefresh)
+            refreshDerivedTranscriptState(for: session, reason: .manualRefresh, diagnosticPath: .terminal)
         }
         #if DEBUG
             if includeExplicitRepoPromptToolCalls || finalizedCount > 0 {

@@ -58,6 +58,8 @@ final class AgentTabSession: ObservableObject {
 
     let perfRecorder: any AgentModePerfRecording
     private var suppressSourceItemsChanged = false
+    /// Diagnostic cadence of source-change callbacks; never persisted or logged by identity.
+    var lastTranscriptMutationCallbackUptime: UInt64?
 
     /// Canonical runtime source-item suffix. Coordinators and tests mutate this list,
     /// but it only retains the mutable full-detail working turns; older compacted
