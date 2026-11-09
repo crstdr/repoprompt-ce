@@ -674,7 +674,9 @@ final class MCPReadFileAutoSelectionCoordinator {
         guard target > 0 else { return .completed }
         let (windowID, tabID, generation) = (key.windowID, key.tabID, key.bindingGeneration)
         let requirementLabel = requirement.rawValue
-        let overdueReport = OverdueWaitReporter.begin(
+        // The mirrored requirement may still wait for its mirror ticket after the canonical lane is complete.
+        let canonicalComplete = (canonicalLanes[key]?.completedSequence ?? 0) >= target
+        let overdueReport = canonicalComplete && requirement == .canonicalSelection ? nil : OverdueWaitReporter.begin(
             event: "selection_drain",
             threshold: MCPTimeoutPolicy.workspaceFreshnessWaitTimeout,
             fields: {
@@ -682,7 +684,7 @@ final class MCPReadFileAutoSelectionCoordinator {
                     + " requirement=\(requirementLabel) sequence=\(target)"
             }
         )
-        defer { overdueReport.cancel() }
+        defer { overdueReport?.cancel() }
         emitCanonicalDiagnostic(
             .drainHighWaterCaptured,
             for: key,

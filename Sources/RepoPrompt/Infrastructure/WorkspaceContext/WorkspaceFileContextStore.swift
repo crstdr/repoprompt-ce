@@ -1082,11 +1082,20 @@ actor WorkspaceFileContextStore {
         }
 
         func value() async -> ScopedIngressBarrierTaskOutput? {
+            lock.lock()
+            if isCompleted {
+                let output = completedOutput
+                lock.unlock()
+                return output
+            }
+            lock.unlock()
             let waiterID = UUID()
             let rootID = rootID
+            // Callers bound by `workspaceFreshnessWaitTimeout` cancel this wait at that timeout; only a
+            // wait that outlives it, or has no caller timeout, is overdue.
             let overdueReport = OverdueWaitReporter.begin(
                 event: "root_ingress",
-                threshold: MCPTimeoutPolicy.workspaceFreshnessWaitTimeout,
+                threshold: MCPTimeoutPolicy.workspaceFreshnessWaitTimeout + .seconds(5),
                 fields: { "root=\(rootID.uuidString.prefix(8))" }
             )
             defer { overdueReport.cancel() }

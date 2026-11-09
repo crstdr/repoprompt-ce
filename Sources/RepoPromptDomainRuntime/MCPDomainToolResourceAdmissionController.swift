@@ -73,7 +73,7 @@ package final class MCPDomainToolResourceAdmissionController: @unchecked Sendabl
         let id: UUID
         let continuation: CheckedContinuation<Lease, Error>
         let context: WaitContext?
-        let overdueWatcher: Task<Void, Never>?
+        let overdueWatcher: OverdueWaitReporter.Watch?
     }
 
     private struct Holder {
@@ -305,7 +305,7 @@ package final class MCPDomainToolResourceAdmissionController: @unchecked Sendabl
     }
 
     /// Called with `lock` held, for a waiter that is about to be queued.
-    private func startOverdueWatcher(waiterID: UUID, resource: Resource, context: WaitContext?) -> Task<Void, Never>? {
+    private func startOverdueWatcher(waiterID: UUID, resource: Resource, context: WaitContext?) -> OverdueWaitReporter.Watch? {
         guard let overdueThreshold, let context else { return nil }
         return OverdueWaitReporter.begin(
             event: "admission",
@@ -318,18 +318,24 @@ package final class MCPDomainToolResourceAdmissionController: @unchecked Sendabl
         )
     }
 
-    /// Holders not yet reported within the repeat interval, or `nil` when the waiter is gone or all were reported.
+    /// The waiter's report, or `nil` when it is no longer queued or every tracked holder was reported recently.
+    /// With no tracked holder it always reports, since that is the lost-wakeup or untracked-holder shape.
     private func overdueFields(waiterID: UUID, resource: Resource, waiter: WaitContext) -> String? {
         let now = ContinuousClock.now
         return lock.withLock {
             guard resourceByWaiterID[waiterID] != nil else { return nil }
-            let due = holdersByLeaseID.filter { _, holder in
-                holder.resource == resource
-                    && holder.lastReportedAt.map { $0.duration(to: now) >= overdueRepeatInterval } != false
+            let active = activeCountByResource[resource] ?? 0
+            let tracked = holdersByLeaseID.filter { $0.value.resource == resource }
+            let due = tracked.filter { _, holder in
+                holder.lastReportedAt.map { $0.duration(to: now) >= overdueRepeatInterval } != false
             }
-            guard !due.isEmpty else { return nil }
+            guard tracked.isEmpty || !due.isEmpty else { return nil }
             var fields = "resource=\(Self.describe(resource)) waiter_tool=\(waiter.tool) waiter_conn=\(waiter.connection)"
-                + " waiter_run=\(waiter.run ?? "-") waiters=\(waitersByResource[resource]?.count ?? 0) holders=\(due.count)"
+                + " waiter_run=\(waiter.run ?? "-") waiters=\(waitersByResource[resource]?.count ?? 0)"
+                + " holders=\(tracked.isEmpty ? "untracked" : String(due.count)) active=\(active)"
+            if !tracked.isEmpty, active > tracked.count {
+                fields += " untracked_holders=\(active - tracked.count)"
+            }
             for (index, entry) in due.sorted(by: { $0.value.acquiredAt < $1.value.acquiredAt }).enumerated() {
                 holdersByLeaseID[entry.key]?.lastReportedAt = now
                 let holder = entry.value
