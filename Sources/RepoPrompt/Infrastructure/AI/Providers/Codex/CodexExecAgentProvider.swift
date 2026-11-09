@@ -54,7 +54,8 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         selectedModelString: String?,
         serverEntries: [MCPIntegrationHelper.CodexServerEntry],
         brokenServers: Set<String>,
-        fullAccess: Bool = false
+        fullAccess: Bool = false,
+        contextWindowArguments: [String] = []
     ) -> (args: [String], modelSpecifier: CodexModelSpecifier) {
         var args: [String] = []
         let modelCLIArgs = codexModelCLIArgs(selectedModelString: selectedModelString)
@@ -84,6 +85,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         // Add exec subcommand and its arguments.
         args.append("exec")
         args.append(contentsOf: modelCLIArgs.configArgs)
+        args.append(contentsOf: contextWindowArguments)
         args.append(contentsOf: toolOverrideArgs)
         args.append(contentsOf: serverOverrideArgs)
         args.append(contentsOf: ["--json", "--skip-git-repo-check"])
@@ -200,6 +202,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
                     var attemptModelString = self.config.modelString
                     var didRetryBrokenServer = false
                     var didRetryModelFallback = false
+                    let contextWindowArguments = CodexContextWindowPreferences.cliArguments(CodexContextWindowPreferences.selection())
 
                     while attemptNumber < maxAttempts {
                         attemptNumber += 1
@@ -236,7 +239,8 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
                                     selectedModelString: selectedModelString,
                                     serverEntries: serverEntries,
                                     brokenServers: brokenServers,
-                                    fullAccess: config.fullAccess
+                                    fullAccess: config.fullAccess,
+                                    contextWindowArguments: contextWindowArguments
                                 )
                                 let args = command.args
                                 let modelSpecifier = command.modelSpecifier

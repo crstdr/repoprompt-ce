@@ -30,7 +30,7 @@ final class ComputerUseChildSafetyTests: XCTestCase {
             testWindowID: window, testWorkspacePath: FileManager.default.temporaryDirectory.path,
             shouldManageCodexTooling: false,
             codexControllerFactory: { runID, _, _, _, _, _ in factory.make(runID: runID) },
-            codexControllerFactoryWithComputerUse: { runID, _, _, _, _, _, enabled, _ in factory.make(runID: runID, computerUseEnabled: enabled) },
+            codexControllerFactoryWithComputerUse: { runID, _, _, _, _, _, enabled, _, _ in factory.make(runID: runID, computerUseEnabled: enabled) },
             mcpServerEnabler: { true }, testCodexComputerUseRuntimeUnavailableMessage: { nil },
             testCodexComputerUseRuntimePreflight: preflight, testCodexComputerUseCompanionReady: { true },
             testCodexComputerUseReservedEntryExists: { false }, testCodexRouteOwnerValidator: { _, _, _, _ in true }

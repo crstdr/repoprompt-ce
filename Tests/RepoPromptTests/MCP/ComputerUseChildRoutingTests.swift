@@ -302,7 +302,7 @@ final class ComputerUseChildRoutingTests: XCTestCase {
                         let vm = AgentModeViewModel(
                             testWindowID: id, shouldManageCodexTooling: false,
                             codexControllerFactory: { runID, _, _, _, _, _ in factory.make(runID: runID) },
-                            codexControllerFactoryWithComputerUse: { runID, _, _, _, _, _, enabled, _ in factory.make(runID: runID, computerUseEnabled: enabled) },
+                            codexControllerFactoryWithComputerUse: { runID, _, _, _, _, _, enabled, _, _ in factory.make(runID: runID, computerUseEnabled: enabled) },
                             testMCPServer: server, testWorkspaceFileContextStore: prompt.workspaceFileContextStore,
                             testCodexComputerUseRuntimePreflight: { nil }, testCodexComputerUseCompanionReady: { true },
                             testCodexComputerUseReservedEntryExists: { false }

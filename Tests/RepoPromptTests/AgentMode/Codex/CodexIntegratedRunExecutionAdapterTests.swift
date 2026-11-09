@@ -207,7 +207,7 @@ final class CodexComputerUseWorkflowTests: XCTestCase {
         var controllerCreated = false
         let coordinator = CodexAgentModeCoordinator(
             windowID: 1, runtimeWorkspacePathsProvider: { _ in .uniform(nil) },
-            codexControllerFactory: { _, _, _, _, _, _, _, _ in
+            codexControllerFactory: { _, _, _, _, _, _, _, _, _ in
                 controllerCreated = true
                 XCTFail("Rejected runtime must not launch")
                 return self.makeController(options: .agentModeDefault())
@@ -811,7 +811,7 @@ final class CodexComputerUseWorkflowTests: XCTestCase {
     }
 
     private func makeCoordinator(ready: Bool = true, collision: Bool = false) -> CodexAgentModeCoordinator {
-        CodexAgentModeCoordinator(windowID: 1, runtimeWorkspacePathsProvider: { _ in .uniform(nil) }, codexControllerFactory: { _, _, _, _, _, _, _, _ in fatalError("Admission tests must not launch a controller") }, connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in }, shouldManageCodexTooling: false, computerUseRuntimeUnavailableMessage: { nil }, computerUseCompanionReady: { ready }, computerUseReservedEntryExists: { collision }, codexHookApprovalSettings: GlobalSettingsStore.shared)
+        CodexAgentModeCoordinator(windowID: 1, runtimeWorkspacePathsProvider: { _ in .uniform(nil) }, codexControllerFactory: { _, _, _, _, _, _, _, _, _ in fatalError("Admission tests must not launch a controller") }, connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in }, shouldManageCodexTooling: false, computerUseRuntimeUnavailableMessage: { nil }, computerUseCompanionReady: { ready }, computerUseReservedEntryExists: { collision }, codexHookApprovalSettings: GlobalSettingsStore.shared)
     }
 }
 
@@ -848,5 +848,57 @@ private final class MCPApprovalWireRecorder: @unchecked Sendable {
 
     var actions: [String] {
         lock.withLock { recordedActions }
+    }
+}
+
+final class CodexContextWindowConfigurationTests: XCTestCase {
+    func testPresetOverridesArePairedAndDefaultIsEmpty() {
+        XCTAssertTrue(CodexContextWindowPreferences.overrides(.codexDefault).isEmpty)
+        XCTAssertTrue(CodexContextWindowPreferences.cliArguments(.codexDefault).isEmpty)
+        XCTAssertEqual(CodexContextWindowPreferences.cliArguments(.tokens1M), ["-c", "model_auto_compact_token_limit=900000", "-c", "model_context_window=1000000"])
+        for (selection, window, compact) in [
+            (CodexContextWindowPreferences.Selection.tokens500K, 500_000, 450_000),
+            (.tokens750K, 750_000, 675_000),
+            (.tokens1M, 1_000_000, 900_000)
+        ] {
+            let overrides = CodexContextWindowPreferences.overrides(selection)
+            XCTAssertEqual(overrides["model_context_window"], window)
+            XCTAssertEqual(overrides["model_auto_compact_token_limit"], compact)
+            let appServer = CodexNativeSessionController.defaultAppServerConfigOverrides(serverEntries: [], contextWindowSelection: selection)
+            XCTAssertEqual(appServer["model_context_window"] as? Int, window)
+            XCTAssertEqual(appServer["model_auto_compact_token_limit"] as? Int, compact)
+        }
+        let defaults = CodexNativeSessionController.defaultAppServerConfigOverrides(serverEntries: [])
+        XCTAssertNil(defaults["model_context_window"])
+        XCTAssertNil(defaults["model_auto_compact_token_limit"])
+    }
+
+    func testExecArgumentsCarrySelectedPair() {
+        let defaults = CodexExecAgentProvider.buildCodexExecArguments(selectedModelString: nil, serverEntries: [], brokenServers: []).args
+        XCTAssertFalse(defaults.contains { $0.hasPrefix("model_context_window=") || $0.hasPrefix("model_auto_compact_token_limit=") })
+        let pair = CodexContextWindowPreferences.cliArguments(.tokens1M)
+        let selected = CodexExecAgentProvider.buildCodexExecArguments(selectedModelString: nil, serverEntries: [], brokenServers: [], contextWindowArguments: pair).args
+        XCTAssertTrue(selected.contains("model_context_window=1000000"))
+        XCTAssertTrue(selected.contains("model_auto_compact_token_limit=900000"))
+    }
+
+    @MainActor
+    func testBindingKeepsSelectionAcrossControllerReplacementButColdSessionUsesCurrent() {
+        let session = AgentTabSession(tabID: UUID())
+        XCTAssertEqual(session.codexContextWindowForBinding(current: .tokens500K), .tokens500K)
+        XCTAssertEqual(session.codexContextWindowForBinding(current: .tokens1M), .tokens500K)
+        let coldSession = AgentTabSession(tabID: UUID())
+        XCTAssertEqual(coldSession.codexContextWindowForBinding(current: .tokens1M), .tokens1M)
+    }
+
+    func testSelectionPersistence() throws {
+        let name = "CodexContextWindowConfigurationTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: name))
+        defer { defaults.removePersistentDomain(forName: name) }
+        XCTAssertEqual(CodexContextWindowPreferences.selection(defaults: defaults), .codexDefault)
+        CodexContextWindowPreferences.setSelection(.tokens1M, defaults: defaults)
+        XCTAssertEqual(CodexContextWindowPreferences.selection(defaults: defaults), .tokens1M)
+        CodexContextWindowPreferences.setSelection(.codexDefault, defaults: defaults)
+        XCTAssertEqual(CodexContextWindowPreferences.selection(defaults: defaults), .codexDefault)
     }
 }
