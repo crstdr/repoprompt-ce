@@ -238,7 +238,13 @@ final class CatalogPerfTests: XCTestCase {
         XCTAssertFalse(off.contains("prewarm"))
         perf.prewarm(.started)
         perf.receiverPhase(.prewarmDecode, elapsedMS: 2)
+        #if DEBUG
+            let snapshot = perf.attributionSnapshotForTesting()
+        #endif
         let on = perf.rotateEmissionRecords()
+        #if DEBUG
+            XCTAssertEqual(snapshot, on.attribution, "Reading working attribution must not reset the pair counters")
+        #endif
         XCTAssertNil(on.records)
         XCTAssertTrue(try XCTUnwrap(on.attribution).contains("prewarm_started=1"))
         XCTAssertNil(perf.rotateEmissionRecords().attribution)

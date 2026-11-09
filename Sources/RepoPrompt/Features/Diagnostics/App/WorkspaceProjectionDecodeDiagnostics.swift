@@ -133,9 +133,7 @@ import RepoPromptShared
             }
         }
     }
-#endif
 
-#if DEBUG
     /// Bounded test-only scheduling samples; no paths or workspace identifiers.
     final class WorkspaceCatalogPrewarmMeasurements: @unchecked Sendable {
         private let lock = NSLock()

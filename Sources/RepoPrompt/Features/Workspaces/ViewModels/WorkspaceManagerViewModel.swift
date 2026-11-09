@@ -113,7 +113,7 @@ private struct WorkspaceFileCachedLoadResult {
 
 final class WorkspaceFileDecodeCache: @unchecked Sendable {
     static let shared = WorkspaceFileDecodeCache()
-    let catalogPrewarmer = WorkspaceCatalogDecodePrewarmer()
+    static let catalogPrewarmer = WorkspaceCatalogDecodePrewarmer()
 
     private let lock = NSLock()
     private var cachedWorkspacesByKey: [WorkspaceFileDecodeCacheKey: WorkspaceModel] = [:]

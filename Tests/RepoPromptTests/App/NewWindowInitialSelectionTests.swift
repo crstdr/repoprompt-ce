@@ -84,8 +84,10 @@ import XCTest
         private actor ColdDecodeGate {
             var open = false
             var waiter: CheckedContinuation<Void, Never>?
-            func wait() async {
-                if !open { await withCheckedContinuation { waiter = $0 } }
+            func wait(onEntry: @Sendable () -> Void = {}) async {
+                if !open { onEntry()
+                    await withCheckedContinuation { waiter = $0 }
+                }
             }
 
             func release() {
@@ -99,9 +101,7 @@ import XCTest
             try await Fixture.run(seeds: Fixture.standardSeeds) { f in
                 let gate = ColdDecodeGate()
                 let entered = expectation(description: "worker entered")
-                let prewarmer = WorkspaceCatalogDecodePrewarmer(beforeWork: { entered.fulfill()
-                    await gate.wait()
-                })
+                let prewarmer = WorkspaceCatalogDecodePrewarmer(beforeWork: { await gate.wait { entered.fulfill() } })
                 let managers = [f.makeManager(), f.makeManager()]
                 let bridges = managers.enumerated().map { index, manager in
                     DomainWorkspacePresentationBridge(
@@ -193,6 +193,25 @@ import XCTest
         }
 
         func testTrustedDigest35ReceiversEightMiBParityWithVisibleAndHiddenOwners() async throws {
+            try await checkColdDecode35Receivers(prewarmModes: [false])
+        }
+
+        func testColdDecodePrewarm35ReceiversEightMiBParity() async throws {
+            let measuring = ProcessInfo.processInfo.environment["RPCE_RUN_SCALE_TESTS"] == "1"
+            try await checkColdDecode35Receivers(
+                prewarmModes: measuring
+                    ? [false, false, true, false, true, false, true, false] : [false, true]
+            )
+        }
+
+        func testColdDecodePrewarm35ReceiversRefreshOverload() async throws {
+            let measuring = ProcessInfo.processInfo.environment["RPCE_RUN_SCALE_TESTS"] == "1"
+            try await checkColdDecode35Receivers(
+                prewarmModes: measuring ? [false, true, false, true, false, true] : [false, true], refreshOverload: true
+            )
+        }
+
+        private func checkColdDecode35Receivers(prewarmModes: [Bool], refreshOverload: Bool = false) async throws {
             let seeds = Fixture.standardSeeds
             var edited = Fixture.model(id: Fixture.aardvarkID, name: "Aardvark")
             edited.composeTabs = (0 ..< 99).map { index in
@@ -212,15 +231,16 @@ import XCTest
             }
             for visible in [2, 35] {
                 var countsByMode: [[String: String]] = []
-                var finalByMode: [[WorkspaceModel]] = []
-                for reuse in [false, true] {
+                var referenceModels: [WorkspaceModel]?
+                for (reuse, prewarm) in [false, true].flatMap({ reuse in prewarmModes.map { (reuse, $0) } }) {
                     try await Fixture.run(seeds: seeds) { f in
+                        let prewarmer = WorkspaceCatalogDecodePrewarmer()
                         let managers = (0 ..< 35).map { _ in f.makeManager() }
                         let bridges = managers.enumerated().map { index, manager in
                             DomainWorkspacePresentationBridge(
                                 workspaceManager: manager,
                                 client: DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: -20000 - index),
-                                trustedDigestReuse: reuse
+                                trustedDigestReuse: reuse, catalogDecodePrewarmer: prewarm ? prewarmer : nil
                             )
                         }
                         let observers = bridges.map { DomainWorkspaceProjectionObserver(bridge: $0) }
@@ -253,8 +273,23 @@ import XCTest
                             bridges.forEach { $0.start() }
                             let initial = await f.runtime.workspaceStore.snapshot()
                             try await settle(initial.publicationSequence, before: clock.now.advanced(by: .seconds(5)))
+                            await prewarmer.awaitIdleForTesting()
                             WorkspaceFileDecodeCache.shared.removeAllForTesting()
                             _ = CatalogPerf.shared.rotate()
+                            let memoryBefore = try XCTUnwrap(DebugProcessMemorySampler.captureSnapshot())
+                            let sampler = Task.detached {
+                                var rss = memoryBefore.residentBytes
+                                var footprint = memoryBefore.physicalFootprintBytes ?? 0
+                                while !Task.isCancelled {
+                                    if let sample = DebugProcessMemorySampler.captureSnapshot() {
+                                        rss = max(rss, sample.residentBytes)
+                                        footprint = max(footprint, sample.physicalFootprintBytes ?? 0)
+                                    }
+                                    try? await Task.sleep(for: .milliseconds(1))
+                                }
+                                return (rss: rss, footprint: footprint)
+                            }
+                            defer { sampler.cancel() }
                             let start = clock.now
                             let deadline = start.advanced(by: .seconds(5))
                             let writer = DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: -9999)
@@ -263,10 +298,18 @@ import XCTest
                                 edited, fileURL: f.workspaceURL(for: edited), expectedWorkspaceRevision: record.revisions.workingRevision
                             )
                             XCTAssertEqual(working.disposition, .applied)
+                            if refreshOverload { bridges.forEach { $0.requestCatalogRefresh(isRetry: false) } }
                             let afterWorking = await f.runtime.workspaceStore.snapshot()
                             try await settle(afterWorking.publicationSequence, before: deadline)
+                            if refreshOverload {
+                                for bridge in bridges {
+                                    await bridge.awaitCatalogRefreshForTesting()
+                                }
+                            }
                             buildVisibleDisplays()
                             let changed = try XCTUnwrap(afterWorking.workspaces.first { $0.document.workspaceID == edited.id })
+                            // Snapshot only the working interval; keep the later rotation intact for whole-pair count parity.
+                            let workingDetail = try XCTUnwrap(CatalogPerf.shared.attributionSnapshotForTesting())
                             let saved = await writer.saveCommittedWorkingRevision(workspaceID: edited.id, expectedWorkspaceRevision: changed.revisions.workingRevision)
                             XCTAssertEqual(saved.disposition, .applied)
                             let final = await f.runtime.workspaceStore.snapshot()
@@ -274,6 +317,15 @@ import XCTest
                             buildVisibleDisplays()
                             let elapsed = start.duration(to: clock.now)
                             XCTAssertLessThan(elapsed, .seconds(5), "Completion budget, not a speed-ratio assertion")
+                            await prewarmer.awaitIdleForTesting()
+                            sampler.cancel()
+                            let peak = await sampler.value
+                            let memorySettled = try XCTUnwrap(DebugProcessMemorySampler.captureSnapshot())
+                            let json = WorkspaceFileDecodeCache.shared.jsonDecodeCountsForTesting(changed.document.contentDigest)
+                            XCTAssertEqual(json.main, prewarm ? 0 : 1)
+                            XCTAssertEqual(json.worker, prewarm ? 1 : 0)
+                            let latency = prewarmer.measurements.snapshot()
+                            XCTAssertEqual(latency.starts.isEmpty, !prewarm, "A resident re-probe may start an extra flight without decoding")
                             let emission = CatalogPerf.shared.rotateEmissionRecords()
                             let core = try XCTUnwrap(emission.records?.core)
                             let detail = try XCTUnwrap(emission.attribution)
@@ -281,14 +333,18 @@ import XCTest
                                 let parts = $0.split(separator: "=", maxSplits: 1)
                                 return (String(parts[0]), String(parts[1]))
                             })
-                            let compared = ["receipts_full", "receipts_metadata", "applications_attempted", "canonical_decodes", "decode_cache_hits"]
+                            let compared = ["receipts_full", "receipts_metadata", "applications_attempted"]
+                                + (prewarmModes.allSatisfy { !$0 } ? ["canonical_decodes", "decode_cache_hits"] : [])
                             countsByMode.append(fields.filter { compared.contains($0.key) })
                             XCTAssertEqual(fields["receivers"], "35")
-                            XCTAssertTrue(detail.contains("receiver_hash_count=\(reuse ? 0 : 35) "), detail)
-                            XCTAssertEqual(Int(fields["decode_bytes_hashed"] ?? ""), reuse ? 0 : changed.document.documentBytes.count * 35)
+                            if !refreshOverload {
+                                XCTAssertTrue(detail.contains("receiver_hash_count=\(reuse ? 0 : 35) "), detail)
+                                XCTAssertEqual(Int(fields["decode_bytes_hashed"] ?? ""), reuse ? 0 : changed.document.documentBytes.count * 35)
+                            }
                             XCTAssertTrue(detail.contains("pair_same_digest=1 "), detail)
                             let models = try f.decoded(final)
-                            finalByMode.append(managers[0].workspaces)
+                            if let referenceModels { XCTAssertEqual(managers[0].workspaces, referenceModels) }
+                            else { referenceModels = managers[0].workspaces }
                             for manager in managers {
                                 // The same synchronous accessor serves hidden-window MCP readers.
                                 XCTAssertEqual(manager.workspace(withID: edited.id)?.stashedTabs.count, 1330)
@@ -296,22 +352,35 @@ import XCTest
                                 XCTAssertTrue(manager.hasAcceptedDomainCatalogForRestoration)
                                 XCTAssertTrue(manager.test_carrierIndexesEqual(to: managers[0]))
                                 XCTAssertNotNil(manager.adoptedFullDocumentGeneration(workspaceID: edited.id, contentDigest: changed.document.contentDigest))
-                                XCTAssertEqual(manager.domainCatalogReconciliationGeneration, managers[0].domainCatalogReconciliationGeneration)
+                                if !refreshOverload {
+                                    XCTAssertEqual(manager.domainCatalogReconciliationGeneration, managers[0].domainCatalogReconciliationGeneration)
+                                }
                             }
+                            if prewarm { XCTAssertTrue(detail.contains("prewarm_busy=0 "), detail) }
+                            print("CATALOG_PREWARM_METRIC working_only=true overload=\(refreshOverload) visible=\(visible) reuse=\(reuse) prewarm=\(prewarm) main_json=\(json.main) worker_json=\(json.worker) starts_ms=\(latency.starts) waits_ms=\(latency.waits) rss_before=\(memoryBefore.residentBytes) rss_peak=\(peak.rss) rss_settled=\(memorySettled.residentBytes) footprint_before=\(memoryBefore.physicalFootprintBytes ?? 0) footprint_peak=\(peak.footprint) footprint_settled=\(memorySettled.physicalFootprintBytes ?? 0) \(workingDetail)")
                             print("CATALOG_DIGEST_FAKE receivers=35 visible=\(visible) reuse=\(reuse) encoded_bytes=\(changed.document.documentBytes.count) elapsed=\(elapsed) \(core)")
                         } catch {
                             for bridge in bridges {
                                 await bridge.stopAndJoinForTesting()
                             }
+                            await prewarmer.awaitIdleForTesting()
                             throw error
                         }
                         for bridge in bridges {
                             await bridge.stopAndJoinForTesting()
                         }
+                        await prewarmer.awaitIdleForTesting()
+                    }
+                    if let released = DebugProcessMemorySampler.captureSnapshot() {
+                        print("CATALOG_PREWARM_RELEASE overload=\(refreshOverload) visible=\(visible) reuse=\(reuse) prewarm=\(prewarm) rss=\(released.residentBytes) footprint=\(released.physicalFootprintBytes ?? 0)")
                     }
                 }
-                XCTAssertEqual(countsByMode[0], countsByMode[1])
-                XCTAssertEqual(finalByMode[0], finalByMode[1])
+                let baseline = try XCTUnwrap(countsByMode.first)
+                if !refreshOverload {
+                    for counts in countsByMode.dropFirst() {
+                        XCTAssertEqual(counts, baseline)
+                    }
+                }
             }
         }
 

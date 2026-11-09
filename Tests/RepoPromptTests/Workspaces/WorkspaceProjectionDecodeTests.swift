@@ -110,6 +110,9 @@ import XCTest
         func testColdDecodeLaunchKeyIsTrueOnlyAndTestsDefaultOff() {
             XCTAssertFalse(AppLaunchConfiguration.resolveCatalogColdDecodePrewarm(storedValue: nil))
             XCTAssertFalse(AppLaunchConfiguration.resolveCatalogColdDecodePrewarm(storedValue: "true"))
+            XCTAssertFalse(AppLaunchConfiguration.resolveCatalogColdDecodePrewarm(storedValue: NSNumber(value: 1)))
+            XCTAssertFalse(AppLaunchConfiguration.resolveCatalogColdDecodePrewarm(storedValue: NSNumber(value: 0)))
+            XCTAssertTrue(AppLaunchConfiguration.resolveCatalogColdDecodePrewarm(storedValue: NSNumber(value: true)))
             XCTAssertFalse(AppLaunchConfiguration.resolveCatalogColdDecodePrewarm(storedValue: false))
             XCTAssertTrue(AppLaunchConfiguration.resolveCatalogColdDecodePrewarm(storedValue: true))
             XCTAssertFalse(AppLaunchConfiguration.current.catalogColdDecodePrewarmEnabled)
@@ -598,6 +601,19 @@ import XCTest
         override func tearDown() async throws {
             WorkspaceFileDecodeCache.shared.removeAllForTesting()
             try? FileManager.default.removeItem(at: temporaryRoot)
+        }
+
+        func testPurePrewarmDefersLossyBackupToProjection() throws {
+            let original = try document(mutating: { $0 = corruptingTab(at: 1, in: $0) })
+            let url = temporaryRoot.appendingPathComponent("workspace.json")
+            let document = try DomainWorkspaceDocument.decode(documentBytes: original, fileURL: url)
+            let backup = WorkspaceUnreadableDocumentBackup.backupURL(for: url, documentBytes: original)
+            XCTAssertEqual(WorkspaceFileDecodeCache.shared.prewarmCatalogDocument(.init(document)), .stored)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: backup.path))
+            let projected = try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(document: document)
+            XCTAssertEqual(projected.composeTabsDroppedDuringDecode, 1)
+            XCTAssertEqual(try Data(contentsOf: backup), original)
+            XCTAssertEqual(WorkspaceFileDecodeCache.shared.digestDecodeStatsForTesting().hits, 1)
         }
 
         func testTypedAndRawLossyProjectionPreserveTheSameBackupBytes() throws {

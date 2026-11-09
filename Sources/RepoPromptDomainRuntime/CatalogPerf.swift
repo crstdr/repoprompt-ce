@@ -43,6 +43,10 @@ package final class CatalogPerf: @unchecked Sendable {
             lock.unlock()
         }
 
+        package func attributionSnapshotForTesting() -> String? {
+            lock.withLock { attribution.record() }
+        }
+
         package func setSuppressAutomaticEmissionForTesting(_ suppress: Bool) {
             lock.lock()
             suppressAutomaticEmission = suppress

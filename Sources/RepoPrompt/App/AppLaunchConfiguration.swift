@@ -1,3 +1,4 @@
+import CoreFoundation
 import Foundation
 
 struct AppLaunchConfiguration {
@@ -26,7 +27,9 @@ struct AppLaunchConfiguration {
     let catalogColdDecodePrewarmEnabled: Bool
 
     static func resolveCatalogColdDecodePrewarm(storedValue: Any?) -> Bool {
-        storedValue as? Bool ?? false
+        guard let value = storedValue as? NSNumber,
+              CFGetTypeID(value) == CFBooleanGetTypeID() else { return false }
+        return value.boolValue
     }
 
     static let catalogPublicationTrustedDigestReuseKey = "catalogPublicationTrustedDigestReuseEnabled"
