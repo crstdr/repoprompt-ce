@@ -13,15 +13,32 @@ package enum OverdueWaitReporter {
     private static let logger = Logger(subsystem: "com.pvncher.repoprompt.ce", category: "MCPWaitDiagnostics")
     private static let queue = DispatchQueue(label: "com.pvncher.repoprompt.ce.wait-diagnostics", qos: .utility)
 
+    /// Cancels the timer when the wait ends. `cancel()` is asynchronous by design (it may run under a
+    /// caller's lock while a handler waits for that lock), so one report already in flight can still
+    /// be written just after it returns.
     package final class Watch: @unchecked Sendable {
-        private let timer: DispatchSourceTimer
+        fileprivate final class Flag: @unchecked Sendable {
+            private let lock = NSLock()
+            private var value = false
+            var isCancelled: Bool { lock.withLock { value } }
+            func cancel() { lock.withLock { value = true } }
+        }
 
-        fileprivate init(timer: DispatchSourceTimer) {
+        private let timer: DispatchSourceTimer
+        fileprivate let flag: Flag
+
+        fileprivate init(timer: DispatchSourceTimer, flag: Flag) {
             self.timer = timer
+            self.flag = flag
         }
 
         package func cancel() {
+            flag.cancel()
             timer.cancel()
+        }
+
+        deinit {
+            cancel()
         }
     }
 
@@ -43,13 +60,14 @@ package enum OverdueWaitReporter {
             repeating: .nanoseconds(nanoseconds(repeatInterval)),
             leeway: .nanoseconds(min(1_000_000_000, thresholdNanoseconds / 4))
         )
+        let flag = Watch.Flag()
         timer.setEventHandler {
-            guard !timer.isCancelled, let fields = fields() else { return }
+            guard !flag.isCancelled, let fields = fields(), !flag.isCancelled else { return }
             let waitMilliseconds = milliseconds(started.duration(to: .now))
             report("mcp_wait_overdue event=\(event) wait_ms=\(waitMilliseconds) \(fields)")
         }
         timer.resume()
-        return Watch(timer: timer)
+        return Watch(timer: timer, flag: flag)
     }
 
     private static func nanoseconds(_ duration: Duration) -> Int {

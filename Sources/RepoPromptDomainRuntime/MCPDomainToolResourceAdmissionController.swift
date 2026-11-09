@@ -80,7 +80,6 @@ package final class MCPDomainToolResourceAdmissionController: @unchecked Sendabl
         let resource: Resource
         let context: WaitContext
         let acquiredAt: ContinuousClock.Instant
-        var lastReportedAt: ContinuousClock.Instant?
     }
 
     package let limit: Int
@@ -318,27 +317,24 @@ package final class MCPDomainToolResourceAdmissionController: @unchecked Sendabl
         )
     }
 
-    /// The waiter's report, or `nil` when it is no longer queued or every tracked holder was reported recently.
-    /// With no tracked holder it always reports, since that is the lost-wakeup or untracked-holder shape.
+    /// The waiter's report, or `nil` once it is no longer queued. Every queued waiter names the current
+    /// holders on each interval; with no tracked holder it reports `holders=untracked`, the
+    /// lost-wakeup or untracked-holder shape.
     private func overdueFields(waiterID: UUID, resource: Resource, waiter: WaitContext) -> String? {
         let now = ContinuousClock.now
         return lock.withLock {
             guard resourceByWaiterID[waiterID] != nil else { return nil }
             let active = activeCountByResource[resource] ?? 0
-            let tracked = holdersByLeaseID.filter { $0.value.resource == resource }
-            let due = tracked.filter { _, holder in
-                holder.lastReportedAt.map { $0.duration(to: now) >= overdueRepeatInterval } != false
-            }
-            guard tracked.isEmpty || !due.isEmpty else { return nil }
+            let tracked = holdersByLeaseID.values
+                .filter { $0.resource == resource }
+                .sorted { $0.acquiredAt < $1.acquiredAt }
             var fields = "resource=\(Self.describe(resource)) waiter_tool=\(waiter.tool) waiter_conn=\(waiter.connection)"
                 + " waiter_run=\(waiter.run ?? "-") waiters=\(waitersByResource[resource]?.count ?? 0)"
-                + " holders=\(tracked.isEmpty ? "untracked" : String(due.count)) active=\(active)"
+                + " holders=\(tracked.isEmpty ? "untracked" : String(tracked.count)) active=\(active)"
             if !tracked.isEmpty, active > tracked.count {
                 fields += " untracked_holders=\(active - tracked.count)"
             }
-            for (index, entry) in due.sorted(by: { $0.value.acquiredAt < $1.value.acquiredAt }).enumerated() {
-                holdersByLeaseID[entry.key]?.lastReportedAt = now
-                let holder = entry.value
+            for (index, holder) in tracked.enumerated() {
                 let age = holder.acquiredAt.duration(to: now).components
                 fields += " holder\(index)_tool=\(holder.context.tool) holder\(index)_conn=\(holder.context.connection)"
                     + " holder\(index)_run=\(holder.context.run ?? "-") holder\(index)_phase=unknown"
