@@ -204,6 +204,275 @@ import XCTest
             }
         }
 
+        func testOmittedEphemeral35ReceiversEightMiBParityWithVisibleAndHiddenOwners() async throws {
+            var seeds = Fixture.standardSeeds
+            var omitted = Fixture.model(id: UUID(), name: "Legacy omitted")
+            omitted.isEphemeral = true
+            seeds.append(omitted)
+            var edited = Fixture.model(id: Fixture.aardvarkID, name: "Aardvark")
+            edited.composeTabs = (0 ..< 99).map { index in
+                ComposeTabState(id: UUID(), name: "Open \(index)", activeChatSessionID: UUID())
+            }
+            edited.activeComposeTabID = edited.composeTabs[0].id
+            edited.stashedTabs = (0 ..< 1330).map { index in
+                StashedTab(tab: ComposeTabState(id: UUID(), name: "Stashed \(index)", activeChatSessionID: index < 201 ? UUID() : nil))
+            }
+            edited.composeTabs[0].promptText = String(repeating: "x", count: 8 * 1024 * 1024)
+            XCTAssertEqual(edited.composeTabs.count + edited.stashedTabs.count(where: { $0.tab.activeChatSessionID != nil }), 300)
+            XCTAssertGreaterThanOrEqual(try JSONEncoder().encode(edited).count, 8 * 1024 * 1024)
+            CatalogPerf.shared.setSuppressAutomaticEmissionForTesting(true)
+            defer {
+                _ = CatalogPerf.shared.rotate()
+                CatalogPerf.shared.setSuppressAutomaticEmissionForTesting(false)
+            }
+            for visible in [2, 35] {
+                var countsByMode: [[String: String]] = []
+                var finalByMode: [[WorkspaceModel]] = []
+                for reuse in [false, true] {
+                    try await Fixture.run(seeds: seeds) { f in
+                        let managers = (0 ..< 35).map { _ in f.makeManager() }
+                        let bridges = managers.enumerated().map { index, manager in
+                            DomainWorkspacePresentationBridge(
+                                workspaceManager: manager,
+                                client: DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: -20000 - index),
+                                trustedDigestReuse: true, omittedEphemeralWitness: reuse
+                            )
+                        }
+                        let observers = bridges.map { DomainWorkspaceProjectionObserver(bridge: $0) }
+                        let displayPerf = CatalogPerf()
+                        let gates = (0 ..< 35).map { index -> AgentPresentationWorkGate in
+                            let gate = AgentPresentationWorkGate(enabled: true, perf: displayPerf, catchUp: {})
+                            gate.setVisible(index < visible)
+                            return gate
+                        }
+                        defer { gates.forEach { $0.close() } }
+                        let clock = ContinuousClock()
+                        @MainActor func settle(_ sequence: UInt64, before deadline: ContinuousClock.Instant) async throws {
+                            for observer in observers {
+                                let remaining = clock.now.duration(to: deadline)
+                                XCTAssertGreaterThan(remaining, .zero)
+                                let checkpoint = await observer.waitForProjection(
+                                    afterGeneration: 0, through: sequence, requireCatalogApplication: true,
+                                    timeout: max(.milliseconds(1), remaining)
+                                )
+                                _ = try XCTUnwrap(checkpoint)
+                            }
+                        }
+                        @MainActor func buildVisibleDisplays() {
+                            for (index, gate) in gates.enumerated() where gate.shouldBuild() {
+                                _ = managers[index].workspace(withID: edited.id)?.name
+                                gate.didApply()
+                            }
+                        }
+                        do {
+                            bridges.forEach { $0.start() }
+                            let initial = await f.runtime.workspaceStore.snapshot()
+                            try await settle(initial.publicationSequence, before: clock.now.advanced(by: .seconds(5)))
+                            WorkspaceFileDecodeCache.shared.removeAllForTesting()
+                            _ = CatalogPerf.shared.rotate()
+                            let start = clock.now
+                            let deadline = start.advanced(by: .seconds(5))
+                            let writer = DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: -9999)
+                            let record = try XCTUnwrap(initial.workspaces.first { $0.document.workspaceID == edited.id })
+                            let working = try await writer.replaceWorkingFailClosed(
+                                edited, fileURL: f.workspaceURL(for: edited), expectedWorkspaceRevision: record.revisions.workingRevision
+                            )
+                            XCTAssertEqual(working.disposition, .applied)
+                            let afterWorking = await f.runtime.workspaceStore.snapshot()
+                            try await settle(afterWorking.publicationSequence, before: deadline)
+                            buildVisibleDisplays()
+                            let changed = try XCTUnwrap(afterWorking.workspaces.first { $0.document.workspaceID == edited.id })
+                            let saved = await writer.saveCommittedWorkingRevision(workspaceID: edited.id, expectedWorkspaceRevision: changed.revisions.workingRevision)
+                            XCTAssertEqual(saved.disposition, .applied)
+                            let final = await f.runtime.workspaceStore.snapshot()
+                            try await settle(final.publicationSequence, before: deadline)
+                            buildVisibleDisplays()
+                            let elapsed = start.duration(to: clock.now)
+                            XCTAssertLessThan(elapsed, .seconds(5), "Completion budget, not a speed-ratio assertion")
+                            let emission = CatalogPerf.shared.rotateEmissionRecords()
+                            let core = try XCTUnwrap(emission.records?.core)
+                            let detail = try XCTUnwrap(emission.attribution)
+                            let fields = Dictionary(uniqueKeysWithValues: core.split(separator: " ").map {
+                                let parts = $0.split(separator: "=", maxSplits: 1)
+                                return (String(parts[0]), String(parts[1]))
+                            })
+                            let compared = ["receipts_full", "receipts_metadata", "applications_attempted", "canonical_decodes", "decode_cache_hits"]
+                            countsByMode.append(fields.filter { compared.contains($0.key) })
+                            XCTAssertEqual(fields["receivers"], "35")
+                            XCTAssertTrue(detail.contains("receiver_hash_count=\(0) "), detail)
+                            XCTAssertEqual(Int(fields["decode_bytes_hashed"] ?? ""), 0)
+                            XCTAssertTrue(detail.contains("pair_same_digest=1 "), detail)
+                            let models = try f.decoded(final)
+                            finalByMode.append(managers[0].workspaces)
+                            for manager in managers {
+                                // The same synchronous accessor serves hidden-window MCP readers.
+                                XCTAssertEqual(manager.workspace(withID: edited.id)?.stashedTabs.count, 1330)
+                                XCTAssertEqual(manager.workspaces, models.filter { !$0.isEphemeral })
+                                XCTAssertEqual(manager.catalogOmissionStateForTesting(omitted.id), ["revision": false, "digest": false, "fileURL": false, "roots": false, "rootTarget": false, "member": true])
+                                let durableBaseline = manager.debugDomainAuthorityBaseline(for: edited.id)
+                                XCTAssertEqual(durableBaseline.revisions, final.workspaces.first { $0.document.workspaceID == edited.id }?.revisions)
+                                XCTAssertEqual(durableBaseline.digest, changed.document.contentDigest)
+                                XCTAssertEqual(durableBaseline.health, .writable)
+                                let omittedBaseline = manager.debugDomainAuthorityBaseline(for: omitted.id)
+                                XCTAssertNil(omittedBaseline.revisions)
+                                XCTAssertNil(omittedBaseline.digest)
+                                XCTAssertNil(omittedBaseline.health)
+                                XCTAssertTrue(manager.hasAcceptedDomainCatalogForRestoration)
+                                XCTAssertTrue(manager.test_carrierIndexesEqual(to: managers[0]))
+                                XCTAssertNotNil(manager.adoptedFullDocumentGeneration(workspaceID: edited.id, contentDigest: changed.document.contentDigest))
+                                XCTAssertEqual(manager.domainCatalogReconciliationGeneration, managers[0].domainCatalogReconciliationGeneration)
+                            }
+                            XCTAssertEqual(fields["receipts_metadata"], reuse ? "35" : "0")
+                            XCTAssertEqual(fields["receipts_full"], reuse ? "35" : "70")
+                            print("CATALOG_OMITTED_FAKE receivers=35 visible=\(visible) reuse=\(reuse) encoded_bytes=\(changed.document.documentBytes.count) elapsed=\(elapsed) \(core)")
+                        } catch {
+                            for bridge in bridges {
+                                await bridge.stopAndJoinForTesting()
+                            }
+                            throw error
+                        }
+                        for bridge in bridges {
+                            await bridge.stopAndJoinForTesting()
+                        }
+                    }
+                }
+                XCTAssertEqual(countsByMode[0]["applications_attempted"], countsByMode[1]["applications_attempted"])
+                XCTAssertEqual(finalByMode[0], finalByMode[1])
+            }
+        }
+
+        func testOmittedEphemeralWitnessRequiresAcceptedDecodeAndCurrentOwnerState() async throws {
+            for scenario in ["repeat", "failed", "localBefore", "localAfter", "fileURL", "durableMissing", "fence", "stop", "reentrant", "flags", "digest", "remove", "unavailable"] {
+                var omitted = Fixture.model(id: UUID(), name: "Legacy omitted")
+                omitted.isEphemeral = true
+                try await Fixture.run(seeds: Fixture.standardSeeds + [omitted]) { f in
+                    let manager = f.makeManager()
+                    if scenario == "failed" {
+                        manager.setCatalogRecordDecodeFailureForTesting { $0 == omitted.id ? InjectedDecodeFailure() : nil }
+                    }
+                    if scenario == "localBefore" { manager.workspaces.append(omitted) }
+                    let bridge = DomainWorkspacePresentationBridge(
+                        workspaceManager: manager,
+                        client: DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: -9999),
+                        trustedDigestReuse: true, omittedEphemeralWitness: true
+                    )
+                    let observer = DomainWorkspaceProjectionObserver(bridge: bridge)
+                    bridge.start()
+                    do {
+                        let initial = await f.runtime.workspaceStore.snapshot()
+                        let first = await observer.waitForProjection(afterGeneration: 0, through: initial.publicationSequence, requireCatalogApplication: true)
+                        _ = try XCTUnwrap(first)
+                        let generation = manager.domainCatalogReconciliationGeneration
+                        if scenario == "repeat" {
+                            let index = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == Fixture.aardvarkID })
+                            manager.workspaces[index].currentPromptText = "Unsaved local descendant"
+                            let local = manager.workspaces[index]
+                            let registration = try XCTUnwrap(manager.domainReadRegistrationToken(for: local, fileURL: manager.workspaceFileURL(for: local)))
+                            manager.confirmDomainReadRegistration(registration)
+                        }
+                        var next = initial
+                        var token: AnyCancellable?
+                        switch scenario {
+                        case "localAfter": manager.workspaces.append(omitted)
+                        case "fileURL": manager.setCatalogFileURLForTesting(f.workspaceURL(for: omitted), workspaceID: omitted.id)
+                        case "durableMissing": manager.workspaces.removeAll { $0.id == Fixture.aardvarkID }
+                        case "fence": manager.replaceWorkspacesFromUnacceptedImport(manager.workspaces)
+                        case "reentrant":
+                            manager.setCatalogFileURLForTesting(f.workspaceURL(for: omitted), workspaceID: omitted.id)
+                            token = manager.$workspaces.dropFirst().sink { _ in bridge.stop() }
+                        case "flags", "digest":
+                            let old = try XCTUnwrap(initial.workspaces.first { $0.document.workspaceID == omitted.id })
+                            var edited = omitted
+                            if scenario == "flags" { edited.isEphemeral = false } else { edited.name += " changed" }
+                            let document = try DomainWorkspaceDocument(workspaceID: omitted.id, fileURL: old.document.fileURL, documentBytes: JSONEncoder().encode(edited), metadata: old.document.metadata)
+                            var encoded = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(old)) as? [String: Any])
+                            encoded["document"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(document))
+                            let replacement = try JSONDecoder().decode(DomainWorkspaceSnapshot.self, from: JSONSerialization.data(withJSONObject: encoded))
+                            next = DomainWorkspaceCatalogSnapshot(runtimeIdentity: initial.runtimeIdentity, isBootstrapped: true, publicationSequence: initial.publicationSequence, catalogRevision: initial.catalogRevision, health: initial.health, workspaces: initial.workspaces.map { $0.document.workspaceID == omitted.id ? replacement : $0 }, unavailableWorkspaceIDs: [])
+                        case "remove", "unavailable":
+                            next = f.catalog(initial, sequence: initial.publicationSequence, catalogRevision: initial.catalogRevision, dropping: [omitted.id], unavailable: scenario == "unavailable" ? [omitted.id] : [])
+                        case "stop":
+                            await bridge.stopAndJoinForTesting()
+                            XCTAssertEqual(bridge.projectCatalogForTesting(next), .closing)
+                            bridge.start()
+                            let restarted = await observer.waitForProjection(afterGeneration: bridge.projectionObservationStateForTesting.generation, through: next.publicationSequence, requireCatalogApplication: true)
+                            _ = try XCTUnwrap(restarted)
+                        default: break
+                        }
+                        if scenario != "stop" {
+                            let rejection = bridge.projectCatalogForTesting(next)
+                            XCTAssertNil(rejection, scenario)
+                        }
+                        if scenario == "repeat" {
+                            XCTAssertEqual(bridge.projectionObservationStateForTesting.catalogCheckpoint?.catalogReceipt?.kind, .metadata)
+                            XCTAssertNil(bridge.projectCatalogForTesting(next))
+                            XCTAssertEqual(bridge.projectionObservationStateForTesting.catalogCheckpoint?.catalogReceipt?.kind, .metadata)
+                            XCTAssertEqual(manager.domainCatalogReconciliationGeneration, generation + 2)
+                            XCTAssertEqual(manager.workspace(withID: Fixture.aardvarkID)?.currentPromptText, "Unsaved local descendant")
+                            XCTAssertTrue(manager.debugDomainReadRegistrationStateExistsForWorkspace(Fixture.aardvarkID))
+                            XCTAssertEqual(manager.catalogOmissionStateForTesting(omitted.id), ["revision": false, "digest": false, "fileURL": false, "roots": false, "rootTarget": false, "member": true])
+                        } else if scenario == "reentrant" {
+                            XCTAssertNil(bridge.projectionObservationStateForTesting.runID)
+                            XCTAssertNil(bridge.projectionObservationStateForTesting.catalogCheckpoint)
+                        } else {
+                            XCTAssertEqual(bridge.projectionObservationStateForTesting.catalogCheckpoint?.catalogReceipt?.kind, .full, scenario)
+                        }
+                        if scenario == "fileURL" { XCTAssertFalse(manager.catalogOmissionStateForTesting(omitted.id)["fileURL"] ?? true) }
+                        if scenario == "remove" {
+                            XCTAssertNil(bridge.projectCatalogForTesting(initial), "Adding the omitted member back requires full")
+                            XCTAssertEqual(bridge.projectionObservationStateForTesting.catalogCheckpoint?.catalogReceipt?.kind, .full)
+                            XCTAssertNil(bridge.projectCatalogForTesting(initial))
+                            XCTAssertEqual(bridge.projectionObservationStateForTesting.catalogCheckpoint?.catalogReceipt?.kind, .metadata)
+                        }
+                        token?.cancel()
+                    } catch {
+                        await bridge.stopAndJoinForTesting()
+                        throw error
+                    }
+                    await bridge.stopAndJoinForTesting()
+                }
+            }
+        }
+
+        func testOmittedEphemeralManagerRejectsMalformedExclusionsBeforeMutation() async throws {
+            var omitted = Fixture.model(id: UUID(), name: "Omitted")
+            omitted.isEphemeral = true
+            try await Fixture.run(seeds: Fixture.standardSeeds + [omitted]) { f in
+                let initial = await f.runtime.workspaceStore.snapshot()
+                for scenario in ["unknown", "durable", "unavailable", "local", "tracked", "fileURL", "valid"] {
+                    let manager = f.makeManager()
+                    XCTAssertNotNil(try manager.applyDomainWorkspaceCatalog(initial, projection: .full(f.decoded(initial)), preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata).receipt)
+                    var next = initial
+                    var excluded = omitted.id
+                    switch scenario {
+                    case "unknown": excluded = UUID()
+                    case "durable": excluded = Fixture.aardvarkID
+                    case "local": manager.workspaces.append(omitted)
+                    case "fileURL": manager.setCatalogFileURLForTesting(f.workspaceURL(for: omitted), workspaceID: omitted.id)
+                    case "tracked":
+                        XCTAssertNotNil(manager.applyDomainWorkspaceCatalog(initial, projection: .metadata(baselineGeneration: manager.domainCatalogReconciliationGeneration), preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata).receipt)
+                    case "unavailable":
+                        next = DomainWorkspaceCatalogSnapshot(runtimeIdentity: initial.runtimeIdentity, isBootstrapped: true, publicationSequence: initial.publicationSequence, catalogRevision: initial.catalogRevision, health: initial.health, workspaces: initial.workspaces, unavailableWorkspaceIDs: [omitted.id])
+                    default: break
+                    }
+                    let before = (manager.workspaces, manager.domainCatalogReconciliationGeneration, manager.catalogOmissionStateForTesting(omitted.id))
+                    let result = manager.applyDomainWorkspaceCatalog(next, projection: .metadata(baselineGeneration: before.1, omittedWorkspaceIDs: [excluded]), preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata)
+                    if scenario == "valid" {
+                        XCTAssertEqual(result.receipt?.kind, .metadata)
+                    } else {
+                        XCTAssertEqual(result, .rejected(.fullProjectionRequired), scenario)
+                        XCTAssertEqual(manager.workspaces, before.0)
+                        XCTAssertEqual(manager.domainCatalogReconciliationGeneration, before.1)
+                        XCTAssertEqual(manager.catalogOmissionStateForTesting(omitted.id), before.2)
+                    }
+                }
+            }
+            XCTAssertTrue(AppLaunchConfiguration.resolveCatalogPublicationOmittedEphemeralWitness(storedValue: nil))
+            XCTAssertTrue(AppLaunchConfiguration.resolveCatalogPublicationOmittedEphemeralWitness(storedValue: "invalid"))
+            XCTAssertFalse(AppLaunchConfiguration.resolveCatalogPublicationOmittedEphemeralWitness(storedValue: false))
+            XCTAssertTrue(AppLaunchConfiguration.resolveCatalogPublicationOmittedEphemeralWitness(storedValue: true))
+        }
+
         func testCatalogPerfCountsForeignWorkingCommits() async throws {
             CatalogPerf.shared.setSuppressAutomaticEmissionForTesting(true)
             defer {

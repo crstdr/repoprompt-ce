@@ -24,6 +24,12 @@ struct AppLaunchConfiguration {
 
     static let catalogPublicationTrustedDigestReuseKey = "catalogPublicationTrustedDigestReuseEnabled"
     let catalogPublicationTrustedDigestReuseEnabled: Bool
+    static let catalogPublicationOmittedEphemeralWitnessKey = "catalogPublicationOmittedEphemeralWitnessEnabled"
+    let catalogPublicationOmittedEphemeralWitnessEnabled: Bool
+
+    static func resolveCatalogPublicationOmittedEphemeralWitness(storedValue: Any?) -> Bool {
+        storedValue as? Bool ?? true
+    }
 
     static func resolveCatalogPublicationTrustedDigestReuse(storedValue: Any?) -> Bool {
         // Malformed values keep the default; the rollback command writes an explicit Boolean.
@@ -104,6 +110,11 @@ struct AppLaunchConfiguration {
             ? true
             : Self.resolveCatalogPublicationTrustedDigestReuse(
                 storedValue: UserDefaults.standard.object(forKey: Self.catalogPublicationTrustedDigestReuseKey)
+            )
+        catalogPublicationOmittedEphemeralWitnessEnabled = Self.isUnitTestProcess
+            ? true
+            : Self.resolveCatalogPublicationOmittedEphemeralWitness(
+                storedValue: UserDefaults.standard.object(forKey: Self.catalogPublicationOmittedEphemeralWitnessKey)
             )
         self.isUITestSession = isUITestSession
         suppressesWindowRestore = isDeterministicUITestLaunch
