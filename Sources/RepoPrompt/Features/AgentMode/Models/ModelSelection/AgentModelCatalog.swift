@@ -362,6 +362,43 @@ enum AgentModelCatalog {
         )
     }
 
+    /// Immutable option captures for one synchronous role-resolution operation. Never retain on
+    /// a view model or in static storage. Distinct availability/override inputs get distinct captures;
+    /// nil and empty overrides have different source precedence and publication eligibility.
+    final class CodexOptionsOperation {
+        private struct Capture {
+            let availability: AvailabilityContext
+            let models: [CodexAppServerClient.RemoteModel]?
+            let options: [AgentModelOption]
+        }
+
+        private var captures: [Capture] = []
+
+        func options(
+            availability: AvailabilityContext,
+            codexDynamicModels: [CodexAppServerClient.RemoteModel]? = nil
+        ) -> [AgentModelOption] {
+            if let capture = captures.first(where: {
+                $0.availability == availability && $0.models == codexDynamicModels
+            }) {
+                #if DEBUG
+                    StartupRecommendationDiagnostics.count("codexOperationHit", catalog: true)
+                #endif
+                return capture.options
+            }
+            #if DEBUG
+                StartupRecommendationDiagnostics.count("codexOperationCapture", catalog: true)
+            #endif
+            // The canonical producer captures generation before reads. Hits never publish again,
+            // even if admission was invalidated after this operation captured its input.
+            let options = AgentModelCatalog.options(
+                for: .codexExec, availability: availability, codexDynamicModels: codexDynamicModels
+            )
+            captures.append(Capture(availability: availability, models: codexDynamicModels, options: options))
+            return options
+        }
+    }
+
     /// Producing canonical options also refreshes the memory-only admission index. Capture its
     /// generation before reading provider snapshots so a concurrent invalidation defeats old work.
     /// Window-local Codex overrides are picker projections, not the list_agents catalogue.
@@ -496,7 +533,8 @@ enum AgentModelCatalog {
         availability: AvailabilityContext = .current,
         codexDynamicModels: [CodexAppServerClient.RemoteModel]? = nil,
         defaults: UserDefaults = .standard,
-        includeEffortSuffix: Bool = true
+        includeEffortSuffix: Bool = true,
+        codexOperation: CodexOptionsOperation? = nil
     ) -> String {
         let normalized = rawModel.trimmingCharacters(in: .whitespacesAndNewlines)
         let effectiveRaw = normalized.isEmpty
@@ -563,18 +601,20 @@ enum AgentModelCatalog {
             #endif
             let specifier = CodexModelSpecifier(raw: effectiveRaw)
             let baseSlug = CodexAgentToolPreferences.reasoningEffortPreferenceSlug(forModelRaw: effectiveRaw)
+            let codexOptions = codexOperation?.options(availability: availability, codexDynamicModels: codexDynamicModels)
             let baseName = codexBaseDisplayName(
                 forModelSlug: baseSlug,
                 rawModel: effectiveRaw,
                 availability: availability,
-                codexDynamicModels: codexDynamicModels
+                codexDynamicModels: codexDynamicModels,
+                precomputedOptions: codexOptions
             )
             guard includeEffortSuffix else { return baseName }
             if let effort = specifier.reasoningEffort {
                 return "\(baseName) \(effort.displayName)"
             }
             if let storedEffort = CodexAgentToolPreferences.lastUsedReasoningEffortsByModelSlug(defaults: defaults)[baseSlug],
-               codexEffort(storedEffort, isSupportedForModelRaw: effectiveRaw, availability: availability, codexDynamicModels: codexDynamicModels)
+               codexEffort(storedEffort, isSupportedForModelRaw: effectiveRaw, availability: availability, codexDynamicModels: codexDynamicModels, precomputedOptions: codexOptions)
             {
                 return "\(baseName) \(storedEffort.displayName)"
             }
@@ -1150,9 +1190,10 @@ enum AgentModelCatalog {
         forModelSlug modelSlug: String,
         rawModel: String,
         availability: AvailabilityContext,
-        codexDynamicModels: [CodexAppServerClient.RemoteModel]?
+        codexDynamicModels: [CodexAppServerClient.RemoteModel]?,
+        precomputedOptions: [AgentModelOption]?
     ) -> String {
-        let options = options(for: .codexExec, availability: availability, codexDynamicModels: codexDynamicModels)
+        let options = precomputedOptions ?? options(for: .codexExec, availability: availability, codexDynamicModels: codexDynamicModels)
         if let option = options.first(where: {
             CodexAgentToolPreferences.reasoningEffortPreferenceSlug(forModelRaw: $0.rawValue)
                 .caseInsensitiveCompare(modelSlug) == .orderedSame
@@ -1166,10 +1207,11 @@ enum AgentModelCatalog {
         _ effort: CodexReasoningEffort,
         isSupportedForModelRaw modelRaw: String,
         availability: AvailabilityContext,
-        codexDynamicModels: [CodexAppServerClient.RemoteModel]?
+        codexDynamicModels: [CodexAppServerClient.RemoteModel]?,
+        precomputedOptions: [AgentModelOption]?
     ) -> Bool {
         let selectedSlug = CodexAgentToolPreferences.reasoningEffortPreferenceSlug(forModelRaw: modelRaw)
-        let matchingOptions = options(for: .codexExec, availability: availability, codexDynamicModels: codexDynamicModels)
+        let matchingOptions = (precomputedOptions ?? options(for: .codexExec, availability: availability, codexDynamicModels: codexDynamicModels))
             .filter {
                 CodexAgentToolPreferences.reasoningEffortPreferenceSlug(forModelRaw: $0.rawValue)
                     .caseInsensitiveCompare(selectedSlug) == .orderedSame
@@ -1765,11 +1807,12 @@ enum AgentModelCatalog {
         matching raw: String,
         for agentKind: AgentProviderKind,
         availability: AvailabilityContext = .current,
-        codexDynamicModels: [CodexAppServerClient.RemoteModel]? = nil
+        codexDynamicModels: [CodexAppServerClient.RemoteModel]? = nil,
+        precomputedOptions: [AgentModelOption]? = nil
     ) -> AgentModelOption? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
-        return options(for: agentKind, availability: availability, codexDynamicModels: codexDynamicModels)
+        return (precomputedOptions ?? options(for: agentKind, availability: availability, codexDynamicModels: codexDynamicModels))
             .first { $0.rawValue.caseInsensitiveCompare(trimmed) == .orderedSame }
     }
 
@@ -1919,12 +1962,13 @@ enum AgentModelCatalog {
     static func preferredCodexFamilyModelRaw(
         _ family: String,
         effort: CodexReasoningEffort,
-        availability: AvailabilityContext = .current
+        availability: AvailabilityContext = .current,
+        precomputedOptions: [AgentModelOption]? = nil
     ) -> String? {
         #if DEBUG
             StartupRecommendationDiagnostics.count("family", catalog: true)
         #endif
-        let codexOptions = options(for: .codexExec, availability: availability)
+        let codexOptions = precomputedOptions ?? options(for: .codexExec, availability: availability)
         guard let option = preferredCodexFamilyOption(family, from: codexOptions),
               let base = CodexModelSpecifier(raw: option.rawValue).baseModel
         else { return nil }
@@ -1959,16 +2003,18 @@ enum AgentModelCatalog {
     /// Explicit candidate chains per role. Order matters: first available wins.
     private static func candidateChain(
         for kind: TaskLabelKind,
-        availability: AvailabilityContext
+        availability: AvailabilityContext,
+        codexOperation: CodexOptionsOperation?
     ) -> [SelectionCandidate] {
         #if DEBUG
             StartupRecommendationDiagnostics.count("candidateChain", catalog: true)
         #endif
-        let lunaLow = preferredCodexFamilyModelRaw("luna", effort: .low, availability: availability)
+        let codexOptions = codexOperation?.options(availability: availability)
+        let lunaLow = preferredCodexFamilyModelRaw("luna", effort: .low, availability: availability, precomputedOptions: codexOptions)
             ?? AgentModel.gpt6LunaLow.rawValue
-        let solMedium = preferredCodexFamilyModelRaw("sol", effort: .medium, availability: availability)
+        let solMedium = preferredCodexFamilyModelRaw("sol", effort: .medium, availability: availability, precomputedOptions: codexOptions)
             ?? AgentModel.gpt61SolMedium.rawValue
-        let solHigh = preferredCodexFamilyModelRaw("sol", effort: .high, availability: availability)
+        let solHigh = preferredCodexFamilyModelRaw("sol", effort: .high, availability: availability, precomputedOptions: codexOptions)
             ?? AgentModel.gpt61SolHigh.rawValue
         return switch kind {
         case .explore:
@@ -2021,7 +2067,8 @@ enum AgentModelCatalog {
     /// Checks if a candidate agent+model is currently available.
     private static func isCandidateAvailable(
         _ candidate: SelectionCandidate,
-        availability: AvailabilityContext
+        availability: AvailabilityContext,
+        codexOperation: CodexOptionsOperation?
     ) -> Bool {
         guard isAgentAvailable(candidate.agent, availability: availability) else { return false }
         // For non-Codex agents, validate the model is known and available
@@ -2032,11 +2079,12 @@ enum AgentModelCatalog {
             StartupRecommendationDiagnostics.count("codexValidation", catalog: true)
         #endif
         // For Codex, check exact option match for availability-sensitive defaults
-        if modelOption(matching: candidate.modelRaw, for: candidate.agent, availability: availability) != nil {
+        let codexOptions = codexOperation?.options(availability: availability)
+        if modelOption(matching: candidate.modelRaw, for: candidate.agent, availability: availability, precomputedOptions: codexOptions) != nil {
             return true
         }
         // If no dynamic models loaded yet, allow static fallback
-        let allOptions = options(for: candidate.agent, availability: availability)
+        let allOptions = codexOptions ?? options(for: candidate.agent, availability: availability)
         let hasDynamicModels = allOptions.contains(where: \.isProviderDefault)
         if !hasDynamicModels {
             return AgentModel(rawValue: candidate.modelRaw)?.isValidFor(candidate.agent) == true
@@ -2057,11 +2105,12 @@ enum AgentModelCatalog {
     /// Resolves a task label kind to the best available agent+model.
     static func resolveTaskLabelKind(
         _ kind: TaskLabelKind,
-        availability: AvailabilityContext = .current
+        availability: AvailabilityContext = .current,
+        codexOperation: CodexOptionsOperation? = nil
     ) -> NormalizedAgentSelection? {
-        let chain = candidateChain(for: kind, availability: availability)
+        let chain = candidateChain(for: kind, availability: availability, codexOperation: codexOperation)
         for candidate in chain {
-            if isCandidateAvailable(candidate, availability: availability) {
+            if isCandidateAvailable(candidate, availability: availability, codexOperation: codexOperation) {
                 return NormalizedAgentSelection(agent: candidate.agent, modelRaw: candidate.modelRaw)
             }
         }

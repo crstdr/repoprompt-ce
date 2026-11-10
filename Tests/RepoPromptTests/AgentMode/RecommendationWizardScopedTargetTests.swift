@@ -427,6 +427,155 @@ final class StartupRecommendationBaselineTests: XCTestCase {
         check("sOl", effort: .high, availability: available, expected: mixedCase)
     }
 
+    func testRoleResolutionOutputsMatchM2() {
+        withConflictingCodexCatalog {
+            let actual = AgentModelCatalog.AvailabilityContext(claudeCodeAvailable: true, codexAvailable: true, openCodeAvailable: false)
+            let codexOnly = actual.filteredForRecommendationProviders([.codex])
+            let pins = [
+                "explore": "codexExec:gpt-6.1-sol-high",
+                "engineer": "claudeCode:\(AgentModel.claudeSonnet.rawValue)",
+                "pair": "codexExec:gpt-6.1-sol-medium",
+                "design": "codexExec:unadvertised-pin"
+            ]
+            let display = [
+                CodexAppServerClient.RemoteModel(id: "gpt-6.1-sol", model: "gpt-6.1-sol", displayName: "Display Sol", description: "Display only", isDefault: true, supportedReasoningEfforts: ["low", "medium", "high"].map { .init(reasoningEffort: $0, description: "") }, defaultReasoningEffort: "medium"),
+                remote("gpt-99-sol", efforts: ["high"])
+            ]
+            let scenarios: [(String, AgentModelCatalog.AvailabilityContext, AgentModelCatalog.AvailabilityContext, [CodexAppServerClient.RemoteModel]?)] = [
+                ("nil", actual, actual, nil),
+                ("empty", actual, actual, []),
+                ("display", actual, actual, display),
+                ("collision", actual, actual, display + [remote("gpt-6.1-sol-medium", efforts: [])]),
+                ("filtered", actual, codexOnly, nil),
+                ("fallback", actual, .none, nil),
+                ("unavailablePins", .none, codexOnly, nil),
+                ("noAgents", .none, .none, nil)
+            ]
+            let expected = [
+                "nil": "c86360da9e76aecdb2d229ded1b15311f907d64bc0fdfa31496b361ea80903aa",
+                "empty": "81ac2ac8cc75a568c56698f979bfff0488f91084f4b11962be55c50e33209ea8",
+                "display": "4754f6d86b028542cd290fbfc018a17f1f5c166b60b7e44aa56e543817bb2506",
+                "collision": "4754f6d86b028542cd290fbfc018a17f1f5c166b60b7e44aa56e543817bb2506",
+                "filtered": "bb54c3b24bac119ed0438c39240419e7348e9e9a397edd8d97b2f036a5345b85",
+                "fallback": "c86360da9e76aecdb2d229ded1b15311f907d64bc0fdfa31496b361ea80903aa",
+                "unavailablePins": "2e80c9b0cf6e6815621effce567793d2847c398ec3a5893e55c3d71da44c7b87",
+                "noAgents": "821bf06b4dcb406ea508a4a992eadc22f29850cd208ba24aea7c29148de8ccf1"
+            ]
+            var outputs: [String: [MCPAgentRoleDefaultsService.RoleDefaultResolution]] = [:]
+            for (name, availability, recommended, override) in scenarios {
+                let store = AgentModelsProfileRoleDefaultsStore(overrides: pins)
+                let rows = MCPAgentRoleDefaultsService.resolutions(availability: availability, recommendedAvailability: recommended, codexDynamicModels: override, settingsStore: store)
+                XCTAssertEqual(rows, MCPAgentRoleDefaultsService.resolutions(availability: availability, recommendedAvailability: recommended, codexDynamicModels: override, settingsStore: store), name)
+                let derived = rows.map { "\($0.selectionID.rawValue)|\(String(reflecting: $0.pinState))|\(String(reflecting: $0.thinkingParameterValueRaw))" }
+                let value = String(reflecting: rows) + String(reflecting: derived)
+                let digest = SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
+                XCTAssertEqual(digest, expected[name], name)
+                outputs[name] = rows
+            }
+            for name in ["empty", "display", "collision"] {
+                XCTAssertEqual(outputs[name]?.map(\.recommended), outputs["nil"]?.map(\.recommended), name)
+            }
+            XCTAssertNotEqual(outputs["nil"], outputs["empty"], "An empty display override must consult persistence instead of live records")
+        }
+    }
+
+    func testCodexOperationSeparatesInputsAndPreservesParsingAndLabels() throws {
+        try withConflictingCodexCatalog {
+            let actual = AgentModelCatalog.AvailabilityContext(claudeCodeAvailable: true, codexAvailable: true, openCodeAvailable: false)
+            let filtered = actual.filteredForRecommendationProviders([.codex])
+            func displayModel(_ label: String) -> CodexAppServerClient.RemoteModel {
+                .init(id: "gpt-6.1-sol", model: "gpt-6.1-sol", displayName: label, description: "Display override", isDefault: true, supportedReasoningEfforts: ["low", "medium", "high"].map { .init(reasoningEffort: $0, description: "") }, defaultReasoningEffort: "medium")
+            }
+            let display = [displayModel("Display Sol")]
+            let inputs: [(AgentModelCatalog.AvailabilityContext, [CodexAppServerClient.RemoteModel]?)] = [
+                (actual, nil), (actual, []), (actual, display), (filtered, nil),
+                (actual, [displayModel("Changed Display Sol")]),
+                (actual, display + [remote("gpt-6.1-sol-medium", efforts: [])])
+            ]
+            let expected = inputs.map { AgentModelCatalog.options(for: .codexExec, availability: $0.0, codexDynamicModels: $0.1) }
+            let operation = AgentModelCatalog.CodexOptionsOperation()
+            StartupRecommendationDiagnostics.begin()
+            for (index, input) in inputs.enumerated() {
+                XCTAssertEqual(operation.options(availability: input.0, codexDynamicModels: input.1), expected[index])
+                XCTAssertEqual(operation.options(availability: input.0, codexDynamicModels: input.1), expected[index])
+            }
+            let counts = StartupRecommendationDiagnostics.snapshot()
+            StartupRecommendationDiagnostics.end()
+            XCTAssertEqual(counts["codexOperationCapture"], inputs.count)
+            XCTAssertEqual(counts["codexOperationHit"], inputs.count)
+            XCTAssertEqual(counts["codexOptionsProduction"], inputs.count)
+            XCTAssertEqual(counts["codexRecordAttempt"], 2, "Only the two canonical nil-override inputs may publish")
+            XCTAssertEqual(counts["codexRecordAccepted"], 2)
+            XCTAssertNotEqual(expected[0], expected[1], "nil uses live records; empty uses persisted records")
+            XCTAssertEqual(expected[5].first { $0.rawValue == "gpt-6.1-sol-medium" }?.effortVariant, AgentModelEffortVariant(baseModelRaw: "gpt-6.1-sol", reasoningEffort: .medium))
+
+            let suite = "CodexOperationLabels.\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            CodexAgentToolPreferences.setLastUsedReasoningEffort(.high, forModelRaw: "gpt-6.1-sol", defaults: defaults)
+            for input in inputs {
+                for raw in ["gpt-6.1-sol", "gpt-6.1-sol-medium", "default", "unadvertised-pin"] {
+                    let legacy = AgentModelCatalog.displayName(for: raw, agentKind: .codexExec, availability: input.0, codexDynamicModels: input.1, defaults: defaults)
+                    XCTAssertEqual(AgentModelCatalog.displayName(for: raw, agentKind: .codexExec, availability: input.0, codexDynamicModels: input.1, defaults: defaults, codexOperation: operation), legacy)
+                }
+            }
+            let defaultLabel = AgentModelCatalog.displayName(for: "gpt-6.1-sol", agentKind: .codexExec, codexDynamicModels: display, defaults: defaults)
+            XCTAssertEqual(AgentModelCatalog.displayName(for: "gpt-6.1-sol", agentKind: .codexExec, codexDynamicModels: display, defaults: defaults, codexOperation: operation), defaultLabel)
+            XCTAssertNotEqual(defaultLabel, AgentModelCatalog.displayName(for: "gpt-6.1-sol", agentKind: .codexExec, availability: .none, codexDynamicModels: display, defaults: defaults, codexOperation: operation))
+
+            let old = operation.options(availability: actual)
+            let raw = AgentModel.gpt54MiniMedium.rawValue
+            XCTAssertNotNil(old.first { $0.rawValue == raw }?.effortVariant)
+            CodexDynamicModelStore.save([remote(raw, efforts: [])])
+            XCTAssertEqual(operation.options(availability: actual), old)
+            let fresh = AgentModelCatalog.CodexOptionsOperation().options(availability: actual)
+            XCTAssertEqual(fresh, AgentModelCatalog.options(for: .codexExec, availability: actual))
+            XCTAssertNil(fresh.first { $0.rawValue == raw }?.effortVariant)
+            XCTAssertNotEqual(fresh, old, "A fresh operation must observe direct persisted writes even with unchanged live records")
+        }
+    }
+
+    func testRoleOperationPreservesModelParameterPins() throws {
+        try withConflictingCodexCatalog {
+            let available = AgentModelCatalog.AvailabilityContext(claudeCodeAvailable: true, codexAvailable: true, openCodeAvailable: false, cursorAvailable: true)
+            let pin = ACPModelParameterSelection(providerID: .cursor, baseModelRaw: "future-cursor-pin", kind: .thinking, configID: "reasoning_effort", valueRaw: "xhigh")
+            let store = AgentModelsProfileRoleDefaultsStore(overrides: ["engineer": "cursor:future-cursor-pin"], roleModelParameters: ["engineer": [pin]])
+            let selected = try XCTUnwrap(MCPAgentRoleDefaultsService.effectiveSelection(for: .engineer, availability: available, recommendedAvailability: available.filteredForRecommendationProviders([.codex]), settingsStore: store))
+            XCTAssertEqual(selected.selectionID.rawValue, "cursor:future-cursor-pin")
+            XCTAssertEqual(selected.modelParameters, [pin])
+            XCTAssertEqual(selected.thinkingParameterValueRaw, "xhigh")
+            XCTAssertTrue(selected.hasStoredOverride)
+            XCTAssertTrue(selected.hasCustomOverride)
+            XCTAssertFalse(selected.overrideUnavailable)
+            let unavailable = try XCTUnwrap(MCPAgentRoleDefaultsService.effectiveSelection(for: .engineer, availability: available.filteredForRecommendationProviders([.codex]), settingsStore: store))
+            XCTAssertEqual(unavailable.effective, unavailable.recommended)
+            XCTAssertTrue(unavailable.overrideUnavailable)
+            XCTAssertEqual(unavailable.modelParameters, [])
+            XCTAssertNil(unavailable.thinkingParameterValueRaw)
+        }
+    }
+
+    private func withConflictingCodexCatalog(_ body: () throws -> Void) rethrows {
+        let registry = AgentCodexModelRegistry.shared
+        let originalLive = registry.currentLiveModels()
+        let originalPersisted = UserDefaults.standard.object(forKey: "CodexDynamicModelRecords")
+        defer {
+            StartupRecommendationDiagnostics.end()
+            registry.updateLiveModels(originalLive)
+            UserDefaults.standard.set(originalPersisted, forKey: "CodexDynamicModelRecords")
+            AgentAdvertisedModelCatalog.shared.invalidate(.codexExec)
+        }
+        registry.updateLiveModels([
+            remote("gpt-6-luna", efforts: ["low"], isDefault: true),
+            remote("gpt-6.1-sol", efforts: ["low", "medium", "high"])
+        ])
+        CodexDynamicModelStore.save([
+            CodexAppServerClient.RemoteModel(id: "gpt-6.1-sol", model: "gpt-6.1-sol", displayName: "Persisted Sol", description: "Conflicting persistence", isDefault: true, supportedReasoningEfforts: [.init(reasoningEffort: "low", description: "")], defaultReasoningEffort: "low"),
+            remote("gpt-6.1-sol-medium", efforts: [])
+        ])
+        try body()
+    }
+
     func testRealSubscriptionBaselineIsRepeatable() async throws {
         let first = try await runCohort(timing: false)
         let second = try await runCohort(timing: false)
@@ -567,10 +716,10 @@ final class StartupRecommendationBaselineTests: XCTestCase {
         }
         for phase in result.phases.keys.sorted() {
             let counts = try XCTUnwrap(result.phases[phase]).counts.sorted { $0.key < $1.key }
-            print("M2_COUNTS \(phase) \(counts)")
+            print("M3_COUNTS \(phase) \(counts)")
         }
-        print("M2_COHORT_MS \(Double(DispatchTime.now().uptimeNanoseconds - cohortStart) / 1e6)")
-        print("M2_OUTPUT_SHA256 \(SHA256.hash(data: Data(result.outputs[0].utf8)).map { String(format: "%02x", $0) }.joined())")
+        print("M3_COHORT_MS \(Double(DispatchTime.now().uptimeNanoseconds - cohortStart) / 1e6)")
+        print("M3_OUTPUT_SHA256 \(SHA256.hash(data: Data(result.outputs[0].utf8)).map { String(format: "%02x", $0) }.joined())")
         if timing {
             for iteration in 0 ..< 10 {
                 StartupRecommendationDiagnostics.begin(timings: true, scopeCatalogCounts: true)
@@ -593,21 +742,22 @@ final class StartupRecommendationBaselineTests: XCTestCase {
                 XCTAssertEqual(snapshot["compute"], 36)
                 let compute = snapshot.durations["compute", default: []].sorted()
                 let role = snapshot.durations["roleBatch", default: []]
-                print("M2_TIMING \(iteration) computeSumMs=\(Double(compute.reduce(0, +)) / 1e6) computeUpperMiddleMs=\(Double(compute[compute.count / 2]) / 1e6) roleSumMs=\(Double(role.reduce(0, +)) / 1e6) mainActorSpanMs=\(Double((snapshot.lastEnd ?? 0) - (snapshot.firstStart ?? 0)) / 1e6) sentinelGapMs=\(Double(sentinel.maximumGap) / 1e6) endToEndMs=\(Double(end - start) / 1e6)")
+                print("M3_TIMING \(iteration) computeSumMs=\(Double(compute.reduce(0, +)) / 1e6) computeUpperMiddleMs=\(Double(compute[compute.count / 2]) / 1e6) roleSumMs=\(Double(role.reduce(0, +)) / 1e6) mainActorSpanMs=\(Double((snapshot.lastEnd ?? 0) - (snapshot.firstStart ?? 0)) / 1e6) sentinelGapMs=\(Double(sentinel.maximumGap) / 1e6) endToEndMs=\(Double(end - start) / 1e6)")
             }
         }
         return result
     }
 
     private func assertGolden(_ snapshot: StartupRecommendationDiagnostics.Snapshot?, phase: String) {
-        // M2 production counts for the unchanged populated, Codex+Claude fixture.
+        // Measured M3 counts for the unchanged populated, Codex+Claude fixture.
         let computes = phase == "initialization" ? 180 : (["provider", "workspaceCreation"].contains(phase) ? 72 : 36)
         var expected = [
             "compute": 1, "mcpCompute": 1, "roleBatch": 1,
             "candidateChain": 4, "family": 14, "codexValidation": 3, "codexLabel": 7,
-            "codexOptionsRequest": 24, "codexOptionsProduction": 24,
-            "codexRecordAttempt": 24, "codexRecordAccepted": 24,
-            "staticOption": 1320, "staticParser": 2568, "staticPersistedLoad": 2544
+            "codexOperationCapture": 2, "codexOperationHit": 11,
+            "codexOptionsRequest": 5, "codexOptionsProduction": 5,
+            "codexRecordAttempt": 5, "codexRecordAccepted": 5,
+            "staticOption": 275, "staticParser": 535, "staticPersistedLoad": 530
         ].mapValues { $0 * computes }
         if phase == "initialization" {
             expected.merge([

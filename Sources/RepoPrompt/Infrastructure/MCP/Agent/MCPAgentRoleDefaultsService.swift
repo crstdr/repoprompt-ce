@@ -202,6 +202,7 @@ enum MCPAgentRoleDefaultsService {
         let overrides = settingsStore.mcpAgentRoleOverrides(workspaceID: workspaceID)
         let roleModelParameters = settingsStore.mcpAgentRoleModelParameters(workspaceID: workspaceID)
         let recommendationAvailability = recommendedAvailability ?? defaultRecommendedAvailability(from: availability, settingsStore: settingsStore)
+        let codexOperation = AgentModelCatalog.CodexOptionsOperation()
         return AgentModelCatalog.TaskLabelKind.allCases.compactMap { kind in
             resolve(
                 kind: kind,
@@ -209,7 +210,8 @@ enum MCPAgentRoleDefaultsService {
                 roleModelParameters: roleModelParameters,
                 availability: availability,
                 recommendedAvailability: recommendationAvailability,
-                codexDynamicModels: codexDynamicModels
+                codexDynamicModels: codexDynamicModels,
+                codexOperation: codexOperation
             )
         }
     }
@@ -231,7 +233,8 @@ enum MCPAgentRoleDefaultsService {
             roleModelParameters: settingsStore.mcpAgentRoleModelParameters(workspaceID: workspaceID),
             availability: availability,
             recommendedAvailability: recommendedAvailability ?? defaultRecommendedAvailability(from: availability, settingsStore: settingsStore),
-            codexDynamicModels: codexDynamicModels
+            codexDynamicModels: codexDynamicModels,
+            codexOperation: AgentModelCatalog.CodexOptionsOperation()
         )
     }
 
@@ -375,18 +378,20 @@ enum MCPAgentRoleDefaultsService {
         roleModelParameters: [String: [ACPModelParameterSelection]]?,
         availability: AgentModelCatalog.AvailabilityContext,
         recommendedAvailability: AgentModelCatalog.AvailabilityContext,
-        codexDynamicModels: [CodexAppServerClient.RemoteModel]?
+        codexDynamicModels: [CodexAppServerClient.RemoteModel]?,
+        codexOperation: AgentModelCatalog.CodexOptionsOperation
     ) -> RoleDefaultResolution? {
         guard let taskLabel = AgentModelCatalog.taskLabel(for: kind) else { return nil }
         guard let recommended = resolvedRecommendedSelection(
             for: kind,
             recommendedAvailability: recommendedAvailability,
-            fallbackAvailability: availability
+            fallbackAvailability: availability,
+            codexOperation: codexOperation
         ) else {
             return nil
         }
 
-        let recommendedDisplayName = "\(recommended.agent.displayName) \(AgentModelCatalog.displayName(for: recommended.modelRaw, agentKind: recommended.agent, codexDynamicModels: codexDynamicModels))"
+        let recommendedDisplayName = "\(recommended.agent.displayName) \(AgentModelCatalog.displayName(for: recommended.modelRaw, agentKind: recommended.agent, codexDynamicModels: codexDynamicModels, codexOperation: codexOperation))"
 
         // Check for stored override
         let hasStoredOverride = overrides?[kind.rawValue] != nil
@@ -411,7 +416,7 @@ enum MCPAgentRoleDefaultsService {
             }
         }
 
-        let effectiveDisplayName = "\(effective.agent.displayName) \(AgentModelCatalog.displayName(for: effective.modelRaw, agentKind: effective.agent, codexDynamicModels: codexDynamicModels))"
+        let effectiveDisplayName = "\(effective.agent.displayName) \(AgentModelCatalog.displayName(for: effective.modelRaw, agentKind: effective.agent, codexDynamicModels: codexDynamicModels, codexOperation: codexOperation))"
 
         return RoleDefaultResolution(
             role: kind,
@@ -431,11 +436,12 @@ enum MCPAgentRoleDefaultsService {
     private static func resolvedRecommendedSelection(
         for role: AgentModelCatalog.TaskLabelKind,
         recommendedAvailability: AgentModelCatalog.AvailabilityContext,
-        fallbackAvailability: AgentModelCatalog.AvailabilityContext
+        fallbackAvailability: AgentModelCatalog.AvailabilityContext,
+        codexOperation: AgentModelCatalog.CodexOptionsOperation
     ) -> AgentModelCatalog.NormalizedAgentSelection? {
         // Recommendation filters pick the preferred default when possible, but they should not hide
         // role rows when the app still has selectable agents outside the filtered recommendation set.
-        AgentModelCatalog.resolveTaskLabelKind(role, availability: recommendedAvailability)
-            ?? AgentModelCatalog.resolveTaskLabelKind(role, availability: fallbackAvailability)
+        AgentModelCatalog.resolveTaskLabelKind(role, availability: recommendedAvailability, codexOperation: codexOperation)
+            ?? AgentModelCatalog.resolveTaskLabelKind(role, availability: fallbackAvailability, codexOperation: codexOperation)
     }
 }
