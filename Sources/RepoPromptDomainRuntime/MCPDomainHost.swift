@@ -143,7 +143,8 @@ package actor MCPDomainHost {
     private let metrics: DomainRuntimeMetricsSink
     private let beforeFinalAdmission: @Sendable () async -> Void
     private let mutationAdmissionController = MCPDomainToolResourceAdmissionController(
-        limit: MCPDomainToolAdmissionLimits.exclusiveConnection
+        limit: MCPDomainToolAdmissionLimits.exclusiveConnection,
+        overdueThreshold: MCPTimeoutPolicy.workspaceFreshnessWaitTimeout
     )
     private let smallReadAdmissionController = MCPDomainToolResourceAdmissionController(
         limit: MCPDomainToolAdmissionLimits.smallReadPerWindow
@@ -412,11 +413,13 @@ package actor MCPDomainHost {
 
     package func acquireMutationResourceAdmission(
         _ resource: MCPDomainToolResourceAdmissionController.Resource,
+        context: MCPDomainToolResourceAdmissionController.WaitContext? = nil,
         admissionDeadline: MCPDomainAdmissionDeadline? = nil
     ) async throws -> MCPDomainToolResourceAdmissionController.Lease {
         guard lifecycle == .accepting else { throw MCPDomainHostError.draining }
         return try await mutationAdmissionController.acquire(
             resource,
+            context: context,
             admissionDeadline: admissionDeadline
         )
     }

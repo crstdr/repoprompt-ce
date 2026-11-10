@@ -422,6 +422,152 @@ final class MCPReadAutoSelectionRecoveryTests: XCTestCase {
         assertFullyReclaimed(coordinator)
     }
 
+    func testDrainCompletionAndInvalidationStopOverdueReports() async throws {
+        for invalidate in [false, true] {
+            let authority = try await makeAuthority()
+            let gate = RecoveryCancellationIgnoringGate()
+            let waiterRegistered = RecoveryMainActorSignal()
+            let reports = OverdueSettlementReports()
+            let key = contextKey(authority: authority)
+            var current: MCPReadFileAutoSelectionCoordinator.ContextKey? = key
+            let coordinator = MCPReadFileAutoSelectionCoordinator(
+                isContextCurrent: { $0 == current },
+                applyCanonical: { _, _ in .unchanged },
+                applyMirror: { _ in .converged },
+                overdueThreshold: .milliseconds(30),
+                overdueRepeatInterval: .milliseconds(60),
+                overdueReportSink: { reports.append($0) }
+            )
+            coordinator.setCanonicalApplyGateForTesting { await gate.enter() }
+
+            XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/A.swift"]), authority: authority, for: key))
+            guard await gate.waitUntilEntered() else {
+                await failWait("canonical worker to enter", gates: [gate])
+                coordinator.invalidate(context: key)
+                return
+            }
+            let drain = Task { @MainActor in
+                await coordinator.drain(
+                    .canonicalSelection,
+                    for: key,
+                    onCanonicalWaiterRegistered: { waiterRegistered.signal() }
+                )
+            }
+            guard await waiterRegistered.wait() else {
+                drain.cancel()
+                await failWait("canonical drain waiter registration", gates: [gate])
+                coordinator.invalidate(context: key)
+                return
+            }
+            try await reports.waitForFirstReport()
+            XCTAssertTrue(
+                reports.all[0].contains("event=selection_drain") && reports.all[0].contains("stage=canonical"),
+                "\(reports.all)"
+            )
+
+            if invalidate {
+                current = nil
+                coordinator.invalidate(context: key)
+                // The drain task resumes on this actor; keep it from running while the timer keeps ticking.
+                let atSettle = reports.count
+                usleep(300_000)
+                XCTAssertLessThanOrEqual(reports.count, atSettle + 1, "\(reports.all)")
+            } else {
+                await gate.release()
+            }
+            let result = await drain.value
+            XCTAssertEqual(result, invalidate ? .invalidated : .completed)
+            try await reports.assertSettled(after: .milliseconds(60), atCancel: reports.count)
+            await gate.release()
+            coordinator.invalidate(context: key)
+        }
+    }
+
+    #if DEBUG
+        private typealias Join = WorkspaceFileContextStore.ScopedIngressBarrierJoin
+
+        private static let interval = Duration.milliseconds(60)
+
+        private func makeJoin(_ reports: OverdueSettlementReports) -> Join {
+            Join(
+                rootID: UUID(),
+                overdueThreshold: .milliseconds(30),
+                overdueRepeatInterval: Self.interval,
+                overdueReport: { reports.append($0) }
+            )
+        }
+
+        private func output() -> WorkspaceFileContextStore.ScopedIngressBarrierTaskOutput {
+            let sample = WorkspaceIngressBarrierSample(
+                rootID: UUID(),
+                rootPath: "/tmp/root",
+                pendingRawEventCountBeforeFlush: 0,
+                acceptedWatcherWatermark: 1,
+                publishedServicePublicationSequence: 1,
+                appliedServicePublicationSequence: 1,
+                appliedWatcherWatermark: 1
+            )
+            return .init(sample: sample, completedAtNanoseconds: 0)
+        }
+
+        func testIngressJoinCompletionStopsReporting() async throws {
+            let reports = OverdueSettlementReports()
+            let join = makeJoin(reports)
+            let waiter = Task { await join.value() }
+            try await reports.waitForFirstReport()
+            XCTAssertTrue(reports.all[0].contains("event=root_ingress"), "\(reports.all)")
+
+            join.complete(with: output())
+            let result = await waiter.value
+            XCTAssertNotNil(result)
+            try await reports.assertSettled(after: Self.interval, atCancel: reports.count)
+        }
+
+        func testSettlementStopsReportsEvenWhenTheWaitingTaskCannotResume() async throws {
+            let reports = OverdueSettlementReports()
+            let join = makeJoin(reports)
+            // Resumes on this actor, so it cannot run while the actor is blocked below.
+            let waiter = Task { await join.value() }
+            try await reports.waitForFirstReport()
+
+            join.complete(with: output())
+            let atSettle = reports.count
+            usleep(300_000)
+            XCTAssertLessThanOrEqual(reports.count, atSettle + 1, "\(reports.all)")
+            let result = await waiter.value
+            XCTAssertNotNil(result)
+        }
+
+        func testIngressJoinCancellationStopsReporting() async throws {
+            let reports = OverdueSettlementReports()
+            let join = makeJoin(reports)
+            let waiter = Task { await join.value() }
+            try await reports.waitForFirstReport()
+
+            waiter.cancel()
+            let result = await waiter.value
+            XCTAssertNil(result)
+            try await reports.assertSettled(after: Self.interval, atCancel: reports.count)
+        }
+
+        func testCancelledCallerOnCompletedIngressJoinGetsNil() async {
+            let join = Join(rootID: UUID())
+            join.complete(with: output())
+            let caller = Task {
+                while !Task.isCancelled {
+                    await Task.yield()
+                }
+                return await join.value()
+            }
+            caller.cancel()
+            let result = await caller.value
+            XCTAssertNil(result, "a cancelled caller keeps the base precedence: cancellation before completion")
+
+            let uncancelled = await join.value()
+            XCTAssertNotNil(uncancelled)
+        }
+    #endif
+
     /// Recovery tests replace file application with callbacks, but enqueue still receives
     /// authority captured from a genuinely activated catalog rather than a fabricated ticket.
     private func makeAuthority() async throws -> MCPFrozenFileToolAuthority {
@@ -777,3 +923,46 @@ private final class RecoveryDiagnosticEventProbe: @unchecked Sendable {
         return nil
     }
 }
+
+#if DEBUG
+    private struct OverdueSettlementTimeout: Error, CustomStringConvertible {
+        var description: String {
+            "timed out waiting for the first overdue report"
+        }
+    }
+
+    private final class OverdueSettlementReports: @unchecked Sendable {
+        private let lock = NSLock()
+        private var lines: [String] = []
+        func append(_ line: String) {
+            lock.withLock { lines.append(line) }
+        }
+
+        var count: Int {
+            lock.withLock { lines.count }
+        }
+
+        var all: [String] {
+            lock.withLock { lines }
+        }
+
+        /// A cancelled watch can still land one report that was already in flight, and no more.
+        func assertSettled(
+            after interval: Duration,
+            atCancel: Int,
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) async throws {
+            try await Task.sleep(for: interval * 4)
+            XCTAssertLessThanOrEqual(count, atCancel + 1, "\(all)", file: file, line: line)
+        }
+
+        func waitForFirstReport() async throws {
+            let deadline = ContinuousClock.now + .seconds(5)
+            while count == 0 {
+                guard ContinuousClock.now < deadline else { throw OverdueSettlementTimeout() }
+                try await Task.sleep(for: .milliseconds(5))
+            }
+        }
+    }
+#endif

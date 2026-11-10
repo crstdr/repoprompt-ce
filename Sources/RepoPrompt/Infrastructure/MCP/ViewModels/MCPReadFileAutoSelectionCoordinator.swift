@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptFoundation
+import RepoPromptShared
 import RepoPromptWorkspaceCore
 
 /// Window-scoped response-lane coordinator for Agent Mode `read_file` and eligible `file_search`
@@ -470,12 +471,24 @@ final class MCPReadFileAutoSelectionCoordinator {
     private struct CanonicalSequenceWaiter {
         let target: UInt64
         let continuation: CheckedContinuation<CanonicalWaitResult, Never>
+        let overdueReport: OverdueWaitReporter.Watch
+
+        func settle(_ result: CanonicalWaitResult) {
+            overdueReport.cancel()
+            continuation.resume(returning: result)
+        }
     }
 
     private struct SequenceWaiter {
         let contextKey: ContextKey
         let target: UInt64
         let continuation: CheckedContinuation<SequenceWaitResult, Never>
+        let overdueReport: OverdueWaitReporter.Watch
+
+        func settle(_ result: SequenceWaitResult) {
+            overdueReport.cancel()
+            continuation.resume(returning: result)
+        }
     }
 
     private struct CanonicalLane {
@@ -535,6 +548,9 @@ final class MCPReadFileAutoSelectionCoordinator {
     private var invalidatedContexts = Set<ContextKey>()
     private var retiringContexts = Set<ContextKey>()
     private var mirrorWaitTimeout: Duration
+    private let overdueThreshold: Duration
+    private let overdueRepeatInterval: Duration
+    private let overdueReportSink: (@Sendable (String) -> Void)?
     #if DEBUG
         private struct DebugContextAccounting {
             var acceptedIntentCount: UInt64 = 0
@@ -566,13 +582,35 @@ final class MCPReadFileAutoSelectionCoordinator {
         applyCanonical: @escaping ApplyCanonical,
         applyMirror: @escaping ApplyMirror,
         diagnosticObserver: DiagnosticObserver? = nil,
-        mirrorWaitTimeout: Duration = .seconds(10)
+        mirrorWaitTimeout: Duration = .seconds(10),
+        overdueThreshold: Duration = MCPTimeoutPolicy.workspaceFreshnessWaitTimeout,
+        overdueRepeatInterval: Duration = OverdueWaitReporter.defaultRepeatInterval,
+        overdueReportSink: (@Sendable (String) -> Void)? = nil
     ) {
         self.isContextCurrent = isContextCurrent
         self.applyCanonical = applyCanonical
         self.applyMirror = applyMirror
         self.diagnosticObserver = diagnosticObserver
         self.mirrorWaitTimeout = mirrorWaitTimeout
+        self.overdueThreshold = overdueThreshold
+        self.overdueRepeatInterval = overdueRepeatInterval
+        self.overdueReportSink = overdueReportSink
+    }
+
+    /// Canonical waits have no timeout. With the default timeouts, mirror waits are cancelled at
+    /// `mirrorWaitTimeout` (10 s), before this threshold, so only a wait that outlives the freshness timeout is reported. The watch is stored with the
+    /// waiter and stopped where the waiter is settled.
+    private func overdueReport(stage: String, key: ContextKey, target: UInt64) -> OverdueWaitReporter.Watch {
+        let (windowID, tabID, generation) = (key.windowID, key.tabID, key.bindingGeneration)
+        return OverdueWaitReporter.begin(
+            event: "selection_drain",
+            threshold: overdueThreshold,
+            repeatInterval: overdueRepeatInterval,
+            fields: {
+                "stage=\(stage) window=\(windowID) tab=\(tabID.uuidString.prefix(8)) generation=\(generation) target=\(target)"
+            },
+            report: overdueReportSink
+        )
     }
 
     @discardableResult
@@ -1000,7 +1038,7 @@ final class MCPReadFileAutoSelectionCoordinator {
                 target: waiter.target,
                 waiterID: id
             )
-            waiter.continuation.resume(returning: .completed(requiredMirrorTicket: lane.latestRequiredMirrorTicket))
+            waiter.settle(.completed(requiredMirrorTicket: lane.latestRequiredMirrorTicket))
         }
     }
 
@@ -1230,7 +1268,7 @@ final class MCPReadFileAutoSelectionCoordinator {
                 waiterID: id
             )
             let result = resolvedMirrorWaitResult(for: waiter.target, in: lane, context: waiter.contextKey)
-            waiter.continuation.resume(returning: result)
+            waiter.settle(result)
         }
         pruneMirrorSettlements(for: key)
     }
@@ -1310,7 +1348,11 @@ final class MCPReadFileAutoSelectionCoordinator {
                 } else if lane.completedSequence >= target {
                     continuation.resume(returning: .completed(requiredMirrorTicket: lane.latestRequiredMirrorTicket))
                 } else {
-                    lane.waiters[waiterID] = CanonicalSequenceWaiter(target: target, continuation: continuation)
+                    lane.waiters[waiterID] = CanonicalSequenceWaiter(
+                        target: target,
+                        continuation: continuation,
+                        overdueReport: overdueReport(stage: "canonical", key: key, target: target)
+                    )
                     canonicalLanes[key] = lane
                     emitCanonicalDiagnostic(
                         .waiterRegistered,
@@ -1360,7 +1402,8 @@ final class MCPReadFileAutoSelectionCoordinator {
                     lane.waiters[waiterID] = SequenceWaiter(
                         contextKey: contextKey,
                         target: target,
-                        continuation: continuation
+                        continuation: continuation,
+                        overdueReport: overdueReport(stage: "mirror", key: contextKey, target: target)
                     )
                     mirrorLanes[key] = lane
                     let timeout = mirrorWaitTimeout
@@ -1400,7 +1443,7 @@ final class MCPReadFileAutoSelectionCoordinator {
             target: waiter.target,
             waiterID: waiterID
         )
-        waiter.continuation.resume(returning: .cancelled)
+        waiter.settle(.cancelled)
         cleanupRetiredContextIfSettled(key)
     }
 
@@ -1411,7 +1454,7 @@ final class MCPReadFileAutoSelectionCoordinator {
         canonicalLanes[key] = lane
         for (id, waiter) in waiters {
             emitCanonicalDiagnostic(.waiterResumed, for: key, lane: lane, target: waiter.target, waiterID: id)
-            waiter.continuation.resume(returning: result)
+            waiter.settle(result)
         }
         cleanupRetiredContextIfSettled(key)
     }
@@ -1433,7 +1476,7 @@ final class MCPReadFileAutoSelectionCoordinator {
             target: waiter.target,
             waiterID: waiterID
         )
-        waiter.continuation.resume(returning: result)
+        waiter.settle(result)
         cleanupMirrorLaneIfSettled(key)
     }
 
@@ -1449,7 +1492,7 @@ final class MCPReadFileAutoSelectionCoordinator {
         mirrorLanes[key] = lane
         for (id, waiter) in cancelled {
             emitMirrorDiagnostic(.waiterResumed, for: key, lane: lane, target: waiter.target, waiterID: id)
-            waiter.continuation.resume(returning: result)
+            waiter.settle(result)
         }
         cleanupMirrorLaneIfSettled(key)
     }

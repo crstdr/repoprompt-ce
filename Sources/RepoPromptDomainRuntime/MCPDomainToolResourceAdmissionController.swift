@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptShared
 
 package enum MCPDomainToolAdmissionLimits {
     package static let exclusiveConnection = 1
@@ -15,20 +16,37 @@ package enum MCPDomainToolAdmissionLimits {
 /// Protocol-neutral, cancellation-safe admission keyed by the physical state resource.
 /// Connection lanes provide client ordering; this controller bounds cross-connection work.
 package final class MCPDomainToolResourceAdmissionController: @unchecked Sendable {
+    // swiftformat:disable:next redundantSendable
     package enum AdmissionError: Error, Equatable, Sendable {
         case closed
     }
 
+    // swiftformat:disable:next redundantSendable
     package struct Snapshot: Equatable, Sendable {
         package let activeLeaseCount: Int
         package let waiterCount: Int
         package let isClosed: Bool
     }
 
+    // swiftformat:disable:next redundantSendable
     package enum Resource: Hashable, Sendable {
         case appWide
         case window(Int)
         case repository(String)
+    }
+
+    /// Opaque identifiers for the call that waits for, or holds, a lease. Logged only when a wait is overdue.
+    // swiftformat:disable:next redundantSendable
+    package struct WaitContext: Equatable, Sendable {
+        package let tool: String
+        package let connection: String
+        package let run: String?
+
+        package init(tool: String, connection: String, run: String?) {
+            self.tool = tool
+            self.connection = connection
+            self.run = run
+        }
     }
 
     package final class Lease: @unchecked Sendable {
@@ -57,6 +75,14 @@ package final class MCPDomainToolResourceAdmissionController: @unchecked Sendabl
     private struct Waiter {
         let id: UUID
         let continuation: CheckedContinuation<Lease, Error>
+        let context: WaitContext?
+        let overdueWatcher: OverdueWaitReporter.Watch?
+    }
+
+    private struct Holder {
+        let resource: Resource
+        let context: WaitContext
+        let acquiredAt: ContinuousClock.Instant
     }
 
     package let limit: Int
@@ -66,23 +92,37 @@ package final class MCPDomainToolResourceAdmissionController: @unchecked Sendabl
     private var resourceByWaiterID: [UUID: Resource] = [:]
     private var cancelledWaiterIDs: Set<UUID> = []
     private var isClosed = false
+    private var holdersByLeaseID: [UUID: Holder] = [:]
+    private let overdueThreshold: Duration?
+    private let overdueRepeatInterval: Duration
+    private let overdueReport: (@Sendable (String) -> Void)?
 
-    package init(limit: Int) {
+    /// A non-nil `overdueThreshold` logs waiters that carry a `WaitContext` once they have waited that long.
+    package init(
+        limit: Int,
+        overdueThreshold: Duration? = nil,
+        overdueRepeatInterval: Duration = OverdueWaitReporter.defaultRepeatInterval,
+        overdueReport: (@Sendable (String) -> Void)? = nil
+    ) {
         precondition(limit > 0)
         self.limit = limit
+        self.overdueThreshold = overdueThreshold
+        self.overdueRepeatInterval = overdueRepeatInterval
+        self.overdueReport = overdueReport
     }
 
     package func acquire(
         _ resource: Resource,
+        context: WaitContext? = nil,
         admissionDeadline: MCPDomainAdmissionDeadline? = nil
     ) async throws -> Lease {
         guard let admissionDeadline else {
-            return try await acquireWithoutDeadline(resource)
+            return try await acquireWithoutDeadline(resource, context: context)
         }
         try admissionDeadline.check()
         return try await withThrowingTaskGroup(of: Lease.self) { group in
             group.addTask {
-                try await self.acquireWithoutDeadline(resource)
+                try await self.acquireWithoutDeadline(resource, context: context)
             }
             group.addTask {
                 try await admissionDeadline.waitUntilExpired()
@@ -106,7 +146,7 @@ package final class MCPDomainToolResourceAdmissionController: @unchecked Sendabl
         }
     }
 
-    private func acquireWithoutDeadline(_ resource: Resource) async throws -> Lease {
+    private func acquireWithoutDeadline(_ resource: Resource, context: WaitContext?) async throws -> Lease {
         try Task.checkCancellation()
 
         let waiterID = UUID()
@@ -120,13 +160,18 @@ package final class MCPDomainToolResourceAdmissionController: @unchecked Sendabl
                         return .failure(AdmissionError.closed)
                     }
                     guard canAcquire(resource), waitersByResource[resource]?.isEmpty != false else {
-                        let waiter = Waiter(id: waiterID, continuation: continuation)
+                        let waiter = Waiter(
+                            id: waiterID,
+                            continuation: continuation,
+                            context: context,
+                            overdueWatcher: startOverdueWatcher(waiterID: waiterID, resource: resource, context: context)
+                        )
                         waitersByResource[resource, default: []].append(waiter)
                         resourceByWaiterID[waiterID] = resource
                         return nil
                     }
                     activate(resource)
-                    return .success(makeLease(for: resource))
+                    return .success(makeLease(for: resource, context: context))
                 }
                 if let immediateResult {
                     continuation.resume(with: immediateResult)
@@ -176,6 +221,7 @@ package final class MCPDomainToolResourceAdmissionController: @unchecked Sendabl
             return waiters
         }
         for waiter in waiters {
+            waiter.overdueWatcher?.cancel()
             waiter.continuation.resume(throwing: AdmissionError.closed)
         }
         return waiters.count
@@ -189,14 +235,22 @@ package final class MCPDomainToolResourceAdmissionController: @unchecked Sendabl
         activeCountByResource[resource, default: 0] += 1
     }
 
-    private func makeLease(for resource: Resource) -> Lease {
-        Lease { [weak self] in
-            self?.release(resource)
+    /// Called with `lock` held.
+    private func makeLease(for resource: Resource, context: WaitContext?) -> Lease {
+        var leaseID: UUID?
+        if let context {
+            let id = UUID()
+            holdersByLeaseID[id] = Holder(resource: resource, context: context, acquiredAt: .now)
+            leaseID = id
+        }
+        return Lease { [weak self] in
+            self?.release(resource, leaseID: leaseID)
         }
     }
 
-    private func release(_ resource: Resource) {
+    private func release(_ resource: Resource, leaseID: UUID?) {
         let handoffs: [(CheckedContinuation<Lease, Error>, Lease)] = lock.withLock {
+            if let leaseID { holdersByLeaseID.removeValue(forKey: leaseID) }
             let nextCount = max(0, (activeCountByResource[resource] ?? 0) - 1)
             if nextCount == 0 {
                 activeCountByResource.removeValue(forKey: resource)
@@ -214,7 +268,8 @@ package final class MCPDomainToolResourceAdmissionController: @unchecked Sendabl
                     waitersByResource[resource] = waiters
                 }
                 activate(resource)
-                handoffs.append((next.continuation, makeLease(for: resource)))
+                next.overdueWatcher?.cancel()
+                handoffs.append((next.continuation, makeLease(for: resource, context: next.context)))
             }
             return handoffs
         }
@@ -236,6 +291,7 @@ package final class MCPDomainToolResourceAdmissionController: @unchecked Sendabl
             }
 
             let waiter = waiters.remove(at: index)
+            waiter.overdueWatcher?.cancel()
             if waiters.isEmpty {
                 waitersByResource.removeValue(forKey: resource)
             } else {
@@ -244,5 +300,53 @@ package final class MCPDomainToolResourceAdmissionController: @unchecked Sendabl
             return waiter.continuation
         }
         continuation?.resume(throwing: CancellationError())
+    }
+
+    /// Called with `lock` held, for a waiter that is about to be queued.
+    private func startOverdueWatcher(waiterID: UUID, resource: Resource, context: WaitContext?) -> OverdueWaitReporter.Watch? {
+        guard let overdueThreshold, let context else { return nil }
+        return OverdueWaitReporter.begin(
+            event: "admission",
+            threshold: overdueThreshold,
+            repeatInterval: overdueRepeatInterval,
+            fields: { [weak self] in
+                self?.overdueFields(waiterID: waiterID, resource: resource, waiter: context)
+            },
+            report: overdueReport
+        )
+    }
+
+    /// The waiter's report, or `nil` once it is no longer queued. Every queued waiter names the current
+    /// holders on each interval; with no tracked holder it reports `holders=untracked`, the
+    /// lost-wakeup or untracked-holder shape.
+    private func overdueFields(waiterID: UUID, resource: Resource, waiter: WaitContext) -> String? {
+        lock.withLock {
+            guard resourceByWaiterID[waiterID] != nil else { return nil }
+            let now = ContinuousClock.now
+            let active = activeCountByResource[resource] ?? 0
+            let tracked = holdersByLeaseID.values
+                .filter { $0.resource == resource }
+                .sorted { $0.acquiredAt < $1.acquiredAt }
+            var fields = "resource=\(Self.describe(resource)) waiter_tool=\(waiter.tool) waiter_conn=\(waiter.connection)"
+                + " waiter_run=\(waiter.run ?? "-") waiters=\(waitersByResource[resource]?.count ?? 0)"
+                + " holders=\(tracked.isEmpty ? "untracked" : String(tracked.count)) active=\(active)"
+            if !tracked.isEmpty, active > tracked.count {
+                fields += " untracked_holders=\(active - tracked.count)"
+            }
+            for (index, holder) in tracked.enumerated() {
+                fields += " holder\(index)_tool=\(holder.context.tool) holder\(index)_conn=\(holder.context.connection)"
+                    + " holder\(index)_run=\(holder.context.run ?? "-")"
+                    + " holder\(index)_age_ms=\(OverdueWaitReporter.milliseconds(holder.acquiredAt.duration(to: now)))"
+            }
+            return fields
+        }
+    }
+
+    private static func describe(_ resource: Resource) -> String {
+        switch resource {
+        case .appWide: "app"
+        case let .window(id): "window:\(id)"
+        case .repository: "repository"
+        }
     }
 }

@@ -15010,6 +15010,11 @@ actor ServerNetworkManager {
                                         let evidenceLeaseWaitStart = evidenceClock.now
                                         mutationAdmissionLease = try await self.domainHost.acquireMutationResourceAdmission(
                                             mutationResource,
+                                            context: .init(
+                                                tool: toolName,
+                                                connection: String(connectionID.uuidString.prefix(8)),
+                                                run: observerRunIDForCallbacksFinal.map { String($0.uuidString.prefix(8)) }
+                                            ),
                                             admissionDeadline: promptExportExecutionEnvelope?.admissionDeadline
                                         )
                                         MCPToolConcurrencyEvidenceRecorder.shared.recordLeaseWait(
