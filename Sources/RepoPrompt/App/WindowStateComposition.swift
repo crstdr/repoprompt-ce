@@ -72,6 +72,18 @@ struct WindowStateComposition {
 enum WindowStateCompositionFactory {
     typealias AgentModeViewModelFactory = (Int, PromptViewModel, WorkspaceManagerViewModel, MCPServerViewModel) -> AgentModeViewModel
 
+    static func availableModelsRecorder(windowID: Int) -> (AvailableModelsUpdateTrigger, Int, Int, Int, Bool) -> Void {
+        { trigger, duration, models, groups, same in
+            StartupPhaseLog.mark(.availableModelsUpdate, window: windowID, fields: [
+                "duration_ms": duration,
+                "models": models,
+                "groups": groups,
+                "sameAsPrevious": same ? 1 : 0,
+                "trigger": trigger.rawValue
+            ])
+        }
+    }
+
     static func make(
         windowID: Int,
         deferredInitialAgentSystemWorkspaceRefresh: Bool,
@@ -157,6 +169,7 @@ enum WindowStateCompositionFactory {
         let apiSettingsViewModel = borrowedAPISettingsViewModel ?? APISettingsViewModel(
             aiQueriesService: aiQueriesService,
             keyManager: keyManager,
+            recordAvailableModelsUpdate: availableModelsRecorder(windowID: windowID),
             loadStoredDataOnInit: loadStoredAPISettingsDataOnInit && automaticProviderModelDiscoveryEnabled,
             codexModelPollingService: codexModelPollingService
         )

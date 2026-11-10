@@ -13,7 +13,7 @@ struct SettingsWindowRootView: View {
             windowState: windowState,
             onAPIKeyUpdated: {
                 Task {
-                    await windowState.promptManager.refreshAvailableModels()
+                    await windowState.promptManager.refreshAvailableModels(trigger: .settingsWindowRefreshCallback)
                 }
             },
             selectedTab: $model.selectedTab,

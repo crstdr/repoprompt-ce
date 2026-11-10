@@ -289,7 +289,7 @@ struct APISettingsView: View {
         .sheet(isPresented: $showSecureStorageRepair) {
             SecureStorageRepairView(viewModel: secureStorageRepairViewModel) {
                 Task {
-                    await viewModel.loadStoredData()
+                    await viewModel.loadStoredData(trigger: .settingsManualRefresh)
                     onAPIKeyUpdated?()
                 }
             }
@@ -765,7 +765,7 @@ struct APISettingsView: View {
                         .labelsHidden()
                         .onChange(of: viewModel.ollamaModel) { _, _ in
                             Task {
-                                await viewModel.updateAvailableModels()
+                                await viewModel.updateAvailableModels(trigger: .ollamaModelSelection)
                             }
                         }
 
@@ -846,7 +846,7 @@ struct APISettingsView: View {
         viewModel.availableLocalModels = []
         UserDefaults.standard.set([], forKey: "OllamaLocalModels")
         Task {
-            await viewModel.updateAvailableModels()
+            await viewModel.updateAvailableModels(trigger: .ollamaModelSelection)
         }
     }
 

@@ -462,6 +462,52 @@ phase=switchReplaySelectionFence boundary=end window=1 elapsed_ms=1121 span_ms=1
 phase=switchReplayDeferredFlush boundary=end window=1 elapsed_ms=1122 span_ms=1 nested=0 pending=1 selectedFiles=1
 ```
 
+### Available-model update attribution
+
+Release builds emit one `Startup` event after each `updateAvailableModels` publication. Extract these events from a captured timeline with:
+
+```bash
+grep -E 'phase=availableModelsUpdate ' startup-timeline.txt
+```
+
+For example:
+
+```text
+phase=availableModelsUpdate boundary=event window=3 elapsed_ms=1250 duration_ms=17 groups=6 models=176 sameAsPrevious=1 trigger=25
+```
+
+`elapsed_ms` is monotonic time since process start; `duration_ms` is the time spent in the update through publication and the equality check. `models` and `groups` are the published model and provider-group counts. `sameAsPrevious` is 1 only when the previously published ordered array is equal; it is 0 for a different array or the first publication. Equality is an exact linear comparison, performed after publication. The window ordinal identifies the publishing API-settings owner; a borrowed owner retains its original ordinal. No model names, labels, paths or workspace identifiers are logged. Repeated calls still publish and produce separate markers. These events continue throughout the process lifetime, including subscription updates.
+
+The `trigger` field uses these stable integer codes:
+
+| Code | Initiator |
+| --- | --- |
+| 1 | API owner initial load |
+| 2 | Prompt startup refresh |
+| 3 | Settings view appearance |
+| 4 | Settings secure-storage repair |
+| 5 | Settings window refresh callback (also follows service-tier changes and secure-storage repair) |
+| 6 | Model availability check |
+| 7 | Custom-model edit |
+| 8 | Service-tier toggle |
+| 9 | CLI connection-flag change |
+| 10 | Compatible-backend secret change |
+| 11 | Claude-family availability change |
+| 12 | Devin discovery |
+| 13 | Key validation |
+| 14 | Key deletion |
+| 15 | Custom-provider validation |
+| 16 | Provider deletion |
+| 17 | Provider model refresh completion |
+| 18 | Ollama URL validation, model selection or reset |
+| 19 | OpenRouter custom-model edit or test |
+| 20 | OpenRouter default-models toggle |
+| 21 | Custom-model toggle |
+| 22 | CLI connection test |
+| 23 | Codex connection change, including tests, login and sign-out |
+| 24 | CLI disconnect |
+| 25 | Provider model subscription snapshot |
+
 ## Live Codex Desktop direct-headless worktree routing
 
 Run this release acceptance only from a Codex Desktop task whose repository root is an existing linked worktree and whose RepoPrompt launcher selects `--backend headless` with that exact root in `REPOPROMPT_MCP_WORKING_DIRS`. The canonical checkout must already belong to one saved RepoPrompt CE workspace. This lane validates an installed release candidate; it does not build, install, launch, stop, or relaunch RepoPrompt, create a workspace, or create a worktree.

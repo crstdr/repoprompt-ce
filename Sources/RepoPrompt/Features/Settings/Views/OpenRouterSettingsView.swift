@@ -130,7 +130,7 @@ extension OpenRouterSettingsView {
             Toggle("Include default OpenRouter models", isOn: $viewModel.includeDefaultOpenRouterModels)
                 .onChange(of: viewModel.includeDefaultOpenRouterModels) { _, _ in
                     Task {
-                        await viewModel.updateAvailableModels()
+                        await viewModel.updateAvailableModels(trigger: .openRouterDefaultModelsToggle)
                     }
                 }
                 .padding(.bottom, 4)
@@ -381,7 +381,7 @@ extension OpenRouterSettingsView {
             UserDefaults.standard.set(viewModel.customOpenRouterModels, forKey: "CustomOpenRouterModels")
         }
         Task {
-            await viewModel.updateAvailableModels()
+            await viewModel.updateAvailableModels(trigger: .openRouterCustomModelEdit)
         }
     }
 

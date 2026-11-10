@@ -2468,7 +2468,7 @@ class PromptViewModel: ObservableObject {
         if refreshAvailableModelsOnInit {
             initialModelRefreshTask = Task { [weak self] in
                 guard let self else { return }
-                await refreshAvailableModels()
+                await refreshAvailableModels(trigger: .promptStartupRefresh)
             }
         }
 
@@ -6921,8 +6921,8 @@ class PromptViewModel: ObservableObject {
     }
 
     @MainActor
-    func refreshAvailableModels() async {
-        await apiSettingsViewModel?.loadStoredData {
+    func refreshAvailableModels(trigger: AvailableModelsUpdateTrigger) async {
+        await apiSettingsViewModel?.loadStoredData(trigger: trigger) {
             self.refreshModelSelectionState()
         }
     }
@@ -7111,7 +7111,7 @@ class PromptViewModel: ObservableObject {
     }
 
     func hasValidModelSelected() async -> Bool {
-        await refreshAvailableModels()
+        await refreshAvailableModels(trigger: .modelAvailabilityCheck)
         guard !preferredModel.isEmpty, !availableModels.isEmpty else { return false }
         return isModelCurrentlyUsable(preferredModel)
     }
