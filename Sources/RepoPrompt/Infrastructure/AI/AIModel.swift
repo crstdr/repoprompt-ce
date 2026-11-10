@@ -1969,6 +1969,16 @@ public enum AIModel: Equatable, Hashable {
         return semanticMetadataPrecedes(leftMetadata, rightMetadata)
     }
 
+    static func codexBaseModelPrecedes(
+        _ lhs: String,
+        _ rhs: String,
+        discovery: CodexModelDiscovery
+    ) -> Bool {
+        let leftMetadata = semanticSortMetadata(identifier: lhs, fallbackDisplayName: lhs, reasoningEffort: nil, semanticSource: codexPreviewDisplayAlias(for: lhs, discovery: discovery) ?? lhs)
+        let rightMetadata = semanticSortMetadata(identifier: rhs, fallbackDisplayName: rhs, reasoningEffort: nil, semanticSource: codexPreviewDisplayAlias(for: rhs, discovery: discovery) ?? rhs)
+        return semanticMetadataPrecedes(leftMetadata, rightMetadata)
+    }
+
     static func codexBaseDisplayName(for baseModelID: String, fallbackDisplayName: String) -> String {
         if let storeLabel = CodexDynamicModelStore.displayName(forModelID: baseModelID) {
             let normalizedStoreLabel = normalizedCodexBaseLabel(storeLabel)
@@ -2189,6 +2199,15 @@ public enum AIModel: Equatable, Hashable {
         discoveredRecords: @autoclosure () -> [CodexDynamicModelRecord] = CodexDynamicModelStore.load()
     ) -> SemanticSortMetadata {
         let semanticSource = codexPreviewDisplayAlias(for: identifier, discoveredRecords: discoveredRecords()) ?? (identifier.isEmpty ? fallbackDisplayName : identifier)
+        return semanticSortMetadata(identifier: identifier, fallbackDisplayName: fallbackDisplayName, reasoningEffort: reasoningEffort, semanticSource: semanticSource)
+    }
+
+    private static func semanticSortMetadata(
+        identifier: String,
+        fallbackDisplayName: String,
+        reasoningEffort: CodexReasoningEffort?,
+        semanticSource: String
+    ) -> SemanticSortMetadata {
         let normalizedIdentifier = normalizedSemanticText(semanticSource)
         let family = semanticFamily(in: normalizedIdentifier)
         let versionComponents = semanticVersionComponents(in: normalizedIdentifier)
