@@ -384,6 +384,270 @@ import XCTest
             }
         }
 
+        /// Paired diagnostic: the same raw reader with independent or shared versioned delivery.
+        func testSavedConsolidationMarker35Managers() async throws {
+            try XCTSkipUnless(ProcessInfo.processInfo.environment["RPCE_RUN_SCALE_TESTS"] == "1", "Opt-in saved-marker baseline")
+            try await checkSavedConsolidationMarker35Managers(measuring: true)
+        }
+
+        func testSavedMarker35ManagersSaveBothDirectionsWithinBudget() async throws {
+            try await checkSavedConsolidationMarker35Managers(measuring: false)
+        }
+
+        func testSavedMarkerCloseCannotResetBetweenDetachedLookups() async throws {
+            try await checkSavedConsolidationMarker35Managers(measuring: false, closeBetweenLookups: true)
+        }
+
+        private func checkSavedConsolidationMarker35Managers(measuring: Bool, closeBetweenLookups: Bool = false) async throws {
+            let owner = WorkspaceFileDecodeCache.shared.savedMarkerOwner
+            struct Metric: Encodable {
+                let arm: String
+                let owner: WorkspaceSavedConsolidationMarkerOwner.Stats
+                let workload: String
+                let dirty: Int
+                let managers: Int
+                let publications: Int
+                let delivery: String
+                let trial: Int
+                let savedBytes: Int
+                let wallNanoseconds: UInt64
+                let cpuUserMS: Double
+                let cpuSystemMS: Double
+                let counts: WorkspaceSavedMarkerMeasurements.Snapshot
+                let pendingParity: Bool
+                let accepted: Bool
+                let valid: Bool
+            }
+            defer { WorkspaceSavedMarkerMeasurements.install(nil) }
+            for workload in measuring ? [WorkspaceProjectionDecodeFixture.Workload.ordinary, .busy] : [.ordinary] {
+                for dirtyCount in measuring ? [5, 20] : [5] {
+                    let builder = WorkspaceProjectionDecodeFixture(workload: workload)
+                    let candidates = (0 ..< dirtyCount).map { ordinal in
+                        builder.model(
+                            id: UUID(uuidString: String(format: "C0000000-0000-0000-0000-%012d", ordinal + 1))!, revision: 0
+                        )
+                    }
+                    let system = Fixture.model(id: Fixture.defaultID, name: "Default", isSystem: true)
+                    try await Fixture.run(seeds: [system] + candidates) { f in
+                        let writer = DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: -99000)
+                        let initial = await writer.snapshot()
+                        var expected: Set<UUID> = []
+                        for (ordinal, candidate) in candidates.enumerated() {
+                            let record = try XCTUnwrap(initial.workspaces.first { $0.document.workspaceID == candidate.id })
+                            var working = candidate
+                            working.currentPromptText = "Dirty working revision"
+                            let outcome = try await writer.replaceWorkingFailClosed(
+                                working, fileURL: f.workspaceURL(for: candidate), expectedWorkspaceRevision: record.revisions.workingRevision
+                            )
+                            XCTAssertEqual(outcome.disposition, .applied)
+                            var saved = candidate
+                            if ordinal.isMultiple(of: 2) {
+                                saved.consolidatedIntoWorkspaceID = system.id
+                                expected.insert(saved.id)
+                            }
+                            try f.writeDocument(saved)
+                        }
+                        if !closeBetweenLookups {
+                            try XCTSkipUnless(WorkspaceSavedConsolidationMarkerOwner.reuseSupportedForTesting(at: f.storage), "Shared measurement requires local APFS")
+                        }
+                        let base = await writer.snapshot()
+                        XCTAssertEqual(base.workspaces.count(where: { $0.revisions.dirtyRevision != nil }), dirtyCount)
+                        let models = try f.decoded(base)
+                        let managers = (0 ..< 35).map { _ in f.makeManager() }
+                        let gapGate = f.makeGate()
+                        defer {
+                            WorkspaceSavedMarkerMeasurements.install(nil)
+                            owner.setReadGateForTesting(nil)
+                            gapGate.release()
+                        }
+                        let atGap = Signal("detached classifications between saved-marker lookups")
+                        if closeBetweenLookups {
+                            owner.setReadGateForTesting { phase, _ in
+                                if phase == .betweenLookups {
+                                    await atGap.fire()
+                                    await gapGate.wait()
+                                }
+                            }
+                        }
+                        for manager in managers {
+                            XCTAssertNotNil(manager.applyDomainWorkspaceCatalog(
+                                base, projection: .full(models), preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata
+                            ).receipt)
+                        }
+                        if closeBetweenLookups {
+                            let clock = ContinuousClock()
+                            let deadline = clock.now.advanced(by: .seconds(5))
+                            while atGap.count < managers.count {
+                                guard clock.now < deadline else { throw Fixture.Failure.timedOut("classification gap gates") }
+                                await Task.yield()
+                            }
+                            for manager in managers {
+                                manager.prepareForWindowClose()
+                            }
+                            let stats = owner.snapshotForTesting().stats
+                            XCTAssertEqual(stats.activeClassifications, 35)
+                            XCTAssertEqual(stats.activeReads, 0)
+                            XCTAssertEqual(stats.activeLookups, 0)
+                            let drained = await owner.awaitIdleForTesting(timeout: .milliseconds(10))
+                            XCTAssertFalse(drained, "An idle interval between lookups does not complete the detached sequence")
+                            let beforeReset = owner.snapshotForTesting()
+                            XCTAssertFalse(owner.resetForTesting(perCaller: true), "A busy reset must leave shared strategy/state untouched")
+                            let afterReset = owner.snapshotForTesting()
+                            XCTAssertEqual(afterReset.stats, beforeReset.stats)
+                            XCTAssertEqual(afterReset.entries, beforeReset.entries)
+                            XCTAssertEqual(afterReset.flights, beforeReset.flights)
+                            XCTAssertEqual(afterReset.invalidatedFlights, beforeReset.invalidatedFlights)
+                            XCTAssertEqual(afterReset.perCaller, beforeReset.perCaller)
+                            XCTAssertEqual(afterReset.hasReadGate, beforeReset.hasReadGate)
+                            owner.setReadGateForTesting(nil)
+                            gapGate.release()
+                            guard await owner.awaitIdleForTesting() else { throw Fixture.Failure.timedOut("joined classifications after release") }
+                            XCTAssertTrue(owner.resetForTesting())
+                            return
+                        }
+                        for manager in managers {
+                            await manager.awaitAuthorityIncompleteRestoreClassificationForTesting()
+                        }
+                        XCTAssertTrue(managers.allSatisfy { $0.pendingConsolidatedRestoreIDs == expected })
+                        let savedBytes = try candidates.map { try Data(contentsOf: f.workspaceURL(for: $0)) }
+                        let totalBytes = savedBytes.reduce(0) { $0 + $1.count }
+                        var sequence = base.publicationSequence
+                        var revision = base.catalogRevision
+                        let modes: [(publications: Int, settled: Bool)] = [(1, true), (8, true)]
+                            + (workload == .busy && dirtyCount == 20 ? [(8, false)] : [])
+                        // One warmup and three retained samples per cell; alternate cell order each sample.
+                        for trial in (measuring ? -1 : 0) ..< (measuring ? 3 : 1) {
+                            for legacy in measuring ? (trial.isMultiple(of: 2) ? [false, true] : [true, false]) : [false] {
+                                for mode in measuring ? (trial.isMultiple(of: 2) ? Array(modes.reversed()) : modes) : [modes[0]] {
+                                    guard await owner.awaitIdleForTesting(), owner.resetForTesting(perCaller: legacy) else {
+                                        throw Fixture.Failure.timedOut("saved-marker classification idle before trial")
+                                    }
+                                    let snapshots = (0 ..< mode.publications).map { _ in
+                                        sequence += 1
+                                        revision += 1
+                                        return f.catalog(base, sequence: sequence, catalogRevision: revision)
+                                    }
+                                    let recorder = WorkspaceSavedMarkerMeasurements()
+                                    WorkspaceSavedMarkerMeasurements.install(recorder)
+                                    let cpuBefore = try XCTUnwrap(DebugProcessMemorySampler.captureSnapshot())
+                                    let start = DispatchTime.now().uptimeNanoseconds
+                                    var accepted = true
+                                    var parity = true
+                                    for snapshot in snapshots {
+                                        for manager in managers {
+                                            let result = manager.applyDomainWorkspaceCatalog(
+                                                snapshot, projection: .metadata(baselineGeneration: manager.domainCatalogReconciliationGeneration),
+                                                preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata
+                                            )
+                                            accepted = result.receipt != nil && accepted
+                                        }
+                                        if mode.settled {
+                                            for manager in managers {
+                                                await manager.awaitAuthorityIncompleteRestoreClassificationForTesting()
+                                            }
+                                            parity = managers.allSatisfy { $0.pendingConsolidatedRestoreIDs == expected } && parity
+                                        }
+                                    }
+                                    if !mode.settled {
+                                        for manager in managers {
+                                            await manager.awaitAuthorityIncompleteRestoreClassificationForTesting()
+                                        }
+                                        parity = managers.allSatisfy { $0.pendingConsolidatedRestoreIDs == expected }
+                                    }
+                                    let wall = DispatchTime.now().uptimeNanoseconds - start
+                                    let cpuAfter = try XCTUnwrap(DebugProcessMemorySampler.captureSnapshot())
+                                    WorkspaceSavedMarkerMeasurements.install(nil)
+                                    let cpu = try XCTUnwrap(cpuAfter.cpuUsage.delta(since: cpuBefore.cpuUsage))
+                                    let counts = recorder.snapshot()
+                                    let unchanged = try candidates.enumerated().allSatisfy {
+                                        try Data(contentsOf: f.workspaceURL(for: $0.element)) == savedBytes[$0.offset]
+                                    }
+                                    let calls = 35 * dirtyCount * (mode.settled ? mode.publications : 1)
+                                    let expectedDecodes = legacy ? calls : dirtyCount
+                                    let stats = owner.snapshotForTesting().stats
+                                    let valid = accepted && parity && unchanged && counts.requests == expectedDecodes
+                                        && counts.reads == expectedDecodes && counts.fullDecodes == expectedDecodes
+                                        && counts.marked == (legacy ? 35 * expected.count * (mode.settled ? mode.publications : 1) : expected.count)
+                                        && counts.unreadable == 0
+                                        && WorkspaceSavedMarkerMeasurements.validCPU(userMS: cpu.userMS, systemMS: cpu.systemMS)
+                                        && stats.requests == calls
+                                    let metric = Metric(
+                                        arm: legacy ? "legacy" : "shared", owner: stats, workload: workload.rawValue, dirty: dirtyCount, managers: 35,
+                                        publications: mode.publications, delivery: mode.settled ? "settled" : "backToBack",
+                                        trial: trial, savedBytes: totalBytes, wallNanoseconds: wall,
+                                        cpuUserMS: cpu.userMS, cpuSystemMS: cpu.systemMS, counts: counts,
+                                        pendingParity: parity, accepted: accepted, valid: valid
+                                    )
+                                    let encoder = JSONEncoder()
+                                    encoder.outputFormatting = .sortedKeys
+                                    try print("CONSOLIDATION_MARKER_METRIC \(String(decoding: encoder.encode(metric), as: UTF8.self))")
+                                    XCTAssertTrue(valid, "Invalid diagnostic sample (retained in log): \(workload)/\(dirtyCount)/\(mode)/\(trial)")
+                                    if !legacy { XCTAssertLessThan(wall, 5_000_000_000, "Five-second completion budget, not a speed-ratio assertion") }
+                                }
+                            }
+                        }
+                        if !measuring {
+                            // Preserve cached observations for the four unchanged files across each saved-phase flip.
+                            for (index, marked, write) in [(1, true, true), (0, false, true), (0, false, false)] {
+                                var saved = candidates[index]
+                                saved.consolidatedIntoWorkspaceID = marked ? system.id : nil
+                                if write { try f.writeDocument(saved) }
+                                WorkspaceFileDecodeCache.shared.invalidate(url: f.workspaceURL(for: saved))
+                                if marked { expected.insert(saved.id) } else { expected.remove(saved.id) }
+                                sequence += 1
+                                revision += 1
+                                let snapshot = f.catalog(base, sequence: sequence, catalogRevision: revision)
+                                let recorder = WorkspaceSavedMarkerMeasurements()
+                                WorkspaceSavedMarkerMeasurements.install(recorder)
+                                let start = DispatchTime.now().uptimeNanoseconds
+                                for manager in managers {
+                                    XCTAssertNotNil(manager.applyDomainWorkspaceCatalog(
+                                        snapshot, projection: .metadata(baselineGeneration: manager.domainCatalogReconciliationGeneration),
+                                        preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata
+                                    ).receipt)
+                                }
+                                for manager in managers {
+                                    await manager.awaitAuthorityIncompleteRestoreClassificationForTesting()
+                                }
+                                XCTAssertLessThan(DispatchTime.now().uptimeNanoseconds - start, 5_000_000_000)
+                                WorkspaceSavedMarkerMeasurements.install(nil)
+                                XCTAssertEqual(recorder.snapshot().fullDecodes, 1)
+                                XCTAssertTrue(managers.allSatisfy { $0.pendingConsolidatedRestoreIDs == expected })
+                            }
+                        }
+                        // Failure mapping control, outside timing: malformed and wrong-ID saved documents stay pending.
+                        if workload == .busy, dirtyCount == 20 {
+                            XCTAssertTrue(owner.resetForTesting(perCaller: true))
+                            try Data("malformed".utf8).write(to: f.workspaceURL(for: candidates[0]), options: .atomic)
+                            try savedBytes[0].write(to: f.workspaceURL(for: candidates[1]), options: .atomic)
+                            expected.insert(candidates[1].id)
+                            sequence += 1
+                            revision += 1
+                            let broken = f.catalog(base, sequence: sequence, catalogRevision: revision)
+                            let recorder = WorkspaceSavedMarkerMeasurements()
+                            WorkspaceSavedMarkerMeasurements.install(recorder)
+                            for manager in managers {
+                                XCTAssertNotNil(manager.applyDomainWorkspaceCatalog(
+                                    broken, projection: .metadata(baselineGeneration: manager.domainCatalogReconciliationGeneration),
+                                    preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata
+                                ).receipt)
+                            }
+                            for manager in managers {
+                                await manager.awaitAuthorityIncompleteRestoreClassificationForTesting()
+                            }
+                            WorkspaceSavedMarkerMeasurements.install(nil)
+                            let counts = recorder.snapshot()
+                            XCTAssertEqual(counts.decodeFailures, 35)
+                            XCTAssertEqual(counts.identityMismatches, 35)
+                            XCTAssertEqual(counts.unreadable, 70)
+                            XCTAssertTrue(managers.allSatisfy { $0.pendingConsolidatedRestoreIDs == expected })
+                            print("CONSOLIDATION_MARKER_CONTROL malformed=35 identity_mismatches=35 unreadable=70 pending_parity=true")
+                        }
+                    }
+                }
+            }
+        }
+
         func testOmittedEphemeral35ReceiversEightMiBParityWithVisibleAndHiddenOwners() async throws {
             var seeds = Fixture.standardSeeds
             var omitted = Fixture.model(id: UUID(), name: "Legacy omitted")
@@ -8000,6 +8264,12 @@ import XCTest
                 await manager.awaitRootReconciliationShutdown()
             }
             managers.removeAll()
+            let markerOwnerIdle = await WorkspaceFileDecodeCache.shared.savedMarkerOwner.awaitIdleForTesting()
+            if markerOwnerIdle {
+                XCTAssertTrue(WorkspaceFileDecodeCache.shared.savedMarkerOwner.resetForTesting())
+            } else {
+                XCTFail("Saved-marker classifications did not drain; preserving storage while continuing fixture teardown")
+            }
             await polling.shutdown()
             if !networkWasRunning { await ServerNetworkManager.shared.stop() }
             if let runtime {
@@ -8016,7 +8286,7 @@ import XCTest
                 restore(previousOnboardingPreference, forKey: "agentOnboardingHasSeen")
             }
             do {
-                if FileManager.default.fileExists(atPath: base.path) {
+                if markerOwnerIdle, FileManager.default.fileExists(atPath: base.path) {
                     try FileManager.default.removeItem(at: base)
                 }
             } catch {
