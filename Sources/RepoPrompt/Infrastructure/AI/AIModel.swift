@@ -1679,13 +1679,25 @@ public enum AIModel: Equatable, Hashable {
         let groups: [ClaudeCodePickerMenuGroup]
     }
 
-    private struct SemanticSortMetadata {
+    fileprivate struct SemanticSortMetadata {
         let family: String
         let versionComponents: [Int]
         let suffix: String
         let reasoningEffort: CodexReasoningEffort?
         let displayName: String
         let tieBreaker: String
+        #if DEBUG
+            var exactBytes: [[UInt8]] {
+                [
+                    family,
+                    versionComponents.map(String.init).joined(separator: ","),
+                    suffix,
+                    reasoningEffort?.rawValue ?? "nil",
+                    displayName,
+                    tieBreaker
+                ].map { Array($0.utf8) }
+            }
+        #endif
     }
 
     static func sortedForPicker(_ models: [AIModel]) -> [AIModel] {
@@ -1694,10 +1706,16 @@ public enum AIModel: Equatable, Hashable {
 
     static func sortedForPicker(_ models: [AIModel], sources: AIModelPickerSnapshot.Sources) -> [AIModel] {
         let snapshot = AIModelPickerSnapshot(models: models, sources: sources)
-        return sortedForPicker(models, snapshot: snapshot)
+        return sortedForPicker(models, snapshot: snapshot, memo: Self.pickerSemanticMemo)
     }
 
+    private static let pickerSemanticMemo = AIModelSemanticMemo()
+
     #if DEBUG
+        static func test_sortedForPicker(_ models: [AIModel], sources: AIModelPickerSnapshot.Sources, memo: AIModelSemanticMemo?) -> [AIModel] {
+            sortedForPicker(models, snapshot: AIModelPickerSnapshot(models: models, sources: sources), memo: memo)
+        }
+
         static func test_sortedForPickerWithoutSnapshot(_ models: [AIModel]) -> [AIModel] {
             sortedForPicker(models, snapshot: nil)
         }
@@ -1716,14 +1734,40 @@ public enum AIModel: Equatable, Hashable {
         }
     #endif
 
-    private static func sortedForPicker(_ models: [AIModel], snapshot: AIModelPickerSnapshot?) -> [AIModel] {
+    private static func sortedForPicker(_ models: [AIModel], snapshot: AIModelPickerSnapshot?, memo: AIModelSemanticMemo? = nil) -> [AIModel] {
         // Only the DEBUG parity reference passes nil; shipping calls always capture a snapshot.
         var metadataCache: [AIModel: SemanticSortMetadata] = [:]
+        var preparedMemo = false
+        var memoToken: AIModelSemanticMemo.Token?
         func metadata(for model: AIModel) -> SemanticSortMetadata {
             if let cached = metadataCache[model] {
                 return cached
             }
+            // Native local equality and first-comparison ownership remain authoritative.
+            var exactKey: AIModelSemanticMemo.ModelKey?
+            if let memo, let snapshot {
+                if !preparedMemo {
+                    preparedMemo = true
+                    memoToken = snapshot.semanticMemoContent(limit: memo.limits.contentBytes).flatMap { memo.token(for: $0) }
+                }
+                if let token = memoToken {
+                    exactKey = memo.modelKey(model.identity)
+                    if let key = exactKey, let cached = memo.lookup(token: token, key: key) {
+                        #if DEBUG
+                            if memo.verifyHits {
+                                let fresh = semanticSortMetadata(for: model, snapshot: snapshot)
+                                precondition(cached.exactBytes == fresh.exactBytes, "Semantic memo byte drift")
+                            }
+                        #endif
+                        metadataCache[model] = cached
+                        return cached
+                    }
+                }
+            }
             let metadata = snapshot.map { semanticSortMetadata(for: model, snapshot: $0) } ?? semanticSortMetadata(for: model)
+            if let memo, let token = memoToken, let key = exactKey {
+                memo.insert(metadata, token: token, key: key)
+            }
             metadataCache[model] = metadata
             return metadata
         }
@@ -2360,7 +2404,7 @@ public enum AIModel: Equatable, Hashable {
         return models.filter(\.isAvailable)
     }
 
-    private indirect enum AIModelIdentity: Hashable {
+    fileprivate indirect enum AIModelIdentity: Hashable {
         case openAIServiceTierVariant(base: AIModelIdentity, tier: String)
         case openrouterCustom(name: String)
         case openaiCustom(name: String)
@@ -2385,7 +2429,7 @@ public enum AIModel: Equatable, Hashable {
         case staticCase(StaticIdentity)
     }
 
-    private enum StaticIdentity: Hashable {
+    fileprivate enum StaticIdentity: Hashable {
         case gpt41
         case gpt5
         case gpt5Low
@@ -2558,7 +2602,7 @@ public enum AIModel: Equatable, Hashable {
         case claudeCodeOpus
     }
 
-    private var identity: AIModelIdentity {
+    fileprivate var identity: AIModelIdentity {
         switch self {
         case let .openAIServiceTierVariant(base, tier):
             .openAIServiceTierVariant(base: base.identity, tier: tier)
@@ -3018,6 +3062,304 @@ public enum AIModel: Equatable, Hashable {
     }
 }
 
+/// Bounded model-associated text may remain after sign-out until eviction/process exit; no credential/config fields, membership or authorization are cached.
+final class AIModelSemanticMemo: @unchecked Sendable {
+    struct Limits {
+        var entries = 1024
+        var states = 16
+        // Logical key/value byte accounting plus fixed allowances, not an allocator/RSS limit.
+        var bytes = 512 * 1024
+        var contentBytes = 64 * 1024
+        var entryBytes = 16 * 1024
+    }
+
+    struct Stats {
+        var hits = 0
+        var misses = 0
+        var inserts = 0
+        var duplicates = 0
+        var evictions = 0
+        var stale = 0
+        var rejected = 0
+        var entries = 0
+        var states = 0
+        var chargedBytes = 0
+    }
+
+    // A retained empty token cannot have its address reused; it retains no content/entries.
+    final class Token: Sendable {}
+    fileprivate struct Content: Hashable {
+        let bytes: Data
+        let hint: Int
+        init(_ bytes: Data, forcedHash: Int? = nil) {
+            self.bytes = bytes
+            hint = forcedHash ?? bytes.hashValue
+        }
+
+        func hash(into hasher: inout Hasher) {
+            hasher.combine(hint)
+        }
+    }
+
+    fileprivate indirect enum ModelKey: Hashable {
+        case fixed(AIModel.StaticIdentity)
+        case dynamic(UInt8, Data)
+        case tier(ModelKey, Data)
+        var charge: Int {
+            switch self {
+            case .fixed: 32
+            case let .dynamic(_, bytes): bytes.count + 32
+            case let .tier(base, bytes): base.charge + bytes.count + 32
+            }
+        }
+    }
+
+    private final class ContentState {
+        let token = Token()
+        let content: Content
+        var entries: [ModelKey: AIModel.SemanticSortMetadata] = [:]
+        var charged: Int
+        init(_ content: Content) {
+            self.content = content
+            charged = content.bytes.count + 256
+        }
+    }
+
+    let limits: Limits
+    private let lock = NSLock()
+    private var states: [Content: ContentState] = [:]
+    private var recency: [ContentState] = [] // oldest first; bounded by limits.states
+    private var stats = Stats()
+    private let recording: Bool
+    let verifyHits: Bool
+
+    init(limits: Limits = Limits(), recording: Bool = false, verifyHits: Bool = false) {
+        precondition(limits.entries > 0 && limits.states > 0 && limits.bytes > 0 && limits.contentBytes > 0 && limits.entryBytes > 0)
+        self.limits = limits
+        self.recording = recording
+        self.verifyHits = verifyHits
+    }
+
+    #if DEBUG
+        func statistics() -> Stats {
+            lock.withLock { stats }
+        }
+
+        func purge() {
+            lock.withLock {
+                states.removeAll()
+                recency.removeAll()
+                stats = Stats()
+            }
+        }
+    #endif
+
+    private func touch(_ state: ContentState) {
+        recency.removeAll { $0 === state }
+        recency.append(state)
+    }
+
+    private func evict(except protected: ContentState? = nil) -> Bool {
+        guard let index = recency.firstIndex(where: { $0 !== protected }) else { return false }
+        let state = recency.remove(at: index)
+        states.removeValue(forKey: state.content)
+        stats.entries -= state.entries.count
+        stats.chargedBytes -= state.charged
+        stats.states -= 1
+        if recording { stats.evictions += 1 }
+        return true
+    }
+
+    fileprivate func token(for content: Content) -> Token? {
+        guard limits.bytes >= 256,
+              content.bytes.count <= limits.contentBytes,
+              content.bytes.count <= limits.bytes - 256 else { return nil }
+        return lock.withLock {
+            if let state = states[content] { touch(state)
+                return state.token
+            }
+            while stats.states >= limits.states || stats.chargedBytes > limits.bytes - content.bytes.count - 256 {
+                guard evict() else { return nil }
+            }
+            let state = ContentState(content)
+            states[content] = state
+            recency.append(state)
+            stats.states += 1
+            stats.chargedBytes += state.charged
+            return state.token
+        }
+    }
+
+    private func live(_ token: Token) -> ContentState? {
+        recency.first { $0.token === token }
+    }
+
+    fileprivate func lookup(token: Token, key: ModelKey) -> AIModel.SemanticSortMetadata? {
+        lock.withLock {
+            guard let state = live(token) else { if recording { stats.stale += 1 }
+                return nil
+            }
+            touch(state)
+            if let value = state.entries[key] { if recording { stats.hits += 1 }
+                return value
+            }
+            if recording { stats.misses += 1 }
+            return nil
+        }
+    }
+
+    fileprivate func insert(_ value: AIModel.SemanticSortMetadata, token: Token, key: ModelKey) {
+        // Counts are capped while adding: arithmetic cannot exceed entryBytes or overflow.
+        guard value.versionComponents.count <= limits.entryBytes / MemoryLayout<Int>.stride else { return }
+        var charge = key.charge
+        for size in [
+            value.family.utf8.count,
+            value.suffix.utf8.count,
+            value.displayName.utf8.count,
+            value.tieBreaker.utf8.count,
+            value.versionComponents.count * MemoryLayout<Int>.stride,
+            128
+        ] {
+            guard size <= limits.entryBytes, charge <= limits.entryBytes - size else { return }
+            charge += size
+        }
+        guard charge <= limits.bytes else { return }
+        lock.withLock {
+            guard let state = live(token) else { if recording { stats.stale += 1 }
+                return
+            }
+            if state.entries[key] != nil { if recording { stats.duplicates += 1 }
+                touch(state)
+                return
+            }
+            while stats.entries >= limits.entries || stats.chargedBytes > limits.bytes - charge {
+                guard evict(except: state) else { if recording { stats.rejected += 1 }
+                    return
+                }
+            }
+            state.entries[key] = value
+            state.charged += charge
+            stats.chargedBytes += charge
+            stats.entries += 1
+            if recording { stats.inserts += 1 }
+            touch(state)
+        }
+    }
+
+    fileprivate func modelKey(_ identity: AIModel.AIModelIdentity) -> ModelKey? {
+        var remaining = limits.entryBytes
+        func fields(_ tag: UInt8, _ values: [String]) -> ModelKey? {
+            var bytes = Data()
+            for value in values {
+                let count = value.utf8.count
+                guard count <= remaining, remaining - count >= 8 else { return nil }
+                remaining -= count + 8
+                var length = UInt64(count).littleEndian
+                withUnsafeBytes(of: &length) { bytes.append(contentsOf: $0) }
+                bytes.append(contentsOf: value.utf8)
+            }
+            return .dynamic(tag, bytes)
+        }
+        func walk(_ value: AIModel.AIModelIdentity) -> ModelKey? {
+            guard remaining >= 32 else { return nil }
+            remaining -= 32
+            switch value {
+            case let .staticCase(value): return .fixed(value)
+            case .claudeCodeModel: return nil
+            case let .openAIServiceTierVariant(base, tier):
+                guard let key = walk(base), tier.utf8.count <= remaining else { return nil }
+                remaining -= tier.utf8.count
+                return .tier(key, Data(tier.utf8))
+            case let .openrouterCustom(name): return fields(1, [name])
+            case let .openaiCustom(name): return fields(2, [name])
+            case let .openaiCustomResponses(name): return fields(3, [name])
+            case let .openaiCustomReasoning(name, effort): return fields(4, [name, effort.rawValue])
+            case let .anthropicCustom(name): return fields(5, [name])
+            case let .geminiCustom(name): return fields(6, [name])
+            case let .deepseekCustom(name): return fields(7, [name])
+            case let .fireworksCustom(name): return fields(8, [name])
+            case let .azureCustom(name): return fields(9, [name])
+            case let .grokCustom(name): return fields(10, [name])
+            case let .groqCustom(name): return fields(11, [name])
+            case let .zaiCustom(name): return fields(12, [name])
+            case let .codexCustom(name): return fields(13, [name])
+            case let .openCodeCustom(name): return fields(14, [name])
+            case let .cursorCustom(name): return fields(15, [name])
+            case let .grokBuildCustom(name): return fields(16, [name])
+            case let .devinCustom(name): return fields(17, [name])
+            case let .customProvider(name, provider, model): return fields(18, [name, provider, model])
+            case let .customProviderUser(name): return fields(19, [name])
+            }
+        }
+        return walk(identity)
+    }
+
+    #if DEBUG
+        func test_content(_ data: Data, hash: Int = 0) -> Token? {
+            token(for: Content(data, forcedHash: hash))
+        }
+
+        func test_insert(_ text: String, token: Token, model: AIModel) {
+            guard let key = modelKey(model.identity) else { return }
+            insert(.init(family: text, versionComponents: [], suffix: "", reasoningEffort: nil, displayName: text, tieBreaker: text), token: token, key: key)
+        }
+
+        func test_lookup(token: Token, model: AIModel) -> String? {
+            guard let key = modelKey(model.identity) else { return nil }
+            return lookup(token: token, key: key)?.displayName
+        }
+    #endif
+}
+
+/// A two-pass, allocation-bounded encoder. Dictionary ordering is performed only after sizing.
+private struct PickerSemanticBytes {
+    let limit: Int
+    var data: Data?
+    var count = 0
+    var valid = true
+    mutating func reserve(_ size: Int) {
+        guard valid, size >= 0, size <= limit, count <= limit - size else { valid = false
+            return
+        }
+        count += size
+    }
+
+    mutating func number(_ value: Int) {
+        reserve(8)
+        if valid, data != nil { var n = UInt64(value).littleEndian
+            withUnsafeBytes(of: &n) { data!.append(contentsOf: $0) }
+        }
+    }
+
+    mutating func string(_ value: String) {
+        let size = value.utf8.count
+        number(size)
+        reserve(size)
+        if valid, data != nil { data!.append(contentsOf: value.utf8) }
+    }
+
+    mutating func optional(_ value: String?) {
+        number(value == nil ? 0 : 1)
+        if let value { string(value) }
+    }
+
+    mutating func dictionary(_ values: [String: String]) {
+        number(values.count)
+        if data == nil {
+            for (key, value) in values {
+                string(key)
+                string(value)
+                if !valid { return }
+            }
+        } else {
+            for key in values.keys.sorted(by: { $0.utf8.lexicographicallyPrecedes($1.utf8) }) {
+                string(key)
+                string(values[key]!)
+            }
+        }
+    }
+}
+
 /// Read dependencies before comparisons; discard every index when this sort returns.
 /// Projections are valid only for this input's same-provider groups with at least two entries.
 /// Keep Requirements.include and AIModel's picker projections synchronized, including wrapped bases;
@@ -3140,6 +3482,40 @@ final class AIModelPickerSnapshot {
             }
         }
         return result
+    }
+
+    /// This projection covers the parser's ordered id/effort inputs and every non-Claude label/default.
+    /// CodexModelDiscovery.contains/supports read only IDs and efforts, independent of advertised tiers/isDefault.
+    /// Display-name/model fallback changes are covered by codexLabels when a Codex lane can compare.
+    /// New mutable semantic dependencies must be captured here and included in this encoding.
+    fileprivate func semanticMemoContent(limit: Int) -> AIModelSemanticMemo.Content? {
+        func encode(_ writer: inout PickerSemanticBytes) {
+            writer.number(1)
+            writer.number(discovery.records.count)
+            for record in discovery.records {
+                writer.string(record.id)
+                writer.number(record.supportedReasoningEfforts.count)
+                for effort in record.supportedReasoningEfforts {
+                    writer.string(effort.reasoningEffort)
+                }
+                writer.optional(record.defaultReasoningEffort)
+                if !writer.valid { return }
+            }
+            for labels in [codexLabels, openCodeLabels, grokBuildLabels, devinLabels, cursorLabels] {
+                writer.dictionary(labels)
+                if !writer.valid { return }
+            }
+            writer.optional(ollamaName)
+        }
+        var sizing = PickerSemanticBytes(limit: limit)
+        encode(&sizing)
+        guard sizing.valid else { return nil }
+        var data = Data()
+        data.reserveCapacity(sizing.count)
+        var writer = PickerSemanticBytes(limit: limit, data: data)
+        encode(&writer)
+        guard writer.valid, writer.count == sizing.count, let result = writer.data else { return nil }
+        return AIModelSemanticMemo.Content(result)
     }
 
     private struct Requirements {
