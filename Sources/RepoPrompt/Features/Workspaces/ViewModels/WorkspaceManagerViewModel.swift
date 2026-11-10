@@ -7507,7 +7507,14 @@ class WorkspaceManagerViewModel: ObservableObject {
         let schedulerStopSpan = StartupPhaseLog.begin(.tokenSchedulerStop, window: promptViewModel.windowID)
         await promptViewModel.stopTokenCountUpdateTimer()
         schedulerStopSpan.end()
-        await workspaceSearchService.reset()
+        let searchResetSpan = StartupPhaseLog.begin(.switchSearchReset, window: promptViewModel.windowID)
+        let searchCompletedAt = await workspaceSearchService.reset(measureCompletion: true)
+        let searchResumedAt = ProcessInfo.processInfo.systemUptime
+        searchResetSpan.end(extraFields: [
+            "actorResumeDelayMs": searchCompletedAt.map {
+                StartupPhaseLog.spanMilliseconds(from: $0, to: searchResumedAt)
+            } ?? 0
+        ])
         if let cancellation = cancellationResult(
             operationID: operationID,
             targetWorkspace: newWorkspace,
@@ -7581,7 +7588,9 @@ class WorkspaceManagerViewModel: ObservableObject {
             let targetBeforeLoad = workspaces[wsIndex]
             let diskURL = workspaceFileURL(for: newWorkspace)
             if domainWorkspaceAuthorityClient != nil {
+                let canonicalRootSpan = StartupPhaseLog.begin(.switchCanonicalRootRefresh, window: promptViewModel.windowID)
                 await refreshCanonicalRootState(workspaceID: newWorkspace.id)
+                canonicalRootSpan.end()
                 if let cancellation = cancellationResult(operationID: operationID, targetWorkspace: newWorkspace, boundary: "refreshing canonical roots") {
                     return cancellation
                 }
@@ -7748,6 +7757,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         // Same-ID replacement reloads use loadWorkspaceFolders as the destructive unload
         // boundary. Keep that path serial so cancellation/recovery observes the existing
         // roots-unloaded marker in the same task that owns the switch operation.
+        let hydrationSpawnSpan = StartupPhaseLog.begin(.switchHydrationSpawn, window: promptViewModel.windowID)
         let shouldOverlapRootHydration = activeWS.id != previousActiveWorkspace?.id
         var folderLoadStart: Date?
         let folderLoadTask: Task<Void, Never>?
@@ -7766,6 +7776,11 @@ class WorkspaceManagerViewModel: ObservableObject {
                    boundary: "spawning root hydration"
                )
             {
+                hydrationSpawnSpan.end(extraFields: [
+                    "cancelled": 1,
+                    "configuredRoots": activeWS.repoPaths.count,
+                    "overlap": 1
+                ])
                 return cancellation
             }
             folderLoadTask = Task { @MainActor in
@@ -7774,6 +7789,11 @@ class WorkspaceManagerViewModel: ObservableObject {
         } else {
             folderLoadTask = nil
         }
+        hydrationSpawnSpan.end(extraFields: [
+            "cancelled": 0,
+            "configuredRoots": activeWS.repoPaths.count,
+            "overlap": shouldOverlapRootHydration ? 1 : 0
+        ])
         var folderLoadCompleted = !shouldOverlapRootHydration
         defer {
             if !folderLoadCompleted {
@@ -7786,7 +7806,9 @@ class WorkspaceManagerViewModel: ObservableObject {
         // not require root descendant UI projection; final checkbox reconciliation still
         // happens after target hydration and selection replay below.
         advanceWorkspaceSwitchOperation(operationID, to: .restoringState)
+        let restoreYieldSpan = StartupPhaseLog.begin(.switchRestoreStateYield, window: promptViewModel.windowID)
         await Task.yield()
+        restoreYieldSpan.end()
         if let cancellation = cancellationResult(
             operationID: operationID,
             targetWorkspace: newWorkspace,
@@ -9360,10 +9382,33 @@ class WorkspaceManagerViewModel: ObservableObject {
             owner.beginClassificationForTesting()
             defer { owner.endClassificationForTesting() }
         #endif
-        let savedStatus = await Task.detached(priority: .utility) {
-            await owner.status(url: candidate.savedFileURL, workspaceID: candidate.workspaceID)
+        let markerSpan = StartupPhaseLog.begin(.switchSavedMarkerLookup, window: promptViewModel.windowID)
+        let (savedStatus, workerCompletedAt) = await Task.detached(priority: .utility) {
+            let status = await owner.status(url: candidate.savedFileURL, workspaceID: candidate.workspaceID)
+            return (status, ProcessInfo.processInfo.systemUptime)
         }.value
-        guard ownsAuthorityRestoreClassification(attemptID, publicationSequence: snapshot.publicationSequence) else { return .stale }
+        let markerResumeDelay = StartupPhaseLog.spanMilliseconds(
+            from: workerCompletedAt, to: ProcessInfo.processInfo.systemUptime
+        )
+        #if DEBUG
+            afterAuthorityRestoreSavedReadForTesting?(workspaceID)
+        #endif
+        let markerState = switch savedStatus {
+        case .marked: 1
+        case .unmarked: 2
+        case .unreadable: 3
+        }
+        guard ownsAuthorityRestoreClassification(attemptID, publicationSequence: snapshot.publicationSequence) else {
+            markerSpan.end(extraFields: [
+                "markerState": markerState, "outcome": WorkspaceRestoreAttributionOutcome.staleIdentity.rawValue,
+                "workerResumeDelayMs": markerResumeDelay, "workers": 1
+            ])
+            return .stale
+        }
+        markerSpan.end(extraFields: [
+            "markerState": markerState, "outcome": WorkspaceRestoreAttributionOutcome.completed.rawValue,
+            "workerResumeDelayMs": markerResumeDelay, "workers": 1
+        ])
         switch savedStatus {
         case .marked:
             authorityIncompleteConsolidatedRestoreIDs.insert(workspaceID)
@@ -9391,6 +9436,15 @@ class WorkspaceManagerViewModel: ObservableObject {
     /// lifecycle transition. Authority-backed activation therefore proceeds only from a fresh,
     /// clear classification, followed by one final local projection check.
     private func canActivateWorkspaceAfterAuthorityCheck(workspaceID: UUID) async -> Bool {
+        let classificationSpan = StartupPhaseLog.begin(.switchAuthorityClassification, window: promptViewModel.windowID)
+        var activationAllowed = false
+        var systemFallback = false
+        defer {
+            classificationSpan.end(extraFields: [
+                "allowed": activationAllowed ? 1 : 0,
+                "systemFallback": systemFallback ? 1 : 0
+            ])
+        }
         guard let target = workspace(withID: workspaceID) else { return false }
         // The empty system workspace is the window shell, not a saved project activation.
         // Its initialization must be independent of catalog migration and recovery.
@@ -9398,6 +9452,8 @@ class WorkspaceManagerViewModel: ObservableObject {
            target.consolidatedIntoWorkspaceID == nil,
            !pendingConsolidatedRestoreIDs.contains(workspaceID)
         {
+            systemFallback = true
+            activationAllowed = true
             return true
         }
         if domainWorkspaceAuthorityClient != nil, !target.isEphemeral {
@@ -9424,8 +9480,9 @@ class WorkspaceManagerViewModel: ObservableObject {
             }
         }
         guard let current = workspace(withID: workspaceID) else { return false }
-        return current.consolidatedIntoWorkspaceID == nil
+        activationAllowed = current.consolidatedIntoWorkspaceID == nil
             && !pendingConsolidatedRestoreIDs.contains(workspaceID)
+        return activationAllowed
     }
 
     private func isOlderDomainRevision(_ revision: DomainRevisionState, workspaceID: UUID) -> Bool {
@@ -9769,6 +9826,11 @@ class WorkspaceManagerViewModel: ObservableObject {
     #if DEBUG
         private var catalogRecordDecodeFailureForTesting: ((UUID) -> Error?)?
         var beforeAuthorityRestoreSavedReadForTesting: ((UUID?) async -> Void)?
+        var afterAuthorityRestoreSavedReadForTesting: ((UUID) -> Void)?
+
+        func cancelAuthorityRestoreClassificationForTesting() {
+            cancelAuthorityRestoreClassification()
+        }
 
         func catalogOmissionStateForTesting(_ id: UUID) -> [String: Bool] {
             [
@@ -10735,14 +10797,37 @@ class WorkspaceManagerViewModel: ObservableObject {
               let workspace = activeWorkspace, workspace.id == workspaceID,
               workspace.activeComposeTabID == snapshot.tabID,
               let currentTab = workspace.composeTabs.first(where: { $0.id == snapshot.tabID })
-        else { return }
+        else {
+            let outcome: WorkspaceRestoreAttributionOutcome = snapshot == nil ? .skipped : .staleIdentity
+            for phase: WorkspaceRestoreStartupPhase in [
+                .switchReplayExpansion, .switchReplaySelectionApply, .switchReplaySliceHydration
+            ] {
+                fileManager.restorePerfRecorder.beginStartupSpan(phase, window: promptViewModel.windowID)?
+                    .end(fields: ["outcome": outcome.rawValue])
+            }
+            StartupPhaseLog.begin(.switchReplaySelectionFence, window: promptViewModel.windowID)
+                .end(extraFields: ["outcome": outcome.rawValue])
+            fileManager.restorePerfRecorder.beginStartupSpan(.switchReplayDeferredFlush, window: promptViewModel.windowID)?
+                .end(fields: ["outcome": outcome.rawValue])
+            return
+        }
 
         beginApplyingTabContext(forTabID: snapshot.tabID)
         defer { endApplyingTabContext(forTabID: snapshot.tabID) }
-        await fileManager.withDeferredSelectionSliceSnapshotRebuild(reason: "workspaceRestore.postHydrationReplay") {
-            await fileManager.restoreExpansionState(from: currentTab.expandedFolders)
-            await fileManager.onActiveTabChangedHeavy(for: currentTab.id, selection: currentTab.selection)
+        await fileManager.withDeferredSelectionSliceSnapshotRebuild(
+            reason: "workspaceRestore.postHydrationReplay",
+            startupAttributionWindow: promptViewModel.windowID
+        ) {
+            await fileManager.restoreExpansionState(
+                from: currentTab.expandedFolders, startupAttributionWindow: promptViewModel.windowID
+            )
+            await fileManager.onActiveTabChangedHeavy(
+                for: currentTab.id, selection: currentTab.selection,
+                startupAttributionWindow: promptViewModel.windowID
+            )
+            let fenceSpan = StartupPhaseLog.begin(.switchReplaySelectionFence, window: promptViewModel.windowID)
             selectionCoordinator?.refreshDeferredUISelectionFence(forTabID: currentTab.id)
+            fenceSpan.end(extraFields: ["coordinator": selectionCoordinator == nil ? 0 : 1])
         }
     }
 

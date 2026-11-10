@@ -293,7 +293,8 @@ actor WorkspaceSearchService {
         await rebuildIndex(from: snapshot)
     }
 
-    func reset() async {
+    @discardableResult
+    func reset(measureCompletion: Bool = false) async -> TimeInterval? {
         cancelRefreshFlight()
         bindingEpoch &+= 1
         freshnessListenerSerial &+= 1
@@ -310,6 +311,7 @@ actor WorkspaceSearchService {
         pendingRebuildGeneration = nil
         activeRebuildGeneration = nil
         isReadyIndexUsable = true
+        return measureCompletion ? ProcessInfo.processInfo.systemUptime : nil
     }
 
     func search(_ query: String, limit: Int = 300) async -> WorkspaceSearchQueryResult {

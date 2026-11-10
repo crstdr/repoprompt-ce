@@ -430,6 +430,38 @@ Define the workload, acceptance threshold, comparable environment, sample count,
 
 Use focused before/after measurements to attribute a change, then exercise the full affected boundary before making repository-wide performance claims. Store durable evidence only when it has continuing review value; otherwise keep raw logs and machine-specific samples local. Do not create a replacement executable registry, method census, append-only repository scoreboard, or mandatory artifact hierarchy merely to track test counts.
 
+### Startup restore attribution markers
+
+Release builds emit bounded `Startup` category markers around workspace-switch preparation and post-hydration selection replay. To extract the added phases from an already captured timeline, run:
+
+```bash
+grep -E 'phase=(switchSearchReset|switchCanonicalRootRefresh|switchAuthorityClassification|switchSavedMarkerLookup|switchHydrationSpawn|switchRestoreStateYield|switchReplayExpansion|switchReplaySelectionApply|switchReplaySliceHydration|switchReplaySelectionFence|switchReplayDeferredFlush) ' startup-timeline.txt
+```
+
+For a local capture, replace `startup-timeline.txt` with the output of `/usr/bin/log show --style compact` for the chosen time range and predicate `subsystem == "com.pvncher.repoprompt.ce" AND category == "Startup"`. Use the same process ID and window ordinal when comparing boundaries. Each reached span emits a begin/end pair; skipped branches can omit a pre-state span, while a rejected replay emits skipped outcome records. At most 22 added lines are emitted per switch. Ordinary switches also emit these markers.
+
+`span_ms` includes child awaits and scheduling, so nested spans and the outer replay span must not be summed. `actorResumeDelayMs` measures the search actor's return-to-MainActor delay. `workerResumeDelayMs` measures detached saved-marker and slice-load completion to MainActor resumption. Other actor/store awaits remain inclusive in their enclosing spans; this is the approved probe scope. `nested=1` on deferred flush means another deferral owns the eventual flush; a depth-zero flush may include overlapping requests.
+
+The `outcome` codes for replay and saved-marker records are 1 completed, 2 skipped, 3 no change, 4 cancelled, 5 stale identity, 6 no roots, 7 no scope, and 8 persistence error. Saved-marker `markerState` codes are 1 marked, 2 unmarked, and 3 unreadable. Selection and slice fields prefixed `requested` count input paths and ranges. Actual applied counts can be lower. `plannedPersistRoots` counts roots with proposed partition updates. Fields are aggregate integers without paths or file names. Field sets vary by branch: a skipped fence or flush records its outcome, while a normal fence or flush uses its own fields.
+
+`StartupPhaseLogTests` includes a synthetic 36-owner, 300-tab fixture and separate real-manager and real-root tests. The synthetic fixture does not install the 264 inactive tabs in manager-owned workspaces. Its paired timing uses a test sink; the unified-log emission test runs in a Debug test process. Neither is a paired Release startup measurement. A Release A/B requires a separately authorized app restart.
+
+These illustrative end records show the field names and rendering order; actual durations, counts and reached phases vary:
+
+```text
+phase=switchSearchReset boundary=end window=1 elapsed_ms=1000 span_ms=4 actorResumeDelayMs=1
+phase=switchCanonicalRootRefresh boundary=end window=1 elapsed_ms=1005 span_ms=4
+phase=switchAuthorityClassification boundary=end window=1 elapsed_ms=1010 span_ms=4 allowed=1 systemFallback=0
+phase=switchSavedMarkerLookup boundary=end window=1 elapsed_ms=1008 span_ms=2 markerState=2 outcome=1 workerResumeDelayMs=0 workers=1
+phase=switchHydrationSpawn boundary=end window=1 elapsed_ms=1011 span_ms=1 cancelled=0 configuredRoots=1 overlap=1
+phase=switchRestoreStateYield boundary=end window=1 elapsed_ms=1015 span_ms=4
+phase=switchReplayExpansion boundary=end window=1 elapsed_ms=1100 span_ms=4 changed=1 changedExpandPaths=1 collapsedFolders=0 outcome=1 plannedCollapse=0 plannedExpand=1 requestedFolders=1
+phase=switchReplaySelectionApply boundary=end window=1 elapsed_ms=1110 span_ms=10 outcome=1 requestedManualCodemaps=1 requestedSelectedPaths=1 requestedSliceFiles=1 requestedSliceRanges=1
+phase=switchReplaySliceHydration boundary=end window=1 elapsed_ms=1120 span_ms=10 failedPersistRoots=0 outcome=1 plannedPersistRoots=1 requestedSliceFiles=1 requestedSliceRanges=1 roots=1 workerResumeDelayMs=1 workers=1
+phase=switchReplaySelectionFence boundary=end window=1 elapsed_ms=1121 span_ms=1 coordinator=1
+phase=switchReplayDeferredFlush boundary=end window=1 elapsed_ms=1122 span_ms=1 nested=0 pending=1 selectedFiles=1
+```
+
 ## Live Codex Desktop direct-headless worktree routing
 
 Run this release acceptance only from a Codex Desktop task whose repository root is an existing linked worktree and whose RepoPrompt launcher selects `--backend headless` with that exact root in `REPOPROMPT_MCP_WORKING_DIRS`. The canonical checkout must already belong to one saved RepoPrompt CE workspace. This lane validates an installed release candidate; it does not build, install, launch, stop, or relaunch RepoPrompt, create a workspace, or create a worktree.

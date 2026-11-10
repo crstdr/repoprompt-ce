@@ -1248,6 +1248,9 @@ class WorkspaceFilesViewModel: ObservableObject {
         private var appliedIndexProjectionWillHandleHandler: (@Sendable (UUID, UInt64) async -> Void)?
         private var hiddenSessionSliceRebaseWillCommitHandler: (@Sendable (String) async -> Void)?
         private var appliedIndexProjectionStateObserver: ((AppliedIndexProjectionDiagnosticsSnapshot) -> Void)?
+        var startupAfterSelectionForTesting: (() -> Void)?
+        var startupAfterSlicePersistenceForTesting: (() -> Void)?
+        var startupBeforeSlicePersistenceForTesting: (() throws -> Void)?
 
         func setAppliedIndexProjectionWillHandleHandlerForTesting(
             _ handler: (@Sendable (UUID, UInt64) async -> Void)?
@@ -2788,7 +2791,25 @@ class WorkspaceFilesViewModel: ObservableObject {
 
     /// Initialize expansion state from saved paths
     @MainActor
-    func restoreExpansionState(from paths: [String]) async {
+    func restoreExpansionState(from paths: [String], startupAttributionWindow: Int? = nil) async {
+        let attributionSpan = startupAttributionWindow.flatMap { restorePerfRecorder.beginStartupSpan(.switchReplayExpansion, window: $0) }
+        var attributionOutcome = WorkspaceRestoreAttributionOutcome.completed
+        var collapseCount = 0
+        var expandCount = 0
+        var collapsedFolders = 0
+        var changedExpandPaths = 0
+        var didChange = false
+        defer {
+            attributionSpan?.end(fields: [
+                "outcome": attributionOutcome.rawValue,
+                "requestedFolders": paths.count,
+                "plannedCollapse": collapseCount,
+                "plannedExpand": expandCount,
+                "collapsedFolders": collapsedFolders,
+                "changedExpandPaths": changedExpandPaths,
+                "changed": didChange ? 1 : 0
+            ])
+        }
         #if DEBUG
             let restoreExpansionStartMS = restorePerfRecorder.timestampMSIfEnabled()
             var restoreExpansionOutcome = "completed"
@@ -2829,12 +2850,15 @@ class WorkspaceFilesViewModel: ObservableObject {
         let currentExpanded = Set(expandedFolderPaths.map { ($0 as NSString).standardizingPath })
         let toCollapse = currentExpanded.subtracting(targetFullPaths)
         let toExpand = targetFullPaths.subtracting(currentExpanded)
+        collapseCount = toCollapse.count
+        expandCount = toExpand.count
         #if DEBUG
             restoreExpansionTargetFolders = targetFullPaths.count
             restoreExpansionCollapseCount = toCollapse.count
             restoreExpansionExpandCount = toExpand.count
         #endif
         guard !toCollapse.isEmpty || !toExpand.isEmpty else {
+            attributionOutcome = .noChange
             #if DEBUG
                 restoreExpansionOutcome = "noChange"
             #endif
@@ -2847,12 +2871,12 @@ class WorkspaceFilesViewModel: ObservableObject {
         isApplyingExpansionState = true
         defer { isApplyingExpansionState = false }
 
-        var didChange = false
         let collapseList = Array(toCollapse)
         if !collapseList.isEmpty {
             var index = 0
             while index < collapseList.count {
                 guard !Task.isCancelled else {
+                    attributionOutcome = .cancelled
                     #if DEBUG
                         restoreExpansionOutcome = "cancelled"
                     #endif
@@ -2862,6 +2886,7 @@ class WorkspaceFilesViewModel: ObservableObject {
                 for path in collapseList[index ..< end] {
                     if let folder = foldersByFullPath[path], folder.isExpanded {
                         folder.setExpanded(false)
+                        collapsedFolders += 1
                         didChange = true
                     }
                 }
@@ -2875,6 +2900,7 @@ class WorkspaceFilesViewModel: ObservableObject {
             var index = 0
             while index < expandList.count {
                 guard !Task.isCancelled else {
+                    attributionOutcome = .cancelled
                     #if DEBUG
                         restoreExpansionOutcome = "cancelled"
                     #endif
@@ -2884,6 +2910,7 @@ class WorkspaceFilesViewModel: ObservableObject {
                 for path in expandList[index ..< end] {
                     if let folder = foldersByFullPath[path] {
                         if expandParentChain(of: folder) {
+                            changedExpandPaths += 1
                             didChange = true
                         }
                     }
@@ -9853,7 +9880,26 @@ class WorkspaceFilesViewModel: ObservableObject {
     #endif
 
     @MainActor
-    func hydrateSlicesForActiveTab(from tabSelection: StoredSelection) async {
+    func hydrateSlicesForActiveTab(from tabSelection: StoredSelection, startupAttributionWindow: Int? = nil) async {
+        let attributionSpan = startupAttributionWindow.flatMap { restorePerfRecorder.beginStartupSpan(.switchReplaySliceHydration, window: $0) }
+        var attributionOutcome = WorkspaceRestoreAttributionOutcome.completed
+        let requestedRootCount = rootFolders.count
+        var workerResumeDelayMs = 0
+        var workerCount = 0
+        var persistRoots = 0
+        var failedPersistRoots = 0
+        defer {
+            attributionSpan?.end(fields: [
+                "outcome": attributionOutcome.rawValue,
+                "roots": requestedRootCount,
+                "plannedPersistRoots": persistRoots,
+                "failedPersistRoots": failedPersistRoots,
+                "requestedSliceFiles": tabSelection.slices.count,
+                "requestedSliceRanges": tabSelection.slices.values.reduce(0) { $0 + $1.count },
+                "workerResumeDelayMs": workerResumeDelayMs,
+                "workers": workerCount
+            ])
+        }
         #if DEBUG
             let hydrateSlicesStartMS = restorePerfRecorder.timestampMSIfEnabled()
             var hydrateSlicesOutcome = "completed"
@@ -9880,6 +9926,7 @@ class WorkspaceFilesViewModel: ObservableObject {
             }
         #endif
         guard !rootFolders.isEmpty else {
+            attributionOutcome = .noRoots
             #if DEBUG
                 hydrateSlicesOutcome = "noRoots"
             #endif
@@ -9889,6 +9936,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         }
 
         guard let scope = try? currentPartitionScope() else {
+            attributionOutcome = .noScope
             #if DEBUG
                 hydrateSlicesOutcome = "noScope"
             #endif
@@ -9923,9 +9971,11 @@ class WorkspaceFilesViewModel: ObservableObject {
         #endif
 
         let selectionSliceCoordinator = selectionSliceCoordinator
+        let measureWorkerResume = attributionSpan != nil
         let loadTask = Task.detached(priority: .utility) { () -> (
             [String: [String: PartitionStore.StoredSlices]],
-            [String: [String: PartitionStore.SliceUpdate]]
+            [String: [String: PartitionStore.SliceUpdate]],
+            TimeInterval?
         ) in
             var next: [String: [String: PartitionStore.StoredSlices]] = [:]
             var loadedByRoot: [String: [String: PartitionStore.StoredSlices]] = [:]
@@ -9985,10 +10035,15 @@ class WorkspaceFilesViewModel: ObservableObject {
                     toPersist[rootPath] = updates
                 }
             }
-            return (next, toPersist)
+            return (next, toPersist, measureWorkerResume ? ProcessInfo.processInfo.systemUptime : nil)
         }
 
-        let (snapshot, pendingPersist) = await loadTask.value
+        let (snapshot, pendingPersist, workerCompletedAt) = await loadTask.value
+        persistRoots = pendingPersist.count
+        if let workerCompletedAt {
+            workerCount = 1
+            workerResumeDelayMs = Int(max(0, (ProcessInfo.processInfo.systemUptime - workerCompletedAt) * 1000).rounded())
+        }
         #if DEBUG
             hydrateSlicesLoadedPartitionFiles = snapshot.values.reduce(0) { $0 + $1.count }
             hydrateSlicesPendingPersistRoots = pendingPersist.count
@@ -9996,19 +10051,32 @@ class WorkspaceFilesViewModel: ObservableObject {
         #endif
 
         guard !Task.isCancelled else {
+            attributionOutcome = .cancelled
             #if DEBUG
                 hydrateSlicesOutcome = "cancelled"
             #endif
             return
         }
         guard currentTabID == scope.tabID else {
+            attributionOutcome = .staleIdentity
             #if DEBUG
                 hydrateSlicesOutcome = "staleTab"
             #endif
             return
         }
 
-        await applySlicesSnapshot(snapshot: snapshot, pendingPersist: pendingPersist, scope: scope)
+        let failedRoots = await applySlicesSnapshot(snapshot: snapshot, pendingPersist: pendingPersist, scope: scope)
+        #if DEBUG
+            startupAfterSlicePersistenceForTesting?()
+        #endif
+        failedPersistRoots = failedRoots
+        if Task.isCancelled {
+            attributionOutcome = .cancelled
+        } else if currentTabID != scope.tabID {
+            attributionOutcome = .staleIdentity
+        } else if failedRoots > 0 {
+            attributionOutcome = .error
+        }
     }
 
     @MainActor
@@ -10016,7 +10084,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         snapshot: [String: [String: PartitionStore.StoredSlices]],
         pendingPersist: [String: [String: PartitionStore.SliceUpdate]],
         scope: PartitionScope
-    ) async {
+    ) async -> Int {
         #if DEBUG
             let applySlicesSnapshotStartMS = restorePerfRecorder.timestampMSIfEnabled()
             defer {
@@ -10035,10 +10103,14 @@ class WorkspaceFilesViewModel: ObservableObject {
         currentSlicesByRoot = snapshot
         requestSelectionSliceSnapshotRebuild(reason: "applySlicesSnapshot")
 
-        guard !pendingPersist.isEmpty else { return }
+        guard !pendingPersist.isEmpty else { return 0 }
 
+        var failedRoots = 0
         for (rootPath, updates) in pendingPersist {
             do {
+                #if DEBUG
+                    try startupBeforeSlicePersistenceForTesting?()
+                #endif
                 _ = try await selectionSliceCoordinator.applyPartitionUpdates(
                     forRootPath: rootPath,
                     scope: scope,
@@ -10046,11 +10118,13 @@ class WorkspaceFilesViewModel: ObservableObject {
                     mode: .setPaths
                 )
             } catch {
+                failedRoots += 1
                 if Self.isLoggingEnabled {
                     print("Failed to persist slices during hydrate for root \(rootPath): \(error)")
                 }
             }
         }
+        return failedRoots
     }
 
     private static let sliceTimestampTolerance: Double = 0.000_5
@@ -10077,7 +10151,8 @@ class WorkspaceFilesViewModel: ObservableObject {
     @MainActor
     func onActiveTabChangedHeavy(
         for tabID: UUID,
-        selection: StoredSelection
+        selection: StoredSelection,
+        startupAttributionWindow: Int? = nil
     ) async {
         #if DEBUG
             let activeTabHeavyStartMS = restorePerfRecorder.timestampMSIfEnabled()
@@ -10096,25 +10171,47 @@ class WorkspaceFilesViewModel: ObservableObject {
             }
         #endif
         guard currentTabID == tabID else {
+            if let window = startupAttributionWindow {
+                restorePerfRecorder.beginStartupSpan(.switchReplaySelectionApply, window: window)?.end(fields: ["outcome": WorkspaceRestoreAttributionOutcome.staleIdentity.rawValue])
+                restorePerfRecorder.beginStartupSpan(.switchReplaySliceHydration, window: window)?.end(fields: ["outcome": WorkspaceRestoreAttributionOutcome.staleIdentity.rawValue])
+            }
             #if DEBUG
                 activeTabHeavyOutcome = "staleTab"
             #endif
             return
         }
+        let selectionSpan = startupAttributionWindow.flatMap { restorePerfRecorder.beginStartupSpan(.switchReplaySelectionApply, window: $0) }
         await applyStoredSelection(selection)
+        #if DEBUG
+            startupAfterSelectionForTesting?()
+        #endif
+        selectionSpan?.end(fields: [
+            "requestedSelectedPaths": selection.selectedPaths.count,
+            "requestedManualCodemaps": selection.manualCodemapPaths.count,
+            "outcome": Task.isCancelled ? WorkspaceRestoreAttributionOutcome.cancelled.rawValue :
+                (currentTabID == tabID ? WorkspaceRestoreAttributionOutcome.completed.rawValue : WorkspaceRestoreAttributionOutcome.staleIdentity.rawValue),
+            "requestedSliceFiles": selection.slices.count,
+            "requestedSliceRanges": selection.slices.values.reduce(0) { $0 + $1.count }
+        ])
         guard !Task.isCancelled else {
+            if let window = startupAttributionWindow {
+                restorePerfRecorder.beginStartupSpan(.switchReplaySliceHydration, window: window)?.end(fields: ["outcome": WorkspaceRestoreAttributionOutcome.cancelled.rawValue])
+            }
             #if DEBUG
                 activeTabHeavyOutcome = "cancelled"
             #endif
             return
         }
         guard currentTabID == tabID else {
+            if let window = startupAttributionWindow {
+                restorePerfRecorder.beginStartupSpan(.switchReplaySliceHydration, window: window)?.end(fields: ["outcome": WorkspaceRestoreAttributionOutcome.staleIdentity.rawValue])
+            }
             #if DEBUG
                 activeTabHeavyOutcome = "staleTab"
             #endif
             return
         }
-        await hydrateSlicesForActiveTab(from: selection)
+        await hydrateSlicesForActiveTab(from: selection, startupAttributionWindow: startupAttributionWindow)
     }
 
     @MainActor
@@ -10547,14 +10644,24 @@ class WorkspaceFilesViewModel: ObservableObject {
     @MainActor
     func withDeferredSelectionSliceSnapshotRebuild<T>(
         reason: String,
+        startupAttributionWindow: Int? = nil,
         operation: () async throws -> T
     ) async rethrows -> T {
         sliceSnapshotRebuildDeferralDepth += 1
         defer {
             sliceSnapshotRebuildDeferralDepth = max(0, sliceSnapshotRebuildDeferralDepth - 1)
-            if sliceSnapshotRebuildDeferralDepth == 0 {
+            let flushSpan = startupAttributionWindow.flatMap { restorePerfRecorder.beginStartupSpan(.switchReplayDeferredFlush, window: $0) }
+            let pending = sliceSnapshotRebuildPending
+            let nested = sliceSnapshotRebuildDeferralDepth != 0
+            if !nested {
                 flushDeferredSelectionSliceSnapshotRebuildIfNeeded(reason: reason)
             }
+            // A depth-zero flush can include requests from overlapping scopes.
+            flushSpan?.end(fields: [
+                "nested": nested ? 1 : 0,
+                "pending": pending ? 1 : 0,
+                "selectedFiles": selectedFiles.count
+            ])
         }
         return try await operation()
     }

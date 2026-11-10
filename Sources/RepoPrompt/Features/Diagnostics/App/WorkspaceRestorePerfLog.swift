@@ -238,12 +238,28 @@ struct AppWorkspaceRestorePerfRecorder: WorkspaceRestorePerfRecording {
         case .oversightDiscoveryAdoption: .oversightDiscoveryAdoption
         case .oversightDiscoveryCompletion: .oversightDiscoveryCompletion
         case .oversightDiscoveryBarrier: .oversightDiscoveryBarrier
+        case .switchReplayExpansion: .switchReplayExpansion
+        case .switchReplaySelectionApply: .switchReplaySelectionApply
+        case .switchReplaySliceHydration: .switchReplaySliceHydration
+        case .switchReplayDeferredFlush: .switchReplayDeferredFlush
         }
         if debug {
             StartupPhaseLog.debugMark(phase, window: window, fields: fields)
         } else {
             StartupPhaseLog.mark(phase, window: window, fields: fields)
         }
+    }
+
+    func beginStartupSpan(_ phase: WorkspaceRestoreStartupPhase, window: Int) -> (any WorkspaceRestoreStartupSpan)? {
+        let startupPhase: StartupPhaseLog.Phase? = switch phase {
+        case .switchReplayExpansion: .switchReplayExpansion
+        case .switchReplaySelectionApply: .switchReplaySelectionApply
+        case .switchReplaySliceHydration: .switchReplaySliceHydration
+        case .switchReplayDeferredFlush: .switchReplayDeferredFlush
+        default: nil
+        }
+        guard let startupPhase else { return nil }
+        return StartupPhaseLog.begin(startupPhase, window: window)
     }
 
     func recordOversightRestoreAttempt(observer: UUID, target: UUID, outcome: WorkspaceRestoreOversightOutcome, reason: String?) {

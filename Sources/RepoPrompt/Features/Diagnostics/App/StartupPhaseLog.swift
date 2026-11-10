@@ -57,6 +57,17 @@ enum StartupPhaseLog {
         case switchHydrationJoin
         case switchSelectionReplay
         case switchListenerNotify
+        case switchSearchReset
+        case switchCanonicalRootRefresh
+        case switchAuthorityClassification
+        case switchHydrationSpawn
+        case switchRestoreStateYield
+        case switchSavedMarkerLookup
+        case switchReplayExpansion
+        case switchReplaySelectionApply
+        case switchReplaySliceHydration
+        case switchReplayDeferredFlush
+        case switchReplaySelectionFence
     }
 
     /// Bounded integer codes for a workspace-switch request outcome, so markers can
@@ -85,11 +96,15 @@ enum StartupPhaseLog {
     }
 
     /// A `begin` boundary's token; `end` emits the matching `end` line with `span_ms`.
-    struct Span {
+    struct Span: WorkspaceRestoreStartupSpan {
         let phase: Phase
         let window: Int?
         let startUptime: TimeInterval
         let runtime: Runtime
+
+        func end(fields: [String: Int]) {
+            end(extraFields: fields)
+        }
 
         /// Emits the `end` marker. `fields` keys are restricted to `[A-Za-z0-9_]` and
         /// values are integers, so nothing user-identifying can reach the log.
