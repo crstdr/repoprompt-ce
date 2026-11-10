@@ -1,6 +1,9 @@
 import Foundation
 import SwiftAnthropic
 import SwiftOpenAI
+#if DEBUG
+    import RepoPromptShared
+#endif
 
 enum ModelPickerStringOrdering {
     static func compare(
@@ -568,8 +571,15 @@ public enum AIModel: Equatable, Hashable {
     }
 
     #if DEBUG
-        @TaskLocal private static var test_availabilityOverride: [AIModel: Date?]?
-        @TaskLocal private static var test_availabilityClock: (@Sendable () -> Date)?
+        private static let test_availabilityOverrideTaskLocal = BoxedTaskLocal<[AIModel: Date?]?>(nil)
+        private static let test_availabilityClockTaskLocal = BoxedTaskLocal<(@Sendable () -> Date)?>(nil)
+        private static var test_availabilityOverride: [AIModel: Date?]? {
+            test_availabilityOverrideTaskLocal.get()
+        }
+
+        private static var test_availabilityClock: (@Sendable () -> Date)? {
+            test_availabilityClockTaskLocal.get()
+        }
 
         static var test_availabilityDefinitions: [(AIModel, Date?)] {
             modelDefinitions.map { ($0.model, $0.availableFrom) }
@@ -580,8 +590,8 @@ public enum AIModel: Equatable, Hashable {
             now: (@Sendable () -> Date)? = nil,
             operation: () throws -> T
         ) rethrows -> T {
-            try $test_availabilityOverride.withValue(availabilityIndex(definitions)) {
-                try $test_availabilityClock.withValue(now, operation: operation)
+            try test_availabilityOverrideTaskLocal.withValue(availabilityIndex(definitions)) {
+                try test_availabilityClockTaskLocal.withValue(now, operation: operation)
             }
         }
     #endif
