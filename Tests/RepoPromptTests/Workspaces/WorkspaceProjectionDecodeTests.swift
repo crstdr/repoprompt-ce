@@ -1630,6 +1630,165 @@ import XCTest
             }
         }
 
+        func testSymlinkABADoesNotCacheOtherTargetUnderOriginalVersion() async throws {
+            try XCTSkipUnless(WorkspaceSavedConsolidationMarkerOwner.reuseSupportedForTesting(at: base), "Retained-version ABA regression requires local APFS")
+            let a = base.appendingPathComponent("a.json")
+            let b = base.appendingPathComponent("b.json")
+            let link = base.appendingPathComponent("saved.json")
+            try write(false, to: a)
+            try write(true, to: b)
+            try FileManager.default.createSymbolicLink(at: link, withDestinationURL: a)
+            actor ABA {
+                let link: URL
+                let a: URL
+                let b: URL
+                private(set) var swaps = 0
+                private(set) var failure: String?
+                init(link: URL, a: URL, b: URL) {
+                    self.link = link
+                    self.a = a
+                    self.b = b
+                }
+
+                func visit(_ phase: WorkspaceSavedConsolidationMarkerOwner.ReadPhase) {
+                    let target: URL
+                    if phase == .beforeRead, swaps == 0 { target = b }
+                    else if phase == .afterRead, swaps == 1 { target = a }
+                    else { return }
+                    do {
+                        try FileManager.default.removeItem(at: link)
+                        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+                        swaps += 1
+                    } catch { failure = String(describing: error) }
+                }
+            }
+            let aba = ABA(link: link, a: a, b: b)
+            owner.setReadGateForTesting { phase, _ in await aba.visit(phase) }
+            defer { owner.setReadGateForTesting(nil) }
+            let first = await owner.status(url: link, workspaceID: id)
+            let second = await owner.status(url: link, workspaceID: id)
+            let failure = await aba.failure
+            let swaps = await aba.swaps
+            XCTAssertNil(failure)
+            XCTAssertEqual(swaps, 2, "Both path probes see A, but the first physical read follows B")
+            XCTAssertEqual(first, .unmarked)
+            XCTAssertEqual(second, .unmarked, "B's marked result must never be cached under A's file identity")
+            XCTAssertEqual(owner.snapshotForTesting().stats.staleCompletions, 1)
+            XCTAssertEqual(owner.snapshotForTesting().stats.flightsStarted, 2)
+            XCTAssertEqual(owner.snapshotForTesting().stats.cacheHits, 1)
+        }
+
+        func testDescriptorVersionFollowsOpenedObjectAfterSymlinkRetarget() throws {
+            let a = base.appendingPathComponent("descriptor-a.json")
+            let b = base.appendingPathComponent("descriptor-b.json")
+            let link = base.appendingPathComponent("descriptor-link.json")
+            try write(false, to: a)
+            try write(true, to: b)
+            try FileManager.default.createSymbolicLink(at: link, withDestinationURL: a)
+            let original = try XCTUnwrap(WorkspaceSavedConsolidationMarkerOwner.Version.probe(a))
+            let descriptor = Darwin.open(link.path, O_RDONLY | O_CLOEXEC)
+            XCTAssertGreaterThanOrEqual(descriptor, 0)
+            guard descriptor >= 0 else { return }
+            defer { Darwin.close(descriptor) }
+            try FileManager.default.removeItem(at: link)
+            try FileManager.default.createSymbolicLink(at: link, withDestinationURL: b)
+            let retargeted = try XCTUnwrap(WorkspaceSavedConsolidationMarkerOwner.Version.probe(link))
+            XCTAssertEqual(retargeted, WorkspaceSavedConsolidationMarkerOwner.Version.probe(b))
+            XCTAssertNotEqual(retargeted, original)
+            XCTAssertEqual(WorkspaceSavedConsolidationMarkerOwner.Version.probe(descriptor: descriptor), original)
+        }
+
+        func testConcurrentOpenFailureIsSharedWithoutRetainingUnreadable() async throws {
+            try XCTSkipUnless(WorkspaceSavedConsolidationMarkerOwner.reuseSupportedForTesting(at: base), "Shared reuse requires local APFS")
+            try XCTSkipIf(geteuid() == 0, "Root bypasses the fixture's file permissions")
+            let url = base.appendingPathComponent("denied.json")
+            try write(false, to: url)
+            try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: url.path)
+            defer {
+                try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+                owner.setReadGateForTesting(nil)
+            }
+            let version = try XCTUnwrap(WorkspaceSavedConsolidationMarkerOwner.Version.probe(url))
+            let descriptor = Darwin.open(url.path, O_RDONLY | O_CLOEXEC)
+            let openError = errno
+            if descriptor >= 0 { Darwin.close(descriptor) }
+            XCTAssertEqual(descriptor, -1)
+            XCTAssertEqual(openError, EACCES)
+            guard descriptor == -1 else { return }
+            let recorder = WorkspaceSavedMarkerMeasurements()
+            WorkspaceSavedMarkerMeasurements.install(recorder)
+            let gate = gate()
+            owner.setReadGateForTesting { phase, _ in if phase == .beforeRead { await gate.wait() } }
+            let tasks = (0 ..< 35).map { _ in Task { await owner.status(url: url, workspaceID: id) } }
+            try await waitUntil { self.owner.snapshotForTesting().stats.flightsJoined == 34 }
+            await gate.release()
+            for task in tasks {
+                let result = await task.value
+                XCTAssertEqual(result, .unreadable)
+            }
+            XCTAssertEqual(WorkspaceSavedConsolidationMarkerOwner.Version.probe(url), version)
+            XCTAssertEqual(recorder.snapshot().requests, 1, "All overlapping callers should receive the same open failure")
+            XCTAssertEqual(owner.snapshotForTesting().stats.flightsStarted, 1)
+            XCTAssertEqual(owner.snapshotForTesting().stats.staleCompletions, 0)
+            XCTAssertEqual(owner.snapshotForTesting().entries, 0)
+            let retry = await owner.status(url: url, workspaceID: id)
+            XCTAssertEqual(retry, .unreadable)
+            XCTAssertEqual(recorder.snapshot().requests, 2, "Unreadable must not be cached for later callers")
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            let repaired = await owner.status(url: url, workspaceID: id)
+            XCTAssertEqual(repaired, .unmarked)
+            XCTAssertEqual(recorder.snapshot().requests, 3)
+            XCTAssertEqual(recorder.snapshot().fullDecodes, 1)
+            XCTAssertEqual(owner.snapshotForTesting().entries, 1)
+        }
+
+        func testCountingFake36WindowsSharesReadersAcrossStablePublications() async throws {
+            try XCTSkipUnless(WorkspaceSavedConsolidationMarkerOwner.reuseSupportedForTesting(at: base), "Counting fake requires supported reuse")
+            final class CountingReader: @unchecked Sendable {
+                private let lock = NSLock()
+                private var calls = 0
+                func read(_ url: URL, _ id: UUID) -> WorkspaceSavedConsolidationMarkerOwner.ReadObservation {
+                    lock.withLock { calls += 1 }
+                    return WorkspaceFileDecodeCache.readSavedMarkerUncached(url: url, workspaceID: id)
+                }
+
+                var count: Int {
+                    lock.withLock { calls }
+                }
+            }
+            for dirty in [5, 20] {
+                let counter = CountingReader()
+                let shared = WorkspaceSavedConsolidationMarkerOwner { url, id in counter.read(url, id) }
+                let urls = (0 ..< dirty).map { base.appendingPathComponent("fake-\(dirty)-\($0).json") }
+                for url in urls {
+                    try write(false, to: url)
+                }
+                for _ in 0 ..< 8 {
+                    let windows = (0 ..< 36).map { _ in Task {
+                        var statuses: [WorkspaceSavedConsolidationMarkerOwner.Status] = []
+                        for url in urls {
+                            await statuses.append(shared.status(url: url, workspaceID: id))
+                        }
+                        return statuses
+                    } }
+                    for window in windows {
+                        let statuses = await window.value
+                        XCTAssertEqual(statuses, Array(repeating: .unmarked, count: dirty))
+                    }
+                }
+                XCTAssertEqual(counter.count, dirty)
+                XCTAssertEqual(shared.snapshotForTesting().stats.requests, 36 * dirty * 8)
+                try write(true, to: urls[0])
+                shared.invalidate(url: urls[0])
+                for _ in 0 ..< 36 {
+                    let changed = await shared.status(url: urls[0], workspaceID: id)
+                    XCTAssertEqual(changed, .marked)
+                }
+                XCTAssertEqual(counter.count, dirty + 1)
+                print("SAVED_MARKER_COUNTING_FAKE windows=36 dirty=\(dirty) rounds=8 stable_readers=\(dirty) after_save_readers=\(counter.count)")
+            }
+        }
+
         func testRawMappingUnreadableRetryAndRepair() async throws {
             let url = base.appendingPathComponent("workspace.json")
             let recorder = WorkspaceSavedMarkerMeasurements()
@@ -1645,7 +1804,7 @@ import XCTest
             ]
             for (input, expected) in inputs {
                 if let input { try input.write(to: url, options: .atomic) }
-                let raw = WorkspaceFileDecodeCache.readSavedMarkerUncached(url: url, workspaceID: id)
+                let raw = WorkspaceFileDecodeCache.readSavedMarkerUncached(url: url, workspaceID: id).status
                 let first = await owner.status(url: url, workspaceID: id)
                 let before = recorder.snapshot().requests
                 let second = await owner.status(url: url, workspaceID: id)

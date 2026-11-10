@@ -8,7 +8,7 @@ final class WorkspaceSavedConsolidationMarkerOwner: @unchecked Sendable {
     static let maximumEntries = 128
     static let maximumFlights = 32
 
-    private struct Version: Hashable {
+    struct Version: Hashable {
         let device: Int32
         let inode: UInt64
         let size: Int64
@@ -22,7 +22,21 @@ final class WorkspaceSavedConsolidationMarkerOwner: @unchecked Sendable {
             var info = Darwin.stat()
             guard stat(url.path, &info) == 0 else { return nil }
             var filesystem = Darwin.statfs()
-            let local = statfs(url.path, &filesystem) == 0 && (filesystem.f_flags & UInt32(MNT_LOCAL)) != 0
+            let filesystemKnown = statfs(url.path, &filesystem) == 0
+            return make(info: info, filesystem: filesystem, filesystemKnown: filesystemKnown)
+        }
+
+        static func probe(descriptor: Int32) -> Self? {
+            var info = Darwin.stat()
+            guard fstat(descriptor, &info) == 0 else { return nil }
+            var filesystem = Darwin.statfs()
+            let filesystemKnown = fstatfs(descriptor, &filesystem) == 0
+            return make(info: info, filesystem: filesystem, filesystemKnown: filesystemKnown)
+        }
+
+        private static func make(info: Darwin.stat, filesystem: Darwin.statfs, filesystemKnown: Bool) -> Self {
+            var filesystem = filesystem
+            let local = filesystemKnown && (filesystem.f_flags & UInt32(MNT_LOCAL)) != 0
             let type = withUnsafeBytes(of: &filesystem.f_fstypename) {
                 String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self)
             }
@@ -44,6 +58,13 @@ final class WorkspaceSavedConsolidationMarkerOwner: @unchecked Sendable {
         local && fileSystemType == "apfs"
     }
 
+    /// Versions describe the opened object that supplied the bytes, not merely its lookup path.
+    struct ReadObservation {
+        let status: Status
+        let before: Version?
+        let after: Version?
+    }
+
     private struct Key: Hashable {
         let path: String
         let workspaceID: UUID
@@ -62,9 +83,9 @@ final class WorkspaceSavedConsolidationMarkerOwner: @unchecked Sendable {
         case work(Task<Status?, Never>)
     }
 
-    private let read: @Sendable (URL, UUID) -> Status
+    private let read: @Sendable (URL, UUID) -> ReadObservation
 
-    init(read: @escaping @Sendable (URL, UUID) -> Status) {
+    init(read: @escaping @Sendable (URL, UUID) -> ReadObservation) {
         self.read = read
     }
 
@@ -97,7 +118,7 @@ final class WorkspaceSavedConsolidationMarkerOwner: @unchecked Sendable {
                 return perCaller
             }
             defer { lock.withLock { stats.activeLookups -= 1 } }
-            if legacy { return read(url, workspaceID) }
+            if legacy { return read(url, workspaceID).status }
         #endif
         let url = url.standardizedFileURL
         // Reuse requires a validated version. Discarded observations may be stale or torn.
@@ -108,7 +129,7 @@ final class WorkspaceSavedConsolidationMarkerOwner: @unchecked Sendable {
             }
         }
         // Restore the original per-caller read semantics under continued churn. Never retain this result.
-        return read(url, workspaceID)
+        return read(url, workspaceID).status
     }
 
     private func admit(url: URL, workspaceID: UUID) -> Lookup {
@@ -143,7 +164,8 @@ final class WorkspaceSavedConsolidationMarkerOwner: @unchecked Sendable {
                 #if DEBUG
                     await gate?(.beforeRead, url)
                 #endif
-                let status = read(url, workspaceID)
+                let observation = read(url, workspaceID)
+                let status = observation.status
                 #if DEBUG
                     await gate?(.afterRead, url)
                 #endif
@@ -154,7 +176,10 @@ final class WorkspaceSavedConsolidationMarkerOwner: @unchecked Sendable {
                     #if DEBUG
                         stats.activeReads -= 1
                     #endif
-                    guard !invalidated, after == version else {
+                    // Share failures without descriptor metadata only with current waiters; never retain them.
+                    if !invalidated, after == version, status == .unreadable,
+                       observation.before == nil, observation.after == nil { return status }
+                    guard !invalidated, observation.before == version, observation.after == version, after == version else {
                         #if DEBUG
                             stats.staleCompletions += 1
                         #endif

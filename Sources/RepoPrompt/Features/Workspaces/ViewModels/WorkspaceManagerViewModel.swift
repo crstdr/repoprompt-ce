@@ -1,5 +1,6 @@
 import Combine
 import CryptoKit
+import Darwin
 import Foundation
 import os
 import RepoPromptDomainRuntime
@@ -372,7 +373,7 @@ final class WorkspaceFileDecodeCache: @unchecked Sendable {
         cachedWorkspacesByKey = cachedWorkspacesByKey.filter { $0.key.standardizedPath != key.standardizedPath }
     }
 
-    static func readSavedMarkerUncached(url: URL, workspaceID: UUID) -> WorkspaceSavedConsolidationMarkerOwner.Status {
+    static func readSavedMarkerUncached(url: URL, workspaceID: UUID) -> WorkspaceSavedConsolidationMarkerOwner.ReadObservation {
         #if DEBUG
             let recorder = WorkspaceSavedMarkerMeasurements.current()
             let measurementStart = recorder == nil ? 0 : DispatchTime.now().uptimeNanoseconds
@@ -384,9 +385,18 @@ final class WorkspaceFileDecodeCache: @unchecked Sendable {
                 }
             }
         #endif
-        guard FileManager.default.fileExists(atPath: url.path) else { return .unreadable }
+        var before: WorkspaceSavedConsolidationMarkerOwner.Version?
+        var after: WorkspaceSavedConsolidationMarkerOwner.Version?
+        func observation(_ status: WorkspaceSavedConsolidationMarkerOwner.Status) -> WorkspaceSavedConsolidationMarkerOwner.ReadObservation {
+            .init(status: status, before: before, after: after)
+        }
+        let descriptor = Darwin.open(url.path, O_RDONLY | O_CLOEXEC)
+        guard descriptor >= 0 else { return observation(.unreadable) }
+        defer { Darwin.close(descriptor) }
+        before = WorkspaceSavedConsolidationMarkerOwner.Version.probe(descriptor: descriptor)
         do {
-            let data = try Data(contentsOf: url)
+            let data = try FileHandle(fileDescriptor: descriptor, closeOnDealloc: false).readToEnd() ?? Data()
+            after = WorkspaceSavedConsolidationMarkerOwner.Version.probe(descriptor: descriptor)
             #if DEBUG
                 let decodeStart = recorder == nil ? 0 : DispatchTime.now().uptimeNanoseconds
                 measurement.reads = 1
@@ -403,9 +413,12 @@ final class WorkspaceFileDecodeCache: @unchecked Sendable {
                 else if saved.consolidatedIntoWorkspaceID == nil { measurement.unmarked = 1 }
                 else { measurement.marked = 1 }
             #endif
-            guard saved.id == workspaceID else { return .unreadable }
-            return saved.consolidatedIntoWorkspaceID == nil ? .unmarked : .marked
-        } catch { return .unreadable }
+            guard saved.id == workspaceID else { return observation(.unreadable) }
+            return observation(saved.consolidatedIntoWorkspaceID == nil ? .unmarked : .marked)
+        } catch {
+            if after == nil { after = WorkspaceSavedConsolidationMarkerOwner.Version.probe(descriptor: descriptor) }
+            return observation(.unreadable)
+        }
     }
 
     func invalidate(url: URL) {
