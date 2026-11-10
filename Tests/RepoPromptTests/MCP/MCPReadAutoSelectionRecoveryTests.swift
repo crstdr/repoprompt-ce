@@ -470,7 +470,7 @@ final class MCPReadAutoSelectionRecoveryTests: XCTestCase {
                 coordinator.invalidate(context: key)
                 // The drain task resumes on this actor; keep it from running while the timer keeps ticking.
                 let atSettle = reports.count
-                Thread.sleep(forTimeInterval: 0.3)
+                usleep(300_000)
                 XCTAssertLessThanOrEqual(reports.count, atSettle + 1, "\(reports.all)")
             } else {
                 await gate.release()
@@ -532,7 +532,7 @@ final class MCPReadAutoSelectionRecoveryTests: XCTestCase {
 
             join.complete(with: output())
             let atSettle = reports.count
-            Thread.sleep(forTimeInterval: 0.3)
+            usleep(300_000)
             XCTAssertLessThanOrEqual(reports.count, atSettle + 1, "\(reports.all)")
             let result = await waiter.value
             XCTAssertNotNil(result)
