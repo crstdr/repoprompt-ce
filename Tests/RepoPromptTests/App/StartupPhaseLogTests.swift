@@ -72,6 +72,27 @@ final class StartupPhaseLogTests: XCTestCase {
         )
     }
 
+    func testAvailableModelEventEmissionBudget() {
+        let recorder = Recorder(ticks: [125])
+        StartupPhaseLog.installForTesting(.init(
+            uptime: { recorder.uptime() }, processStartUptime: 100,
+            emit: { recorder.emit($0) }
+        ))
+        let start = ProcessInfo.processInfo.systemUptime
+        for window in 1 ... 36 {
+            for _ in 0 ..< 7 {
+                StartupPhaseLog.mark(.availableModelsUpdate, window: window, fields: [
+                    "duration_ms": 20, "groups": 6, "models": 355,
+                    "sameAsPrevious": 1, "trigger": 25
+                ])
+            }
+        }
+        let elapsed = ProcessInfo.processInfo.systemUptime - start
+        XCTAssertEqual(recorder.emissions.count, 252)
+        XCTAssertLessThan(elapsed, 0.5)
+        print("picker marker emission: lines=252 wall_ms=\(elapsed * 1000)")
+    }
+
     func testRestoreRecorderPreservesStartupLevelsAndAttemptFields() {
         let normal = Recorder(ticks: [125])
         let debug = Recorder(ticks: [125])

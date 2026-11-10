@@ -199,6 +199,35 @@ struct APIKeychainAccessDiagnostic: Identifiable, Equatable {
     }
 }
 
+/// Stable integer codes for startup log attribution; append new cases without renumbering.
+enum AvailableModelsUpdateTrigger: Int, CaseIterable {
+    case apiOwnerInitialLoad = 1
+    case promptStartupRefresh = 2
+    case settingsViewAppear = 3
+    case settingsManualRefresh = 4
+    case settingsWindowRefreshCallback = 5
+    case modelAvailabilityCheck = 6
+    case customModelEdit = 7
+    case serviceTierVariantToggle = 8
+    case cliConnectionFlagChange = 9
+    case compatibleBackendSecretChange = 10
+    case claudeFamilyAvailabilityChange = 11
+    case devinDiscovery = 12
+    case keyValidation = 13
+    case keyDeletion = 14
+    case customProviderValidation = 15
+    case providerDeletion = 16
+    case providerModelRefresh = 17
+    case ollamaModelSelection = 18
+    case openRouterCustomModelEdit = 19
+    case openRouterDefaultModelsToggle = 20
+    case customModelToggle = 21
+    case cliConnectionTest = 22
+    case codexConnectionChange = 23
+    case cliDisconnect = 24
+    case providerModelSubscription = 25
+}
+
 @MainActor
 public class APISettingsViewModel: ObservableObject {
     @Published var openRouterConfig: OpenRouterConfiguration = ProviderConfigurationManager.shared.getOpenRouterConfiguration() {
@@ -695,7 +724,7 @@ public class APISettingsViewModel: ObservableObject {
             } else {
                 stopCursorModelsSubscription(clearModels: true)
             }
-            Task { await updateAvailableModels() }
+            Task { await updateAvailableModels(trigger: .cliConnectionFlagChange) }
         }
     }
 
@@ -1016,12 +1045,12 @@ public class APISettingsViewModel: ObservableObject {
             isZaiKeyValid = hasStoredZAIKey
             availableZAIModels = hasStoredZAIKey ? defaultZAIModels : []
             refreshClaudeCodeGLMAvailability()
-            await updateAvailableModels()
+            await updateAvailableModels(trigger: .compatibleBackendSecretChange)
         } else {
             try await compatibleBackendStore.saveSecret(trimmed, for: id)
             compatibleBackendSecretPresence[id] = !trimmed.isEmpty
             refreshAgentAvailability()
-            await refreshClaudeFamilyModelAvailabilityIfNeeded(previousAvailability: previousAvailability)
+            await refreshClaudeFamilyModelAvailabilityIfNeeded(previousAvailability: previousAvailability, trigger: .compatibleBackendSecretChange)
         }
     }
 
@@ -1042,13 +1071,13 @@ public class APISettingsViewModel: ObservableObject {
             refreshClaudeCodeGLMAvailability()
             zaiCustomModel = ""
             UserDefaults.standard.removeObject(forKey: "customModelZAI")
-            await updateAvailableModels()
+            await updateAvailableModels(trigger: .compatibleBackendSecretChange)
             resetPreferredModelIfNeeded(for: .zAI)
         } else {
             try await compatibleBackendStore.deleteSecret(for: id)
             compatibleBackendSecretPresence[id] = false
             refreshAgentAvailability()
-            await refreshClaudeFamilyModelAvailabilityIfNeeded(previousAvailability: previousAvailability)
+            await refreshClaudeFamilyModelAvailabilityIfNeeded(previousAvailability: previousAvailability, trigger: .compatibleBackendSecretChange)
         }
     }
 
@@ -1087,14 +1116,19 @@ public class APISettingsViewModel: ObservableObject {
 
     private func queueClaudeFamilyModelAvailabilityRefreshIfNeeded(previousAvailability: Bool) {
         guard previousAvailability != isClaudeFamilyModelProviderAvailable else { return }
-        Task { await self.updateAvailableModels() }
+        Task { await self.updateAvailableModels(trigger: .claudeFamilyAvailabilityChange) }
     }
 
-    private func refreshClaudeFamilyModelAvailabilityIfNeeded(previousAvailability: Bool) async {
+    private func refreshClaudeFamilyModelAvailabilityIfNeeded(
+        previousAvailability: Bool,
+        trigger: AvailableModelsUpdateTrigger = .claudeFamilyAvailabilityChange
+    ) async {
         guard previousAvailability != isClaudeFamilyModelProviderAvailable else { return }
-        await updateAvailableModels()
+        await updateAvailableModels(trigger: trigger)
     }
 
+    private let recordAvailableModelsUpdate: (AvailableModelsUpdateTrigger, Int, Int, Int, Bool) -> Void
+    private var hasPublishedAvailableModels = false
     private let aiQueriesService: AIQueriesService
     private let keyManager: KeyManager
     private let cursorModelPollingService: CursorACPModelPollingService
@@ -1111,6 +1145,7 @@ public class APISettingsViewModel: ObservableObject {
     init(
         aiQueriesService: AIQueriesService,
         keyManager: KeyManager,
+        recordAvailableModelsUpdate: @escaping (AvailableModelsUpdateTrigger, Int, Int, Int, Bool) -> Void = { _, _, _, _, _ in },
         loadStoredDataOnInit: Bool = true,
         codexModelPollingService: CodexModelPollingService = .shared,
         cursorModelPollingService: CursorACPModelPollingService = .shared,
@@ -1129,6 +1164,7 @@ public class APISettingsViewModel: ObservableObject {
         }
     ) {
         self.aiQueriesService = aiQueriesService
+        self.recordAvailableModelsUpdate = recordAvailableModelsUpdate
         self.keyManager = keyManager
         self.antigravityRuntimeInstalledProvider = antigravityRuntimeInstalledProvider
         self.devinRuntimeInstalledProvider = devinRuntimeInstalledProvider
@@ -1146,7 +1182,7 @@ public class APISettingsViewModel: ObservableObject {
         if loadStoredDataOnInit {
             initialLoadTask = Task { [weak self] in
                 guard let self else { return }
-                await loadStoredDataIfNeeded()
+                await loadStoredDataIfNeeded(trigger: .apiOwnerInitialLoad)
                 guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
                 refreshDevinModels()
                 if let devinModelsTask {
@@ -1275,9 +1311,10 @@ public class APISettingsViewModel: ObservableObject {
 
     @MainActor
     func loadStoredData(
+        trigger: AvailableModelsUpdateTrigger,
         accessMode: KeychainAccessMode = .nonInteractive(reason: .bulkSettingsLoad)
     ) async {
-        await loadAllKeys(accessMode: accessMode) // returns immediately; fetch tasks run in background
+        await loadAllKeys(trigger: trigger, accessMode: accessMode) // returns immediately; fetch tasks run in background
         guard !Task.isCancelled, !hasPreparedForWindowClose else {
             isLoadingStoredData = false
             return
@@ -1289,10 +1326,11 @@ public class APISettingsViewModel: ObservableObject {
     /// Loads stored data and calls the completion handler after models are fully updated
     @MainActor
     func loadStoredData(
+        trigger: AvailableModelsUpdateTrigger,
         accessMode: KeychainAccessMode = .nonInteractive(reason: .bulkSettingsLoad),
         _ completion: @escaping () -> Void
     ) async {
-        await loadAllKeys(accessMode: accessMode)
+        await loadAllKeys(trigger: trigger, accessMode: accessMode)
         guard !Task.isCancelled, !hasPreparedForWindowClose else {
             isLoadingStoredData = false
             return
@@ -1304,6 +1342,7 @@ public class APISettingsViewModel: ObservableObject {
 
     @MainActor
     func loadStoredDataIfNeeded(
+        trigger: AvailableModelsUpdateTrigger,
         accessMode: KeychainAccessMode = .nonInteractive(reason: .bulkSettingsLoad)
     ) async {
         guard !Task.isCancelled,
@@ -1312,7 +1351,7 @@ public class APISettingsViewModel: ObservableObject {
               !isLoadingStoredData
         else { return }
         isLoadingStoredData = true
-        await loadStoredData(accessMode: accessMode)
+        await loadStoredData(trigger: trigger, accessMode: accessMode)
     }
 
     /// Revalidates persisted CLI connection hints once per view-model lifetime. Startup uses
@@ -1536,6 +1575,7 @@ public class APISettingsViewModel: ObservableObject {
 
     @MainActor
     func loadAllKeys(
+        trigger: AvailableModelsUpdateTrigger,
         accessMode: KeychainAccessMode = .nonInteractive(reason: .bulkSettingsLoad)
     ) async {
         guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
@@ -1720,7 +1760,7 @@ public class APISettingsViewModel: ObservableObject {
         // ----------------------------------------------------------------
         // 5. Build initial UI list from whatever caches we already have
         // ----------------------------------------------------------------
-        await updateAvailableModels()
+        await updateAvailableModels(trigger: trigger)
         guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
 
         // ----------------------------------------------------------------
@@ -1738,7 +1778,7 @@ public class APISettingsViewModel: ObservableObject {
             UserDefaults.standard.set(trimmedModel, forKey: "customModelOpenAI")
         }
         Task {
-            await updateAvailableModels()
+            await updateAvailableModels(trigger: .customModelEdit)
         }
     }
 
@@ -1750,7 +1790,7 @@ public class APISettingsViewModel: ObservableObject {
         Self.persistOpenAIShowServiceTierVariants(openAIShowServiceTierVariants)
 
         Task {
-            await updateAvailableModels()
+            await updateAvailableModels(trigger: .serviceTierVariantToggle)
         }
     }
 
@@ -1779,7 +1819,7 @@ public class APISettingsViewModel: ObservableObject {
             UserDefaults.standard.set(trimmedModel, forKey: "customModelAnthropic")
         }
         Task {
-            await updateAvailableModels()
+            await updateAvailableModels(trigger: .customModelEdit)
         }
     }
 
@@ -1793,7 +1833,7 @@ public class APISettingsViewModel: ObservableObject {
             UserDefaults.standard.set(trimmedModel, forKey: "customModelAzure")
         }
         Task {
-            await updateAvailableModels()
+            await updateAvailableModels(trigger: .customModelEdit)
         }
     }
 
@@ -1805,7 +1845,7 @@ public class APISettingsViewModel: ObservableObject {
             UserDefaults.standard.set(trimmedModel, forKey: "customModelGemini")
         }
         Task {
-            await updateAvailableModels()
+            await updateAvailableModels(trigger: .customModelEdit)
         }
     }
 
@@ -1817,7 +1857,7 @@ public class APISettingsViewModel: ObservableObject {
             UserDefaults.standard.set(trimmedModel, forKey: "customModelDeepSeek")
         }
         Task {
-            await updateAvailableModels()
+            await updateAvailableModels(trigger: .customModelEdit)
         }
     }
 
@@ -1829,7 +1869,7 @@ public class APISettingsViewModel: ObservableObject {
             UserDefaults.standard.set(trimmedModel, forKey: "customModelFireworks")
         }
         Task {
-            await updateAvailableModels()
+            await updateAvailableModels(trigger: .customModelEdit)
         }
     }
 
@@ -1841,7 +1881,7 @@ public class APISettingsViewModel: ObservableObject {
             UserDefaults.standard.set(trimmedModel, forKey: "customModelGrok")
         }
         Task {
-            await updateAvailableModels()
+            await updateAvailableModels(trigger: .customModelEdit)
         }
     }
 
@@ -1853,7 +1893,7 @@ public class APISettingsViewModel: ObservableObject {
             UserDefaults.standard.set(trimmedModel, forKey: "customModelGroq")
         }
         Task {
-            await updateAvailableModels()
+            await updateAvailableModels(trigger: .customModelEdit)
         }
     }
 
@@ -1865,7 +1905,7 @@ public class APISettingsViewModel: ObservableObject {
             UserDefaults.standard.set(trimmedModel, forKey: "customModelZAI")
         }
         Task {
-            await updateAvailableModels()
+            await updateAvailableModels(trigger: .customModelEdit)
         }
     }
 
@@ -1901,12 +1941,15 @@ public class APISettingsViewModel: ObservableObject {
                 devinModelDiscoveryMessage = nil
             }
             refreshAgentAvailability()
-            await updateAvailableModels()
+            await updateAvailableModels(trigger: .devinDiscovery)
             devinModelsTask = nil
         }
     }
 
-    func updateAvailableModels() async {
+    func updateAvailableModels(trigger: AvailableModelsUpdateTrigger) async {
+        let start = ProcessInfo.processInfo.systemUptime
+        let previous = availableModels
+        let hadPrevious = hasPublishedAvailableModels
         var modelSet = Set<AIModel>()
 
         // ── Key-/token-based providers ─────────────────────────────────────────
@@ -2051,9 +2094,14 @@ public class APISettingsViewModel: ObservableObject {
         let sortedProviders = groupedByProvider.keys.sorted {
             AIProviderType.displayName(for: $0).localizedCaseInsensitiveCompare(AIProviderType.displayName(for: $1)) == .orderedAscending
         }
-        availableModels = sortedProviders.flatMap { provider in
+        let nextModels = sortedProviders.flatMap { provider in
             AIModel.sortedForPicker(Array(groupedByProvider[provider] ?? []))
         }
+        availableModels = nextModels
+        hasPublishedAvailableModels = true
+        let sameAsPrevious = hadPrevious && previous == nextModels
+        let duration = Int(max(0, (ProcessInfo.processInfo.systemUptime - start) * 1000).rounded())
+        recordAvailableModelsUpdate(trigger, duration, nextModels.count, sortedProviders.count, sameAsPrevious)
     }
 
     func updateOllamaModel(_ newModel: String) {
@@ -2180,7 +2228,7 @@ public class APISettingsViewModel: ObservableObject {
                 break
             }
 
-            await updateAvailableModels()
+            await updateAvailableModels(trigger: .keyValidation)
         }
         return isValid
     }
@@ -2243,7 +2291,7 @@ public class APISettingsViewModel: ObservableObject {
         case .devin:
             break
         }
-        await updateAvailableModels()
+        await updateAvailableModels(trigger: .keyDeletion)
         resetPreferredModelIfNeeded(for: provider)
     }
 
@@ -2475,7 +2523,7 @@ public class APISettingsViewModel: ObservableObject {
         UserDefaults.standard.set(ollamaModel, forKey: "ollamaModel")
 
         Task {
-            await updateAvailableModels()
+            await updateAvailableModels(trigger: .ollamaModelSelection)
         }
     }
 
@@ -2498,7 +2546,7 @@ public class APISettingsViewModel: ObservableObject {
                         print("The custom model \(normalizedName) is invalid.")
                     }
                     self.isAddingCustomModel = false
-                    await updateAvailableModels()
+                    await updateAvailableModels(trigger: .openRouterCustomModelEdit)
                 } catch {
                     print("Error testing OpenRouter model: \(error)")
                     self.isAddingCustomModel = false
@@ -2514,7 +2562,7 @@ public class APISettingsViewModel: ObservableObject {
         validOpenRouterModels.remove(modelName)
         UserDefaults.standard.set(customOpenRouterModels, forKey: "CustomOpenRouterModels")
         Task {
-            await updateAvailableModels()
+            await updateAvailableModels(trigger: .openRouterCustomModelEdit)
         }
     }
 
@@ -2527,11 +2575,11 @@ public class APISettingsViewModel: ObservableObject {
                 } else {
                     validOpenRouterModels.remove(modelName)
                 }
-                await updateAvailableModels()
+                await updateAvailableModels(trigger: .openRouterCustomModelEdit)
             } catch {
                 print("Error testing OpenRouter model: \(error)")
                 validOpenRouterModels.remove(modelName)
-                await updateAvailableModels()
+                await updateAvailableModels(trigger: .openRouterCustomModelEdit)
             }
         }
     }
@@ -2664,7 +2712,7 @@ public class APISettingsViewModel: ObservableObject {
             isZaiKeyValid = true
             availableZAIModels = defaultZAIModels
             refreshClaudeCodeGLMAvailability()
-            await updateAvailableModels()
+            await updateAvailableModels(trigger: .keyValidation)
         } else {
             isZaiKeyValid = false
             availableZAIModels = []
@@ -2690,7 +2738,7 @@ public class APISettingsViewModel: ObservableObject {
             isZaiKeyValid = true
             availableZAIModels = defaultZAIModels
             refreshClaudeCodeGLMAvailability()
-            await updateAvailableModels()
+            await updateAvailableModels(trigger: .keyValidation)
         } else {
             await markZAIValidationUnavailable()
         }
@@ -2701,7 +2749,7 @@ public class APISettingsViewModel: ObservableObject {
         isZaiKeyValid = false
         availableZAIModels = []
         refreshClaudeCodeGLMAvailability()
-        await updateAvailableModels()
+        await updateAvailableModels(trigger: .keyValidation)
     }
 
     func setOpenAIHTTPConsent(_ endpoint: String?) {
@@ -2891,7 +2939,7 @@ public class APISettingsViewModel: ObservableObject {
             UserDefaults.standard.set(userModel, forKey: "customProviderUserModel")
         }
 
-        await updateAvailableModels()
+        await updateAvailableModels(trigger: .customProviderValidation)
         return true
     }
 
@@ -2991,7 +3039,7 @@ public class APISettingsViewModel: ObservableObject {
         isAzureKeyValid = true
         AzureOpenAIProvider.debug("Azure configuration saved and validated for deployment \(selectedDescriptor.id)")
 
-        await updateAvailableModels()
+        await updateAvailableModels(trigger: .keyValidation)
         return validationPassed
     }
 
@@ -3004,7 +3052,7 @@ public class APISettingsViewModel: ObservableObject {
         isAzureKeyValid = false
         azureCustomModel = ""
         UserDefaults.standard.removeObject(forKey: "customModelAzure")
-        await updateAvailableModels()
+        await updateAvailableModels(trigger: .keyDeletion)
     }
 
     private func normalizeAzureBaseURL(from rawValue: String) -> URL? {
@@ -3047,7 +3095,7 @@ public class APISettingsViewModel: ObservableObject {
         } catch {
             AzureOpenAIProvider.debug("Azure deployment refresh failed: \(error)")
         }
-        await updateAvailableModels()
+        await updateAvailableModels(trigger: .providerModelRefresh)
     }
 
     func deleteCustomProvider() async throws {
@@ -3064,7 +3112,7 @@ public class APISettingsViewModel: ObservableObject {
         customEnabledModelSet = []
         customProviderMaxTokensString = "8192" // Reset to default
 
-        await updateAvailableModels()
+        await updateAvailableModels(trigger: .providerDeletion)
 
         UserDefaults.standard.removeObject(forKey: "CustomProviderSettings")
     }
@@ -3124,7 +3172,7 @@ public class APISettingsViewModel: ObservableObject {
             notifyClaudeCompatibleBackendRuntimeAvailabilityIfNeeded(previousStatus: previousStatus)
             claudeCodeError = nil
             UserDefaults.standard.set(isClaudeCodeConnected, forKey: "ClaudeCodeConnected")
-            await updateAvailableModels()
+            await updateAvailableModels(trigger: .cliConnectionTest)
             NotificationCenter.default.post(
                 name: .claudeCodeConnectionChanged,
                 object: nil,
@@ -3148,7 +3196,7 @@ public class APISettingsViewModel: ObservableObject {
                 : .binaryPresent
             notifyClaudeCompatibleBackendRuntimeAvailabilityIfNeeded(previousStatus: previousStatus)
             UserDefaults.standard.set(isClaudeCodeConnected, forKey: "ClaudeCodeConnected")
-            await updateAvailableModels()
+            await updateAvailableModels(trigger: .cliConnectionTest)
             NotificationCenter.default.post(
                 name: .claudeCodeConnectionChanged,
                 object: nil,
@@ -3213,7 +3261,7 @@ public class APISettingsViewModel: ObservableObject {
             availableCodexModels = []
         }
         if updateModels {
-            await updateAvailableModels()
+            await updateAvailableModels(trigger: .codexConnectionChange)
         }
         guard publicationToken.map { codexSessionFence.allowsAuthenticationPublication($0) } ?? true else { return }
         NotificationCenter.default.post(
@@ -3693,7 +3741,7 @@ public class APISettingsViewModel: ObservableObject {
             openCodeError = nil
             UserDefaults.standard.set(true, forKey: "OpenCodeCLIConnected")
             startOpenCodeModelsSubscriptionIfNeeded(workspacePath: nil)
-            await updateAvailableModels()
+            await updateAvailableModels(trigger: .cliConnectionTest)
             collector.append("OpenCode CLI marked as connected")
             openCodeLogCollector = nil
             NotificationCenter.default.post(
@@ -3709,7 +3757,7 @@ public class APISettingsViewModel: ObservableObject {
             openCodeError = friendlyOpenCodeMessage(for: error)
             UserDefaults.standard.set(false, forKey: "OpenCodeCLIConnected")
             stopOpenCodeModelsSubscription(clearModels: true)
-            await updateAvailableModels()
+            await updateAvailableModels(trigger: .cliConnectionTest)
             let finalMessage = openCodeError ?? error.localizedDescription
             collector.append("User guidance: \(finalMessage)")
             NotificationCenter.default.post(
@@ -3727,7 +3775,7 @@ public class APISettingsViewModel: ObservableObject {
         openCodeError = nil
         UserDefaults.standard.set(false, forKey: "OpenCodeCLIConnected")
         stopOpenCodeModelsSubscription(clearModels: true)
-        Task { await updateAvailableModels() }
+        Task { await updateAvailableModels(trigger: .cliDisconnect) }
         NotificationCenter.default.post(
             name: .openCodeConnectionChanged,
             object: nil,
@@ -3796,7 +3844,7 @@ public class APISettingsViewModel: ObservableObject {
                         setContextBuilderProviderVerified(.openCode, verified: true)
                     }
                 }
-                await self?.updateAvailableModels()
+                await self?.updateAvailableModels(trigger: .providerModelSubscription)
             }
         }
     }
@@ -3863,7 +3911,7 @@ public class APISettingsViewModel: ObservableObject {
             cursorError = nil
             UserDefaults.standard.set(true, forKey: "CursorCLIConnected")
             startCursorModelsSubscriptionIfNeeded(workspacePath: nil)
-            await updateAvailableModels()
+            await updateAvailableModels(trigger: .cliConnectionTest)
             collector.append("Cursor Agent CLI marked as connected")
             cursorLogCollector = nil
             NotificationCenter.default.post(
@@ -3879,7 +3927,7 @@ public class APISettingsViewModel: ObservableObject {
             cursorError = friendlyCursorMessage(for: error)
             UserDefaults.standard.set(false, forKey: "CursorCLIConnected")
             stopCursorModelsSubscription(clearModels: true)
-            await updateAvailableModels()
+            await updateAvailableModels(trigger: .cliConnectionTest)
             let finalMessage = cursorError ?? error.localizedDescription
             collector.append("User guidance: \(finalMessage)")
             NotificationCenter.default.post(
@@ -3898,7 +3946,7 @@ public class APISettingsViewModel: ObservableObject {
         UserDefaults.standard.set(false, forKey: "CursorCLIConnected")
         stopCursorModelsSubscription(clearModels: true)
         Task {
-            await updateAvailableModels()
+            await updateAvailableModels(trigger: .cliDisconnect)
             resetPreferredModelIfNeeded(for: .cursor)
         }
         NotificationCenter.default.post(
@@ -3972,7 +4020,7 @@ public class APISettingsViewModel: ObservableObject {
                         setContextBuilderProviderVerified(.cursor, verified: true)
                     }
                 }
-                await self?.updateAvailableModels()
+                await self?.updateAvailableModels(trigger: .providerModelSubscription)
             }
         }
     }
@@ -4018,7 +4066,7 @@ public class APISettingsViewModel: ObservableObject {
             grokBuildError = nil
             UserDefaults.standard.set(true, forKey: "GrokBuildCLIConnected")
             startGrokBuildModelsSubscriptionIfNeeded(workspacePath: nil)
-            await updateAvailableModels()
+            await updateAvailableModels(trigger: .cliConnectionTest)
             collector.append("Grok Build CLI marked as connected")
             grokBuildLogCollector = nil
             NotificationCenter.default.post(
@@ -4034,7 +4082,7 @@ public class APISettingsViewModel: ObservableObject {
             grokBuildError = Self.friendlyGrokBuildMessage(for: error)
             UserDefaults.standard.set(false, forKey: "GrokBuildCLIConnected")
             stopGrokBuildModelsSubscription(clearModels: true)
-            await updateAvailableModels()
+            await updateAvailableModels(trigger: .cliConnectionTest)
             let finalMessage = grokBuildError ?? error.localizedDescription
             collector.append("User guidance: \(finalMessage)")
             NotificationCenter.default.post(
@@ -4053,7 +4101,7 @@ public class APISettingsViewModel: ObservableObject {
         UserDefaults.standard.set(false, forKey: "GrokBuildCLIConnected")
         stopGrokBuildModelsSubscription(clearModels: true)
         Task {
-            await updateAvailableModels()
+            await updateAvailableModels(trigger: .cliDisconnect)
         }
         NotificationCenter.default.post(
             name: .grokBuildConnectionChanged,
@@ -4129,7 +4177,7 @@ public class APISettingsViewModel: ObservableObject {
                         setContextBuilderProviderVerified(.grokBuild, verified: true)
                     }
                 }
-                await self?.updateAvailableModels()
+                await self?.updateAvailableModels(trigger: .providerModelSubscription)
             }
         }
     }
@@ -4182,7 +4230,7 @@ public class APISettingsViewModel: ObservableObject {
             }
 
             Task {
-                await updateAvailableModels()
+                await updateAvailableModels(trigger: .customModelToggle)
             }
         } catch {
             print("Error toggling custom model: \(error)")
@@ -4258,7 +4306,7 @@ public class APISettingsViewModel: ObservableObject {
         } catch {
             await MainActor.run { availableOpenAIModels = [] }
         }
-        await updateAvailableModels()
+        await updateAvailableModels(trigger: .providerModelRefresh)
     }
 
     private func updateDeepSeekModels() async {
@@ -4275,7 +4323,7 @@ public class APISettingsViewModel: ObservableObject {
         } catch {
             await MainActor.run { availableDeepSeekModels = [] }
         }
-        await updateAvailableModels()
+        await updateAvailableModels(trigger: .providerModelRefresh)
     }
 
     private func updateFireworksModels() async {
@@ -4292,7 +4340,7 @@ public class APISettingsViewModel: ObservableObject {
         } catch {
             await MainActor.run { availableFireworksModels = [] }
         }
-        await updateAvailableModels()
+        await updateAvailableModels(trigger: .providerModelRefresh)
     }
 
     /// Starts a subscription to the centralized Codex model polling service.
@@ -4316,7 +4364,7 @@ public class APISettingsViewModel: ObservableObject {
                     return true
                 }
                 guard didPublish else { continue }
-                await updateAvailableModels()
+                await updateAvailableModels(trigger: .providerModelSubscription)
             }
         }
     }
@@ -4384,7 +4432,7 @@ public class APISettingsViewModel: ObservableObject {
             await MainActor.run { availableGrokModels = [] }
             print("Error fetching Grok models: \(error.asFriendlyString())")
         }
-        await updateAvailableModels()
+        await updateAvailableModels(trigger: .providerModelRefresh)
     }
 
     private func updateGroqModels() async {
@@ -4404,7 +4452,7 @@ public class APISettingsViewModel: ObservableObject {
             await MainActor.run { availableGroqModels = [] }
             print("Error fetching Groq models: \(error.asFriendlyString())")
         }
-        await updateAvailableModels()
+        await updateAvailableModels(trigger: .providerModelRefresh)
     }
 }
 

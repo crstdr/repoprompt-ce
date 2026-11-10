@@ -68,6 +68,7 @@ enum StartupPhaseLog {
         case switchReplaySliceHydration
         case switchReplayDeferredFlush
         case switchReplaySelectionFence
+        case availableModelsUpdate
     }
 
     /// Bounded integer codes for a workspace-switch request outcome, so markers can
