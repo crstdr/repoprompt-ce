@@ -212,6 +212,31 @@ enum CodexDynamicModelMapper {
         return options.sorted { compareOptions($0, $1, discoveredRecords: records) }
     }
 
+    /// Matches displayName(forModelID:records:), including exact-ID precedence and first matches.
+    static func displayNameIndex(discovery: CodexModelDiscovery) -> [String: String] {
+        var exact: [String: String] = [:]
+        var variants: [String: String] = [:]
+        for record in discovery.records {
+            let baseID = normalizeID(record.id)
+            guard !baseID.isEmpty else { continue }
+            let name = formatBaseDisplayName(
+                record.displayName,
+                fallbackModel: record.model,
+                fallbackID: baseID,
+                records: discovery.records,
+                discovery: discovery
+            )
+            let key = CodexModelIdentity.key(baseID)
+            if exact[key] == nil { exact[key] = name }
+            for entry in normalizedEfforts(for: record, fallbackDescription: record.description.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                let variant = CodexModelIdentity.key("\(baseID)-\(entry.effort.rawValue)")
+                if variants[variant] == nil { variants[variant] = "\(name) \(entry.effort.displayName)" }
+            }
+        }
+        variants.merge(exact) { _, advertised in advertised }
+        return variants
+    }
+
     static func optionPrecedes(_ lhs: CodexDynamicModelOption, _ rhs: CodexDynamicModelOption) -> Bool {
         compareOptions(lhs, rhs, discoveredRecords: [])
     }
@@ -347,20 +372,25 @@ enum CodexDynamicModelMapper {
         id.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private static func formatBaseDisplayName(_ preferred: String, fallbackModel: String, fallbackID: String, records: [CodexDynamicModelRecord]) -> String {
+    private static func formatBaseDisplayName(_ preferred: String, fallbackModel: String, fallbackID: String, records: [CodexDynamicModelRecord], discovery: CodexModelDiscovery? = nil) -> String {
         let preferredTrimmed = preferred.trimmingCharacters(in: .whitespacesAndNewlines)
         if !preferredTrimmed.isEmpty {
-            return humanizeLabel(preferredTrimmed, records: records)
+            return humanizeLabel(preferredTrimmed, records: records, discovery: discovery)
         }
         let fallbackModelTrimmed = fallbackModel.trimmingCharacters(in: .whitespacesAndNewlines)
         if !fallbackModelTrimmed.isEmpty {
-            return humanizeLabel(fallbackModelTrimmed, records: records)
+            return humanizeLabel(fallbackModelTrimmed, records: records, discovery: discovery)
         }
-        return humanizeLabel(fallbackID, records: records)
+        return humanizeLabel(fallbackID, records: records, discovery: discovery)
     }
 
-    private static func humanizeLabel(_ raw: String, records: [CodexDynamicModelRecord]) -> String {
-        if let alias = AIModel.codexPreviewDisplayAlias(for: raw, discoveredRecords: records) {
+    private static func humanizeLabel(_ raw: String, records: [CodexDynamicModelRecord], discovery: CodexModelDiscovery? = nil) -> String {
+        let alias: String? = if let discovery {
+            AIModel.codexPreviewDisplayAlias(for: raw, discovery: discovery)
+        } else {
+            AIModel.codexPreviewDisplayAlias(for: raw, discoveredRecords: records)
+        }
+        if let alias {
             return alias
         }
 

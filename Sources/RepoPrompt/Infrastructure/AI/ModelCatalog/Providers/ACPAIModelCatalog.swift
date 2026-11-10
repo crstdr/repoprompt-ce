@@ -451,7 +451,7 @@ enum ACPAIModelCatalog {
         CursorAIModelCatalog.options
     }
 
-    private static func grokBuildModelOptionsFromStore() -> [AgentModelOption] {
+    static func grokBuildModelOptionsFromStore() -> [AgentModelOption] {
         AgentModelCatalog.options(
             for: .grokBuild,
             availability: AgentModelCatalog.AvailabilityContext(grokBuildAvailable: true)
