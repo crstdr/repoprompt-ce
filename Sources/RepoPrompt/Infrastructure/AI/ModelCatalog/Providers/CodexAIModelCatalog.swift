@@ -125,6 +125,7 @@ enum CodexDynamicModelMapper {
     }
 
     static func options(from records: [CodexDynamicModelRecord]) -> [CodexDynamicModelOption] {
+        let discovery = CodexModelDiscovery(records: records)
         var options: [CodexDynamicModelOption] = []
         var seen = Set<String>()
         let advertisedIDs = Set(records.map { CodexModelIdentity.key($0.id) }.filter { !$0.isEmpty })
@@ -133,7 +134,7 @@ enum CodexDynamicModelMapper {
         // A future model can gain Ultrafast on refresh without a model-version allowlist.
         let speedRecords = records.compactMap { record -> CodexDynamicModelRecord? in
             guard !normalizeID(record.id).isEmpty,
-                  CodexModelSpecifier(raw: record.id, discoveredRecords: records).serviceTier == nil,
+                  CodexModelSpecifier(raw: record.id, discovery: discovery).serviceTier == nil,
                   let tier = record.serviceTiers.first(where: {
                       $0.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
                           == CodexServiceTierVariantCatalog.ultrafastServiceTier
@@ -157,7 +158,8 @@ enum CodexDynamicModelMapper {
                 record.displayName,
                 fallbackModel: record.model,
                 fallbackID: baseID,
-                records: records
+                records: records,
+                discovery: discovery
             )
             let baseDescription = record.description.trimmingCharacters(in: .whitespacesAndNewlines)
             let rawEfforts = record.supportedReasoningEfforts.map(\.reasoningEffort)
@@ -209,7 +211,7 @@ enum CodexDynamicModelMapper {
             }
         }
 
-        return options.sorted { compareOptions($0, $1, discoveredRecords: records) }
+        return options.sorted { compareOptions($0, $1, discovery: discovery) }
     }
 
     /// Matches displayName(forModelID:records:), including exact-ID precedence and first matches.
@@ -238,13 +240,13 @@ enum CodexDynamicModelMapper {
     }
 
     static func optionPrecedes(_ lhs: CodexDynamicModelOption, _ rhs: CodexDynamicModelOption) -> Bool {
-        compareOptions(lhs, rhs, discoveredRecords: [])
+        compareOptions(lhs, rhs, discovery: CodexModelDiscovery(records: []))
     }
 
     private static func compareOptions(
         _ lhs: CodexDynamicModelOption,
         _ rhs: CodexDynamicModelOption,
-        discoveredRecords: [CodexDynamicModelRecord]
+        discovery: CodexModelDiscovery
     ) -> Bool {
         if lhs.isDefault != rhs.isDefault {
             return lhs.isDefault && !rhs.isDefault
@@ -259,8 +261,8 @@ enum CodexDynamicModelMapper {
                 return leftRank < rightRank
             }
         } else {
-            if AIModel.codexBaseModelPrecedes(leftBase, rightBase, discoveredRecords: discoveredRecords) { return true }
-            if AIModel.codexBaseModelPrecedes(rightBase, leftBase, discoveredRecords: discoveredRecords) { return false }
+            if AIModel.codexBaseModelPrecedes(leftBase, rightBase, discovery: discovery) { return true }
+            if AIModel.codexBaseModelPrecedes(rightBase, leftBase, discovery: discovery) { return false }
         }
 
         let displayComparison = lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName)
