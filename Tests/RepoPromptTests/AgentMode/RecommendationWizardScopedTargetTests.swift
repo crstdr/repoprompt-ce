@@ -428,6 +428,13 @@ final class StartupRecommendationBaselineTests: XCTestCase {
     }
 
     func testRoleResolutionOutputsMatchFrozenReference() {
+        let original = StandardEffortDefaultsFixture()
+        defer { original.restore() }
+        ClaudeAgentToolPreferences.setEffortLevel(.low, forModelRaw: AgentModel.claudeSonnet.rawValue, agentKind: .claudeCode)
+        ClaudeAgentToolPreferences.setEffortLevel(.low, forModelRaw: AgentModel.claudeOpus.rawValue, agentKind: .claudeCode)
+        CodexAgentToolPreferences.setLastUsedReasoningEffort(.high, forModelRaw: "unadvertised-pin")
+        UserDefaults.standard.set("medium", forKey: "agentMode.codex.lastUsedReasoningEffort")
+        let hostile = StandardEffortDefaultsFixture.snapshot()
         withConflictingCodexCatalog {
             let actual = AgentModelCatalog.AvailabilityContext(claudeCodeAvailable: true, codexAvailable: true, openCodeAvailable: false)
             let codexOnly = actual.filteredForRecommendationProviders([.codex])
@@ -477,6 +484,7 @@ final class StartupRecommendationBaselineTests: XCTestCase {
             }
             XCTAssertNotEqual(outputs["nil"], outputs["empty"], "An empty display override must consult persistence instead of live records")
         }
+        XCTAssertEqual(StandardEffortDefaultsFixture.snapshot(), hostile, "The fixture must restore the caller's effort preferences")
     }
 
     func testCodexOperationSeparatesInputsAndPreservesParsingAndLabels() throws {
@@ -648,7 +656,83 @@ final class StartupRecommendationBaselineTests: XCTestCase {
         XCTAssertEqual(timingSummary(snapshot, expected: 1)?.span, 1)
     }
 
+    /// Role resolution reads these standard keys even when its profile store is isolated.
+    private struct StandardEffortDefaultsFixture {
+        private static let keys = [
+            "claudeCodeEffortLevel", "claudeCodeEffortLevelsByModelSlug",
+            "codexAgent.reasoning.lastUsedEffort", "agentMode.codex.lastUsedReasoningEffort",
+            "codexAgent.reasoning.lastUsedEffortByModelSlug"
+        ]
+        private let saved: [(String, Any?)]
+
+        init() {
+            saved = Self.keys.map { ($0, UserDefaults.standard.object(forKey: $0)) }
+            UserDefaults.standard.set("high", forKey: Self.keys[0])
+            UserDefaults.standard.set([String: String](), forKey: Self.keys[1])
+            UserDefaults.standard.set("", forKey: Self.keys[2])
+            UserDefaults.standard.set("", forKey: Self.keys[3])
+            UserDefaults.standard.set([String: String](), forKey: Self.keys[4])
+        }
+
+        func restore() {
+            for (key, value) in saved {
+                if let value { UserDefaults.standard.set(value, forKey: key) }
+                else { UserDefaults.standard.removeObject(forKey: key) }
+            }
+        }
+
+        static func snapshot() -> NSDictionary {
+            NSDictionary(dictionary: UserDefaults.standard.dictionaryRepresentation().filter { keys.contains($0.key) })
+        }
+    }
+
+    private struct StaticWork {
+        let options: Int
+        let parsers: Int
+        let loads: Int
+    }
+
+    private func staticWorkPerProduction() -> StaticWork {
+        let models = AgentModel.modelsForAgent(.codexExec)
+        let effortCount = models.count(where: { CodexModelSpecifier(raw: $0.rawValue).reasoningEffort != nil })
+        return StaticWork(
+            options: models.count,
+            parsers: models.count + effortCount,
+            loads: models.count(where: { $0 != .defaultModel }) + effortCount
+        )
+    }
+
+    func testStaticCatalogParserPathMatchesOriginalDefaultOverload() throws {
+        try withConflictingCodexCatalog {
+            let models: [AgentModel] = [.gpt54MiniMedium, .gpt61SolMax, .gpt6LunaMax]
+            for collision in [false, true] {
+                CodexDynamicModelStore.save(collision ? models.map { remote($0.rawValue, efforts: []) } : [])
+                let work = staticWorkPerProduction()
+                StartupRecommendationDiagnostics.begin()
+                let options = AgentModelCatalog.options(for: .codexExec)
+                let counts = StartupRecommendationDiagnostics.snapshot()
+                StartupRecommendationDiagnostics.end()
+                XCTAssertEqual(counts["staticOption"], work.options)
+                XCTAssertEqual(counts["staticParser"], work.parsers)
+                XCTAssertEqual(counts["staticPersistedLoad"], work.loads)
+                for model in models {
+                    // This is the original default-autoclosure expression, independent of the new helper.
+                    let original = CodexModelSpecifier(raw: model.rawValue).reasoningEffort.flatMap { effort in
+                        CodexModelSpecifier(raw: model.rawValue).baseModel.map {
+                            AgentModelEffortVariant(baseModelRaw: $0, reasoningEffort: effort)
+                        }
+                    }
+                    let actual = try XCTUnwrap(options.first { $0.rawValue == model.rawValue }, model.rawValue)
+                    XCTAssertEqual(actual.effortVariant, original, "\(model.rawValue), collision=\(collision)")
+                    XCTAssertEqual(original == nil, collision, model.rawValue)
+                }
+            }
+        }
+    }
+
     private func withConflictingCodexCatalog(_ body: () throws -> Void) rethrows {
+        let efforts = StandardEffortDefaultsFixture()
+        defer { efforts.restore() }
         let registry = AgentCodexModelRegistry.shared
         let originalLive = registry.currentLiveModels()
         let originalPersisted = UserDefaults.standard.object(forKey: "CodexDynamicModelRecords")
@@ -688,6 +772,8 @@ final class StartupRecommendationBaselineTests: XCTestCase {
     }
 
     private func runCohort(timing: Bool) async throws -> Result {
+        let efforts = StandardEffortDefaultsFixture()
+        defer { efforts.restore() }
         let registry = AgentCodexModelRegistry.shared
         let originalLive = registry.currentLiveModels()
         let originalPersisted = UserDefaults.standard.object(forKey: "CodexDynamicModelRecords")
@@ -758,6 +844,7 @@ final class StartupRecommendationBaselineTests: XCTestCase {
         }
         defer { owners.forEach { $0.api.prepareForWindowClose() } }
         await drain()
+        let staticWork = staticWorkPerProduction()
         let globalBefore = store.globalAgentModelsProfile()
         let workspacesBefore = owners.map { store.workspaceAgentModelsSettings(for: $0.workspace.id) }
         var result = Result()
@@ -768,7 +855,7 @@ final class StartupRecommendationBaselineTests: XCTestCase {
         }
         try await settle("initialization", key: "delivery.provider", count: 36, startedAt: initializationStart)
         result.phases["initialization"] = StartupRecommendationDiagnostics.snapshot()
-        assertGolden(result.phases["initialization"], phase: "initialization")
+        assertGolden(result.phases["initialization"], phase: "initialization", staticWork: staticWork)
         result.outputs = try owners.map { try output($0) }
         for value in result.outputs {
             XCTAssertEqual(SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined(), "b9016f352407a47cde2501ea372bc82161fc91148db18390810dc9d4fc27c52d")
@@ -798,7 +885,7 @@ final class StartupRecommendationBaselineTests: XCTestCase {
             let key = phase == "workspaceSwitch" ? "refresh.workspaceTarget" : "refresh.\(phase)"
             try await settle(phase, key: key, count: 36, startedAt: phaseStart)
             result.phases[phase] = StartupRecommendationDiagnostics.snapshot()
-            assertGolden(result.phases[phase], phase: phase)
+            assertGolden(result.phases[phase], phase: phase, staticWork: staticWork)
             XCTAssertEqual(UserDefaults.standard.data(forKey: "CodexDynamicModelRecords"), seededPersistence, phase)
             XCTAssertEqual(registry.currentLiveModels(), live, phase)
             XCTAssertEqual(try owners.map { try output($0) }, result.outputs, phase)
@@ -838,7 +925,7 @@ final class StartupRecommendationBaselineTests: XCTestCase {
         return result
     }
 
-    private func assertGolden(_ snapshot: StartupRecommendationDiagnostics.Snapshot?, phase: String) {
+    private func assertGolden(_ snapshot: StartupRecommendationDiagnostics.Snapshot?, phase: String, staticWork: StaticWork) {
         // Frozen counts for the unchanged populated, Codex+Claude fixture.
         let computes = phase == "initialization" ? 180 : (["provider", "workspaceCreation"].contains(phase) ? 72 : 36)
         var expected = [
@@ -847,7 +934,9 @@ final class StartupRecommendationBaselineTests: XCTestCase {
             "codexOperationCapture": 2, "codexOperationHit": 11,
             "codexOptionsRequest": 5, "codexOptionsProduction": 5,
             "codexRecordAttempt": 5, "codexRecordAccepted": 5,
-            "staticOption": 275, "staticParser": 535, "staticPersistedLoad": 530
+            "staticOption": 5 * staticWork.options,
+            "staticParser": 5 * staticWork.parsers,
+            "staticPersistedLoad": 5 * staticWork.loads
         ].mapValues { $0 * computes }
         if phase == "initialization" {
             expected.merge([
