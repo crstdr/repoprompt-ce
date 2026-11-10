@@ -1,5 +1,6 @@
 import Combine
 import CryptoKit
+import Darwin
 import Foundation
 import os
 import RepoPromptDomainRuntime
@@ -114,6 +115,11 @@ private struct WorkspaceFileCachedLoadResult {
 final class WorkspaceFileDecodeCache: @unchecked Sendable {
     static let shared = WorkspaceFileDecodeCache()
     static let catalogPrewarmer = WorkspaceCatalogDecodePrewarmer()
+
+    /// Separate saved-phase state, sharing only this cache's process lifetime and invalidation boundary.
+    let savedMarkerOwner = WorkspaceSavedConsolidationMarkerOwner { url, id in
+        WorkspaceFileDecodeCache.readSavedMarkerUncached(url: url, workspaceID: id)
+    }
 
     private let lock = NSLock()
     private var cachedWorkspacesByKey: [WorkspaceFileDecodeCacheKey: WorkspaceModel] = [:]
@@ -367,7 +373,56 @@ final class WorkspaceFileDecodeCache: @unchecked Sendable {
         cachedWorkspacesByKey = cachedWorkspacesByKey.filter { $0.key.standardizedPath != key.standardizedPath }
     }
 
+    static func readSavedMarkerUncached(url: URL, workspaceID: UUID) -> WorkspaceSavedConsolidationMarkerOwner.ReadObservation {
+        #if DEBUG
+            let recorder = WorkspaceSavedMarkerMeasurements.current()
+            let measurementStart = recorder == nil ? 0 : DispatchTime.now().uptimeNanoseconds
+            var measurement = WorkspaceSavedMarkerMeasurements.Sample()
+            defer {
+                if let recorder {
+                    measurement.operationNanoseconds = DispatchTime.now().uptimeNanoseconds - measurementStart
+                    recorder.record(measurement)
+                }
+            }
+        #endif
+        var before: WorkspaceSavedConsolidationMarkerOwner.Version?
+        var after: WorkspaceSavedConsolidationMarkerOwner.Version?
+        func observation(_ status: WorkspaceSavedConsolidationMarkerOwner.Status) -> WorkspaceSavedConsolidationMarkerOwner.ReadObservation {
+            .init(status: status, before: before, after: after)
+        }
+        let descriptor = Darwin.open(url.path, O_RDONLY | O_CLOEXEC)
+        guard descriptor >= 0 else { return observation(.unreadable) }
+        defer { Darwin.close(descriptor) }
+        before = WorkspaceSavedConsolidationMarkerOwner.Version.probe(descriptor: descriptor)
+        do {
+            let data = try FileHandle(fileDescriptor: descriptor, closeOnDealloc: false).readToEnd() ?? Data()
+            after = WorkspaceSavedConsolidationMarkerOwner.Version.probe(descriptor: descriptor)
+            #if DEBUG
+                let decodeStart = recorder == nil ? 0 : DispatchTime.now().uptimeNanoseconds
+                measurement.reads = 1
+                measurement.bytesRead = data.count
+                measurement.readNanoseconds = decodeStart - measurementStart
+                measurement.fullDecodes = 1
+                defer {
+                    if recorder != nil { measurement.decodeNanoseconds = DispatchTime.now().uptimeNanoseconds - decodeStart }
+                }
+            #endif
+            let saved = try JSONDecoder().decode(WorkspaceModel.self, from: data)
+            #if DEBUG
+                if saved.id != workspaceID { measurement.identityMismatches = 1 }
+                else if saved.consolidatedIntoWorkspaceID == nil { measurement.unmarked = 1 }
+                else { measurement.marked = 1 }
+            #endif
+            guard saved.id == workspaceID else { return observation(.unreadable) }
+            return observation(saved.consolidatedIntoWorkspaceID == nil ? .unmarked : .marked)
+        } catch {
+            if after == nil { after = WorkspaceSavedConsolidationMarkerOwner.Version.probe(descriptor: descriptor) }
+            return observation(.unreadable)
+        }
+    }
+
     func invalidate(url: URL) {
+        savedMarkerOwner.invalidate(url: url)
         let standardizedPath = url.standardizedFileURL.path
         lock.lock()
         defer { lock.unlock() }
@@ -9068,12 +9123,6 @@ class WorkspaceManagerViewModel: ObservableObject {
         let savedFileURL: URL
     }
 
-    private enum SavedConsolidationMarkerStatus {
-        case marked
-        case unmarked
-        case unreadable
-    }
-
     private struct AuthorityIncompleteRestoreState {
         let workspace: WorkspaceModel
         let fileURL: URL
@@ -9124,37 +9173,22 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
     }
 
-    /// Reads the saved workspace document directly. The decode cache represents presentation
-    /// state and may already contain the marker-cleared working document, so it cannot classify
-    /// whether the separate saved phase completed.
-    private nonisolated static func savedConsolidationMarkerStatus(
-        for candidate: AuthorityIncompleteRestoreCandidate
-    ) -> SavedConsolidationMarkerStatus {
-        guard FileManager.default.fileExists(atPath: candidate.savedFileURL.path) else {
-            return .unreadable
-        }
-        do {
-            let data = try Data(contentsOf: candidate.savedFileURL)
-            let saved = try JSONDecoder().decode(WorkspaceModel.self, from: data)
-            guard saved.id == candidate.workspaceID else { return .unreadable }
-            return saved.consolidatedIntoWorkspaceID == nil ? .unmarked : .marked
-        } catch {
-            return .unreadable
-        }
-    }
-
     private nonisolated static func authorityIncompleteRestoreIDs(
         from candidates: [AuthorityIncompleteRestoreCandidate]
     ) async -> Set<UUID> {
-        await Task.detached(priority: .utility) {
-            Set(candidates.compactMap { candidate in
-                switch Self.savedConsolidationMarkerStatus(for: candidate) {
-                case .marked, .unreadable:
-                    candidate.workspaceID
-                case .unmarked:
-                    nil
+        let owner = WorkspaceFileDecodeCache.shared.savedMarkerOwner
+        return await Task.detached(priority: .utility) {
+            var incomplete: Set<UUID> = []
+            for candidate in candidates {
+                switch await owner.status(url: candidate.savedFileURL, workspaceID: candidate.workspaceID) {
+                case .marked, .unreadable: incomplete.insert(candidate.workspaceID)
+                case .unmarked: break
                 }
-            })
+                #if DEBUG
+                    await owner.betweenLookupsForTesting(url: candidate.savedFileURL)
+                #endif
+            }
+            return incomplete
         }.value
     }
 
@@ -9231,6 +9265,11 @@ class WorkspaceManagerViewModel: ObservableObject {
                 await beforeAuthorityRestoreSavedReadForTesting?(nil)
             #endif
             guard ownsAuthorityRestoreClassification(attemptID, publicationSequence: publicationSequence) else { return .superseded }
+            #if DEBUG
+                let owner = WorkspaceFileDecodeCache.shared.savedMarkerOwner
+                owner.beginClassificationForTesting()
+                defer { owner.endClassificationForTesting() }
+            #endif
             let incompleteIDs = await Self.authorityIncompleteRestoreIDs(from: candidates)
             guard ownsAuthorityRestoreClassification(attemptID, publicationSequence: publicationSequence) else { return .superseded }
             // Consult live guards, never a pre-await capture. The attempt owns both membership and results.
@@ -9316,8 +9355,13 @@ class WorkspaceManagerViewModel: ObservableObject {
             await beforeAuthorityRestoreSavedReadForTesting?(workspaceID)
         #endif
         guard ownsAuthorityRestoreClassification(attemptID, publicationSequence: snapshot.publicationSequence) else { return .stale }
+        let owner = WorkspaceFileDecodeCache.shared.savedMarkerOwner
+        #if DEBUG
+            owner.beginClassificationForTesting()
+            defer { owner.endClassificationForTesting() }
+        #endif
         let savedStatus = await Task.detached(priority: .utility) {
-            Self.savedConsolidationMarkerStatus(for: candidate)
+            await owner.status(url: candidate.savedFileURL, workspaceID: candidate.workspaceID)
         }.value
         guard ownsAuthorityRestoreClassification(attemptID, publicationSequence: snapshot.publicationSequence) else { return .stale }
         switch savedStatus {

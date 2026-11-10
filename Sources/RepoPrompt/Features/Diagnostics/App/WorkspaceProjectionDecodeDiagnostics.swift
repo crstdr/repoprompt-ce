@@ -152,4 +152,77 @@ import RepoPromptShared
             lock.withLock { (starts, waits) }
         }
     }
+
+    /// Opt-in aggregate counters for the uncached saved-marker reader. Entry point:
+    /// NewWindowInitialSelectionTests/testSavedConsolidationMarker35Managers.
+    /// Retains no documents, paths, errors, or workspace IDs.
+    final class WorkspaceSavedMarkerMeasurements: @unchecked Sendable {
+        struct Sample {
+            var reads = 0
+            var bytesRead = 0
+            var fullDecodes = 0
+            var identityMismatches = 0
+            var marked = 0
+            var unmarked = 0
+            var readNanoseconds: UInt64 = 0
+            var decodeNanoseconds: UInt64 = 0
+            var operationNanoseconds: UInt64 = 0
+        }
+
+        struct Snapshot: Encodable {
+            var requests = 0
+            var reads = 0
+            var bytesRead = 0
+            var fullDecodes = 0
+            var identityMismatches = 0
+            var marked = 0
+            var unmarked = 0
+            var unreadable = 0
+            var readFailures = 0
+            var decodeFailures = 0
+            var readNanoseconds: UInt64 = 0
+            var decodeNanoseconds: UInt64 = 0
+            var operationNanoseconds: UInt64 = 0
+        }
+
+        static func validCPU(userMS: Double, systemMS: Double) -> Bool {
+            userMS.isFinite && systemMS.isFinite && userMS >= 0 && systemMS >= 0 && (userMS + systemMS).isFinite
+        }
+
+        private static let registrationLock = NSLock()
+        private nonisolated(unsafe) static var active: WorkspaceSavedMarkerMeasurements?
+        private let lock = NSLock()
+        private var counters = Snapshot()
+
+        /// Install/remove only after the fixture's classification tasks have joined.
+        static func install(_ recorder: WorkspaceSavedMarkerMeasurements?) {
+            registrationLock.withLock { active = recorder }
+        }
+
+        static func current() -> WorkspaceSavedMarkerMeasurements? {
+            registrationLock.withLock { active }
+        }
+
+        func record(_ sample: Sample) {
+            lock.withLock {
+                counters.requests += 1
+                counters.reads += sample.reads
+                counters.bytesRead += sample.bytesRead
+                counters.fullDecodes += sample.fullDecodes
+                counters.identityMismatches += sample.identityMismatches
+                counters.marked += sample.marked
+                counters.unmarked += sample.unmarked
+                counters.unreadable += 1 - sample.marked - sample.unmarked
+                counters.readFailures += sample.reads == 0 ? 1 : 0
+                counters.decodeFailures += sample.fullDecodes - sample.marked - sample.unmarked - sample.identityMismatches
+                counters.readNanoseconds += sample.readNanoseconds
+                counters.decodeNanoseconds += sample.decodeNanoseconds
+                counters.operationNanoseconds += sample.operationNanoseconds
+            }
+        }
+
+        func snapshot() -> Snapshot {
+            lock.withLock { counters }
+        }
+    }
 #endif

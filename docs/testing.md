@@ -1179,3 +1179,25 @@ RPCE_RUN_SCALE_TESTS=1 ./conductor test --filter 'NewWindowInitialSelectionTests
 ```
 
 This is optimized DEBUG, not packaged Release/WMO. Record effective compiler flags. The fixture checks actual changed-digest JSON calls/thread identity, state and receipt parity, and the existing 5-second per-scenario budget. `CATALOG_PREWARM_METRIC working_only=true` captures attribution before saved-phase work without resetting whole-pair count checks. Report start delay, first/minimum wait and `max wait − (worker JSON + working apply sum + working hash sum)` per arm; raw waits also include serialized receiver resumption. RSS/footprint peaks are sampled off-main every millisecond, with before/settled/receiver-release boundaries; compare peak-minus-before deltas, not absolute cross-arm peaks. These are headless receivers, not 35 rendered windows.
+
+## Saved consolidation-marker classification
+
+The app's saved-phase classifier shares full raw `WorkspaceModel` reads by file version and expected workspace ID on known local APFS volumes. Other or unknown filesystem types use independent reads. Successful marked/unmarked observations may be retained; unreadable results remain retryable. Two unstable shared attempts fall back to a fresh per-caller raw decode, whose result is never retained. The DEBUG aggregate recorder in `Sources/RepoPrompt/Features/Diagnostics/App/WorkspaceProjectionDecodeDiagnostics.swift` (`WorkspaceSavedMarkerMeasurements`) measures physical reads/decodes without retaining document data or identifiers.
+
+Run correctness coverage in the isolated root test sandbox:
+
+```sh
+make dev-test FILTER=RepoPromptTests.WorkspaceSavedConsolidationMarkerOwnerTests
+make dev-test FILTER=RepoPromptTests.NewWindowInitialSelectionTests/testSavedMarker35ManagersSaveBothDirectionsWithinBudget
+```
+
+Run paired uncached/shared diagnostics through the default build directory:
+
+```sh
+RPCE_RUN_SCALE_TESTS=1 ./conductor test --filter 'RepoPromptTests.NewWindowInitialSelectionTests/testSavedConsolidationMarker35Managers' --async --request-key saved-marker-paired
+./conductor job wait --request-key saved-marker-paired
+```
+
+The fixture uses 35 headless managers, ordinary/busy documents, K=5/20 dirty saved files, one/eight settled publication rounds, and a busy/K=20 back-to-back burst. Each arm/cell has one warmup and three retained samples with alternating arm order. Shared trials start cold. `CONSOLIDATION_MARKER_METRIC` records wall time, process-wide user/system CPU, raw full-decode counts, owner counts, and exact pending-set parity. Stable shared trials require K physical decodes, while uncached trials require `35*K*rounds`. Back-to-back delivery suppresses earlier manager attempts, so uncached work there is `35*K`.
+
+The shared arm and the always-run saved-phase flips have a five-second completion budget. DEBUG idle waits also have a five-second deadline and include complete detached classification sequences, including intervals between lookups. A reset refuses to alter a busy owner. Shared-work diagnostics skip volumes outside the local-APFS support policy. Timing ratios remain diagnostic. Reject and retain invalid samples when bytes drift, counts or pending membership differ, catalog applications are rejected, or either CPU component is nonfinite/negative, or their sum is nonfinite. Keep raw logs and machine-specific results local. Record actual compiler flags before comparing campaigns: default Debug, optimized Debug, and packaged Release/WMO are different configurations. With three retained samples, nearest-rank p95 is the maximum. These tests exclude visible windows, bridge fanout, and production workload prevalence.
