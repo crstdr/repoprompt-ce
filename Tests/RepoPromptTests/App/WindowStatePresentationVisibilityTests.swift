@@ -12,6 +12,71 @@ final class WindowStatePresentationVisibilityTests: XCTestCase {
         var visible = true
     }
 
+    func testStartupVisibilityIsRecordedOnceAndStopsOnClose() async {
+        final class Capture: @unchecked Sendable {
+            private let lock = NSLock()
+            private var lines: [String] = []
+            func append(_ line: String) {
+                lock.lock()
+                defer { lock.unlock() }
+                lines.append(line)
+            }
+
+            func count(_ phase: String) -> Int {
+                lock.lock()
+                defer { lock.unlock() }
+                return lines.count(where: { $0.contains("phase=\(phase) ") })
+            }
+        }
+        let capture = Capture()
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        defer {
+            StartupPhaseLog.resetForTesting()
+            GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        }
+        let first = WindowState()
+        let second = WindowState()
+        let firstWindow = makeTestWindow()
+        let secondWindow = makeTestWindow()
+        let sample = SampleBox()
+        sample.visible = false
+        first.startupVisibilitySampler = { _ in sample.visible }
+        second.startupVisibilitySampler = { _ in sample.visible }
+        StartupPhaseLog.installForTesting(.init(uptime: { 125 }, processStartUptime: 100, emit: { capture.append($0) }))
+        first.noteNativeWindowAvailable(firstWindow)
+        second.noteNativeWindowAvailable(secondWindow)
+        XCTAssertTrue(first.debugHasStartupVisibilityObserver)
+        XCTAssertTrue(second.debugHasStartupVisibilityObserver)
+        second.beginClose()
+        XCTAssertFalse(second.debugHasStartupVisibilityObserver)
+        sample.visible = true
+        NotificationCenter.default.post(name: NSWindow.didChangeOcclusionStateNotification, object: secondWindow)
+        XCTAssertTrue(first.debugHasStartupVisibilityObserver)
+        XCTAssertEqual(capture.count("windowFirstVisible"), 0)
+        NotificationCenter.default.post(name: NSApplication.didUnhideNotification, object: NSApplication.shared)
+        XCTAssertFalse(first.debugHasStartupVisibilityObserver)
+        NotificationCenter.default.post(name: NSWindow.didChangeOcclusionStateNotification, object: firstWindow)
+        NotificationCenter.default.post(name: NSWindow.didChangeOcclusionStateNotification, object: secondWindow)
+        XCTAssertEqual(capture.count("windowNativeAvailable"), 2)
+        XCTAssertEqual(capture.count("windowFirstVisible"), 1)
+        first.beginClose()
+        await first.tearDown()
+        await second.tearDown()
+    }
+
+    func testNativeWindowCallbackPrecedesDebounce() {
+        var discoveries = 0
+        var callbacks = 0
+        let coordinator = WindowAccessor.Coordinator(onNativeWindowAvailable: { _ in discoveries += 1 }) { _ in callbacks += 1 }
+        let window = makeTestWindow()
+        coordinator.schedule(window: nil)
+        coordinator.schedule(window: window)
+        coordinator.schedule(window: window)
+        XCTAssertEqual(discoveries, 1)
+        XCTAssertEqual(callbacks, 0)
+    }
+
     func testSignalFollowsOcclusionMiniaturizeAndAppHideForTheAttachedWindowOnly() async throws {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)

@@ -130,6 +130,26 @@ final class StartupPhaseLogTests: XCTestCase {
         )
     }
 
+    func testAppInitSubphaseRenderingAndNesting() {
+        let recorder = Recorder(ticks: [125])
+        StartupPhaseLog.installForTesting(.init(
+            uptime: { recorder.uptime() }, processStartUptime: 100,
+            emit: { recorder.emit($0) }
+        ))
+        let outer = StartupPhaseLog.begin(.appInit)
+        for phase: StartupPhaseLog.Phase in [
+            .appLoggingBootstrap, .appUIStateSetup, .appTelemetryBootstrap,
+            .appRecorderInstallation, .appWindowManagerInit, .appWindowSessionLoadSchedule
+        ] {
+            let span = StartupPhaseLog.begin(phase)
+            span.end()
+        }
+        outer.end()
+        XCTAssertEqual(recorder.emissions.first, "phase=appInit boundary=begin elapsed_ms=25000")
+        XCTAssertEqual(recorder.emissions.last, "phase=appInit boundary=end elapsed_ms=25000 span_ms=0")
+        XCTAssertEqual(recorder.emissions.count, 14)
+    }
+
     /// Phase names are fixed enum raw values -- letters only -- so no call site can
     /// interpolate names or identifiers into a marker.
     func testPhaseRawValuesAreFixedLetterOnlyNames() {

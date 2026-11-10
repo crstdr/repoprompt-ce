@@ -9,10 +9,11 @@ import AppKit
 import SwiftUI
 
 struct WindowAccessor: NSViewRepresentable {
+    var onNativeWindowAvailable: (NSWindow) -> Void = { _ in }
     let callback: (NSWindow?) -> Void
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(callback: callback)
+        Coordinator(onNativeWindowAvailable: onNativeWindowAvailable, callback: callback)
     }
 
     func makeNSView(context: Context) -> NSView {
@@ -26,19 +27,22 @@ struct WindowAccessor: NSViewRepresentable {
     }
 
     final class Coordinator {
+        private let onNativeWindowAvailable: (NSWindow) -> Void
         private let callback: (NSWindow?) -> Void
         private weak var lastWindow: NSWindow?
         private var tokens: [NSObjectProtocol] = []
         private var pendingCallback: DispatchWorkItem?
         private let callbackWorkGate = WorkItemGate()
 
-        init(callback: @escaping (NSWindow?) -> Void) {
+        init(onNativeWindowAvailable: @escaping (NSWindow) -> Void, callback: @escaping (NSWindow?) -> Void) {
+            self.onNativeWindowAvailable = onNativeWindowAvailable
             self.callback = callback
         }
 
         func schedule(window: NSWindow?) {
             guard lastWindow !== window else { return }
             lastWindow = window
+            if let window { onNativeWindowAvailable(window) }
             installObservers(for: window)
             fireCallbackDebounced(for: window)
         }

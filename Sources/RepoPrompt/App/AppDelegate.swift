@@ -75,6 +75,8 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     // MARK: - Init
 
     override init() {
+        let span = StartupPhaseLog.begin(.appDelegateInit)
+        defer { span.end() }
         appDelegateDebugLog("Appcounter \(AppDelegate.appCounter)")
         AppDelegate.appCounter += 1
 

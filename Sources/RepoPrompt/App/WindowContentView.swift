@@ -42,7 +42,9 @@ struct WindowContentView: View {
             .navigationTitle(windowState.displayedWindowTitle)
             .removingSystemToolbarTitle()
             .background(
-                WindowAccessor { newWindow in
+                WindowAccessor(onNativeWindowAvailable: { [weak windowState] window in
+                    windowState?.noteNativeWindowAvailable(window)
+                }) { newWindow in
                     // IMPORTANT: do not mutate SwiftUI @State here.
                     // Attach is internally guarded and safe even if called multiple times.
                     windowState.attachWindow(newWindow)
@@ -67,6 +69,7 @@ struct WindowContentView: View {
                 AppWindowOpener.shared.install {
                     openWindow(id: "main")
                 }
+                windowState.noteStartupRegistrationComplete()
             }
             // Cleanup if the window goes away
             .onDisappear {
