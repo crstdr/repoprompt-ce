@@ -1924,11 +1924,12 @@ enum AgentModelCatalog {
         #if DEBUG
             StartupRecommendationDiagnostics.count("family", catalog: true)
         #endif
-        guard let option = preferredCodexFamilyOption(family, availability: availability),
+        let codexOptions = options(for: .codexExec, availability: availability)
+        guard let option = preferredCodexFamilyOption(family, from: codexOptions),
               let base = CodexModelSpecifier(raw: option.rawValue).baseModel
         else { return nil }
         let desired = "\(base)-\(effort.rawValue)"
-        return options(for: .codexExec, availability: availability).contains {
+        return codexOptions.contains {
             $0.rawValue.caseInsensitiveCompare(desired) == .orderedSame
         } ? desired : nil
     }

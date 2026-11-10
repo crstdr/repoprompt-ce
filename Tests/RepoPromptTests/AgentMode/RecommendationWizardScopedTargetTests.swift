@@ -362,6 +362,71 @@ final class StartupRecommendationBaselineTests: XCTestCase {
         var wizard: RecommendationWizardViewModel?
     }
 
+    func testPreferredCodexFamilyUsesOneProductionWithLegacyResults() {
+        let registry = AgentCodexModelRegistry.shared
+        let originalLive = registry.currentLiveModels()
+        let originalPersisted = UserDefaults.standard.object(forKey: "CodexDynamicModelRecords")
+        defer {
+            StartupRecommendationDiagnostics.end()
+            registry.updateLiveModels(originalLive)
+            UserDefaults.standard.set(originalPersisted, forKey: "CodexDynamicModelRecords")
+            AgentAdvertisedModelCatalog.shared.invalidate(.codexExec)
+        }
+        let available = AgentModelCatalog.AvailabilityContext(codexAvailable: true)
+        let persisted = [
+            remote("gpt-6-luna", efforts: ["high"]),
+            remote("gpt-6.1-sol", efforts: ["low"]),
+            remote("gpt-6.1-sol-medium", efforts: [])
+        ]
+        registry.updateLiveModels([
+            remote("gpt-6-luna", efforts: ["low"], isDefault: true),
+            remote("gpt-6.1-sol", efforts: ["low", "medium", "high"])
+        ])
+        CodexDynamicModelStore.save(persisted)
+
+        /// Preserve the M1 two-read algorithm as an output oracle for fixed catalog inputs.
+        func legacyValue(_ family: String, effort: CodexReasoningEffort, availability: AgentModelCatalog.AvailabilityContext) -> String? {
+            guard let option = AgentModelCatalog.preferredCodexFamilyOption(family, availability: availability),
+                  let base = CodexModelSpecifier(raw: option.rawValue).baseModel else { return nil }
+            let desired = "\(base)-\(effort.rawValue)"
+            return AgentModelCatalog.options(for: .codexExec, availability: availability).contains {
+                $0.rawValue.caseInsensitiveCompare(desired) == .orderedSame
+            } ? desired : nil
+        }
+        func check(_ family: String, effort: CodexReasoningEffort, availability: AgentModelCatalog.AvailabilityContext, expected: String?) {
+            StartupRecommendationDiagnostics.end()
+            let legacy = legacyValue(family, effort: effort, availability: availability)
+            XCTAssertEqual(legacy, expected, family)
+            StartupRecommendationDiagnostics.begin()
+            let actual = AgentModelCatalog.preferredCodexFamilyModelRaw(family, effort: effort, availability: availability)
+            let counts = StartupRecommendationDiagnostics.snapshot()
+            StartupRecommendationDiagnostics.end()
+            XCTAssertEqual(actual, legacy, family)
+            XCTAssertEqual(counts["family"], 1, family)
+            XCTAssertEqual(counts["codexOptionsRequest"], 1, family)
+            XCTAssertEqual(counts["codexOptionsProduction"], 1, family)
+            XCTAssertEqual(counts["codexRecordAttempt"], availability.codexAvailable ? 1 : 0, family)
+            XCTAssertEqual(counts["codexRecordAccepted"], availability.codexAvailable ? 1 : 0, family)
+        }
+        check("sol", effort: .high, availability: available, expected: "gpt-6.1-sol-high")
+        check(" SOL ", effort: .medium, availability: available, expected: "gpt-6.1-sol-medium")
+        check("luna", effort: .low, availability: available, expected: "gpt-6-luna-low")
+        check("unknown", effort: .high, availability: available, expected: nil)
+        check("", effort: .low, availability: available, expected: nil)
+        check("sol", effort: .high, availability: .none, expected: nil)
+
+        // The newest advertised family member lacks high effort; older static entries must not win.
+        registry.updateLiveModels([remote("gpt-99-sol", efforts: ["low"], isDefault: true)])
+        CodexDynamicModelStore.save(persisted)
+        check("sol", effort: .high, availability: available, expected: nil)
+
+        registry.updateLiveModels([remote("GPT-99.2-Sol", efforts: ["high"], isDefault: true)])
+        CodexDynamicModelStore.save(persisted)
+        let mixedCase = legacyValue("sOl", effort: .high, availability: available)
+        XCTAssertEqual(mixedCase?.lowercased(), "gpt-99.2-sol-high")
+        check("sOl", effort: .high, availability: available, expected: mixedCase)
+    }
+
     func testRealSubscriptionBaselineIsRepeatable() async throws {
         let first = try await runCohort(timing: false)
         let second = try await runCohort(timing: false)
@@ -502,10 +567,10 @@ final class StartupRecommendationBaselineTests: XCTestCase {
         }
         for phase in result.phases.keys.sorted() {
             let counts = try XCTUnwrap(result.phases[phase]).counts.sorted { $0.key < $1.key }
-            print("M1_COUNTS \(phase) \(counts)")
+            print("M2_COUNTS \(phase) \(counts)")
         }
-        print("M1_COHORT_MS \(Double(DispatchTime.now().uptimeNanoseconds - cohortStart) / 1e6)")
-        print("M1_OUTPUT_SHA256 \(SHA256.hash(data: Data(result.outputs[0].utf8)).map { String(format: "%02x", $0) }.joined())")
+        print("M2_COHORT_MS \(Double(DispatchTime.now().uptimeNanoseconds - cohortStart) / 1e6)")
+        print("M2_OUTPUT_SHA256 \(SHA256.hash(data: Data(result.outputs[0].utf8)).map { String(format: "%02x", $0) }.joined())")
         if timing {
             for iteration in 0 ..< 10 {
                 StartupRecommendationDiagnostics.begin(timings: true, scopeCatalogCounts: true)
@@ -528,21 +593,21 @@ final class StartupRecommendationBaselineTests: XCTestCase {
                 XCTAssertEqual(snapshot["compute"], 36)
                 let compute = snapshot.durations["compute", default: []].sorted()
                 let role = snapshot.durations["roleBatch", default: []]
-                print("M1_TIMING \(iteration) computeSumMs=\(Double(compute.reduce(0, +)) / 1e6) computeUpperMiddleMs=\(Double(compute[compute.count / 2]) / 1e6) roleSumMs=\(Double(role.reduce(0, +)) / 1e6) mainActorSpanMs=\(Double((snapshot.lastEnd ?? 0) - (snapshot.firstStart ?? 0)) / 1e6) sentinelGapMs=\(Double(sentinel.maximumGap) / 1e6) endToEndMs=\(Double(end - start) / 1e6)")
+                print("M2_TIMING \(iteration) computeSumMs=\(Double(compute.reduce(0, +)) / 1e6) computeUpperMiddleMs=\(Double(compute[compute.count / 2]) / 1e6) roleSumMs=\(Double(role.reduce(0, +)) / 1e6) mainActorSpanMs=\(Double((snapshot.lastEnd ?? 0) - (snapshot.firstStart ?? 0)) / 1e6) sentinelGapMs=\(Double(sentinel.maximumGap) / 1e6) endToEndMs=\(Double(end - start) / 1e6)")
             }
         }
         return result
     }
 
     private func assertGolden(_ snapshot: StartupRecommendationDiagnostics.Snapshot?, phase: String) {
-        // Measured M1 counts for this exact populated, Codex+Claude fixture.
+        // M2 production counts for the unchanged populated, Codex+Claude fixture.
         let computes = phase == "initialization" ? 180 : (["provider", "workspaceCreation"].contains(phase) ? 72 : 36)
         var expected = [
             "compute": 1, "mcpCompute": 1, "roleBatch": 1,
             "candidateChain": 4, "family": 14, "codexValidation": 3, "codexLabel": 7,
-            "codexOptionsRequest": 38, "codexOptionsProduction": 38,
-            "codexRecordAttempt": 38, "codexRecordAccepted": 38,
-            "staticOption": 2090, "staticParser": 4066, "staticPersistedLoad": 4028
+            "codexOptionsRequest": 24, "codexOptionsProduction": 24,
+            "codexRecordAttempt": 24, "codexRecordAccepted": 24,
+            "staticOption": 1320, "staticParser": 2568, "staticPersistedLoad": 2544
         ].mapValues { $0 * computes }
         if phase == "initialization" {
             expected.merge([
