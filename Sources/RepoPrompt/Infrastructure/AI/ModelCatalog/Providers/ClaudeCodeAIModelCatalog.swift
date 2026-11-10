@@ -109,7 +109,19 @@ enum ClaudeCodeAIModelCatalog {
     }
 
     static func displayName(for specifier: String) -> String {
-        if let descriptor = compatibleBackendDescriptor(specifier: specifier) {
+        displayName(for: specifier, configProvider: { ClaudeCodeCompatibleBackendStore.shared.config(for: $0) })
+    }
+
+    /// Snapshot callers must supply every referenced backend config; a live fallback would mix generations.
+    static func displayName(for specifier: String, configs: [ClaudeCodeCompatibleBackendID: ClaudeCodeCompatibleBackendConfig]) -> String {
+        displayName(for: specifier, configProvider: { id in
+            guard let config = configs[id] else { preconditionFailure("Missing picker config snapshot") }
+            return config
+        })
+    }
+
+    private static func displayName(for specifier: String, configProvider: (ClaudeCodeCompatibleBackendID) -> ClaudeCodeCompatibleBackendConfig) -> String {
+        if let descriptor = compatibleBackendDescriptor(specifier: specifier, configProvider: configProvider) {
             return descriptor.modelDisplayName
         }
         let parsed = ClaudeModelSpecifier(raw: specifier)
@@ -277,13 +289,40 @@ enum ClaudeCodeAIModelCatalog {
         )
     }
 
+    static func sortKey(for model: AIModel, displayName: String, configs: [ClaudeCodeCompatibleBackendID: ClaudeCodeCompatibleBackendConfig]) -> SortKey {
+        let compatible: Bool = if case let .claudeCodeModel(specifier) = model {
+            compatibleBackendDescriptor(specifier: specifier, configProvider: { id in
+                guard let config = configs[id] else { preconditionFailure("Missing picker config snapshot") }
+                return config
+            }) != nil
+        } else {
+            false
+        }
+        return SortKey(
+            isCompatibleBackend: compatible,
+            baseRank: baseSortRank(baseModelRaw(for: model)),
+            effortRank: effortSortRank(explicitEffort(for: model)),
+            displayName: displayName,
+            rawValue: model.rawValue
+        )
+    }
+
     static func precedes(lhsKey: SortKey, lhs: AIModel, rhsKey: SortKey, rhs: AIModel) -> Bool {
+        precedes(lhsKey: lhsKey, rhsKey: rhsKey, compatibleLabels: { (lhs.displayName, rhs.displayName) })
+    }
+
+    static func precedes(lhsKey: SortKey, rhsKey: SortKey) -> Bool {
+        precedes(lhsKey: lhsKey, rhsKey: rhsKey, compatibleLabels: { (lhsKey.displayName, rhsKey.displayName) })
+    }
+
+    private static func precedes(lhsKey: SortKey, rhsKey: SortKey, compatibleLabels: () -> (String, String)) -> Bool {
         let lhsCompatible = lhsKey.isCompatibleBackend
         let rhsCompatible = rhsKey.isCompatibleBackend
         if lhsCompatible || rhsCompatible {
             if !lhsCompatible { return true }
             if !rhsCompatible { return false }
-            return lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName) == .orderedAscending
+            let labels = compatibleLabels()
+            return labels.0.localizedCaseInsensitiveCompare(labels.1) == .orderedAscending
         }
         if lhsKey.baseRank != rhsKey.baseRank {
             return lhsKey.baseRank < rhsKey.baseRank
@@ -335,7 +374,19 @@ enum ClaudeCodeAIModelCatalog {
         return "\(compatibleBackendSpecifierPrefix)\(alias):\(normalizedSpecifier(requestedModelRaw))"
     }
 
+    static func compatibleBackendID(referencedBy rawSpecifier: String) -> ClaudeCodeCompatibleBackendID? {
+        let normalized = normalizedSpecifier(rawSpecifier)
+        guard normalized.hasPrefix(compatibleBackendSpecifierPrefix),
+              let alias = normalized.dropFirst(compatibleBackendSpecifierPrefix.count).split(separator: ":", maxSplits: 1).first
+        else { return nil }
+        return compatibleBackendID(forAlias: String(alias))
+    }
+
     private static func compatibleBackendDescriptor(specifier rawSpecifier: String) -> CompatibleBackendModelDescriptor? {
+        compatibleBackendDescriptor(specifier: rawSpecifier, configProvider: { ClaudeCodeCompatibleBackendStore.shared.config(for: $0) })
+    }
+
+    private static func compatibleBackendDescriptor(specifier rawSpecifier: String, configProvider: (ClaudeCodeCompatibleBackendID) -> ClaudeCodeCompatibleBackendConfig) -> CompatibleBackendModelDescriptor? {
         let normalized = normalizedSpecifier(rawSpecifier)
         guard normalized.hasPrefix(compatibleBackendSpecifierPrefix) else { return nil }
         let rest = normalized.dropFirst(compatibleBackendSpecifierPrefix.count)
@@ -343,7 +394,7 @@ enum ClaudeCodeAIModelCatalog {
         guard let alias = parts.first,
               let backendID = compatibleBackendID(forAlias: alias) else { return nil }
         let requestedModelRaw = parts.count > 1 ? parts[1] : nil
-        let config = ClaudeCodeCompatibleBackendStore.shared.config(for: backendID).normalized
+        let config = configProvider(backendID).normalized
 
         switch config.modelBehavior {
         case .noModel:

@@ -683,6 +683,7 @@ public enum AIModel: Equatable, Hashable {
         }
     }
 
+    /// Keep mutable-source formatting in sync with pickerDisplayName(for:snapshot:).
     var displayName: String {
         if case let .openAIServiceTierVariant(base, _) = self {
             return "\(base.displayName) (\(openAITierDisplayName))"
@@ -1688,12 +1689,41 @@ public enum AIModel: Equatable, Hashable {
     }
 
     static func sortedForPicker(_ models: [AIModel]) -> [AIModel] {
+        sortedForPicker(models, sources: .live)
+    }
+
+    static func sortedForPicker(_ models: [AIModel], sources: AIModelPickerSnapshot.Sources) -> [AIModel] {
+        let snapshot = AIModelPickerSnapshot(models: models, sources: sources)
+        return sortedForPicker(models, snapshot: snapshot)
+    }
+
+    #if DEBUG
+        static func test_sortedForPickerWithoutSnapshot(_ models: [AIModel]) -> [AIModel] {
+            sortedForPicker(models, snapshot: nil)
+        }
+
+        static func test_pickerProjection(
+            _ models: [AIModel], sources: AIModelPickerSnapshot.Sources = .live
+        ) -> [(name: String, display: String, raw: String)] {
+            let snapshot = AIModelPickerSnapshot(models: models, sources: sources)
+            return models.map { model in
+                (
+                    pickerModelName(for: model, snapshot: snapshot),
+                    pickerDisplayName(for: model, snapshot: snapshot),
+                    pickerRawValue(for: model, snapshot: snapshot)
+                )
+            }
+        }
+    #endif
+
+    private static func sortedForPicker(_ models: [AIModel], snapshot: AIModelPickerSnapshot?) -> [AIModel] {
+        // Only the DEBUG parity reference passes nil; shipping calls always capture a snapshot.
         var metadataCache: [AIModel: SemanticSortMetadata] = [:]
         func metadata(for model: AIModel) -> SemanticSortMetadata {
             if let cached = metadataCache[model] {
                 return cached
             }
-            let metadata = semanticSortMetadata(for: model)
+            let metadata = snapshot.map { semanticSortMetadata(for: model, snapshot: $0) } ?? semanticSortMetadata(for: model)
             metadataCache[model] = metadata
             return metadata
         }
@@ -1707,19 +1737,26 @@ public enum AIModel: Equatable, Hashable {
             if let cached = claudeCodeSortKeyCache[model] {
                 return cached
             }
-            let key = ClaudeCodeAIModelCatalog.sortKey(for: model)
+            let key = snapshot.map {
+                ClaudeCodeAIModelCatalog.sortKey(for: model, displayName: pickerDisplayName(for: model, snapshot: $0), configs: $0.compatibleConfigs)
+            } ?? ClaudeCodeAIModelCatalog.sortKey(for: model)
             claudeCodeSortKeyCache[model] = key
             return key
         }
 
         return models.sorted { lhs, rhs in
-            if lhs.providerType != rhs.providerType {
+            let leftProvider = snapshot?.provider(for: lhs) ?? lhs.providerType
+            let rightProvider = snapshot?.provider(for: rhs) ?? rhs.providerType
+            if leftProvider != rightProvider {
                 return ModelPickerStringOrdering.precedes(
-                    AIProviderType.displayName(for: lhs.providerType),
-                    AIProviderType.displayName(for: rhs.providerType)
+                    AIProviderType.displayName(for: leftProvider),
+                    AIProviderType.displayName(for: rightProvider)
                 )
             }
-            if lhs.providerType == .claudeCode {
+            if leftProvider == .claudeCode {
+                if snapshot != nil {
+                    return ClaudeCodeAIModelCatalog.precedes(lhsKey: claudeCodeSortKey(for: lhs), rhsKey: claudeCodeSortKey(for: rhs))
+                }
                 return ClaudeCodeAIModelCatalog.precedes(
                     lhsKey: claudeCodeSortKey(for: lhs), lhs: lhs,
                     rhsKey: claudeCodeSortKey(for: rhs), rhs: rhs
@@ -1882,7 +1919,17 @@ public enum AIModel: Equatable, Hashable {
         guard !trimmed.isEmpty else { return nil }
 
         let specifier = CodexModelSpecifier(raw: trimmed, discoveredRecords: discoveredRecords())
-        let base = specifier.baseModel ?? trimmed
+        return codexPreviewDisplayAlias(specifier: specifier, fallback: trimmed)
+    }
+
+    static func codexPreviewDisplayAlias(for raw: String, discovery: CodexModelDiscovery) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return codexPreviewDisplayAlias(specifier: CodexModelSpecifier(raw: trimmed, discovery: discovery), fallback: trimmed)
+    }
+
+    private static func codexPreviewDisplayAlias(specifier: CodexModelSpecifier, fallback: String) -> String? {
+        let base = specifier.baseModel ?? fallback
         let normalizedBase = normalizedSemanticText(base)
         let canonicalBase: String
         switch normalizedBase {
@@ -1964,6 +2011,80 @@ public enum AIModel: Equatable, Hashable {
         }
 
         return ModelPickerStringOrdering.precedes(lhs.tieBreaker, rhs.tieBreaker)
+    }
+
+    private static func semanticSortMetadata(for model: AIModel, snapshot: AIModelPickerSnapshot) -> SemanticSortMetadata {
+        let name = pickerModelName(for: model, snapshot: snapshot)
+        let display = pickerDisplayName(for: model, snapshot: snapshot)
+        let specifier = snapshot.specifier(name)
+        var identifier = name
+        if snapshot.provider(for: model) == .codex {
+            identifier = specifier.baseModel ?? name
+            if let tier = specifier.serviceTier { identifier += "-\(tier)" }
+            identifier = identifier.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let effort = specifier.reasoningEffort
+            ?? codexSpecifierFromSemanticLabel(name, parse: snapshot.specifier).reasoningEffort
+            ?? codexSpecifierFromSemanticLabel(display, parse: snapshot.specifier).reasoningEffort
+        let source = pickerCodexAlias(identifier, snapshot: snapshot) ?? (identifier.isEmpty ? display : identifier)
+        let normalized = normalizedSemanticText(source)
+        return SemanticSortMetadata(
+            family: semanticFamily(in: normalized), versionComponents: semanticVersionComponents(in: normalized),
+            suffix: semanticSuffix(in: normalized), reasoningEffort: effort, displayName: display,
+            tieBreaker: pickerRawValue(for: model, snapshot: snapshot)
+        )
+    }
+
+    private static func pickerModelName(for model: AIModel, snapshot: AIModelPickerSnapshot) -> String {
+        switch model {
+        case .ollama: snapshot.ollamaName!
+        case let .openAIServiceTierVariant(base, _): pickerModelName(for: base, snapshot: snapshot)
+        default: model.modelName
+        }
+    }
+
+    private static func pickerRawValue(for model: AIModel, snapshot: AIModelPickerSnapshot) -> String {
+        switch model {
+        case .ollama: "ollama_\(snapshot.ollamaName!)"
+        case let .openAIServiceTierVariant(base, tier): "\(Self.openAITierPrefix)\(tier)__\(pickerRawValue(for: base, snapshot: snapshot))"
+        default: model.rawValue
+        }
+    }
+
+    private static func pickerCodexAlias(_ raw: String, snapshot: AIModelPickerSnapshot) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return codexPreviewDisplayAlias(specifier: snapshot.specifier(trimmed), fallback: trimmed)
+    }
+
+    private static func pickerDisplayName(for model: AIModel, snapshot: AIModelPickerSnapshot) -> String {
+        // Mirror displayName formatting without live reads. Requirements.include must capture
+        // every mutable branch, including wrapped bases, before these projections are used.
+        switch model {
+        case let .openAIServiceTierVariant(base, _):
+            return "\(pickerDisplayName(for: base, snapshot: snapshot)) (\(model.openAITierDisplayName))"
+        case .ollama:
+            return "local/\(snapshot.ollamaName!)"
+        case let .claudeCodeModel(specifier):
+            return snapshot.claudeLabel(for: specifier)
+        case let .codexCustom(raw):
+            if let label = snapshot.codexLabels[CodexModelIdentity.key(raw)] { return "CLI·\(label)" }
+            return "CLI·\(pickerCodexAlias(raw, snapshot: snapshot) ?? humanizedCodexTokens(raw))"
+        case let .openCodeCustom(raw):
+            return snapshot.openCodeLabels[raw] ?? raw
+        case let .grokBuildCustom(raw):
+            return snapshot.grokBuildLabels[raw] ?? raw
+        case let .devinCustom(raw):
+            return snapshot.devinLabels[raw] ?? raw
+        case let .cursorCustom(raw):
+            if let label = snapshot.cursorLabels[raw] { return label }
+            let normalized = ACPAIModelCatalog.normalizedCursorModelAlias(raw)
+            if normalized == AgentModel.cursorAuto.rawValue { return AgentModel.cursorAuto.displayName }
+            if normalized == AgentModel.cursorComposer2.rawValue { return AgentModel.cursorComposer2.displayName }
+            return raw
+        default:
+            return model.displayName
+        }
     }
 
     private static func semanticSortMetadata(for model: AIModel) -> SemanticSortMetadata {
@@ -2054,6 +2175,13 @@ public enum AIModel: Equatable, Hashable {
         discoveredRecords: @autoclosure () -> [CodexDynamicModelRecord] = CodexDynamicModelStore.load()
     ) -> CodexModelSpecifier {
         let records = discoveredRecords()
+        return codexSpecifierFromSemanticLabel(text, parse: { CodexModelSpecifier(raw: $0, discoveredRecords: records) })
+    }
+
+    private static func codexSpecifierFromSemanticLabel(
+        _ text: String,
+        parse: (String) -> CodexModelSpecifier
+    ) -> CodexModelSpecifier {
         let parseableText = text
             .replacingOccurrences(of: "CLI·", with: "")
             .replacingOccurrences(of: "(", with: " ")
@@ -2061,12 +2189,12 @@ public enum AIModel: Equatable, Hashable {
         let normalized = normalizedSemanticText(parseableText)
         let candidates = codexSpecifierCandidates(fromNormalizedSemanticText: normalized)
         for candidate in candidates {
-            let specifier = CodexModelSpecifier(raw: candidate, discoveredRecords: records)
+            let specifier = parse(candidate)
             if specifier.reasoningEffort != nil {
                 return specifier
             }
         }
-        return CodexModelSpecifier(raw: normalized, discoveredRecords: records)
+        return parse(normalized)
     }
 
     private static func codexSpecifierCandidates(fromNormalizedSemanticText normalized: String) -> [String] {
@@ -2101,6 +2229,10 @@ public enum AIModel: Equatable, Hashable {
             return alias
         }
 
+        return humanizedCodexTokens(raw)
+    }
+
+    private static func humanizedCodexTokens(_ raw: String) -> String {
         let tokens = raw.split { character in
             character == "_" || character == "-" || character == "/" || character.isWhitespace
         }

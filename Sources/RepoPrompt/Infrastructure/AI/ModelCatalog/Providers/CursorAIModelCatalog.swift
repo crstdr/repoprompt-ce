@@ -179,7 +179,20 @@ enum CursorAIModelCatalog {
     }
 
     static func option(matching modelRaw: String) -> AgentModelOption? {
+        option(matching: modelRaw, snapshot: resolvedSnapshot())
+    }
+
+    /// Resolve requested labels against one captured catalog, including bracket overrides.
+    static func pickerDisplayNames(for modelRaws: [String]) -> [String: String] {
         let snapshot = resolvedSnapshot()
+        var labels: [String: String] = [:]
+        for raw in modelRaws {
+            if let option = option(matching: raw, snapshot: snapshot) { labels[raw] = option.displayName }
+        }
+        return labels
+    }
+
+    private static func option(matching modelRaw: String, snapshot: ACPDiscoveredSessionModels?) -> AgentModelOption? {
         let advertisedIDs = Set(snapshot?.options.map(\.rawValue) ?? [])
         guard let specifier = try? ModelSpecifier(raw: modelRaw, advertisedModelIDs: advertisedIDs) else { return nil }
         let identity = canonicalIdentity(specifier.baseModelRaw)

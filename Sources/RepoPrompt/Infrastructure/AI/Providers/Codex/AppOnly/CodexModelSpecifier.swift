@@ -23,6 +23,11 @@ struct CodexModelSpecifier: Equatable {
         self.init(baseModel: parts.baseModel, reasoningEffort: parts.reasoningEffort, serviceTier: parts.serviceTier)
     }
 
+    init(raw: String?, discovery: CodexModelDiscovery) {
+        let parts = Self.splitLegacyModelID(raw, discovery: discovery)
+        self.init(baseModel: parts.baseModel, reasoningEffort: parts.reasoningEffort, serviceTier: parts.serviceTier)
+    }
+
     static func splitLegacyModelID(
         _ raw: String?,
         discoveredRecords: @autoclosure () -> [CodexDynamicModelRecord] = CodexDynamicModelStore.load()
@@ -38,7 +43,48 @@ struct CodexModelSpecifier: Equatable {
         // A provider-advertised exact ID is a model, even when its name ends in a
         // familiar effort token. Only synthesized variants may be decomposed.
         let records = discoveredRecords()
-        if records.contains(where: { CodexModelIdentity.key($0.id) == CodexModelIdentity.key(raw) }) {
+        return splitNormalizedLegacyModelID(raw, discovery: .records(records))
+    }
+
+    static func splitLegacyModelID(
+        _ raw: String?,
+        discovery: CodexModelDiscovery
+    ) -> (baseModel: String?, reasoningEffort: ReasoningEffort?, serviceTier: String?) {
+        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty, CodexModelIdentity.key(raw) != "default"
+        else { return (nil, nil, nil) }
+        return splitNormalizedLegacyModelID(raw, discovery: .indexed(discovery))
+    }
+
+    private enum DiscoveryInput {
+        case records([CodexDynamicModelRecord])
+        case indexed(CodexModelDiscovery)
+
+        func contains(_ normalizedID: String) -> Bool {
+            switch self {
+            case let .records(records): records.contains { CodexModelIdentity.key($0.id) == normalizedID }
+            case let .indexed(discovery): discovery.contains(normalizedID: normalizedID)
+            }
+        }
+
+        func supports(_ base: String, _ effort: ReasoningEffort) -> Bool {
+            switch self {
+            case let .records(records):
+                guard let record = records.first(where: { CodexModelIdentity.key($0.id) == base }) else { return false }
+                return (record.supportedReasoningEfforts.map(\.reasoningEffort) + [record.defaultReasoningEffort].compactMap(\.self))
+                    .compactMap(ReasoningEffort.parse).contains(effort)
+            case let .indexed(discovery):
+                return discovery.supports(base, effort)
+            }
+        }
+    }
+
+    private static func splitNormalizedLegacyModelID(
+        _ raw: String,
+        discovery: DiscoveryInput
+    ) -> (baseModel: String?, reasoningEffort: ReasoningEffort?, serviceTier: String?) {
+        let rawKey = CodexModelIdentity.key(raw)
+        if discovery.contains(rawKey) {
             return (raw, nil, nil)
         }
 
@@ -59,16 +105,15 @@ struct CodexModelSpecifier: Equatable {
         ]
         var base = raw
         var effort: ReasoningEffort? = nil
-        let lowered = CodexModelIdentity.key(raw)
-        for (suffix, candidateEffort, requiresKnownFamilySupport) in suffixes where lowered.hasSuffix(suffix) {
+        for (suffix, candidateEffort, requiresKnownFamilySupport) in suffixes where rawKey.hasSuffix(suffix) {
             let candidate = String(raw.dropLast(suffix.count))
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             guard !candidate.isEmpty else { break }
             if !requiresKnownFamilySupport || Self.supportsExtendedEffort(
                 candidateEffort,
                 forBaseCandidate: candidate,
-                rawModel: raw,
-                records: records
+                normalizedRaw: rawKey,
+                discovery: discovery
             ) {
                 base = candidate
                 effort = candidateEffort
@@ -99,22 +144,15 @@ struct CodexModelSpecifier: Equatable {
     private static func supportsExtendedEffort(
         _ effort: ReasoningEffort,
         forBaseCandidate candidate: String,
-        rawModel: String,
-        records: [CodexDynamicModelRecord]
+        normalizedRaw: String,
+        discovery: DiscoveryInput
     ) -> Bool {
         // Exact advertised identities take precedence over synthetic effort suffixes.
-        let rawKey = CodexModelIdentity.key(rawModel)
-        if records.contains(where: { CodexModelIdentity.key($0.id) == rawKey }) {
+        if discovery.contains(normalizedRaw) {
             return false
         }
         let supportBase = CodexModelIdentity.key(serviceTierStrippedBase(candidate))
-        if let record = records.first(where: { CodexModelIdentity.key($0.id) == supportBase }) {
-            let advertisedEfforts = record.supportedReasoningEfforts.map(\.reasoningEffort)
-                + [record.defaultReasoningEffort].compactMap(\.self)
-            if advertisedEfforts.compactMap(ReasoningEffort.parse).contains(effort) {
-                return true
-            }
-        }
+        if discovery.supports(supportBase, effort) { return true }
 
         // Keep decoding saved and backfilled legacy selections when discovery is
         // unavailable or omits capabilities previously supported by those families.
