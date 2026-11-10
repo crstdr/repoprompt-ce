@@ -1059,17 +1059,20 @@ final class ActivityMainWorkTests: XCTestCase {
         // cancels the runner's noise floor that an absolute p95 would include.
         let overheads = zip(emptyOn, emptyOff).map { Int64($0) - Int64($1) }.sorted()
         let medianOverhead = overheads[overheads.count / 2]
+        // The input-delay samples are paired the same way, so scheduler noise common to both modes cancels.
+        let addedDelays = zip(delayOn, delayOff).map { Int64($0) - Int64($1) }.sorted()
+        let medianAddedDelay = addedDelays[addedDelays.count / 2]
         let clockRead = clockReadNanoseconds()
         // Protects main-thread frame time: at roughly 100 begin/end pairs per frame, about 1 us per pair is
         // 1% of a 120 Hz frame. Two clock reads plus 300 ns, capped at 5 us so a slow clock cannot void the check.
         let allowance = min(2 * clockRead + 300, 5000)
-        print("ACTIVITY_ADMISSION allocations=\(allocations) payload_allocations_off=\(payloadAllocations) payload_allocations_on=\(wrappedPayloadAllocations) empty_off_p95_ns=\(p95(emptyOff)) empty_on_p95_ns=\(p95(emptyOn)) median_overhead_ns=\(medianOverhead) clock_read_ns=\(clockRead) allowance_ns=\(allowance) representative_off_p95_ns=\(p95(representativeOff)) representative_on_p95_ns=\(p95(representativeOn)) input_off_p95_ns=\(p95(delayOff)) input_on_p95_ns=\(p95(delayOn)) sink=\(sink)")
+        print("ACTIVITY_ADMISSION allocations=\(allocations) payload_allocations_off=\(payloadAllocations) payload_allocations_on=\(wrappedPayloadAllocations) empty_off_p95_ns=\(p95(emptyOff)) empty_on_p95_ns=\(p95(emptyOn)) median_overhead_ns=\(medianOverhead) clock_read_ns=\(clockRead) allowance_ns=\(allowance) representative_off_p95_ns=\(p95(representativeOff)) representative_on_p95_ns=\(p95(representativeOn)) input_off_p95_ns=\(p95(delayOff)) input_on_p95_ns=\(p95(delayOn)) input_median_added_ns=\(medianAddedDelay) sink=\(sink)")
         XCTAssertLessThanOrEqual(
             medianOverhead, allowance,
             "FAIL admission: median empty wrapper overhead exceeds 2 clock reads + 300 ns (capped at 5 us)"
         )
-        // A 20 us noise allowance is below a single frame's input budget; no latency claim beyond this fake workload.
-        XCTAssertLessThanOrEqual(p95(delayOn), p95(delayOff) + 20000, "FAIL admission: added input delay exceeds 20 us")
+        // A 20 us allowance is below a single frame's input budget; no latency claim beyond this fake workload.
+        XCTAssertLessThanOrEqual(medianAddedDelay, 20000, "FAIL admission: median added input delay exceeds 20 us")
     }
 }
 
