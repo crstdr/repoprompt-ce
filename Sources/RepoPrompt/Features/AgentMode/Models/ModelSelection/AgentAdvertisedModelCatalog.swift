@@ -31,6 +31,9 @@ final class AgentAdvertisedModelCatalog: @unchecked Sendable {
 
     @discardableResult
     func record(_ options: [AgentModelOption], for agent: AgentProviderKind, generation: UInt64) -> Bool {
+        #if DEBUG
+            if agent == .codexExec { StartupRecommendationDiagnostics.count("codexRecordAttempt", catalog: true) }
+        #endif
         // Decomposition belongs to the producer too: Codex's legacy parser can consult persisted
         // discovery for extended effort suffixes. Never invoke that default parser during admission.
         let index = options.reduce(into: [String: Entry]()) { index, option in
@@ -41,11 +44,15 @@ final class AgentAdvertisedModelCatalog: @unchecked Sendable {
             } else { nil }
             index[option.rawValue] = Entry(option: option, reasoningEffortRaw: effort)
         }
-        return lock.withLock {
+        let accepted = lock.withLock {
             guard generationsByAgent[agent, default: 0] == generation else { return false }
             optionsByAgent[agent] = index
             return true
         }
+        #if DEBUG
+            if agent == .codexExec, accepted { StartupRecommendationDiagnostics.count("codexRecordAccepted", catalog: true) }
+        #endif
+        return accepted
     }
 
     func invalidate(_ agent: AgentProviderKind) {

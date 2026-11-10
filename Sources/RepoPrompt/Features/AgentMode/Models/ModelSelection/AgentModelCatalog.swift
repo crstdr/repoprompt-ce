@@ -371,6 +371,9 @@ enum AgentModelCatalog {
         codexDynamicModels: [CodexAppServerClient.RemoteModel]? = nil,
         includeClaudeEffortVariants: Bool = true
     ) -> [AgentModelOption] {
+        #if DEBUG
+            if agentKind == .codexExec { StartupRecommendationDiagnostics.count("codexOptionsRequest", catalog: true) }
+        #endif
         let generation = AgentAdvertisedModelCatalog.shared.productionGeneration(for: agentKind)
         let result = uncachedOptions(
             for: agentKind, availability: availability, codexDynamicModels: codexDynamicModels,
@@ -391,6 +394,9 @@ enum AgentModelCatalog {
         codexDynamicModels: [CodexAppServerClient.RemoteModel]?,
         includeClaudeEffortVariants: Bool
     ) -> [AgentModelOption] {
+        #if DEBUG
+            if agentKind == .codexExec { StartupRecommendationDiagnostics.count("codexOptionsProduction", catalog: true) }
+        #endif
         guard isAgentAvailable(agentKind, availability: availability) else { return [] }
         if agentKind == .cursor {
             return CursorAIModelCatalog.options
@@ -552,6 +558,9 @@ enum AgentModelCatalog {
         }
 
         if agentKind == .codexExec {
+            #if DEBUG
+                StartupRecommendationDiagnostics.count("codexLabel", catalog: true)
+            #endif
             let specifier = CodexModelSpecifier(raw: effectiveRaw)
             let baseSlug = CodexAgentToolPreferences.reasoningEffortPreferenceSlug(forModelRaw: effectiveRaw)
             let baseName = codexBaseDisplayName(
@@ -1702,20 +1711,35 @@ enum AgentModelCatalog {
             displayName = model.displayName
             description = model.description
         }
+        #if DEBUG
+            if agentKind == .codexExec { StartupRecommendationDiagnostics.count("staticOption", catalog: true) }
+        #endif
         return AgentModelOption(
             rawValue: model.rawValue,
             displayName: displayName,
             description: description,
             isPlaceholderDefault: model == .defaultModel,
             isProviderDefault: false,
-            effortVariant: agentKind == .codexExec
+            effortVariant: staticEffortVariant(model, for: agentKind)
+        )
+    }
+
+    private static func staticEffortVariant(_ model: AgentModel, for agentKind: AgentProviderKind) -> AgentModelEffortVariant? {
+        #if DEBUG
+            return agentKind == .codexExec
+                ? StartupRecommendationDiagnostics.staticSpecifier(raw: model.rawValue).reasoningEffort.flatMap { effort in
+                    StartupRecommendationDiagnostics.staticSpecifier(raw: model.rawValue).baseModel.map {
+                        AgentModelEffortVariant(baseModelRaw: $0, reasoningEffort: effort)
+                    }
+                } : nil
+        #else
+            return agentKind == .codexExec
                 ? CodexModelSpecifier(raw: model.rawValue).reasoningEffort.flatMap { effort in
                     CodexModelSpecifier(raw: model.rawValue).baseModel.map {
                         AgentModelEffortVariant(baseModelRaw: $0, reasoningEffort: effort)
                     }
-                }
-                : nil
-        )
+                } : nil
+        #endif
     }
 
     // MARK: - MCP Exact Lookup Helpers
@@ -1897,6 +1921,9 @@ enum AgentModelCatalog {
         effort: CodexReasoningEffort,
         availability: AvailabilityContext = .current
     ) -> String? {
+        #if DEBUG
+            StartupRecommendationDiagnostics.count("family", catalog: true)
+        #endif
         guard let option = preferredCodexFamilyOption(family, availability: availability),
               let base = CodexModelSpecifier(raw: option.rawValue).baseModel
         else { return nil }
@@ -1933,6 +1960,9 @@ enum AgentModelCatalog {
         for kind: TaskLabelKind,
         availability: AvailabilityContext
     ) -> [SelectionCandidate] {
+        #if DEBUG
+            StartupRecommendationDiagnostics.count("candidateChain", catalog: true)
+        #endif
         let lunaLow = preferredCodexFamilyModelRaw("luna", effort: .low, availability: availability)
             ?? AgentModel.gpt6LunaLow.rawValue
         let solMedium = preferredCodexFamilyModelRaw("sol", effort: .medium, availability: availability)
@@ -1997,6 +2027,9 @@ enum AgentModelCatalog {
         if candidate.agent != .codexExec {
             return isValid(rawModel: candidate.modelRaw, for: candidate.agent, availability: availability)
         }
+        #if DEBUG
+            StartupRecommendationDiagnostics.count("codexValidation", catalog: true)
+        #endif
         // For Codex, check exact option match for availability-sensitive defaults
         if modelOption(matching: candidate.modelRaw, for: candidate.agent, availability: availability) != nil {
             return true

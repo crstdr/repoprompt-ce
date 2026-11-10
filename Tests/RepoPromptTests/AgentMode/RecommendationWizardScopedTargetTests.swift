@@ -1,4 +1,6 @@
 import Combine
+import CryptoKit
+import Foundation
 @testable import RepoPromptApp
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
@@ -347,5 +349,282 @@ final class RecommendationWizardScopedTargetTests: XCTestCase {
         manager.workspaces = workspaces
         manager.activeWorkspace = workspaces.first
         return manager
+    }
+}
+
+@MainActor
+final class StartupRecommendationBaselineTests: XCTestCase {
+    private struct Owner {
+        let workspace: WorkspaceModel
+        let manager: WorkspaceManagerViewModel
+        let api: APISettingsViewModel
+        let engine: AutoRecommendationEngine
+        var wizard: RecommendationWizardViewModel?
+    }
+
+    func testRealSubscriptionBaselineIsRepeatable() async throws {
+        let first = try await runCohort(timing: false)
+        let second = try await runCohort(timing: false)
+        XCTAssertEqual(first, second)
+    }
+
+    func testRepeatedWarmTimings() async throws {
+        guard ProcessInfo.processInfo.environment["RPCE_RUN_SCALE_TESTS"] == "1" else {
+            throw XCTSkip("Set RPCE_RUN_SCALE_TESTS=1 after freezing the count baseline")
+        }
+        _ = try await runCohort(timing: true)
+    }
+
+    private struct Result: Equatable {
+        var phases: [String: StartupRecommendationDiagnostics.Snapshot] = [:]
+        var outputs: [String] = []
+    }
+
+    private func runCohort(timing: Bool) async throws -> Result {
+        let registry = AgentCodexModelRegistry.shared
+        let originalLive = registry.currentLiveModels()
+        let originalPersisted = UserDefaults.standard.object(forKey: "CodexDynamicModelRecords")
+        defer {
+            StartupRecommendationDiagnostics.end()
+            registry.updateLiveModels(originalLive)
+            UserDefaults.standard.set(originalPersisted, forKey: "CodexDynamicModelRecords")
+            AgentAdvertisedModelCatalog.shared.invalidate(.codexExec)
+        }
+        let live = [remote("gpt-6-luna", efforts: ["low"], isDefault: true), remote("gpt-6.1-sol", efforts: ["low", "medium", "high"])]
+        registry.updateLiveModels(live)
+        // The registry projects live records while implicit parsing sees conflicting persisted exact IDs.
+        CodexDynamicModelStore.save([
+            remote("gpt-6-luna", efforts: ["high"]),
+            remote("gpt-6.1-sol", efforts: ["low"]),
+            remote("gpt-6.1-sol-medium", efforts: [])
+        ])
+        XCTAssertEqual(registry.currentLiveModels(), live)
+        let seededPersistence = UserDefaults.standard.data(forKey: "CodexDynamicModelRecords")
+        AgentAdvertisedModelCatalog.shared.invalidate(.codexExec)
+
+        let suite = "StartupRecommendationBaselineTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer {
+            defaults.removePersistentDomain(forName: suite)
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let store = GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: directory.appendingPathComponent("settings.json")))
+        store.installApplicationEventBridge()
+        store.setGlobalRecommendationProviderFilter([.codex, .claudeCode])
+        store.setMCPShowModelPresets(true)
+        store.setMCPTemporarilyDisablePresets(true)
+        let profile = AgentModelsSettingsProfile(
+            planningModelRaw: "codex:gpt-6.1-sol-high",
+            contextBuilderAgentRaw: "codexExec",
+            contextBuilderModelsByAgent: ["codexExec": "gpt-6-luna-low"],
+            mcpAgentRoleOverrides: ["pair": "codexExec:gpt-6.1-sol-medium"]
+        )
+        store.setGlobalAgentModelsProfile(profile, contextBuilderWriteIntent: .automaticSeed)
+        XCTAssertFalse(store.hasUserSetGlobalContextBuilderAgentDefaults)
+        var owners: [Owner] = []
+        for index in 0 ..< 36 {
+            let id = try XCTUnwrap(UUID(uuidString: String(format: "00000000-0000-0000-0000-%012d", index + 1)))
+            let workspace = WorkspaceModel(id: id, name: String(format: "Startup Owner %02d", index), repoPaths: [])
+            store.setWorkspaceAgentModelsProfile(workspaceID: id, profile: profile)
+            store.setWorkspaceAgentModelsInheritanceMode(workspaceID: id, mode: .useWorkspaceOverrides)
+            let keys = KeyManager(secureService: SecureKeysService(secureStorage: TestSecureStorageBackend()))
+            let queries = AIQueriesService(keyManager: keys)
+            let api = APISettingsViewModel(aiQueriesService: queries, keyManager: keys, loadStoredDataOnInit: false, antigravityRuntimeInstalledProvider: { false }, devinRuntimeInstalledProvider: { false })
+            api.isCodexConnected = true
+            api.isClaudeCodeConnected = true
+            api.isCursorConnected = false
+            api.isGrokBuildConnected = false
+            api.isOpenCodeConnected = false
+            api.isOpenAIKeyValid = false
+            api.test_completeContextBuilderProviderValidation(verifiedProviders: [.codexExec, .claudeCode])
+            let files = WorkspaceFilesViewModel()
+            let windowID = -8000 - index
+            let settings = WindowSettingsManager(windowID: windowID, store: store)
+            let prompt = PromptViewModel(fileManager: files, aiQueriesService: queries, apiSettingsViewModel: api, windowID: windowID, settingsManager: settings, refreshAvailableModelsOnInit: false)
+            let manager = WorkspaceManagerViewModel(fileManager: files, promptViewModel: prompt, performInitialWorkspaceActivation: false)
+            manager.workspaces = [workspace]
+            manager.activeWorkspace = workspace
+            let engine = AutoRecommendationEngine(settingsStore: store, profileSettingsManager: store, apiSettingsViewModel: api)
+            owners.append(Owner(workspace: workspace, manager: manager, api: api, engine: engine))
+        }
+        defer { owners.forEach { $0.api.prepareForWindowClose() } }
+        await drain()
+        let globalBefore = store.globalAgentModelsProfile()
+        let workspacesBefore = owners.map { store.workspaceAgentModelsSettings(for: $0.workspace.id) }
+        var result = Result()
+        let cohortStart = DispatchTime.now().uptimeNanoseconds
+        let initializationStart = ContinuousClock.now
+        StartupRecommendationDiagnostics.begin(scopeCatalogCounts: true)
+        for index in owners.indices {
+            owners[index].wizard = RecommendationWizardViewModel(engine: owners[index].engine, settingsStore: store, workspaceManager: owners[index].manager, windowID: -8000 - index)
+        }
+        try await settle("initialization", key: "delivery.provider", count: 36, startedAt: initializationStart)
+        result.phases["initialization"] = StartupRecommendationDiagnostics.snapshot()
+        assertGolden(result.phases["initialization"], phase: "initialization")
+        result.outputs = try owners.map { try output($0) }
+        for value in result.outputs {
+            XCTAssertEqual(SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined(), "b9016f352407a47cde2501ea372bc82161fc91148db18390810dc9d4fc27c52d")
+        }
+        for owner in owners {
+            XCTAssertEqual(owner.wizard?.providerStatus?.codexCLI, .ready)
+            XCTAssertEqual(owner.wizard?.providerStatus?.claudeCodeCLI, .ready)
+            XCTAssertEqual(owner.wizard?.recommendations.mcpAgentDefaults?.recommendedRoleDefaults.count, 4)
+            XCTAssertTrue(owner.wizard?.recommendations.contextBuilder?.alreadySatisfied == true)
+            XCTAssertFalse(owner.api.test_hasCodexModelsSubscriptionTask)
+        }
+        for phase in ["provider", "validation", "settings", "didApply", "shouldRefresh", "workspaceCreation", "workspaceSwitch"] {
+            let phaseStart = ContinuousClock.now
+            StartupRecommendationDiagnostics.begin(scopeCatalogCounts: true)
+            switch phase {
+            case "provider": owners.forEach { $0.api.isCodexConnected = true }
+            case "validation": owners.forEach { $0.api.test_completeContextBuilderProviderValidation(verifiedProviders: [.codexExec, .claudeCode]) }
+            case "settings": NotificationCenter.default.post(name: .agentModelsSettingsDidChange, object: nil, userInfo: AgentModelsSettingsNotification.userInfo(scope: .global))
+            case "didApply": NotificationCenter.default.post(name: .recommendationsDidApply, object: nil)
+            case "shouldRefresh": NotificationCenter.default.post(name: .recommendationsShouldRefresh, object: nil)
+            case "workspaceCreation": NotificationCenter.default.post(name: .workspaceDidCreate, object: nil, userInfo: ["workspaceID": owners[0].workspace.id])
+            default:
+                owners.forEach { $0.manager.activeWorkspace = nil }
+                await drain()
+                owners.forEach { $0.manager.activeWorkspace = $0.workspace }
+            }
+            let key = phase == "workspaceSwitch" ? "refresh.workspaceTarget" : "refresh.\(phase)"
+            try await settle(phase, key: key, count: 36, startedAt: phaseStart)
+            result.phases[phase] = StartupRecommendationDiagnostics.snapshot()
+            assertGolden(result.phases[phase], phase: phase)
+            XCTAssertEqual(UserDefaults.standard.data(forKey: "CodexDynamicModelRecords"), seededPersistence, phase)
+            XCTAssertEqual(registry.currentLiveModels(), live, phase)
+            XCTAssertEqual(try owners.map { try output($0) }, result.outputs, phase)
+            XCTAssertEqual(store.globalAgentModelsProfile(), globalBefore, phase)
+            XCTAssertEqual(owners.map { store.workspaceAgentModelsSettings(for: $0.workspace.id) }, workspacesBefore, phase)
+            XCTAssertFalse(store.hasUserSetGlobalContextBuilderAgentDefaults, phase)
+        }
+        for phase in result.phases.keys.sorted() {
+            let counts = try XCTUnwrap(result.phases[phase]).counts.sorted { $0.key < $1.key }
+            print("M1_COUNTS \(phase) \(counts)")
+        }
+        print("M1_COHORT_MS \(Double(DispatchTime.now().uptimeNanoseconds - cohortStart) / 1e6)")
+        print("M1_OUTPUT_SHA256 \(SHA256.hash(data: Data(result.outputs[0].utf8)).map { String(format: "%02x", $0) }.joined())")
+        if timing {
+            for iteration in 0 ..< 10 {
+                StartupRecommendationDiagnostics.begin(timings: true, scopeCatalogCounts: true)
+                let sentinel = ResponsivenessSentinel()
+                let sentinelTask = Task { @MainActor in
+                    while !Task.isCancelled {
+                        try? await Task.sleep(for: .milliseconds(10))
+                        sentinel.tick()
+                    }
+                }
+                defer { sentinelTask.cancel() }
+                await drain()
+                let phaseStart = ContinuousClock.now
+                let start = DispatchTime.now().uptimeNanoseconds
+                NotificationCenter.default.post(name: .recommendationsShouldRefresh, object: nil)
+                try await settle("timing", key: "refresh.shouldRefresh", count: 36, startedAt: phaseStart)
+                let end = DispatchTime.now().uptimeNanoseconds
+                sentinel.tick()
+                let snapshot = StartupRecommendationDiagnostics.snapshot()
+                XCTAssertEqual(snapshot["compute"], 36)
+                let compute = snapshot.durations["compute", default: []].sorted()
+                let role = snapshot.durations["roleBatch", default: []]
+                print("M1_TIMING \(iteration) computeSumMs=\(Double(compute.reduce(0, +)) / 1e6) computeUpperMiddleMs=\(Double(compute[compute.count / 2]) / 1e6) roleSumMs=\(Double(role.reduce(0, +)) / 1e6) mainActorSpanMs=\(Double((snapshot.lastEnd ?? 0) - (snapshot.firstStart ?? 0)) / 1e6) sentinelGapMs=\(Double(sentinel.maximumGap) / 1e6) endToEndMs=\(Double(end - start) / 1e6)")
+            }
+        }
+        return result
+    }
+
+    private func assertGolden(_ snapshot: StartupRecommendationDiagnostics.Snapshot?, phase: String) {
+        // Measured M1 counts for this exact populated, Codex+Claude fixture.
+        let computes = phase == "initialization" ? 180 : (["provider", "workspaceCreation"].contains(phase) ? 72 : 36)
+        var expected = [
+            "compute": 1, "mcpCompute": 1, "roleBatch": 1,
+            "candidateChain": 4, "family": 14, "codexValidation": 3, "codexLabel": 7,
+            "codexOptionsRequest": 38, "codexOptionsProduction": 38,
+            "codexRecordAttempt": 38, "codexRecordAccepted": 38,
+            "staticOption": 2090, "staticParser": 4066, "staticPersistedLoad": 4028
+        ].mapValues { $0 * computes }
+        if phase == "initialization" {
+            expected.merge([
+                "wizardInit": 36, "delivery.workspaceSelection": 36,
+                "refresh.workspaceTarget": 36, "refresh.initializer": 36,
+                "delivery.validation": 36, "refresh.validation": 36,
+                "delivery.provider": 36, "refresh.provider": 36,
+                "autoApplyEligibility": 36, "autoApplyCompute": 36
+            ]) { _, new in new }
+        } else if phase == "workspaceSwitch" {
+            expected["delivery.workspaceSelection"] = 72
+            expected["refresh.workspaceTarget"] = 36
+        } else {
+            expected["refresh.\(phase)"] = 36
+            if phase == "settings" {
+                expected["delivery.settingsImmediate"] = 36
+                expected["delivery.settingsDebounced"] = 36
+            } else {
+                expected["delivery.\(phase)"] = 36
+            }
+            if ["provider", "workspaceCreation"].contains(phase) {
+                expected["autoApplyEligibility"] = 36
+                expected["autoApplyCompute"] = 36
+            }
+        }
+        XCTAssertEqual(snapshot?.counts, expected, phase)
+    }
+
+    private func output(_ owner: Owner) throws -> String {
+        let wizard = try XCTUnwrap(owner.wizard)
+        XCTAssertEqual(wizard.target?.sourceWorkspaceID, owner.workspace.id)
+        XCTAssertEqual(wizard.target?.scope, .workspace(owner.workspace.id))
+        XCTAssertFalse(owner.engine.hasCompletedRecently(workspaceID: owner.workspace.id))
+        for kind in RecommendationKind.allCases {
+            XCTAssertFalse(owner.engine.isMuted(kind, workspaceID: owner.workspace.id))
+        }
+        // These value-only DTOs contain no unordered dictionaries or generated identities.
+        return String(reflecting: wizard.recommendations) + String(reflecting: wizard.providerStatus)
+            + String(reflecting: wizard.steps) + String(reflecting: wizard.currentStep)
+            + wizard.selectedChatBackend.rawValue + String(wizard.hasActiveRecommendations)
+    }
+
+    @MainActor
+    private final class ResponsivenessSentinel {
+        private var lastTick = DispatchTime.now().uptimeNanoseconds
+        private(set) var maximumGap: UInt64 = 0
+
+        func tick() {
+            let now = DispatchTime.now().uptimeNanoseconds
+            maximumGap = max(maximumGap, now - lastTick)
+            lastTick = now
+        }
+    }
+
+    private func settle(_ phase: String, key: String, count: Int, startedAt: ContinuousClock.Instant) async throws {
+        // Slow baseline phases may complete, but each phase must stay within a bounded window.
+        let deadline = startedAt.advanced(by: .seconds(60))
+        while StartupRecommendationDiagnostics.snapshot()[key] < count {
+            guard ContinuousClock.now < deadline else {
+                XCTFail("Watchdog \(phase): \(StartupRecommendationDiagnostics.snapshot())")
+                throw NSError(domain: "StartupRecommendationBaseline", code: 1)
+            }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        guard ContinuousClock.now < deadline else {
+            XCTFail("Watchdog exceeded after delivery: \(phase)")
+            throw NSError(domain: "StartupRecommendationBaseline", code: 2)
+        }
+        await drain()
+        let snapshot = StartupRecommendationDiagnostics.snapshot()
+        await drain()
+        XCTAssertEqual(StartupRecommendationDiagnostics.snapshot(), snapshot, phase)
+        XCTAssertEqual(snapshot[key], count, phase)
+    }
+
+    private func drain() async {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { DispatchQueue.main.async { continuation.resume() } }
+        }
+    }
+
+    private func remote(_ id: String, efforts: [String], isDefault: Bool = false) -> CodexAppServerClient.RemoteModel {
+        CodexAppServerClient.RemoteModel(id: id, model: id, displayName: id, description: "Deterministic baseline", isDefault: isDefault, supportedReasoningEfforts: efforts.map { .init(reasoningEffort: $0, description: "") }, defaultReasoningEffort: efforts.first)
     }
 }

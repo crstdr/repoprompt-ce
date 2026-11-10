@@ -193,6 +193,11 @@ enum MCPAgentRoleDefaultsService {
         workspaceID: UUID? = nil,
         settingsStore: (any MCPAgentRoleDefaultsStoring)? = nil
     ) -> [RoleDefaultResolution] {
+        #if DEBUG
+            StartupRecommendationDiagnostics.count("roleBatch", catalog: true)
+            let diagnosticStart = StartupRecommendationDiagnostics.start()
+            defer { StartupRecommendationDiagnostics.finish("roleBatch", since: diagnosticStart) }
+        #endif
         let settingsStore = settingsStore ?? GlobalSettingsStore.shared
         let overrides = settingsStore.mcpAgentRoleOverrides(workspaceID: workspaceID)
         let roleModelParameters = settingsStore.mcpAgentRoleModelParameters(workspaceID: workspaceID)
