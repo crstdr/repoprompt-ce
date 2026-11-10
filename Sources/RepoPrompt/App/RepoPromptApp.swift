@@ -63,6 +63,7 @@ struct RepoPromptSwiftUIApp: App {
     init() {
         let appInitSpan = StartupPhaseLog.begin(.appInit)
         defer { appInitSpan.end() }
+        let loggingSpan = StartupPhaseLog.begin(.appLoggingBootstrap)
         LoggingSystem.bootstrap { label in
             var handler = RepoPromptFileLogHandler(label: label)
             #if DEBUG
@@ -72,10 +73,14 @@ struct RepoPromptSwiftUIApp: App {
             #endif
             return handler
         }
+        loggingSpan.end()
+        let shortcutSpan = StartupPhaseLog.begin(.appUIStateSetup)
         // Do not initialize the settings-backed property before the state boundary
         // check (stored-property default initializers run before this init body).
         _fontScale = StateObject(wrappedValue: FontScaleManager.shared)
         _shortcutDisplay = ObservedObject(wrappedValue: GlobalKeyboardShortcutsCoordinator.shared.bindingDisplay)
+        shortcutSpan.end()
+        let telemetrySpan = StartupPhaseLog.begin(.appTelemetryBootstrap)
         // Avoid process-killing SIGPIPE when the child closes stdin while we're still writing.
         signal(SIGPIPE, SIG_IGN)
 
@@ -87,6 +92,8 @@ struct RepoPromptSwiftUIApp: App {
 
         SentryTelemetryBootstrap.start()
 
+        telemetrySpan.end()
+        let recorderSpan = StartupPhaseLog.begin(.appRecorderInstallation)
         AgentSessionDataService.shared.installRestorePerfRecorder(AppWorkspaceRestorePerfRecorder())
         AgentSessionDataService.shared.installPerfRecorder(AppAgentModePerfRecorder())
         AgentRunCoordinator.shared.installPerfRecorder(AppAgentModePerfRecorder())
@@ -94,6 +101,7 @@ struct RepoPromptSwiftUIApp: App {
         AgentSessionDeletionRegistry.shared.installRestorePerfRecorder(AppWorkspaceRestorePerfRecorder())
         AgentSessionLinkRuntimeBridge.shared.installRestorePerfRecorder(AppWorkspaceRestorePerfRecorder())
 
+        recorderSpan.end()
         ProcessDebugLogging.log(
             prefix: "MCPStartup",
             "RepoPromptApp.init scheduling ServerNetworkManager.start",
@@ -123,7 +131,12 @@ struct RepoPromptSwiftUIApp: App {
         }
 
         if !AppLaunchConfiguration.current.suppressesWindowRestore {
-            WindowStatesManager.shared.loadWindowRestoreSessionIfNeeded()
+            let managerSpan = StartupPhaseLog.begin(.appWindowManagerInit)
+            let manager = WindowStatesManager.shared
+            managerSpan.end()
+            let sessionSpan = StartupPhaseLog.begin(.appWindowSessionLoadSchedule)
+            manager.loadWindowRestoreSessionIfNeeded()
+            sessionSpan.end()
         }
     }
 

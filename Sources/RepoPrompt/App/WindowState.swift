@@ -253,6 +253,50 @@ class WindowState: ObservableObject {
         }
     }
 
+    private var didRecordNativeWindow = false
+    private var didRecordRegistrationComplete = false
+    private var didRecordFirstVisible = false
+    private var startupVisibilityObserver: AnyCancellable?
+    var startupVisibilitySampler: @MainActor (NSWindow) -> Bool = WindowPresentationVisibility.sample
+
+    func noteNativeWindowAvailable(_ window: NSWindow) {
+        guard !isClosing, !didRecordFirstVisible else { return }
+        if !didRecordNativeWindow {
+            didRecordNativeWindow = true
+            StartupPhaseLog.mark(.windowNativeAvailable, window: windowID)
+        }
+        let center = NotificationCenter.default
+        let windowPublishers = WindowPresentationVisibility.windowNotifications.map { center.publisher(for: $0) }
+        let appPublishers = WindowPresentationVisibility.applicationNotifications.map { center.publisher(for: $0) }
+        startupVisibilityObserver = Publishers.MergeMany(windowPublishers + appPublishers)
+            .sink { [weak self, weak window] notification in
+                guard let self, let window else { return }
+                guard WindowPresentationVisibility.applicationNotifications.contains(notification.name)
+                    || notification.object as AnyObject? === window else { return }
+                noteFirstVisible(window)
+            }
+        noteFirstVisible(window)
+    }
+
+    #if DEBUG
+        var debugHasStartupVisibilityObserver: Bool {
+            startupVisibilityObserver != nil
+        }
+    #endif
+
+    private func noteFirstVisible(_ window: NSWindow) {
+        guard !isClosing, !didRecordFirstVisible, startupVisibilitySampler(window) else { return }
+        didRecordFirstVisible = true
+        startupVisibilityObserver = nil
+        StartupPhaseLog.mark(.windowFirstVisible, window: windowID)
+    }
+
+    func noteStartupRegistrationComplete() {
+        guard !isClosing, !didRecordRegistrationComplete else { return }
+        didRecordRegistrationComplete = true
+        StartupPhaseLog.mark(.windowRegistrationComplete, window: windowID)
+    }
+
     private var focusCancellables = Set<AnyCancellable>()
     private weak var focusObservedWindow: NSWindow?
 
@@ -583,6 +627,7 @@ class WindowState: ObservableObject {
         onFocusChanged = nil
         removeFocusObservers()
         removePresentationVisibilityObservers()
+        startupVisibilityObserver = nil
         pendingPresentationVisibilityTask?.cancel()
         pendingPresentationVisibilityTask = nil
         pendingWindowTitleUpdateTask?.cancel()

@@ -19,6 +19,16 @@ enum StartupPhaseLog {
     enum Phase: String, CaseIterable {
         case bootstrap
         case appInit
+        case appLoggingBootstrap
+        case appUIStateSetup
+        case appTelemetryBootstrap
+        case appRecorderInstallation
+        case appWindowManagerInit
+        case appWindowSessionLoadSchedule
+        case appDelegateInit
+        case windowNativeAvailable
+        case windowRegistrationComplete
+        case windowFirstVisible
         case windowComposition
         case workspaceCorpusLoad
         case authorityBootstrapWait
