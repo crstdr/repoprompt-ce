@@ -84,6 +84,13 @@ final class AutoRecommendationEngine {
         for identity: AgentModelsOperationIdentity,
         enabledProviders: Set<RecommendationProviderKind> = Set(RecommendationProviderKind.allCases)
     ) -> RecommendationSet {
+        #if DEBUG
+            StartupRecommendationDiagnostics.enterCompute(scope: settingsStore)
+            defer { StartupRecommendationDiagnostics.leaveCompute() }
+            StartupRecommendationDiagnostics.count("compute")
+            let diagnosticStart = StartupRecommendationDiagnostics.start()
+            defer { StartupRecommendationDiagnostics.finish("compute", since: diagnosticStart) }
+        #endif
         let scope = identity.scope
         let actualStatus = computeProviderStatus()
         let status = actualStatus.filtered(to: enabledProviders)
@@ -505,6 +512,9 @@ final class AutoRecommendationEngine {
         actualStatus: ProviderStatusSnapshot,
         recommendedStatus: ProviderStatusSnapshot
     ) -> MCPAgentDefaultsRecommendation? {
+        #if DEBUG
+            StartupRecommendationDiagnostics.count("mcpCompute")
+        #endif
         let runtimeAvailability = apiSettingsViewModel?.agentModeAvailabilityContext ?? .none
         let availability = mcpAgentAvailabilityContext(from: actualStatus, runtimeAvailability: runtimeAvailability)
         let recommendedAvailability = mcpAgentAvailabilityContext(from: recommendedStatus, runtimeAvailability: runtimeAvailability)
@@ -795,6 +805,9 @@ final class AutoRecommendationEngine {
     /// Returns true if any mutations were applied.
     @discardableResult
     func autoApplyRecommendationsIfEligible(for workspaceID: UUID) -> Bool {
+        #if DEBUG
+            StartupRecommendationDiagnostics.count("autoApplyEligibility", scope: settingsStore)
+        #endif
         // Check GLOBAL settings for whether user has already configured Context Builder agent
         // If global is already configured, don't auto-apply
         if settingsStore.hasUserSetGlobalContextBuilderAgentDefaults {
@@ -803,6 +816,9 @@ final class AutoRecommendationEngine {
 
         // Compute recommendations
         let identity = AgentModelsOperationIdentity(sourceWorkspaceID: workspaceID, scope: .global)
+        #if DEBUG
+            StartupRecommendationDiagnostics.count("autoApplyCompute", scope: settingsStore)
+        #endif
         let recs = computeRecommendations(for: identity)
         var didApply = false
 

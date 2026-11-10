@@ -97,6 +97,9 @@ final class AgentCodexModelRegistryCacheTests: XCTestCase {
             catalogue.invalidate(.codexExec)
         }
         registry.updateLiveModels([remoteModel(id: "paused-old", displayName: "Old", isDefault: true)])
+        let availability = AgentModelCatalog.AvailabilityContext()
+        let operation = AgentModelCatalog.CodexOptionsOperation()
+        let captured = operation.options(availability: availability)
         let snapshotRead = expectation(description: "Producer has read the old registry snapshot")
         let resume = AsyncStream<Void>.makeStream()
         defer { resume.continuation.finish() }
@@ -112,14 +115,15 @@ final class AgentCodexModelRegistryCacheTests: XCTestCase {
         }
         await fulfillment(of: [snapshotRead], timeout: 5)
         registry.updateLiveModels([remoteModel(id: "current-new", displayName: "New", isDefault: true)])
-        let availability = AgentModelCatalog.AvailabilityContext()
+        XCTAssertEqual(operation.options(availability: availability), captured)
         XCTAssertThrowsError(try catalogue.selection("codexExec:paused-old", availability: availability)) { error in
             XCTAssertEqual(error as? AgentAdvertisedModelCatalog.AdmissionError, .catalogueUnavailable)
         }
-        _ = AgentModelCatalog.options(for: .codexExec, availability: availability)
+        _ = AgentModelCatalog.CodexOptionsOperation().options(availability: availability)
         resume.continuation.yield(())
         let recorded = await producer.value
         XCTAssertFalse(recorded, "A stale producer must not resurrect or overwrite the current catalogue")
+        XCTAssertEqual(operation.options(availability: availability), captured)
         XCTAssertThrowsError(try catalogue.selection("codexExec:paused-old", availability: availability))
         XCTAssertEqual(
             try catalogue.selection("codexExec:current-new", availability: availability).storedModelRaw,
