@@ -3,6 +3,15 @@ import Foundation
 package enum WorkspaceRestoreStartupPhase: String, Sendable {
     case oversightIntentLoad, oversightLaunchSeed, oversightRestoreAdmission
     case oversightDiscoveryAdoption, oversightDiscoveryCompletion, oversightDiscoveryBarrier
+    case switchReplayExpansion, switchReplaySelectionApply, switchReplaySliceHydration, switchReplayDeferredFlush
+}
+
+package enum WorkspaceRestoreAttributionOutcome: Int, Sendable {
+    case completed = 1, skipped, noChange, cancelled, staleIdentity, noRoots, noScope, error
+}
+
+package protocol WorkspaceRestoreStartupSpan: Sendable {
+    func end(fields: [String: Int])
 }
 
 package enum WorkspaceRestoreOversightOutcome: String, Sendable {
@@ -32,6 +41,7 @@ package protocol WorkspaceRestorePerfRecording: Sendable {
     func log(_ message: @autoclosure () -> String)
     func event(_ name: String, fields: [String: String])
     func recordStartupPhase(_ phase: WorkspaceRestoreStartupPhase, debug: Bool, window: Int?, fields: [String: Int])
+    func beginStartupSpan(_ phase: WorkspaceRestoreStartupPhase, window: Int) -> (any WorkspaceRestoreStartupSpan)?
     func recordOversightRestoreAttempt(observer: UUID, target: UUID, outcome: WorkspaceRestoreOversightOutcome, reason: String?)
     func recordLaneCreationAddFailure(branch: WorkspaceRestoreLaneAddFailureBranch, reason: String?)
 }
@@ -39,6 +49,7 @@ package protocol WorkspaceRestorePerfRecording: Sendable {
 package extension WorkspaceRestorePerfRecording {
     /// Always-on startup records use closed phases, identifiers and counters. Reasons are enum raw values.
     func recordStartupPhase(_: WorkspaceRestoreStartupPhase, debug _: Bool, window _: Int?, fields _: [String: Int]) {}
+    func beginStartupSpan(_: WorkspaceRestoreStartupPhase, window _: Int) -> (any WorkspaceRestoreStartupSpan)? { nil }
     func recordOversightRestoreAttempt(observer _: UUID, target _: UUID, outcome _: WorkspaceRestoreOversightOutcome, reason _: String?) {}
     func recordLaneCreationAddFailure(branch _: WorkspaceRestoreLaneAddFailureBranch, reason _: String?) {}
 

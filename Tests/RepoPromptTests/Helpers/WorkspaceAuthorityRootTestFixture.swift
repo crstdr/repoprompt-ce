@@ -117,6 +117,7 @@ import XCTest
             rootNames: [String] = ["A", "B"],
             configuration: (([String]) -> [String])? = nil,
             readmeContent: String = "fixture",
+            enableStartupAttribution: Bool = false,
             _ body: (WorkspaceAuthorityRootTestFixture) async throws -> Void
         ) async throws {
             // Must precede every shared settings, sidecar, key, and store access.
@@ -126,7 +127,7 @@ import XCTest
                 try await fixture.perform("real-authority fixture setup") {
                     try await fixture.setUp(
                         paddedConfiguration: paddedConfiguration, configuration: configuration,
-                        readmeContent: readmeContent, sandbox: sandbox
+                        readmeContent: readmeContent, sandbox: sandbox, enableStartupAttribution: enableStartupAttribution
                     )
                 }
                 try await body(fixture)
@@ -141,7 +142,8 @@ import XCTest
             paddedConfiguration: Bool,
             configuration: (([String]) -> [String])?,
             readmeContent: String,
-            sandbox: URL
+            sandbox: URL,
+            enableStartupAttribution: Bool
         ) async throws {
             try FileManager.default.createDirectory(at: storage, withIntermediateDirectories: true)
             previousStoragePreference = UserDefaults.standard.object(forKey: "GlobalCustomStorageURL")
@@ -185,7 +187,11 @@ import XCTest
             client.commandWillExecuteForTesting = { [weak self] envelope in await self?.gateDomainCommand(envelope) }
             let keys = KeyManager(secureService: SecureKeysService(secureStorage: TestSecureStorageBackend()))
             let queries = AIQueriesService(keyManager: keys)
-            files = WorkspaceFilesViewModel()
+            if enableStartupAttribution {
+                files = WorkspaceFilesViewModel(workspaceFileContextStore: WorkspaceFileContextStore(), restorePerfRecorder: AppWorkspaceRestorePerfRecorder())
+            } else {
+                files = WorkspaceFilesViewModel()
+            }
             let api = APISettingsViewModel(aiQueriesService: queries, keyManager: keys, loadStoredDataOnInit: false)
             let prompt = PromptViewModel(
                 fileManager: files, apiSettingsViewModel: api, windowID: -944,
