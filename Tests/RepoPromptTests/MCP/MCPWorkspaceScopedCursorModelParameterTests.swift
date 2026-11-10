@@ -820,11 +820,15 @@ final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
         XCTAssertEqual(rolesOnly.objectValue?["task_labels"], listed.objectValue?["task_labels"])
         XCTAssertNil(rolesOnly.objectValue?["agents"])
         api.test_completeContextBuilderProviderValidation(verifiedProviders: [.codexExec])
-        let references = window.agentModeViewModel.agentModelRoleDefaultReferences()
-        XCTAssertEqual(references.map(\.roleLabel), rows.map(\.roleLabel))
-        XCTAssertEqual(references.map(\.provider), rows.map(\.effective.agent))
-        XCTAssertEqual(references.map(\.modelRaw), rows.map(\.effective.modelRaw))
-        XCTAssertEqual(references.map(\.isUserOverride), rows.map(\.hasStoredOverride))
+        let router = window.agentModeViewModel
+        XCTAssertEqual(router.modelRouterAvailabilityContext, api.modelRouterAvailabilityContext)
+        XCTAssertTrue(router.workspaceManager === window.workspaceManager)
+        let routingRows = MCPAgentRoleDefaultsService.resolutions(availability: router.modelRouterAvailabilityContext, workspaceID: router.workspaceManager?.activeWorkspaceID)
+        let references = router.agentModelRoleDefaultReferences()
+        XCTAssertEqual(references.map(\.roleLabel), routingRows.map(\.roleLabel))
+        XCTAssertEqual(references.map(\.provider), routingRows.map(\.effective.agent))
+        XCTAssertEqual(references.map(\.modelRaw), routingRows.map(\.effective.modelRaw))
+        XCTAssertEqual(references.map(\.isUserOverride), routingRows.map(\.hasStoredOverride))
         let agents = try XCTUnwrap(listed.objectValue?["agents"]?.arrayValue)
         let ids = agents.flatMap { agent in
             agent.objectValue?["models"]?.arrayValue?.compactMap { $0.objectValue?["model_id"]?.stringValue } ?? []

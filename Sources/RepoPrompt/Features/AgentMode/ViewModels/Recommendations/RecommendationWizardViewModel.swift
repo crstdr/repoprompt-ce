@@ -294,7 +294,7 @@ final class RecommendationWizardViewModel: ObservableObject {
         appliedRecommendationProviders = initialProviders
 
         #if DEBUG
-            StartupRecommendationDiagnostics.count("wizardInit")
+            StartupRecommendationDiagnostics.count("wizardInit", scope: settingsStore)
         #endif
         setupSubscriptions()
         #if DEBUG
@@ -312,7 +312,7 @@ final class RecommendationWizardViewModel: ObservableObject {
             .removeDuplicates()
             .sink { [weak self] workspaceID in
                 #if DEBUG
-                    if self != nil { StartupRecommendationDiagnostics.count("delivery.workspaceSelection") }
+                    if self != nil { StartupRecommendationDiagnostics.count("delivery.workspaceSelection", scope: self?.settingsStore) }
                 #endif
                 self?.handleActiveWorkspaceChange(to: workspaceID)
             }
@@ -331,7 +331,7 @@ final class RecommendationWizardViewModel: ObservableObject {
             .debounce(for: .milliseconds(300), scheduler: RunLoop.main)
             .sink { [weak self] _ in
                 #if DEBUG
-                    if self != nil { StartupRecommendationDiagnostics.count("delivery.provider") }
+                    if self != nil { StartupRecommendationDiagnostics.count("delivery.provider", scope: self?.settingsStore) }
                     self?.diagnosticRefreshReason = "provider"
                 #endif
                 self?.tryAutoApplyOnProviderChange()
@@ -348,7 +348,7 @@ final class RecommendationWizardViewModel: ObservableObject {
             .debounce(for: .milliseconds(100), scheduler: RunLoop.main)
             .sink { [weak self] _ in
                 #if DEBUG
-                    if self != nil { StartupRecommendationDiagnostics.count("delivery.validation") }
+                    if self != nil { StartupRecommendationDiagnostics.count("delivery.validation", scope: self?.settingsStore) }
                     self?.diagnosticRefreshReason = "validation"
                 #endif
                 self?.refresh(navigation: .preserveCurrentStep)
@@ -362,7 +362,7 @@ final class RecommendationWizardViewModel: ObservableObject {
             .sink { [weak self] notification in
                 guard let self else { return }
                 #if DEBUG
-                    StartupRecommendationDiagnostics.count("delivery.settingsImmediate")
+                    StartupRecommendationDiagnostics.count("delivery.settingsImmediate", scope: settingsStore)
                 #endif
                 invalidateActionsIfRelevant(notification)
                 handlePotentialTargetChange()
@@ -373,7 +373,7 @@ final class RecommendationWizardViewModel: ObservableObject {
             .debounce(for: .milliseconds(100), scheduler: RunLoop.main)
             .sink { [weak self] _ in
                 #if DEBUG
-                    if self != nil { StartupRecommendationDiagnostics.count("delivery.settingsDebounced") }
+                    if self != nil { StartupRecommendationDiagnostics.count("delivery.settingsDebounced", scope: self?.settingsStore) }
                     self?.diagnosticRefreshReason = "settings"
                 #endif
                 self?.refresh(navigation: .preserveCurrentStep)
@@ -391,7 +391,7 @@ final class RecommendationWizardViewModel: ObservableObject {
             .debounce(for: .milliseconds(100), scheduler: RunLoop.main)
             .sink { [weak self] _ in
                 #if DEBUG
-                    if self != nil { StartupRecommendationDiagnostics.count("delivery.didApply") }
+                    if self != nil { StartupRecommendationDiagnostics.count("delivery.didApply", scope: self?.settingsStore) }
                     self?.diagnosticRefreshReason = "didApply"
                 #endif
                 self?.refresh(navigation: .preserveCurrentStep)
@@ -404,7 +404,7 @@ final class RecommendationWizardViewModel: ObservableObject {
             .debounce(for: .milliseconds(100), scheduler: RunLoop.main)
             .sink { [weak self] _ in
                 #if DEBUG
-                    if self != nil { StartupRecommendationDiagnostics.count("delivery.shouldRefresh") }
+                    if self != nil { StartupRecommendationDiagnostics.count("delivery.shouldRefresh", scope: self?.settingsStore) }
                     self?.diagnosticRefreshReason = "shouldRefresh"
                 #endif
                 self?.refresh(navigation: .preserveCurrentStep)
@@ -417,7 +417,7 @@ final class RecommendationWizardViewModel: ObservableObject {
                 guard let self,
                       let workspaceID = notification.userInfo?["workspaceID"] as? UUID else { return }
                 #if DEBUG
-                    StartupRecommendationDiagnostics.count("delivery.workspaceCreation")
+                    StartupRecommendationDiagnostics.count("delivery.workspaceCreation", scope: settingsStore)
                 #endif
                 autoApplyForNewWorkspace(workspaceID: workspaceID)
             }
@@ -430,7 +430,7 @@ final class RecommendationWizardViewModel: ObservableObject {
     /// - Parameter navigation: How to handle step navigation after recomputation.
     func refresh(navigation: RefreshNavigationMode = .resetToIntro) {
         #if DEBUG
-            StartupRecommendationDiagnostics.count("refresh." + (diagnosticRefreshReason ?? "external"))
+            StartupRecommendationDiagnostics.count("refresh." + (diagnosticRefreshReason ?? "external"), scope: settingsStore)
             diagnosticRefreshReason = nil
         #endif
         guard let currentTarget = makeCurrentTarget() else {
@@ -479,7 +479,7 @@ final class RecommendationWizardViewModel: ObservableObject {
     private func recomputeState(for identity: AgentModelsOperationIdentity) -> RecommendationSet {
         // 1) Provider status snapshot
         #if DEBUG
-            let diagnosticStart = StartupRecommendationDiagnostics.start()
+            let diagnosticStart = StartupRecommendationDiagnostics.start(scope: settingsStore)
             defer { StartupRecommendationDiagnostics.finish("wizard", since: diagnosticStart) }
         #endif
         let status = engine.computeProviderStatus()
@@ -554,7 +554,7 @@ final class RecommendationWizardViewModel: ObservableObject {
         target = nextTarget
         if let nextTarget {
             #if DEBUG
-                StartupRecommendationDiagnostics.count("refresh.workspaceTarget")
+                StartupRecommendationDiagnostics.count("refresh.workspaceTarget", scope: settingsStore)
             #endif
             refresh(target: nextTarget, navigation: .resetToIntro)
         }

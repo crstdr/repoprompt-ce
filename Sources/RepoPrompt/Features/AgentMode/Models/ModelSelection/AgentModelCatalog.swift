@@ -1767,21 +1767,27 @@ enum AgentModelCatalog {
     }
 
     private static func staticEffortVariant(_ model: AgentModel, for agentKind: AgentProviderKind) -> AgentModelEffortVariant? {
+        agentKind == .codexExec
+            ? staticCodexSpecifier(raw: model.rawValue).reasoningEffort.flatMap { effort in
+                staticCodexSpecifier(raw: model.rawValue).baseModel.map {
+                    AgentModelEffortVariant(baseModelRaw: $0, reasoningEffort: effort)
+                }
+            } : nil
+    }
+
+    /// Both build configurations use this parser path, including lazy persisted-record loading.
+    private static func staticCodexSpecifier(raw: String) -> CodexModelSpecifier {
         #if DEBUG
-            return agentKind == .codexExec
-                ? StartupRecommendationDiagnostics.staticSpecifier(raw: model.rawValue).reasoningEffort.flatMap { effort in
-                    StartupRecommendationDiagnostics.staticSpecifier(raw: model.rawValue).baseModel.map {
-                        AgentModelEffortVariant(baseModelRaw: $0, reasoningEffort: effort)
-                    }
-                } : nil
-        #else
-            return agentKind == .codexExec
-                ? CodexModelSpecifier(raw: model.rawValue).reasoningEffort.flatMap { effort in
-                    CodexModelSpecifier(raw: model.rawValue).baseModel.map {
-                        AgentModelEffortVariant(baseModelRaw: $0, reasoningEffort: effort)
-                    }
-                } : nil
+            StartupRecommendationDiagnostics.count("staticParser", catalog: true)
         #endif
+        return CodexModelSpecifier(raw: raw, discoveredRecords: staticCodexPersistedRecords())
+    }
+
+    private static func staticCodexPersistedRecords() -> [CodexDynamicModelRecord] {
+        #if DEBUG
+            StartupRecommendationDiagnostics.count("staticPersistedLoad", catalog: true)
+        #endif
+        return CodexDynamicModelStore.load()
     }
 
     // MARK: - MCP Exact Lookup Helpers

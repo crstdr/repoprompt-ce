@@ -384,7 +384,7 @@ final class StartupRecommendationBaselineTests: XCTestCase {
         ])
         CodexDynamicModelStore.save(persisted)
 
-        /// Preserve the M1 two-read algorithm as an output oracle for fixed catalog inputs.
+        /// Preserve the original two-read algorithm as an output oracle for fixed catalog inputs.
         func legacyValue(_ family: String, effort: CodexReasoningEffort, availability: AgentModelCatalog.AvailabilityContext) -> String? {
             guard let option = AgentModelCatalog.preferredCodexFamilyOption(family, availability: availability),
                   let base = CodexModelSpecifier(raw: option.rawValue).baseModel else { return nil }
@@ -427,7 +427,7 @@ final class StartupRecommendationBaselineTests: XCTestCase {
         check("sOl", effort: .high, availability: available, expected: mixedCase)
     }
 
-    func testRoleResolutionOutputsMatchM2() {
+    func testRoleResolutionOutputsMatchFrozenReference() {
         withConflictingCodexCatalog {
             let actual = AgentModelCatalog.AvailabilityContext(claudeCodeAvailable: true, codexAvailable: true, openCodeAvailable: false)
             let codexOnly = actual.filteredForRecommendationProviders([.codex])
@@ -555,6 +555,99 @@ final class StartupRecommendationBaselineTests: XCTestCase {
         }
     }
 
+    func testCapturedOptionsRetainExistingPersistedParserSensitivity() {
+        withConflictingCodexCatalog {
+            let models = [remote("gpt-99-sol-high", efforts: []), remote("gpt-99-sol-medium", efforts: [])]
+            AgentCodexModelRegistry.shared.updateLiveModels(models)
+            CodexDynamicModelStore.save(models)
+            let availability = AgentModelCatalog.AvailabilityContext()
+            let operation = AgentModelCatalog.CodexOptionsOperation()
+            let captured = operation.options(availability: availability)
+            let before = AgentModelCatalog.preferredCodexFamilyModelRaw("sol", effort: .medium, availability: availability, precomputedOptions: captured)
+            CodexDynamicModelStore.save([])
+            let reused = AgentModelCatalog.preferredCodexFamilyModelRaw("sol", effort: .medium, availability: availability, precomputedOptions: captured)
+            let fresh = AgentModelCatalog.preferredCodexFamilyModelRaw("sol", effort: .medium, availability: availability)
+            XCTAssertEqual(before, "gpt-6.1-sol-medium")
+            XCTAssertEqual(reused, "gpt-99-sol-medium")
+            XCTAssertEqual(reused, fresh, "The reused array must retain the fresh producer's implicit persisted-parser semantics")
+            XCTAssertEqual(operation.options(availability: availability), captured)
+        }
+    }
+
+    func testRecorderIsolatesThreadsScopesAndStaleTimers() async {
+        let owner = NSObject()
+        let foreign = NSObject()
+        StartupRecommendationDiagnostics.begin(timings: true, scopeCatalogCounts: true, scope: owner)
+        defer { StartupRecommendationDiagnostics.end() }
+        StartupRecommendationDiagnostics.count("delivery", scope: foreign)
+        StartupRecommendationDiagnostics.enterCompute(scope: foreign)
+        StartupRecommendationDiagnostics.count("compute")
+        StartupRecommendationDiagnostics.count("catalog", catalog: true)
+        XCTAssertNil(StartupRecommendationDiagnostics.start())
+        StartupRecommendationDiagnostics.leaveCompute()
+        StartupRecommendationDiagnostics.count("delivery", scope: owner)
+        StartupRecommendationDiagnostics.enterCompute(scope: owner)
+        StartupRecommendationDiagnostics.count("compute")
+        StartupRecommendationDiagnostics.count("catalog", catalog: true)
+        let token = StartupRecommendationDiagnostics.start()
+        StartupRecommendationDiagnostics.finish("compute", since: token)
+        StartupRecommendationDiagnostics.leaveCompute()
+        let before = StartupRecommendationDiagnostics.snapshot()
+        let background = await withCheckedContinuation { continuation in
+            DispatchQueue.global().async {
+                StartupRecommendationDiagnostics.begin()
+                StartupRecommendationDiagnostics.count("foreign")
+                let count = StartupRecommendationDiagnostics.snapshot()["foreign"]
+                StartupRecommendationDiagnostics.end()
+                continuation.resume(returning: count)
+            }
+        }
+        XCTAssertEqual(background, 1)
+        XCTAssertEqual(StartupRecommendationDiagnostics.snapshot(), before)
+        XCTAssertEqual(before.counts, ["delivery": 1, "compute": 1, "catalog": 1])
+        XCTAssertEqual(before.durations["compute"]?.count, 1)
+        StartupRecommendationDiagnostics.begin(timings: true, scope: owner)
+        StartupRecommendationDiagnostics.finish("stale", since: token)
+        XCTAssertEqual(StartupRecommendationDiagnostics.snapshot(), .init())
+    }
+
+    private struct TimingSummary {
+        let computeSum: Double
+        let computeUpperMiddle: Double
+        let roleSum: Double
+        let span: Double
+    }
+
+    private func timingSummary(_ snapshot: StartupRecommendationDiagnostics.Snapshot, expected: Int) -> TimingSummary? {
+        guard expected > 0, let compute = snapshot.durations["compute"], compute.count == expected,
+              let role = snapshot.durations["roleBatch"], role.count == expected,
+              snapshot.durations["wizard"]?.count == expected,
+              let first = snapshot.firstStart, let last = snapshot.lastEnd, last >= first else { return nil }
+        return TimingSummary(
+            computeSum: compute.reduce(0.0) { $0 + Double($1) } / 1e6,
+            computeUpperMiddle: Double(compute.sorted()[expected / 2]) / 1e6,
+            roleSum: role.reduce(0.0) { $0 + Double($1) } / 1e6,
+            span: Double(last - first) / 1e6
+        )
+    }
+
+    func testTimingSummaryRejectsEmptyPartialAndInvalidSamples() {
+        var snapshot = StartupRecommendationDiagnostics.Snapshot()
+        XCTAssertNil(timingSummary(snapshot, expected: 36))
+        snapshot.durations = ["compute": [1_000_000], "roleBatch": [], "wizard": [1_200_000]]
+        XCTAssertNil(timingSummary(snapshot, expected: 36))
+        snapshot.durations = ["compute": [1_000_000], "roleBatch": [500_000], "wizard": [1_200_000]]
+        XCTAssertNil(timingSummary(snapshot, expected: 1))
+        snapshot.firstStart = 2
+        snapshot.lastEnd = 1
+        XCTAssertNil(timingSummary(snapshot, expected: 1))
+        snapshot.lastEnd = 1_000_002
+        XCTAssertNil(timingSummary(snapshot, expected: 0))
+        XCTAssertEqual(timingSummary(snapshot, expected: 1)?.computeSum, 1)
+        XCTAssertEqual(timingSummary(snapshot, expected: 1)?.roleSum, 0.5)
+        XCTAssertEqual(timingSummary(snapshot, expected: 1)?.span, 1)
+    }
+
     private func withConflictingCodexCatalog(_ body: () throws -> Void) rethrows {
         let registry = AgentCodexModelRegistry.shared
         let originalLive = registry.currentLiveModels()
@@ -668,9 +761,8 @@ final class StartupRecommendationBaselineTests: XCTestCase {
         let globalBefore = store.globalAgentModelsProfile()
         let workspacesBefore = owners.map { store.workspaceAgentModelsSettings(for: $0.workspace.id) }
         var result = Result()
-        let cohortStart = DispatchTime.now().uptimeNanoseconds
         let initializationStart = ContinuousClock.now
-        StartupRecommendationDiagnostics.begin(scopeCatalogCounts: true)
+        StartupRecommendationDiagnostics.begin(scopeCatalogCounts: true, scope: store)
         for index in owners.indices {
             owners[index].wizard = RecommendationWizardViewModel(engine: owners[index].engine, settingsStore: store, workspaceManager: owners[index].manager, windowID: -8000 - index)
         }
@@ -688,9 +780,9 @@ final class StartupRecommendationBaselineTests: XCTestCase {
             XCTAssertTrue(owner.wizard?.recommendations.contextBuilder?.alreadySatisfied == true)
             XCTAssertFalse(owner.api.test_hasCodexModelsSubscriptionTask)
         }
-        for phase in ["provider", "validation", "settings", "didApply", "shouldRefresh", "workspaceCreation", "workspaceSwitch"] {
+        for phase in timing ? [] : ["provider", "validation", "settings", "didApply", "shouldRefresh", "workspaceCreation", "workspaceSwitch"] {
             let phaseStart = ContinuousClock.now
-            StartupRecommendationDiagnostics.begin(scopeCatalogCounts: true)
+            StartupRecommendationDiagnostics.begin(scopeCatalogCounts: true, scope: store)
             switch phase {
             case "provider": owners.forEach { $0.api.isCodexConnected = true }
             case "validation": owners.forEach { $0.api.test_completeContextBuilderProviderValidation(verifiedProviders: [.codexExec, .claudeCode]) }
@@ -714,15 +806,9 @@ final class StartupRecommendationBaselineTests: XCTestCase {
             XCTAssertEqual(owners.map { store.workspaceAgentModelsSettings(for: $0.workspace.id) }, workspacesBefore, phase)
             XCTAssertFalse(store.hasUserSetGlobalContextBuilderAgentDefaults, phase)
         }
-        for phase in result.phases.keys.sorted() {
-            let counts = try XCTUnwrap(result.phases[phase]).counts.sorted { $0.key < $1.key }
-            print("M3_COUNTS \(phase) \(counts)")
-        }
-        print("M3_COHORT_MS \(Double(DispatchTime.now().uptimeNanoseconds - cohortStart) / 1e6)")
-        print("M3_OUTPUT_SHA256 \(SHA256.hash(data: Data(result.outputs[0].utf8)).map { String(format: "%02x", $0) }.joined())")
         if timing {
             for iteration in 0 ..< 10 {
-                StartupRecommendationDiagnostics.begin(timings: true, scopeCatalogCounts: true)
+                StartupRecommendationDiagnostics.begin(timings: true, scopeCatalogCounts: true, counts: false, scope: store)
                 let sentinel = ResponsivenessSentinel()
                 let sentinelTask = Task { @MainActor in
                     while !Task.isCancelled {
@@ -735,21 +821,25 @@ final class StartupRecommendationBaselineTests: XCTestCase {
                 let phaseStart = ContinuousClock.now
                 let start = DispatchTime.now().uptimeNanoseconds
                 NotificationCenter.default.post(name: .recommendationsShouldRefresh, object: nil)
-                try await settle("timing", key: "refresh.shouldRefresh", count: 36, startedAt: phaseStart)
+                try await settle("timing", key: "wizard", count: 36, startedAt: phaseStart, timings: true)
                 let end = DispatchTime.now().uptimeNanoseconds
                 sentinel.tick()
                 let snapshot = StartupRecommendationDiagnostics.snapshot()
-                XCTAssertEqual(snapshot["compute"], 36)
-                let compute = snapshot.durations["compute", default: []].sorted()
-                let role = snapshot.durations["roleBatch", default: []]
-                print("M3_TIMING \(iteration) computeSumMs=\(Double(compute.reduce(0, +)) / 1e6) computeUpperMiddleMs=\(Double(compute[compute.count / 2]) / 1e6) roleSumMs=\(Double(role.reduce(0, +)) / 1e6) mainActorSpanMs=\(Double((snapshot.lastEnd ?? 0) - (snapshot.firstStart ?? 0)) / 1e6) sentinelGapMs=\(Double(sentinel.maximumGap) / 1e6) endToEndMs=\(Double(end - start) / 1e6)")
+                XCTAssertEqual(snapshot.counts, [:], "Timing must not collect operation counts")
+                let summary = try XCTUnwrap(timingSummary(snapshot, expected: 36), "Incomplete or invalid timing samples")
+                XCTAssertEqual(try owners.map { try output($0) }, result.outputs)
+                XCTAssertEqual(store.globalAgentModelsProfile(), globalBefore)
+                XCTAssertEqual(owners.map { store.workspaceAgentModelsSettings(for: $0.workspace.id) }, workspacesBefore)
+                if iteration > 0 {
+                    print("STARTUP_RECOMMENDATION_TIMING \(iteration) computeSumMs=\(summary.computeSum) computeUpperMiddleMs=\(summary.computeUpperMiddle) roleSumMs=\(summary.roleSum) mainActorSpanMs=\(summary.span) sentinelGapMs=\(Double(sentinel.maximumGap) / 1e6) endToEndMs=\(Double(end - start) / 1e6)")
+                }
             }
         }
         return result
     }
 
     private func assertGolden(_ snapshot: StartupRecommendationDiagnostics.Snapshot?, phase: String) {
-        // Measured M3 counts for the unchanged populated, Codex+Claude fixture.
+        // Frozen counts for the unchanged populated, Codex+Claude fixture.
         let computes = phase == "initialization" ? 180 : (["provider", "workspaceCreation"].contains(phase) ? 72 : 36)
         var expected = [
             "compute": 1, "mcpCompute": 1, "roleBatch": 1,
@@ -812,10 +902,14 @@ final class StartupRecommendationBaselineTests: XCTestCase {
         }
     }
 
-    private func settle(_ phase: String, key: String, count: Int, startedAt: ContinuousClock.Instant) async throws {
+    private func settle(_ phase: String, key: String, count: Int, startedAt: ContinuousClock.Instant, timings: Bool = false) async throws {
         // Slow baseline phases may complete, but each phase must stay within a bounded window.
         let deadline = startedAt.advanced(by: .seconds(60))
-        while StartupRecommendationDiagnostics.snapshot()[key] < count {
+        func observedCount() -> Int {
+            let snapshot = StartupRecommendationDiagnostics.snapshot()
+            return timings ? snapshot.durations[key, default: []].count : snapshot[key]
+        }
+        while observedCount() < count {
             guard ContinuousClock.now < deadline else {
                 XCTFail("Watchdog \(phase): \(StartupRecommendationDiagnostics.snapshot())")
                 throw NSError(domain: "StartupRecommendationBaseline", code: 1)
@@ -830,7 +924,7 @@ final class StartupRecommendationBaselineTests: XCTestCase {
         let snapshot = StartupRecommendationDiagnostics.snapshot()
         await drain()
         XCTAssertEqual(StartupRecommendationDiagnostics.snapshot(), snapshot, phase)
-        XCTAssertEqual(snapshot[key], count, phase)
+        XCTAssertEqual(observedCount(), count, phase)
     }
 
     private func drain() async {

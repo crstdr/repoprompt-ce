@@ -85,7 +85,7 @@ final class AutoRecommendationEngine {
         enabledProviders: Set<RecommendationProviderKind> = Set(RecommendationProviderKind.allCases)
     ) -> RecommendationSet {
         #if DEBUG
-            StartupRecommendationDiagnostics.enterCompute()
+            StartupRecommendationDiagnostics.enterCompute(scope: settingsStore)
             defer { StartupRecommendationDiagnostics.leaveCompute() }
             StartupRecommendationDiagnostics.count("compute")
             let diagnosticStart = StartupRecommendationDiagnostics.start()
@@ -806,7 +806,7 @@ final class AutoRecommendationEngine {
     @discardableResult
     func autoApplyRecommendationsIfEligible(for workspaceID: UUID) -> Bool {
         #if DEBUG
-            StartupRecommendationDiagnostics.count("autoApplyEligibility")
+            StartupRecommendationDiagnostics.count("autoApplyEligibility", scope: settingsStore)
         #endif
         // Check GLOBAL settings for whether user has already configured Context Builder agent
         // If global is already configured, don't auto-apply
@@ -817,7 +817,7 @@ final class AutoRecommendationEngine {
         // Compute recommendations
         let identity = AgentModelsOperationIdentity(sourceWorkspaceID: workspaceID, scope: .global)
         #if DEBUG
-            StartupRecommendationDiagnostics.count("autoApplyCompute")
+            StartupRecommendationDiagnostics.count("autoApplyCompute", scope: settingsStore)
         #endif
         let recs = computeRecommendations(for: identity)
         var didApply = false
