@@ -48,7 +48,8 @@ enum WindowSessionSnapshotBuilder {
     static func build(
         version: Int,
         candidates: [WindowSessionCaptureCandidate],
-        excludedWindowIDs: Set<Int>
+        excludedWindowIDs: Set<Int>,
+        unclaimedEntries: [WindowSessionEntry] = []
     ) -> WindowSessionSnapshot {
         var entries: [WindowSessionEntry] = []
         for candidate in candidates {
@@ -56,6 +57,7 @@ enum WindowSessionSnapshotBuilder {
             guard let entry = candidate.entry else { continue }
             entries.append(entry)
         }
+        entries.append(contentsOf: unclaimedEntries)
         return WindowSessionSnapshot(version: version, windows: entries)
     }
 }
@@ -1316,7 +1318,8 @@ class WindowStatesManager: ObservableObject {
         return WindowSessionSnapshotBuilder.build(
             version: 4,
             candidates: candidates,
-            excludedWindowIDs: explicitlyClosingWindowIDs
+            excludedWindowIDs: explicitlyClosingWindowIDs,
+            unclaimedEntries: restoreQueue
         )
     }
 
@@ -1416,6 +1419,12 @@ class WindowStatesManager: ObservableObject {
         /// shared Application Support session file.
         static func makeForTesting(windowSessionFileURL: URL) -> WindowStatesManager {
             WindowStatesManager(windowSessionFileURL: windowSessionFileURL)
+        }
+
+        func releaseLeftoverRestoreEntryGateAfterGraceForTesting() {
+            leftoverRestoreEntryGraceTask?.cancel()
+            leftoverRestoreEntryGraceTask = nil
+            releaseLeftoverRestoreEntryGateAfterGrace()
         }
 
         func setTerminatingForTesting(_ isTerminating: Bool) {
