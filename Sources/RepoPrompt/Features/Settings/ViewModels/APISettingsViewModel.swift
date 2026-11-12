@@ -3835,11 +3835,24 @@ public class APISettingsViewModel: ObservableObject {
         return url
     }
 
+    #if DEBUG
+        private var test_openCodePollingService: OpenCodeACPModelPollingService?
+
+        func test_startOpenCodeSubscription(service: OpenCodeACPModelPollingService) {
+            test_openCodePollingService = service
+            startOpenCodeModelsSubscriptionIfNeeded(workspacePath: nil)
+        }
+    #endif
+
     private func startOpenCodeModelsSubscriptionIfNeeded(workspacePath: String?) {
         guard !hasPreparedForWindowClose else { return }
         guard openCodeModelsTask == nil else { return }
         openCodeModelsTask = Task { [weak self, workspacePath] in
-            let stream = await OpenCodeACPModelPollingService.shared.subscribe(workspacePath: workspacePath)
+            #if DEBUG
+                let stream = await (self?.test_openCodePollingService ?? .shared).subscribe(workspacePath: workspacePath)
+            #else
+                let stream = await OpenCodeACPModelPollingService.shared.subscribe(workspacePath: workspacePath)
+            #endif
             for await snapshot in stream {
                 guard !Task.isCancelled else { return }
                 await MainActor.run { [weak self] in

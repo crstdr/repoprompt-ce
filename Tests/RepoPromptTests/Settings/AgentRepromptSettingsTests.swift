@@ -17,6 +17,29 @@ final class AgentRepromptSettingsTests: XCTestCase {
         }
     }
 
+    private actor ReplayGateClient: OpenCodeACPModelDiscoveryClient {
+        private var calls = 0
+        private var isOpen = false
+        private var waiter: CheckedContinuation<Void, Never>?
+
+        func discoverModels(workspacePath _: String?, modelRaw _: String?) async throws -> OpenCodeACPModelDiscoveryResult? {
+            calls += 1
+            let isFirst = calls == 1
+            if !isFirst, !isOpen {
+                await withCheckedContinuation { waiter = $0 }
+            }
+            let name = isFirst ? "replay-model" : "broadcast-model"
+            let option = AgentModelOption(rawValue: name, displayName: name, description: nil, isPlaceholderDefault: false, isProviderDefault: true)
+            return OpenCodeACPModelDiscoveryResult(catalog: ACPDiscoveredSessionModels(options: [option], currentModelRaw: name), parameterState: nil)
+        }
+
+        func open() {
+            isOpen = true
+            waiter?.resume()
+            waiter = nil
+        }
+    }
+
     private final class StartupRecorder: @unchecked Sendable {
         private let lock = NSLock()
         private var lines: [String] = []
@@ -184,7 +207,7 @@ final class AgentRepromptSettingsTests: XCTestCase {
         }
         let lines = recorder.snapshot()
         XCTAssertEqual(lines.count, 108)
-        XCTAssertTrue(lines.allSatisfy { $0.contains("openCodeModels=1") && $0.contains("sourceProvider=1") })
+        XCTAssertTrue(lines.allSatisfy { $0.split(separator: " ").contains("openCodeModels=1") && $0.split(separator: " ").contains("sourceProvider=1") })
         let jobs = recorder.jobs()
         let bJob = try XCTUnwrap(jobs.last { $0.contains("actual=1 ") && $0.contains("origin=4 ") })
         let aJob = try XCTUnwrap(jobs.last { $0.contains("actual=2 ") && $0.contains("origin=4 ") })
@@ -193,14 +216,56 @@ final class AgentRepromptSettingsTests: XCTestCase {
         }
         let bOrdinal = try XCTUnwrap(jobOrdinal(bJob))
         let aOrdinal = try XCTUnwrap(jobOrdinal(aJob))
-        XCTAssertTrue(lines.dropFirst(36).prefix(36).allSatisfy { $0.contains("openCodeJob=\(bOrdinal) ") })
-        XCTAssertTrue(lines.suffix(36).allSatisfy { $0.contains("openCodeJob=\(aOrdinal) ") })
+        XCTAssertTrue(lines.dropFirst(36).prefix(36).allSatisfy { $0.split(separator: " ").contains(Substring("openCodeJob=\(bOrdinal)")) })
+        XCTAssertTrue(lines.suffix(36).allSatisfy { $0.split(separator: " ").contains(Substring("openCodeJob=\(aOrdinal)")) })
         XCTAssertTrue([bJob, aJob].allSatisfy { $0.contains("broadcast=1 ") && $0.contains("canonical=1 ") && $0.contains("effectiveChanged=1 ") })
         XCTAssertFalse(jobs.joined().contains("workspace-"))
         XCTAssertFalse(jobs.joined().contains("catalog-"))
         print("openCode attribution job sample: \(bJob)")
         if let line = lines.dropFirst(36).first { print("openCode attribution update sample: \(line)") }
         await service.shutdown()
+    }
+
+    func testOpenCodeSubscriptionRecordsReplayThenBroadcast() async throws {
+        AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
+        defer {
+            AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
+            StartupPhaseLog.resetForTesting()
+        }
+        let replay = expectation(description: "subscription replay")
+        let broadcast = expectation(description: "changed catalog broadcast")
+        let recorder = StartupRecorder()
+        StartupPhaseLog.installForTesting(.init(
+            uptime: { ProcessInfo.processInfo.systemUptime }, processStartUptime: 0,
+            emit: { line in
+                recorder.append(line)
+                let tokens = line.split(separator: " ")
+                guard tokens.contains("phase=availableModelsUpdate") else { return }
+                if tokens.contains("openCodeDelivery=2") { replay.fulfill() }
+                if tokens.contains("openCodeDelivery=1") { broadcast.fulfill() }
+            }
+        ))
+        let client = ReplayGateClient()
+        let service = OpenCodeACPModelPollingService(client: client)
+        addTeardownBlock {
+            await client.open()
+            await service.shutdown()
+        }
+        _ = try await service.discoverOnce(workspacePath: nil)
+        let (_, api) = try fixture(window: 37)
+        defer { api.prepareForWindowClose() }
+        api.isOpenCodeConnected = true
+        api.test_startOpenCodeSubscription(service: service)
+        await fulfillment(of: [replay], timeout: 5)
+        await client.open()
+        await fulfillment(of: [broadcast], timeout: 5)
+        let lines = recorder.snapshot()
+        XCTAssertEqual(lines.count, 2)
+        for (line, delivery) in zip(lines, [2, 1]) {
+            let tokens = line.split(separator: " ")
+            XCTAssertTrue(tokens.contains("sourceProvider=1"))
+            XCTAssertTrue(tokens.contains(Substring("openCodeDelivery=\(delivery)")))
+        }
     }
 
     func testOpenCodeParameterJobLogsBootstrapCatalog() async throws {
