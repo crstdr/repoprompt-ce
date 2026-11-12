@@ -88,12 +88,18 @@ enum StartupPhaseLog {
         }
     }
 
-    /// Clock and emission seam; tests substitute a scripted clock and a capture sink.
+    struct CPUReading {
+        var main: TimeInterval?
+        var process: TimeInterval?
+    }
+
+    /// Clock and emission seam; tests substitute scripted clocks and a capture sink.
     struct Runtime {
         var uptime: @Sendable () -> TimeInterval
         var processStartUptime: TimeInterval
         var emit: @Sendable (String) -> Void
         var debugEmit: (@Sendable (String) -> Void)?
+        var cpu: @Sendable () -> CPUReading = { CPUReading(main: nil, process: nil) }
     }
 
     /// A `begin` boundary's token; `end` emits the matching `end` line with `span_ms`.
@@ -101,6 +107,7 @@ enum StartupPhaseLog {
         let phase: Phase
         let window: Int?
         let startUptime: TimeInterval
+        let startCPU: CPUReading
         let runtime: Runtime
 
         func end(fields: [String: Int]) {
@@ -111,6 +118,14 @@ enum StartupPhaseLog {
         /// values are integers, so nothing user-identifying can reach the log.
         func end(extraFields: [String: Int] = [:]) {
             let now = runtime.uptime()
+            let cpu = runtime.cpu()
+            var fields = extraFields
+            if let start = startCPU.main, let end = cpu.main, end >= start {
+                fields["main_cpu_ms"] = StartupPhaseLog.spanMilliseconds(from: start, to: end)
+            }
+            if let start = startCPU.process, let end = cpu.process, end >= start {
+                fields["proc_cpu_ms"] = StartupPhaseLog.spanMilliseconds(from: start, to: end)
+            }
             runtime.emit(
                 StartupPhaseLog.render(
                     phase: phase,
@@ -120,7 +135,7 @@ enum StartupPhaseLog {
                         now: now, processStart: runtime.processStartUptime
                     ),
                     spanMS: StartupPhaseLog.spanMilliseconds(from: startUptime, to: now),
-                    fields: extraFields
+                    fields: fields
                 )
             )
         }
@@ -132,7 +147,8 @@ enum StartupPhaseLog {
         uptime: { ProcessInfo.processInfo.systemUptime },
         processStartUptime: processStartUptime(),
         emit: { message in logger.log("\(message, privacy: .public)") },
-        debugEmit: { message in logger.debug("\(message, privacy: .public)") }
+        debugEmit: { message in logger.debug("\(message, privacy: .public)") },
+        cpu: { CPUReading(main: mainThreadCPUSeconds(), process: processCPUSeconds()) }
     )
 
     private static func runtime() -> Runtime {
@@ -211,7 +227,46 @@ enum StartupPhaseLog {
                 fields: [:]
             )
         )
-        return Span(phase: phase, window: window, startUptime: runtime.uptime(), runtime: runtime)
+        let startUptime = runtime.uptime()
+        let startCPU = runtime.cpu()
+        return Span(phase: phase, window: window, startUptime: startUptime, startCPU: startCPU, runtime: runtime)
+    }
+
+    private final class MainThreadPort: @unchecked Sendable {
+        private let lock = NSLock()
+        private var port: mach_port_t?
+
+        func get() -> mach_port_t? {
+            lock.lock()
+            defer { lock.unlock() }
+            if port == nil, pthread_main_np() != 0 {
+                let candidate = pthread_mach_thread_np(pthread_self())
+                if candidate != MACH_PORT_NULL { port = candidate }
+            }
+            return port
+        }
+    }
+
+    private static let mainThreadPort = MainThreadPort()
+
+    static func mainThreadCPUSeconds() -> TimeInterval? {
+        guard let port = mainThreadPort.get() else { return nil }
+        var info = thread_basic_info()
+        var count = mach_msg_type_number_t(MemoryLayout<thread_basic_info>.size / MemoryLayout<integer_t>.size)
+        let result = withUnsafeMutablePointer(to: &info) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                thread_info(port, thread_flavor_t(THREAD_BASIC_INFO), $0, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return nil }
+        return TimeInterval(info.user_time.seconds) + TimeInterval(info.system_time.seconds)
+            + TimeInterval(info.user_time.microseconds + info.system_time.microseconds) / 1_000_000
+    }
+
+    static func processCPUSeconds() -> TimeInterval? {
+        var value = timespec()
+        guard clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &value) == 0 else { return nil }
+        return TimeInterval(value.tv_sec) + TimeInterval(value.tv_nsec) / 1_000_000_000
     }
 
     static func elapsedMilliseconds(now: TimeInterval, processStart: TimeInterval) -> Int {

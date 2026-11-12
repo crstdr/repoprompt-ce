@@ -7,10 +7,21 @@ final class StartupPhaseLogTests: XCTestCase {
         private let lock = NSLock()
         private let ticks: [TimeInterval]
         private var tickIndex = 0
+        private var cpuIndex = 0
+        private let readings: [StartupPhaseLog.CPUReading]
         private(set) var emissions: [String] = []
 
-        init(ticks: [TimeInterval]) {
+        init(ticks: [TimeInterval], readings: [StartupPhaseLog.CPUReading] = []) {
             self.ticks = ticks
+            self.readings = readings
+        }
+
+        func cpu() -> StartupPhaseLog.CPUReading {
+            lock.lock()
+            defer { lock.unlock() }
+            guard cpuIndex < readings.count else { return .init(main: nil, process: nil) }
+            defer { cpuIndex += 1 }
+            return readings[cpuIndex]
         }
 
         func uptime() -> TimeInterval {
@@ -70,6 +81,71 @@ final class StartupPhaseLogTests: XCTestCase {
             recorder.emissions.last,
             "phase=windowComposition boundary=end window=2 elapsed_ms=26000 span_ms=750 entries=42 loaded=40"
         )
+    }
+
+    func testSpanCPUFieldsAndUnavailableReadings() {
+        let recorder = Recorder(ticks: [10, 10, 11, 12, 12, 13, 14, 14, 15], readings: [
+            .init(main: 1, process: 5), .init(main: 1.125, process: 5.3),
+            .init(main: nil, process: 6), .init(main: 2, process: nil),
+            .init(main: 5, process: 8), .init(main: 4, process: 7)
+        ])
+        StartupPhaseLog.installForTesting(.init(
+            uptime: { recorder.uptime() }, processStartUptime: 0,
+            emit: { recorder.emit($0) }, cpu: { recorder.cpu() }
+        ))
+        StartupPhaseLog.begin(.appInit).end(extraFields: ["z": 4, "a": 1])
+        StartupPhaseLog.begin(.appInit).end()
+        StartupPhaseLog.begin(.appInit).end()
+        XCTAssertEqual(recorder.emissions[1], "phase=appInit boundary=end elapsed_ms=11000 span_ms=1000 a=1 main_cpu_ms=125 proc_cpu_ms=300 z=4")
+        XCTAssertEqual(recorder.emissions[3], "phase=appInit boundary=end elapsed_ms=13000 span_ms=1000")
+        XCTAssertEqual(recorder.emissions[5], "phase=appInit boundary=end elapsed_ms=15000 span_ms=1000")
+    }
+
+    @MainActor
+    func testRealCPUClocksDistinguishBusyMainThreadFromSleep() throws {
+        XCTAssertTrue(Thread.isMainThread)
+        let recorder = Recorder(ticks: [0])
+        StartupPhaseLog.installForTesting(.init(
+            uptime: { ProcessInfo.processInfo.systemUptime }, processStartUptime: 0,
+            emit: { recorder.emit($0) }, cpu: {
+                .init(main: StartupPhaseLog.mainThreadCPUSeconds(), process: StartupPhaseLog.processCPUSeconds())
+            }
+        ))
+        let busy = StartupPhaseLog.begin(.appInit)
+        let wallStart = ProcessInfo.processInfo.systemUptime
+        var accumulator: UInt64 = 1
+        repeat {
+            for _ in 0 ..< 1000 {
+                accumulator = accumulator &* 1_664_525 &+ 1_013_904_223
+            }
+        } while ProcessInfo.processInfo.systemUptime - wallStart < 0.03
+        busy.end()
+        let sleeping = StartupPhaseLog.begin(.appInit)
+        Thread.sleep(forTimeInterval: 0.06)
+        sleeping.end()
+        func field(_ name: String, in line: String) throws -> Int {
+            let token = try XCTUnwrap(line.split(separator: " ").first { $0.hasPrefix("\(name)=") })
+            return try XCTUnwrap(Int(token.dropFirst(name.count + 1)))
+        }
+        let busyMain = try field("main_cpu_ms", in: recorder.emissions[1])
+        let busyProcess = try field("proc_cpu_ms", in: recorder.emissions[1])
+        let busyWall = try field("span_ms", in: recorder.emissions[1])
+        let sleepMain = try field("main_cpu_ms", in: recorder.emissions[3])
+        let sleepWall = try field("span_ms", in: recorder.emissions[3])
+        XCTAssertNotEqual(accumulator, 0)
+        XCTAssertGreaterThan(busyMain, 5)
+        XCTAssertGreaterThan(Double(busyMain), Double(busyWall) * 0.15)
+        XCTAssertLessThanOrEqual(busyMain, busyWall + 30)
+        XCTAssertGreaterThanOrEqual(busyProcess + 10, busyMain)
+        XCTAssertGreaterThanOrEqual(sleepWall, 50)
+        XCTAssertLessThan(sleepMain, 30)
+    }
+
+    @MainActor
+    func testMainThreadClockCanBeReadOffMain() async throws {
+        let before = try XCTUnwrap(StartupPhaseLog.mainThreadCPUSeconds())
+        let reading = await Task.detached { StartupPhaseLog.mainThreadCPUSeconds() }.value
+        XCTAssertGreaterThanOrEqual(try XCTUnwrap(reading), before)
     }
 
     func testAvailableModelEventEmissionBudget() {
