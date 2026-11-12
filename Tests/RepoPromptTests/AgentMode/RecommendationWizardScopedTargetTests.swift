@@ -544,6 +544,8 @@ final class StartupRecommendationBaselineTests: XCTestCase {
     }
 
     func testRoleOperationPreservesModelParameterPins() throws {
+        CursorDiscoveredCatalogTestSupport.reset()
+        defer { CursorDiscoveredCatalogTestSupport.reset() }
         try withConflictingCodexCatalog {
             let available = AgentModelCatalog.AvailabilityContext(claudeCodeAvailable: true, codexAvailable: true, openCodeAvailable: false, cursorAvailable: true)
             let pin = ACPModelParameterSelection(providerID: .cursor, baseModelRaw: "future-cursor-pin", kind: .thinking, configID: "reasoning_effort", valueRaw: "xhigh")
