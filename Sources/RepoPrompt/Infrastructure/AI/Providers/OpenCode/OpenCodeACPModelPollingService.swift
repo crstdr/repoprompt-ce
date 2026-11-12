@@ -566,6 +566,7 @@ actor OpenCodeACPModelPollingService {
         guard !isShutdown else { return nil }
         let attribution = AgentACPModelRegistry.shared.updateDiscoveredModels(discovered, for: .openCode, jobOrdinal: entry.ordinal)
         let normalized = AgentACPModelRegistry.shared.resolvedSnapshot(for: .openCode)
+        let hadPrior = latest != nil
         let priorWasLive = latest?.isLiveDiscovery == true
         guard let normalized else {
             AgentACPModelRegistry.shared.recordOpenCodeCatalogJob(fields: [
@@ -573,7 +574,7 @@ actor OpenCodeACPModelPollingService {
                 "requested": entry.requestedContext, "actual": entry.actualContext, "outcome": 2,
                 "raw": discovered.options.count, "canonical": attribution.canonicalCount,
                 "changed": attribution.didChange ? 1 : 0, "effectiveChanged": attribution.effectiveChanged ? 1 : 0,
-                "broadcast": 0, "priorLive": priorWasLive ? 1 : 0, "subscribers": catalogContinuations.count
+                "broadcast": 0, "hadPrior": hadPrior ? 1 : 0, "priorLive": priorWasLive ? 1 : 0, "subscribers": catalogContinuations.count
             ])
             return nil
         }
@@ -588,7 +589,7 @@ actor OpenCodeACPModelPollingService {
             "outcome": discovered.options.isEmpty ? 2 : 1,
             "raw": discovered.options.count, "canonical": attribution.canonicalCount,
             "changed": attribution.didChange ? 1 : 0, "effectiveChanged": attribution.effectiveChanged ? 1 : 0,
-            "broadcast": shouldBroadcast ? 1 : 0, "priorLive": priorWasLive ? 1 : 0,
+            "broadcast": shouldBroadcast ? 1 : 0, "hadPrior": hadPrior ? 1 : 0, "priorLive": priorWasLive ? 1 : 0,
             "subscribers": catalogContinuations.count
         ])
         if shouldBroadcast {

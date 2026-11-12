@@ -203,6 +203,34 @@ final class AgentRepromptSettingsTests: XCTestCase {
         await service.shutdown()
     }
 
+    func testOpenCodeParameterJobLogsBootstrapCatalog() async throws {
+        AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
+        AgentACPModelRegistry.shared.installOpenCodeCatalogJobRecorder { fields in
+            StartupPhaseLog.mark(.openCodeCatalogJob, fields: fields)
+        }
+        defer {
+            AgentACPModelRegistry.shared.installOpenCodeCatalogJobRecorder(nil)
+            AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
+            StartupPhaseLog.resetForTesting()
+        }
+        let recorder = StartupRecorder()
+        StartupPhaseLog.installForTesting(.init(
+            uptime: { ProcessInfo.processInfo.systemUptime }, processStartUptime: 0,
+            emit: { recorder.append($0) }
+        ))
+        let service = OpenCodeACPModelPollingService(client: ContextCatalogClient())
+        addTeardownBlock { await service.shutdown() }
+        _ = try await service.discoverModelParametersOnce(workspacePath: "/workspace-b", modelRaw: "private-model", forceRefresh: true)
+        let jobs = recorder.jobs()
+        XCTAssertEqual(jobs.count, 1)
+        let job = try XCTUnwrap(jobs.first)
+        XCTAssertTrue(job.contains("kind=2 ") && job.contains("origin=16 "))
+        XCTAssertTrue(job.contains("hadPrior=0 ") && job.contains("priorLive=0 "))
+        XCTAssertFalse(job.contains("private-model"))
+        XCTAssertFalse(job.contains("workspace-b"))
+        await service.shutdown()
+    }
+
     func testAvailableModelEqualityCostForLargeIndependentArrays() {
         let left: [AIModel] = (0 ..< 355).map { .openaiCustom(name: "model-\($0)") }
         let right: [AIModel] = (0 ..< 355).map { .openaiCustom(name: "model-\($0)") }
