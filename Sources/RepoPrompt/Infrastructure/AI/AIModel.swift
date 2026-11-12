@@ -1595,7 +1595,7 @@ public enum AIModel: Equatable, Hashable {
         return modelData.first(where: { $0.value.rawValue == normalizedRawValue })?.key
     }
 
-    static func modelsForProvider(_ provider: AIProviderType) -> [AIModel] {
+    static func modelsForProvider(_ provider: AIProviderType, reportOpenCodeJob: ((Int) -> Void)? = nil) -> [AIModel] {
         let models: [AIModel]
         switch provider {
         case .anthropic:
@@ -1634,7 +1634,7 @@ public enum AIModel: Equatable, Hashable {
         case .codex:
             models = codexModelsForPicker()
         case .openCode:
-            models = ACPAIModelCatalog.openCodeModelsFromStore()
+            models = ACPAIModelCatalog.openCodeModelsFromStore(reportJob: reportOpenCodeJob)
         case .cursor:
             models = ACPAIModelCatalog.cursorModelsFromStore()
         case .grokBuild:

@@ -386,8 +386,10 @@ enum ACPAIModelCatalog {
         AgentACPModelRegistry.shared.resolvedSnapshot(for: .openCode)?.options ?? []
     }
 
-    static func openCodeModelsFromStore() -> [AIModel] {
-        openCodeModelOptionsFromStore().map { .openCodeCustom(name: $0.rawValue) }
+    static func openCodeModelsFromStore(reportJob: ((Int) -> Void)? = nil) -> [AIModel] {
+        let (snapshot, job) = AgentACPModelRegistry.shared.openCodeSnapshotWithJobOrdinal()
+        reportJob?(job)
+        return (snapshot?.options ?? []).map { .openCodeCustom(name: $0.rawValue) }
     }
 
     static func cursorModelsFromStore() -> [AIModel] {

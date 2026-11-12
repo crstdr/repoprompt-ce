@@ -228,6 +228,10 @@ enum AvailableModelsUpdateTrigger: Int, CaseIterable {
     case providerModelSubscription = 25
 }
 
+enum AvailableModelsUpdateSource: Int {
+    case none = 0, openCode = 1, cursor = 2, grokBuild = 3, codex = 4
+}
+
 @MainActor
 public class APISettingsViewModel: ObservableObject {
     @Published var openRouterConfig: OpenRouterConfiguration = ProviderConfigurationManager.shared.getOpenRouterConfiguration() {
@@ -1127,7 +1131,7 @@ public class APISettingsViewModel: ObservableObject {
         await updateAvailableModels(trigger: trigger)
     }
 
-    private let recordAvailableModelsUpdate: (AvailableModelsUpdateTrigger, Int, Int, Int, Bool) -> Void
+    private let recordAvailableModelsUpdate: (AvailableModelsUpdateTrigger, Int, Int, Int, Bool, Int, Int, Int, Int) -> Void
     private var hasPublishedAvailableModels = false
     private let aiQueriesService: AIQueriesService
     private let keyManager: KeyManager
@@ -1145,7 +1149,7 @@ public class APISettingsViewModel: ObservableObject {
     init(
         aiQueriesService: AIQueriesService,
         keyManager: KeyManager,
-        recordAvailableModelsUpdate: @escaping (AvailableModelsUpdateTrigger, Int, Int, Int, Bool) -> Void = { _, _, _, _, _ in },
+        recordAvailableModelsUpdate: @escaping (AvailableModelsUpdateTrigger, Int, Int, Int, Bool, Int, Int, Int, Int) -> Void = { _, _, _, _, _, _, _, _, _ in },
         loadStoredDataOnInit: Bool = true,
         codexModelPollingService: CodexModelPollingService = .shared,
         cursorModelPollingService: CursorACPModelPollingService = .shared,
@@ -1946,11 +1950,12 @@ public class APISettingsViewModel: ObservableObject {
         }
     }
 
-    func updateAvailableModels(trigger: AvailableModelsUpdateTrigger) async {
+    func updateAvailableModels(trigger: AvailableModelsUpdateTrigger, sourceProvider: AvailableModelsUpdateSource = .none, openCodeDelivery: Int = 0) async {
         let start = ProcessInfo.processInfo.systemUptime
         let previous = availableModels
         let hadPrevious = hasPublishedAvailableModels
         var modelSet = Set<AIModel>()
+        var openCodeJob = 0
 
         // ── Key-/token-based providers ─────────────────────────────────────────
         if isAnthropicKeyValid {
@@ -2058,7 +2063,7 @@ public class APISettingsViewModel: ObservableObject {
         }
 
         if isOpenCodeConnected {
-            modelSet.formUnion(AIModel.modelsForProvider(.openCode))
+            modelSet.formUnion(AIModel.modelsForProvider(.openCode, reportOpenCodeJob: { openCodeJob = $0 }))
         }
 
         if isCursorConnected {
@@ -2101,7 +2106,7 @@ public class APISettingsViewModel: ObservableObject {
         hasPublishedAvailableModels = true
         let sameAsPrevious = hadPrevious && previous == nextModels
         let duration = Int(max(0, (ProcessInfo.processInfo.systemUptime - start) * 1000).rounded())
-        recordAvailableModelsUpdate(trigger, duration, nextModels.count, sortedProviders.count, sameAsPrevious)
+        recordAvailableModelsUpdate(trigger, duration, nextModels.count, sortedProviders.count, sameAsPrevious, sourceProvider.rawValue, openCodeJob, groupedByProvider[.openCode]?.count ?? 0, openCodeDelivery)
     }
 
     func updateOllamaModel(_ newModel: String) {
@@ -3844,7 +3849,7 @@ public class APISettingsViewModel: ObservableObject {
                         setContextBuilderProviderVerified(.openCode, verified: true)
                     }
                 }
-                await self?.updateAvailableModels(trigger: .providerModelSubscription)
+                await self?.updateAvailableModels(trigger: .providerModelSubscription, sourceProvider: .openCode, openCodeDelivery: snapshot.isReplay ? 2 : 1)
             }
         }
     }
@@ -4020,7 +4025,7 @@ public class APISettingsViewModel: ObservableObject {
                         setContextBuilderProviderVerified(.cursor, verified: true)
                     }
                 }
-                await self?.updateAvailableModels(trigger: .providerModelSubscription)
+                await self?.updateAvailableModels(trigger: .providerModelSubscription, sourceProvider: .cursor)
             }
         }
     }
@@ -4177,7 +4182,7 @@ public class APISettingsViewModel: ObservableObject {
                         setContextBuilderProviderVerified(.grokBuild, verified: true)
                     }
                 }
-                await self?.updateAvailableModels(trigger: .providerModelSubscription)
+                await self?.updateAvailableModels(trigger: .providerModelSubscription, sourceProvider: .grokBuild)
             }
         }
     }
@@ -4364,7 +4369,7 @@ public class APISettingsViewModel: ObservableObject {
                     return true
                 }
                 guard didPublish else { continue }
-                await updateAvailableModels(trigger: .providerModelSubscription)
+                await updateAvailableModels(trigger: .providerModelSubscription, sourceProvider: .codex)
             }
         }
     }

@@ -5,6 +5,8 @@ final class AgentACPModelRegistry {
     static let shared = AgentACPModelRegistry()
 
     private let lock = NSLock()
+    private var openCodeCatalogJobOrdinal = 0
+    private var openCodeCatalogJobRecorder: (@Sendable ([String: Int]) -> Void)?
     private var liveSnapshotsByProvider: [ACPProviderID: ACPDiscoveredSessionModels] = [:]
     private var liveSignaturesByProvider: [ACPProviderID: ACPDynamicProviderRecord] = [:]
     private var persistedSnapshotsByProvider: [ACPProviderID: ACPDiscoveredSessionModels] = [:]
@@ -18,34 +20,67 @@ final class AgentACPModelRegistry {
 
     private init() {}
 
+    struct CatalogUpdateAttribution {
+        let didChange: Bool
+        let effectiveChanged: Bool
+        let canonicalCount: Int
+    }
+
+    func installOpenCodeCatalogJobRecorder(_ recorder: (@Sendable ([String: Int]) -> Void)?) {
+        lock.withLock { openCodeCatalogJobRecorder = recorder }
+    }
+
+    func recordOpenCodeCatalogJob(fields: [String: Int]) {
+        let recorder = lock.withLock { openCodeCatalogJobRecorder }
+        recorder?(fields)
+    }
+
     @discardableResult
     func updateDiscoveredModels(
         _ snapshot: ACPDiscoveredSessionModels,
         for providerID: ACPProviderID
     ) -> Bool {
+        updateDiscoveredModels(snapshot, for: providerID, jobOrdinal: 0).didChange
+    }
+
+    func updateDiscoveredModels(
+        _ snapshot: ACPDiscoveredSessionModels,
+        for providerID: ACPProviderID,
+        jobOrdinal: Int
+    ) -> CatalogUpdateAttribution {
         guard let providerRecord = ACPDynamicModelStore.canonicalProviderRecord(
             from: snapshot,
             providerID: providerID
         ),
             let normalizedSnapshot = ACPDynamicModelStore.snapshot(from: providerRecord)
         else {
-            return false
+            return CatalogUpdateAttribution(didChange: false, effectiveChanged: false, canonicalCount: 0)
         }
 
         lock.lock()
+        let previous = providerID == .openCode ? (liveSnapshotsByProvider[providerID] ?? persistedSnapshotsByProvider[providerID]) : nil
         let didChange = liveSignaturesByProvider[providerID] != providerRecord
         if didChange {
             liveSnapshotsByProvider[providerID] = normalizedSnapshot
             liveSignaturesByProvider[providerID] = providerRecord
         }
         persistedSnapshotsByProvider[providerID] = normalizedSnapshot
+        let effectiveChanged = providerID == .openCode && previous != (liveSnapshotsByProvider[providerID] ?? persistedSnapshotsByProvider[providerID])
+        if providerID == .openCode, didChange || effectiveChanged {
+            openCodeCatalogJobOrdinal = jobOrdinal
+        }
         if providerID == .devin { refreshDevinCatalogIfNeededLocked() }
         lock.unlock()
 
-        guard didChange else { return false }
-        invalidateAdvertisedModels(for: providerID)
-        ACPDynamicModelStore.save(normalizedSnapshot, for: providerID)
-        return true
+        if didChange {
+            invalidateAdvertisedModels(for: providerID)
+            ACPDynamicModelStore.save(normalizedSnapshot, for: providerID)
+        }
+        return CatalogUpdateAttribution(
+            didChange: didChange,
+            effectiveChanged: effectiveChanged,
+            canonicalCount: normalizedSnapshot.options.count
+        )
     }
 
     private func invalidateAdvertisedModels(for providerID: ACPProviderID) {
@@ -62,6 +97,12 @@ final class AgentACPModelRegistry {
 
     func resolvedSnapshot(for providerID: ACPProviderID) -> ACPDiscoveredSessionModels? {
         snapshotFromMemory(for: providerID)
+    }
+
+    func openCodeSnapshotWithJobOrdinal() -> (ACPDiscoveredSessionModels?, Int) {
+        lock.withLock {
+            (liveSnapshotsByProvider[.openCode] ?? persistedSnapshotsByProvider[.openCode], openCodeCatalogJobOrdinal)
+        }
     }
 
     func currentDevinCatalog() -> DevinModelCatalog {
@@ -107,6 +148,7 @@ final class AgentACPModelRegistry {
                 invalidateAdvertisedModels(for: providerID)
             }
             persistedSnapshotsByProvider = loadedSnapshots
+            if liveSnapshotsByProvider[.openCode] == nil { openCodeCatalogJobOrdinal = 0 }
             refreshDevinCatalogIfNeededLocked()
             didWarmStandardStore = true
             standardStoreWarmTask = nil
@@ -148,6 +190,7 @@ final class AgentACPModelRegistry {
             liveSnapshotsByProvider.removeValue(forKey: providerID)
             liveSignaturesByProvider.removeValue(forKey: providerID)
             persistedSnapshotsByProvider.removeValue(forKey: providerID)
+            if providerID == .openCode { openCodeCatalogJobOrdinal = 0 }
             if providerID == .devin { refreshDevinCatalogIfNeededLocked() }
             standardStoreWarmTask?.cancel()
             standardStoreWarmTask = nil
@@ -167,6 +210,7 @@ final class AgentACPModelRegistry {
             liveSnapshotsByProvider.removeValue(forKey: providerID)
             liveSignaturesByProvider.removeValue(forKey: providerID)
             persistedSnapshotsByProvider.removeValue(forKey: providerID)
+            if providerID == .openCode { openCodeCatalogJobOrdinal = 0 }
             if providerID == .devin { refreshDevinCatalogIfNeededLocked() }
             standardStoreWarmTask?.cancel()
             standardStoreWarmTask = nil

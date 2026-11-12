@@ -94,6 +94,9 @@ struct RepoPromptSwiftUIApp: App {
 
         telemetrySpan.end()
         let recorderSpan = StartupPhaseLog.begin(.appRecorderInstallation)
+        AgentACPModelRegistry.shared.installOpenCodeCatalogJobRecorder { fields in
+            StartupPhaseLog.mark(.openCodeCatalogJob, fields: fields)
+        }
         AgentSessionDataService.shared.installRestorePerfRecorder(AppWorkspaceRestorePerfRecorder())
         AgentSessionDataService.shared.installPerfRecorder(AppAgentModePerfRecorder())
         AgentRunCoordinator.shared.installPerfRecorder(AppAgentModePerfRecorder())

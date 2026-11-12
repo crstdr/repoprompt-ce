@@ -1,5 +1,5 @@
 import Foundation
-@testable import RepoPromptApp
+@_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
 import SwiftUI
@@ -7,6 +7,16 @@ import XCTest
 
 @MainActor
 final class AgentRepromptSettingsTests: XCTestCase {
+    private struct ContextCatalogClient: OpenCodeACPModelDiscoveryClient {
+        func discoverModels(workspacePath: String?, modelRaw _: String?) async throws -> OpenCodeACPModelDiscoveryResult? {
+            let name = workspacePath?.hasSuffix("workspace-b") == true ? "catalog-b" : "catalog-a"
+            let options: [AgentModelOption] = [
+                .init(rawValue: name, displayName: name, description: nil, isPlaceholderDefault: false, isProviderDefault: true)
+            ]
+            return OpenCodeACPModelDiscoveryResult(catalog: ACPDiscoveredSessionModels(options: options, currentModelRaw: name), parameterState: nil)
+        }
+    }
+
     private final class StartupRecorder: @unchecked Sendable {
         private let lock = NSLock()
         private var lines: [String] = []
@@ -21,6 +31,12 @@ final class AgentRepromptSettingsTests: XCTestCase {
             lock.lock()
             defer { lock.unlock() }
             return lines.filter { $0.contains("phase=availableModelsUpdate ") }
+        }
+
+        func jobs() -> [String] {
+            lock.lock()
+            defer { lock.unlock() }
+            return lines.filter { $0.contains("phase=openCodeCatalogJob ") }
         }
     }
 
@@ -44,9 +60,9 @@ final class AgentRepromptSettingsTests: XCTestCase {
         XCTAssertEqual(lines.count, 3)
         guard lines.count == 3 else { return }
         XCTAssertTrue(lines[0].contains("window=19 "))
-        XCTAssertTrue(lines[0].contains("sameAsPrevious=0 trigger=1"))
-        XCTAssertTrue(lines[1].contains("sameAsPrevious=1 trigger=2"))
-        XCTAssertTrue(lines[2].contains("sameAsPrevious=0 trigger=7"))
+        XCTAssertTrue(lines[0].contains("sameAsPrevious=0 ") && lines[0].hasSuffix("trigger=1"))
+        XCTAssertTrue(lines[1].contains("sameAsPrevious=1 ") && lines[1].hasSuffix("trigger=2"))
+        XCTAssertTrue(lines[2].contains("sameAsPrevious=0 ") && lines[2].hasSuffix("trigger=7"))
         XCTAssertTrue(lines[2].contains("models=\(api.availableModels.count) "))
         let groupCount = Set(api.availableModels.map(\.providerType)).count
         XCTAssertTrue(lines[2].contains("groups=\(groupCount) "))
@@ -70,7 +86,7 @@ final class AgentRepromptSettingsTests: XCTestCase {
         XCTAssertEqual(lines.count, 25)
         for (line, trigger) in zip(lines, AvailableModelsUpdateTrigger.allCases) {
             let keys = Set(line.split(separator: " ").compactMap { $0.split(separator: "=", maxSplits: 1).first }.map(String.init))
-            XCTAssertEqual(keys, ["phase", "boundary", "window", "elapsed_ms", "duration_ms", "groups", "models", "sameAsPrevious", "trigger"])
+            XCTAssertEqual(keys, ["phase", "boundary", "window", "elapsed_ms", "duration_ms", "groups", "models", "sameAsPrevious", "trigger", "sourceProvider", "openCodeJob", "openCodeModels", "openCodeDelivery"])
             XCTAssertTrue(line.hasSuffix("trigger=\(trigger.rawValue)"))
             XCTAssertNotNil(line.wholeMatch(of: #/^phase=availableModelsUpdate boundary=event window=20 elapsed_ms=\d+( [a-zA-Z0-9_]+=\d+)*$/#))
         }
@@ -122,6 +138,69 @@ final class AgentRepromptSettingsTests: XCTestCase {
         XCTAssertEqual(lines.count, 252)
         XCTAssertLessThan(elapsed, 5)
         print("picker attribution fixture: owners=36 updates=252 lines=\(lines.count) wall_ms=\(elapsed * 1000)")
+    }
+
+    func testOpenCodeCatalogChangesFanOutToThirtySixOwners() async throws {
+        AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
+        AgentACPModelRegistry.shared.installOpenCodeCatalogJobRecorder { fields in
+            StartupPhaseLog.mark(.openCodeCatalogJob, fields: fields)
+        }
+        defer {
+            AgentACPModelRegistry.shared.installOpenCodeCatalogJobRecorder(nil)
+            AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
+        }
+        let recorder = StartupRecorder()
+        StartupPhaseLog.installForTesting(.init(
+            uptime: { ProcessInfo.processInfo.systemUptime }, processStartUptime: 0,
+            emit: { recorder.append($0) }
+        ))
+        defer { StartupPhaseLog.resetForTesting() }
+        let service = OpenCodeACPModelPollingService(client: ContextCatalogClient())
+        addTeardownBlock { await service.shutdown() }
+        var owners: [APISettingsViewModel] = []
+        var iterators: [AsyncStream<OpenCodeACPModelPollingService.Snapshot>.Iterator] = []
+        for window in 1 ... 36 {
+            let (_, api) = try fixture(window: window)
+            api.isOpenCodeConnected = true
+            owners.append(api)
+            let stream = await service.subscribe(workspacePath: nil)
+            iterators.append(stream.makeAsyncIterator())
+        }
+        defer { owners.forEach { $0.prepareForWindowClose() } }
+        _ = try await service.discoverOnce(workspacePath: nil)
+        for index in iterators.indices {
+            let snapshot = await iterators[index].next()
+            XCTAssertEqual(snapshot?.models.options.first?.rawValue, "catalog-a")
+            await owners[index].updateAvailableModels(trigger: .providerModelSubscription, sourceProvider: .openCode, openCodeDelivery: snapshot?.isReplay == true ? 2 : 1)
+        }
+        for (path, expected) in [("/workspace-b", "catalog-b"), ("/workspace-a", "catalog-a")] {
+            _ = try await service.discoverOnce(workspacePath: path)
+            XCTAssertEqual(AgentACPModelRegistry.shared.resolvedSnapshot(for: .openCode)?.options.first?.rawValue, expected)
+            for index in iterators.indices {
+                let snapshot = await iterators[index].next()
+                XCTAssertEqual(snapshot?.models.options.first?.rawValue, expected)
+                await owners[index].updateAvailableModels(trigger: .providerModelSubscription, sourceProvider: .openCode, openCodeDelivery: 1)
+            }
+        }
+        let lines = recorder.snapshot()
+        XCTAssertEqual(lines.count, 108)
+        XCTAssertTrue(lines.allSatisfy { $0.contains("openCodeModels=1") && $0.contains("sourceProvider=1") })
+        let jobs = recorder.jobs()
+        let bJob = try XCTUnwrap(jobs.last { $0.contains("actual=1 ") && $0.contains("origin=4 ") })
+        let aJob = try XCTUnwrap(jobs.last { $0.contains("actual=2 ") && $0.contains("origin=4 ") })
+        func jobOrdinal(_ line: String) -> String? {
+            line.split(separator: " ").first { $0.hasPrefix("job=") }.map { String($0.dropFirst(4)) }
+        }
+        let bOrdinal = try XCTUnwrap(jobOrdinal(bJob))
+        let aOrdinal = try XCTUnwrap(jobOrdinal(aJob))
+        XCTAssertTrue(lines.dropFirst(36).prefix(36).allSatisfy { $0.contains("openCodeJob=\(bOrdinal) ") })
+        XCTAssertTrue(lines.suffix(36).allSatisfy { $0.contains("openCodeJob=\(aOrdinal) ") })
+        XCTAssertTrue([bJob, aJob].allSatisfy { $0.contains("broadcast=1 ") && $0.contains("canonical=1 ") && $0.contains("effectiveChanged=1 ") })
+        XCTAssertFalse(jobs.joined().contains("workspace-"))
+        XCTAssertFalse(jobs.joined().contains("catalog-"))
+        print("openCode attribution job sample: \(bJob)")
+        if let line = lines.dropFirst(36).first { print("openCode attribution update sample: \(line)") }
+        await service.shutdown()
     }
 
     func testAvailableModelEqualityCostForLargeIndependentArrays() {
