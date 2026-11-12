@@ -252,6 +252,17 @@ actor OpenCodeACPModelPollingService {
         let models: ACPDiscoveredSessionModels
         let fetchedAt: Date
         let isLiveDiscovery: Bool
+        var isReplay = false
+
+        static func == (lhs: Snapshot, rhs: Snapshot) -> Bool {
+            lhs.models == rhs.models && lhs.fetchedAt == rhs.fetchedAt && lhs.isLiveDiscovery == rhs.isLiveDiscovery
+        }
+
+        func replayed() -> Snapshot {
+            var copy = self
+            copy.isReplay = true
+            return copy
+        }
     }
 
     private let client: any OpenCodeACPModelDiscoveryClient
@@ -263,6 +274,17 @@ actor OpenCodeACPModelPollingService {
 
     /// Demand-scoped parameter observations, keyed by (workspace, canonical model).
     private var observations: [OpenCodeACPModelParameterKey: Observation] = [:]
+
+    /// Bit values are stable startup-log codes; coalesced jobs can have multiple origins.
+    private enum JobOrigin: Int {
+        case subscription = 1
+        case parameterProbe = 2
+        case discovery = 4
+        case refresh = 8
+        case mcpOneShot = 16
+        case parameterRefresh = 32
+        case periodic = 64
+    }
 
     // MARK: Job runner state (FIFO queue + single active + per-key coalescing)
 
@@ -280,6 +302,17 @@ actor OpenCodeACPModelPollingService {
 
     private var preferredWorkspacePath: String?
     private var isShutdown = false
+    private var nextCatalogJobOrdinal = 0
+    private var contextOrdinals: [String: Int] = [:]
+
+    private func contextOrdinal(_ workspace: String?) -> Int {
+        guard let workspace else { return 0 }
+        if let ordinal = contextOrdinals[workspace] { return ordinal }
+        guard contextOrdinals.count < 256 else { return 257 }
+        let ordinal = contextOrdinals.count + 1
+        contextOrdinals[workspace] = ordinal
+        return ordinal
+    }
 
     init(
         client: any OpenCodeACPModelDiscoveryClient,
@@ -308,7 +341,7 @@ actor OpenCodeACPModelPollingService {
         guard !isShutdown else { return nil }
         let workspace = OpenCodeACPModelParameterKey.normalizedWorkspacePath(workspacePath)
         preferredWorkspacePath = workspace
-        return try await awaitCatalogJob(workspace: workspace).snapshot
+        return try await awaitCatalogJob(workspace: workspace, origin: .discovery).snapshot
     }
 
     func subscribe(workspacePath: String?) async -> AsyncStream<Snapshot> {
@@ -316,7 +349,8 @@ actor OpenCodeACPModelPollingService {
             return AsyncStream { continuation in continuation.finish() }
         }
 
-        preferredWorkspacePath = OpenCodeACPModelParameterKey.normalizedWorkspacePath(workspacePath)
+        let requestedWorkspace = OpenCodeACPModelParameterKey.normalizedWorkspacePath(workspacePath)
+        preferredWorkspacePath = requestedWorkspace
         let id = UUID()
         let (stream, continuation) = AsyncStream<Snapshot>.makeStream(bufferingPolicy: .bufferingNewest(1))
         catalogContinuations[id] = continuation
@@ -325,7 +359,7 @@ actor OpenCodeACPModelPollingService {
         }
 
         if let latest {
-            continuation.yield(latest)
+            continuation.yield(latest.replayed())
         } else if let cached = await registrySnapshotAfterWarmingStore() {
             guard !isShutdown else {
                 continuation.finish()
@@ -335,7 +369,7 @@ actor OpenCodeACPModelPollingService {
                 latest = cached
             }
             if let latest {
-                continuation.yield(latest)
+                continuation.yield(latest.replayed())
             }
         }
 
@@ -343,7 +377,7 @@ actor OpenCodeACPModelPollingService {
         // New catalog interest -> enqueue a catalog refresh for the preferred workspace and
         // ensure the periodic refresh loop is running while interest exists. Publication of
         // that refresh's result is owned by job completion, not by this caller.
-        enqueueJob(.catalog(workspacePath: preferredWorkspacePath))
+        enqueueJob(.catalog(workspacePath: preferredWorkspacePath), origin: .subscription, requestedWorkspace: requestedWorkspace)
         updateRefreshLoop()
         return stream
     }
@@ -354,7 +388,7 @@ actor OpenCodeACPModelPollingService {
         preferredWorkspacePath = workspace
         let previous = AgentACPModelRegistry.shared.resolvedSnapshot(for: .openCode)
         do {
-            let result = try await awaitCatalogJob(workspace: workspace)
+            let result = try await awaitCatalogJob(workspace: workspace, origin: .refresh)
             guard result.didObtainCatalog else {
                 return Task.isCancelled ? .cancelled : .failed
             }
@@ -408,7 +442,7 @@ actor OpenCodeACPModelPollingService {
             continuation.yield(latest)
         }
         if !hadPriorObservation {
-            probeObservationIfNeeded(key: key)
+            probeObservationIfNeeded(key: key, origin: .parameterProbe)
         }
         return stream
     }
@@ -458,7 +492,7 @@ actor OpenCodeACPModelPollingService {
                 var observation = observations[key] ?? Observation()
                 observation.oneShotWaiters[waiterID] = continuation
                 observations[key] = observation
-                probeObservationIfNeeded(key: key)
+                probeObservationIfNeeded(key: key, origin: .mcpOneShot)
             }
         } onCancel: {
             Task { await self.cancelOneShotWaiter(key: key, id: waiterID) }
@@ -528,15 +562,36 @@ actor OpenCodeACPModelPollingService {
     /// subscriber-triggered and periodic refreshes — publishes exactly once even when no
     /// foreground caller is waiting. Returns `nil` after shutdown (no publication).
     @discardableResult
-    private func publishCatalog(_ discovered: ACPDiscoveredSessionModels) -> Snapshot? {
+    private func publishCatalog(_ discovered: ACPDiscoveredSessionModels, entry: JobEntry, key: JobKey) -> Snapshot? {
         guard !isShutdown else { return nil }
-        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(discovered, for: .openCode)
-        guard let normalized = AgentACPModelRegistry.shared.resolvedSnapshot(for: .openCode) else { return nil }
+        let attribution = AgentACPModelRegistry.shared.updateDiscoveredModels(discovered, for: .openCode, jobOrdinal: entry.ordinal)
+        let normalized = AgentACPModelRegistry.shared.resolvedSnapshot(for: .openCode)
+        let hadPrior = latest != nil
+        let priorWasLive = latest?.isLiveDiscovery == true
+        guard let normalized else {
+            AgentACPModelRegistry.shared.recordOpenCodeCatalogJob(fields: [
+                "job": entry.ordinal, "kind": key.parameterKey == nil ? 1 : 2, "origin": entry.origins,
+                "requested": entry.requestedContext, "actual": entry.actualContext, "outcome": 2,
+                "raw": discovered.options.count, "canonical": attribution.canonicalCount,
+                "changed": attribution.didChange ? 1 : 0, "effectiveChanged": attribution.effectiveChanged ? 1 : 0,
+                "broadcast": 0, "hadPrior": hadPrior ? 1 : 0, "priorLive": priorWasLive ? 1 : 0, "subscribers": catalogContinuations.count
+            ])
+            return nil
+        }
         let snapshot = Snapshot(models: normalized, fetchedAt: Date(), isLiveDiscovery: true)
         // The registry was updated unconditionally above; the model-equality guard only avoids
         // redundant subscriber spam. The fresh snapshot is still recorded in `latest`.
         let shouldBroadcast = latest?.models != snapshot.models || latest?.isLiveDiscovery == false
         latest = snapshot
+        AgentACPModelRegistry.shared.recordOpenCodeCatalogJob(fields: [
+            "job": entry.ordinal, "kind": key.parameterKey == nil ? 1 : 2, "origin": entry.origins,
+            "requested": entry.requestedContext, "actual": entry.actualContext,
+            "outcome": discovered.options.isEmpty ? 2 : 1,
+            "raw": discovered.options.count, "canonical": attribution.canonicalCount,
+            "changed": attribution.didChange ? 1 : 0, "effectiveChanged": attribution.effectiveChanged ? 1 : 0,
+            "broadcast": shouldBroadcast ? 1 : 0, "hadPrior": hadPrior ? 1 : 0, "priorLive": priorWasLive ? 1 : 0,
+            "subscribers": catalogContinuations.count
+        ])
         if shouldBroadcast {
             for continuation in catalogContinuations.values {
                 continuation.yield(snapshot)
@@ -557,17 +612,21 @@ actor OpenCodeACPModelPollingService {
     /// Publish `.loading` and enqueue a probe for the key, unless a job for this exact key is
     /// already queued (a queued identical probe is a valid forthcoming result, so an owner
     /// simply joins it without forcing a duplicate probe).
-    private func probeObservationIfNeeded(key: OpenCodeACPModelParameterKey) {
+    private func probeObservationIfNeeded(key: OpenCodeACPModelParameterKey, origin: JobOrigin) {
         guard !isShutdown, var observation = observations[key] else { return }
         let jobKey = JobKey.parameter(key)
-        guard jobsByKey[jobKey] == nil else { return } // identical probe already queued/active
+        if var existing = jobsByKey[jobKey] {
+            existing.origins |= origin.rawValue
+            jobsByKey[jobKey] = existing
+            return
+        } // identical probe already queued/active
         let loading = OpenCodeACPModelParameterSnapshot(key: key, state: .loading, updatedAt: Date())
         observation.latest = loading
         observations[key] = observation
         for continuation in observation.subscribers.values {
             continuation.yield(loading)
         }
-        enqueueJob(jobKey)
+        enqueueJob(jobKey, origin: origin, requestedWorkspace: key.workspacePath)
     }
 
     /// Re-probe the owned parameter observations for a workspace, driven by `refreshNow`'s
@@ -577,7 +636,7 @@ actor OpenCodeACPModelPollingService {
         for (key, observation) in observations where key.workspacePath == workspace {
             pruneJobIfUnowned(key: key, observation: observation)
             guard observation.subscribers.isEmpty == false || observation.oneShotWaiters.isEmpty == false else { continue }
-            probeObservationIfNeeded(key: key)
+            probeObservationIfNeeded(key: key, origin: .parameterRefresh)
         }
     }
 
@@ -644,7 +703,7 @@ actor OpenCodeACPModelPollingService {
     /// periodically re-probed (see `refreshTask`).
     private func performPeriodicRefresh() {
         guard !isShutdown, !catalogContinuations.isEmpty else { return }
-        enqueueJob(.catalog(workspacePath: preferredWorkspacePath))
+        enqueueJob(.catalog(workspacePath: preferredWorkspacePath), origin: .periodic, requestedWorkspace: preferredWorkspacePath)
     }
 
     // MARK: - Parameter outcome delivery (runner, on-actor)
@@ -713,12 +772,23 @@ actor OpenCodeACPModelPollingService {
     /// result/error. Jobs are run one at a time from the FIFO queue.
     private struct JobEntry {
         var catalogWaiters: [CatalogWaiter] = []
+        let ordinal: Int
+        var origins: Int
+        var requestedContext: Int
+        let actualContext: Int
     }
 
-    private func enqueueJob(_ key: JobKey) {
+    private func enqueueJob(_ key: JobKey, origin: JobOrigin, requestedWorkspace: String?) {
         guard !isShutdown else { return }
-        guard jobsByKey[key] == nil else { return } // identical job coalesces
-        jobsByKey[key] = JobEntry()
+        let requested = contextOrdinal(requestedWorkspace)
+        if var existing = jobsByKey[key] {
+            existing.origins |= origin.rawValue
+            if existing.requestedContext != requested { existing.requestedContext = 257 }
+            jobsByKey[key] = existing
+            return
+        }
+        nextCatalogJobOrdinal += 1
+        jobsByKey[key] = JobEntry(ordinal: nextCatalogJobOrdinal, origins: origin.rawValue, requestedContext: requested, actualContext: contextOrdinal(key.workspacePath))
         queuedKeys.append(key)
         pumpRunner()
     }
@@ -773,7 +843,7 @@ actor OpenCodeACPModelPollingService {
             // with that same value rather than `awaitCatalogJob` reconstructing a second one.
             let catalogResult = if let catalog = value?.catalog {
                 CatalogRefreshResult(
-                    snapshot: publishCatalog(catalog),
+                    snapshot: entry.flatMap { publishCatalog(catalog, entry: $0, key: key) },
                     didObtainCatalog: true,
                     didAdvertiseModels: !catalog.options.isEmpty
                 )
@@ -819,7 +889,7 @@ actor OpenCodeACPModelPollingService {
     /// Join (or start) the catalog job for a workspace. Foreground callers receive this job's
     /// real result/error. Cancellation withdraws only this caller's waiter; the shared job keeps
     /// running for other owners.
-    private func awaitCatalogJob(workspace: String?) async throws -> CatalogRefreshResult {
+    private func awaitCatalogJob(workspace: String?, origin: JobOrigin) async throws -> CatalogRefreshResult {
         try Task.checkCancellation()
         guard !isShutdown else { throw CancellationError() }
         let key = JobKey.catalog(workspacePath: workspace)
@@ -839,7 +909,7 @@ actor OpenCodeACPModelPollingService {
                 // Enqueue first so the entry exists, then append the waiter. Registration is
                 // atomic on the actor: `finishJob` runs on the actor too, so it cannot drop
                 // this waiter between enqueue and append.
-                enqueueJob(key)
+                enqueueJob(key, origin: origin, requestedWorkspace: workspace)
                 jobsByKey[key]?.catalogWaiters.append(CatalogWaiter(id: waiterID, continuation: continuation))
             }
         } onCancel: {
