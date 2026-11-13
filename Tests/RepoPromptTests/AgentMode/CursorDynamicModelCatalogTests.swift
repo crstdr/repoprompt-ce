@@ -1,3 +1,4 @@
+import Darwin
 import MCP
 import RepoPromptSettingsCore
 import XCTest
@@ -984,6 +985,67 @@ final class CursorDynamicModelCatalogTests: XCTestCase {
             AgentModelCatalog.defaultModelRaw(for: .grokBuild, availability: grokAvailability)
         )
         XCTAssertNotEqual(normalized.modelRaw, "not-a-grok-build-model")
+    }
+
+    func testPickerLabelsMatchUnindexedProjection() {
+        let options = (0 ..< 80).map { discoveredOption("model-\($0)", "Model \($0)") } + [
+            discoveredOption("grok-4.6", "Grok first"),
+            discoveredOption("cursor-grok-4.6", "Grok duplicate"),
+            discoveredOption("model[effort=high]", "Literal brackets"),
+            discoveredOption("default", "Auto")
+        ]
+        seedCursorCatalog(
+            options: options, currentModelRaw: "grok-4.6",
+            parameterSets: [ACPModelParameterSet(baseModelRaw: "grok-4.6", parameters: [effortDefinition(configID: "effort", values: ["low", "high"], currentValueRaw: "high")])]
+        )
+        let queries = options.map(\.rawValue) + [
+            "Cursor Grok 4.6", "GROK-4.6", "grok-4.6[effort=high]", "grok-4.6[effort=missing]",
+            "grok-4.6[bad]", "model[effort=high]", "default", "auto", "unknown", "grok-4.6"
+        ]
+        let actual = CursorAIModelCatalog.pickerDisplayNames(for: queries)
+        let reference = CursorAIModelCatalog.test_unindexedPickerDisplayNames(for: queries)
+        XCTAssertEqual(actual, reference)
+        for query in queries {
+            XCTAssertEqual(actual[query].map { Array($0.utf8) }, reference[query].map { Array($0.utf8) })
+        }
+        seedCursorCatalog(options: CursorDiscoveredCatalogTestSupport.standardSnapshot.options, currentModelRaw: "grok-4.6", parameterSets: CursorDiscoveredCatalogTestSupport.standardSnapshot.modelParameterSets)
+        let realQueries = ["grok-4.6", "Cursor Grok 4.6", "composer-2", "default", "grok-4.6[effort=high,fast=true]", "unknown"]
+        XCTAssertEqual(CursorAIModelCatalog.pickerDisplayNames(for: realQueries), CursorAIModelCatalog.test_unindexedPickerDisplayNames(for: realQueries))
+    }
+
+    func testPickerLabelScaleAndTiming() {
+        let options = (0 ..< 100).map { discoveredOption("model-\($0)", "Model \($0)") } + [discoveredOption("grok-4.6", "Cursor Grok 4.6")]
+        seedCursorCatalog(options: options, currentModelRaw: "grok-4.6")
+        let queries = options.map(\.rawValue) + ["Cursor Grok 4.6", "unknown"]
+        let expected = CursorAIModelCatalog.test_unindexedPickerDisplayNames(for: queries)
+        for _ in 0 ..< 2 {
+            _ = CursorAIModelCatalog.pickerDisplayNames(for: queries)
+        }
+        var oldTimes: [Double] = []
+        var newTimes: [Double] = []
+        var oldCPU: [Double] = []
+        var newCPU: [Double] = []
+        for pair in 0 ..< 5 {
+            for indexed in pair.isMultiple(of: 2) ? [false, true] : [true, false] {
+                let start = ProcessInfo.processInfo.systemUptime
+                let cpuStart = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID)
+                for _ in 0 ..< 37 {
+                    let result = indexed ? CursorAIModelCatalog.pickerDisplayNames(for: queries) : CursorAIModelCatalog.test_unindexedPickerDisplayNames(for: queries)
+                    XCTAssertEqual(result, expected)
+                }
+                let cpu = Double(clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) - cpuStart) / 1_000_000_000 / 37
+                let elapsed = (ProcessInfo.processInfo.systemUptime - start) / 37
+                if indexed {
+                    newTimes.append(elapsed)
+                    newCPU.append(cpu)
+                } else {
+                    oldTimes.append(elapsed)
+                    oldCPU.append(cpu)
+                }
+            }
+        }
+        print("Cursor picker seconds per call wall old=\(oldTimes) new=\(newTimes); thread CPU old=\(oldCPU) new=\(newCPU)")
+        XCTAssertLessThan(newTimes.sorted()[2], 0.1)
     }
 
     // MARK: - Helpers
