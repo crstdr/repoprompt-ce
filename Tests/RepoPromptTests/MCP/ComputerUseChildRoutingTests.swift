@@ -26,6 +26,11 @@ final class ComputerUseChildRoutingTests: XCTestCase {
         var submissions = 0
         var startEntries = 0
         var armEntries = 0
+        var readinessEntries = 0
+        var computerUseModelID = "codexExec:gpt-6.1-sol-high"
+        var beforeReadiness: (() async throws -> Void)?
+        var beforeArm: (() async throws -> Void)?
+        var afterSteerDispatch: (() async throws -> Void)?
         var catalog: MCPAppToolCatalogRegistration?
         var beforeAdmission: (() async throws -> Void)?
         var beforeMetadata: (() async -> Void)?
@@ -150,10 +155,19 @@ final class ComputerUseChildRoutingTests: XCTestCase {
                     reason: .sourceCaptureFailed("Test-owned transport fixture")
                 )))
             }
-            service.testComputerUseConfiguration = { .init(enabled: true, modelID: "codexExec:gpt-6.1-sol-high", modelAvailable: true) }
-            if !realStarter { service.testArmComputerUseChild = { [self] _, _ in armEntries += 1 } }
+            service.testComputerUseConfiguration = { [self] in .init(enabled: true, modelID: computerUseModelID, modelAvailable: true) }
+            service.testBeforeRestoredChildReadiness = { [self] in
+                readinessEntries += 1
+                try await beforeReadiness?()
+            }
+            service.testArmComputerUseChild = { [self] child, proof in
+                armEntries += 1
+                try await beforeArm?()
+                if realStarter { try await vm.armComputerUseChild(session: child, proof: proof) }
+            }
             service.testBeforeProviderDispatch = { [self] in await beforeStartDispatch?() }
             service.testBeforeSteerDispatch = { [self] in await beforeSteerDispatch?() }
+            service.testAfterSteerDispatchBeforeBookkeeping = { [self] _ in try await afterSteerDispatch?() }
             if !realSteer {
                 service.testDispatchSteerInstruction = { [self] id, _, _, vm in
                     let child = try XCTUnwrap(vm.mcpControlledSession(sessionID: id))
@@ -230,7 +244,7 @@ final class ComputerUseChildRoutingTests: XCTestCase {
             )
         }
 
-        func controlledChild(computerUse: Bool = true, parentID: UUID? = nil) async throws -> AgentTabSession {
+        func controlledChild(computerUse: Bool = true, parentID: UUID? = nil, model: String = "gpt-6.1-sol", effort: String = "high", priorTask: String? = nil) async throws -> AgentTabSession {
             let target = try await vm.mcpResolveOrCreateSessionTarget(
                 tabID: nil, sessionID: nil, createIfNeeded: true, sessionName: "Idle child",
                 parentSessionID: parentID ?? parent.activeAgentSessionID, inheritWorktreeBindings: false,
@@ -243,17 +257,30 @@ final class ComputerUseChildRoutingTests: XCTestCase {
                 creationHandle: target.creationHandle
             )
             try await vm.mcpConfigureSession(
-                tabID: target.tabID, agentRaw: "codexExec", modelRaw: "gpt-6.1-sol", reasoningEffortRaw: "high",
+                tabID: target.tabID, agentRaw: "codexExec", modelRaw: model, reasoningEffortRaw: effort,
                 expectedControlContext: control, creationHandle: target.creationHandle
             )
             child.selectedAgent = .codexExec
-            child.selectedModelRaw = "gpt-6.1-sol"
-            child.selectedReasoningEffortRaw = "high"
+            child.selectedModelRaw = model
+            child.selectedReasoningEffortRaw = effort
             child.purpose = computerUse ? "computerUse" : nil
             child.hasLoadedPersistedState = true
+            if let priorTask { child.appendItem(.user(priorTask, sequenceIndex: child.nextSequenceIndex)) }
             let committed = await vm.commitConfiguredSessionCreation(target: target)
             XCTAssertTrue(committed)
             vm.mcpAcceptSessionTarget(target)
+            return child
+        }
+
+        func restoredChild(model: String = "gpt-6.1-sol", effort: String = "high", reload: Bool = false, parentID: UUID? = nil) async throws -> AgentTabSession {
+            let child = try await controlledChild(parentID: parentID, model: model, effort: effort, priorTask: "pre-restart task must not replay")
+            let id = try XCTUnwrap(child.activeAgentSessionID)
+            child.mcpControlContext = nil
+            let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+            let owner = AgentModeViewModel.SessionIndexOwner(workspaceID: workspace.id, activationEpoch: 1)
+            let entry = AgentSessionIndexEntry(id: id, tabID: child.tabID, name: "Computer Use", savedAt: Date(), itemCount: 0, agentKindRaw: "codexExec", agentModelRaw: model, agentReasoningEffortRaw: effort, autoEditEnabled: false, purpose: "computerUse", parentSessionID: child.parentSessionID, hasUnknownConversationContent: false, isMCPOriginated: true, worktreeBindingSummaries: [], activeWorktreeMergeSummaries: [])
+            vm.test_installSessionIndexSnapshot([id: entry], owner: owner, latestOwner: owner, activeWorkspace: workspace)
+            if reload { child.hasLoadedPersistedState = false }
             return child
         }
 
@@ -263,6 +290,10 @@ final class ComputerUseChildRoutingTests: XCTestCase {
 
         func finish() async {
             beforeAdmission = nil
+            beforeReadiness = nil
+            beforeArm = nil
+            afterSteerDispatch = nil
+            vm.test_afterMCPControlSetupAwait = nil
             beforeMetadata = nil
             beforeAuthorization = nil
             beforeStartDispatch = nil
@@ -479,6 +510,223 @@ final class ComputerUseChildRoutingTests: XCTestCase {
             }
             XCTAssertEqual(controller.startedTurnCount, 1)
             XCTAssertEqual(controller.shutdownCount, 1)
+        }
+    }
+
+    func testRestoredIdleComputerUseChildCanBeSteeredByGrantedParent() async throws {
+        for model in ["gpt-6.1-sol", "gpt-6.1-terra-high"] {
+            try await withRoute(realSteer: true, realStarter: true) { f in
+                f.computerUseModelID = model.contains("terra") ? "codexExec:gpt-6.1-terra-high" : "codexExec:gpt-6.1-sol-high"
+                let child = try await f.restoredChild(model: model, reload: true)
+                let id = try XCTUnwrap(child.activeAgentSessionID)
+                XCTAssertNil(f.vm.mcpControlledSession(sessionID: id))
+                XCTAssertEqual(f.vm.sessionIndex[id]?.purpose, "computerUse")
+                let tabs = f.window.workspaceManager.activeWorkspace?.composeTabs.map(\.id)
+                let sessionCount = f.vm.sessions.count
+                f.beforeSteerDispatch = { f.window.apiSettingsViewModel.isCodexConnected = true }
+                let response = try await f.transport.callTool(name: "agent_run", arguments: [
+                    "op": "steer", "session_id": id.uuidString,
+                    "message": "Restored child fake turn", "wait": false, "_rawJSON": true
+                ])
+                XCTAssertFalse(response.rawJSON.contains("\"isError\":true"), response.rawJSON)
+                try await AsyncTestWait.waitUntil("Restored child reaches fake controller", timeout: 8) {
+                    (child.codexController as? WedgeFakeCodexController)?.startedTurnCount == 1
+                }
+                let controller = try XCTUnwrap(child.codexController as? WedgeFakeCodexController)
+                XCTAssertEqual(controller.startedTexts.count, 1)
+                XCTAssertTrue(controller.startedTexts[0].contains("Restored child fake turn"))
+                XCTAssertFalse(controller.startedTexts[0].contains("pre-restart task must not replay"))
+                XCTAssertEqual(child.selectedModelRaw, model.contains("terra") ? "gpt-6.1-terra" : model)
+                XCTAssertEqual(child.selectedReasoningEffortRaw, "high")
+                XCTAssertEqual(f.readinessEntries, 1)
+                XCTAssertEqual(f.armEntries, 1)
+                XCTAssertEqual(f.vm.sessions.count, sessionCount)
+                XCTAssertEqual(f.window.workspaceManager.activeWorkspace?.composeTabs.map(\.id), tabs)
+            }
+        }
+    }
+
+    func testRestoredComputerUseRefusalsDoNotEnterReadiness() async throws {
+        for variant in ["noGrant", "differentBase", "fast", "effort", "embeddedEffort", "workflow", "wrongParent", "stashed", "duplicate", "noRuntimeNoGrant", "noRuntimeFast"] {
+            try await withRoute { f in
+                let model = variant == "differentBase" ? "gpt-6.1-terra" : ["fast", "noRuntimeFast"].contains(variant) ? "gpt-6.1-sol-fast" : variant == "embeddedEffort" ? "gpt-6.1-sol-low" : "gpt-6.1-sol"
+                let child = try await f.restoredChild(model: model, effort: variant == "effort" ? "low" : "high", reload: true, parentID: variant == "wrongParent" ? f.visible.activeAgentSessionID : nil)
+                let id = try XCTUnwrap(child.activeAgentSessionID)
+                if ["noGrant", "noRuntimeNoGrant"].contains(variant) { f.parent.computerUseParentGrant = nil }
+                if variant.hasPrefix("noRuntime") { f.vm.test_removeSession(tabID: child.tabID) }
+                if variant == "stashed" {
+                    let index = try XCTUnwrap(f.window.workspaceManager.workspaces.firstIndex { $0.id == f.base.contextA.workspaceID })
+                    let tab = try XCTUnwrap(f.window.workspaceManager.workspaces[index].composeTabs.first { $0.id == child.tabID })
+                    f.window.workspaceManager.workspaces[index].composeTabs.removeAll { $0.id == child.tabID }
+                    f.window.workspaceManager.workspaces[index].stashedTabs.append(StashedTab(tab: tab))
+                }
+                if variant == "duplicate" { _ = try await f.controlledChild() }
+                var arguments: [String: Any] = ["op": "steer", "session_id": id.uuidString, "message": "Must not run", "wait": false, "_rawJSON": true]
+                if variant == "workflow" { arguments["workflow_id"] = AgentWorkflow.review.definition.id }
+                let response = try await f.transport.callTool(name: "agent_run", arguments: arguments)
+                XCTAssertTrue(response.rawJSON.contains("\"isError\":true"), "\(variant): \(response.rawJSON)")
+                if variant != "wrongParent" { XCTAssertTrue(response.rawJSON.contains(ComputerUseChildProof.denied), "\(variant): \(response.rawJSON)") }
+                XCTAssertEqual(f.readinessEntries, 0, variant)
+                XCTAssertEqual(f.armEntries, 0, variant)
+                XCTAssertFalse(child.hasLoadedPersistedState, variant)
+                XCTAssertNil(child.mcpControlContext, variant)
+                if variant.hasPrefix("noRuntime") { XCTAssertNil(f.vm.sessions[child.tabID], variant) }
+                try await AsyncTestWait.waitUntil("Refused restored child releases slot", timeout: 5) { ComputerUseChildProof.holder == nil }
+            }
+        }
+    }
+
+    func testRestoredComputerUseRechecksWitnessAcrossSuspension() async throws {
+        for phase in ["metadata", "readiness", "activation", "arm"] {
+            for mutation in ["childStop", "childBinding", "childClosed", "parentStop", "grant", "model", "configuration"] {
+                try await withRoute(realStarter: true) { f in
+                    let child = try await f.restoredChild()
+                    let id = try XCTUnwrap(child.activeAgentSessionID)
+                    let mutate: @MainActor () async throws -> Void = {
+                        if mutation == "childStop" { child.stopState.invalidateScheduledStarts() }
+                        else if mutation == "childClosed" { f.vm.test_removeSession(tabID: child.tabID) }
+                        else if mutation == "parentStop" { f.parent.stopState.invalidateScheduledStarts() }
+                        else if mutation == "configuration" { f.computerUseModelID = "codexExec:gpt-6.1-terra-high" }
+                        else if mutation == "childBinding" { _ = try XCTUnwrap(f.vm.test_installPersistentSessionBinding(sessionID: UUID(), on: child)) }
+                        else if mutation == "grant" { f.parent.computerUseParentGrant = UUID() }
+                        else { child.selectedModelRaw = "gpt-6.1-sol-fast" }
+                    }
+                    if phase == "metadata" { f.beforeMetadata = { try? await mutate() } }
+                    else if phase == "readiness" { f.beforeReadiness = mutate }
+                    else if phase == "activation" { f.vm.test_afterMCPControlSetupAwait = { _ in try? await mutate() } }
+                    else { f.beforeArm = mutate }
+                    let response = try await f.transport.callTool(name: "agent_run", arguments: ["op": "steer", "session_id": id.uuidString, "message": "Stale work", "wait": false, "_rawJSON": true])
+                    XCTAssertTrue(response.rawJSON.contains("\"isError\":true"), "\(phase)/\(mutation): \(response.rawJSON)")
+                    XCTAssertNil(child.codexController)
+                    try await AsyncTestWait.waitUntil("Invalidated restored producer releases", timeout: 5) { ComputerUseChildProof.holder == nil }
+                }
+            }
+        }
+    }
+
+    func testRestoredComputerUseContentionAndFailedArmRelease() async throws {
+        try await withRoute { f in
+            let child = try await f.restoredChild()
+            let id = try XCTUnwrap(child.activeAgentSessionID)
+            let args: [String: Any] = ["op": "steer", "session_id": id.uuidString, "message": "New work", "wait": false, "_rawJSON": true]
+            var contenderResult: String?
+            f.beforeReadiness = {
+                f.beforeReadiness = nil
+                XCTAssertNotNil(ComputerUseChildProof.holder)
+                let contender = try await f.transport.callTool(name: "agent_run", arguments: args)
+                contenderResult = contender.rawJSON
+                XCTAssertTrue(contender.rawJSON.contains(ComputerUseChildProof.busy), contender.rawJSON)
+                let duplicateStart = try await f.transport.callTool(name: "agent_run", arguments: self.start)
+                XCTAssertTrue(duplicateStart.rawJSON.contains(ComputerUseChildProof.existingChildMessage(id)), duplicateStart.rawJSON)
+                throw MCPError.invalidParams("Injected readiness failure")
+            }
+            let response = try await f.transport.callTool(name: "agent_run", arguments: args)
+            XCTAssertTrue(response.rawJSON.contains("\"isError\":true"), response.rawJSON)
+            XCTAssertNotNil(contenderResult)
+            XCTAssertEqual(f.readinessEntries, 1)
+            try await AsyncTestWait.waitUntil("Unattached producer releases slot", timeout: 5) { ComputerUseChildProof.holder == nil }
+            f.beforeArm = { throw MCPError.invalidParams("Injected arm failure") }
+            let failedArm = try await f.transport.callTool(name: "agent_run", arguments: args)
+            XCTAssertTrue(failedArm.rawJSON.contains("Injected arm failure"), failedArm.rawJSON)
+            try await AsyncTestWait.waitUntil("Failed activation cleanup settles", timeout: 5) { ComputerUseChildProof.holder == nil }
+            XCTAssertNil(child.mcpControlContext)
+            XCTAssertFalse(child.mcpFollowUpRunPending)
+            XCTAssertNil(child.codexController)
+            XCTAssertEqual(child.activeAgentSessionID, id)
+            XCTAssertEqual(child.purpose, "computerUse")
+            f.beforeArm = nil
+            let retry = try await f.transport.callTool(name: "agent_run", arguments: args)
+            XCTAssertFalse(retry.rawJSON.contains("\"isError\":true"), retry.rawJSON)
+            XCTAssertEqual(f.submissions, 1)
+        }
+    }
+
+    func testOpenRestoredComputerUseChildWithoutRuntimeCanBeSteered() async throws {
+        try await withRoute(realSteer: true, realStarter: true) { f in
+            let child = try await f.restoredChild(reload: true)
+            let id = try XCTUnwrap(child.activeAgentSessionID)
+            f.vm.test_removeSession(tabID: child.tabID)
+            XCTAssertNil(f.vm.sessions[child.tabID])
+            XCTAssertTrue(f.window.workspaceManager.activeWorkspace?.composeTabs.contains { $0.id == child.tabID && $0.activeAgentSessionID == id } == true)
+            let tabs = f.window.workspaceManager.activeWorkspace?.composeTabs
+            f.beforeSteerDispatch = { f.window.apiSettingsViewModel.isCodexConnected = true }
+            let response = try await f.transport.callTool(name: "agent_run", arguments: ["op": "steer", "session_id": id.uuidString, "message": "New restored task", "wait": false, "_rawJSON": true])
+            XCTAssertFalse(response.rawJSON.contains("\"isError\":true"), response.rawJSON)
+            let restored = try XCTUnwrap(f.vm.sessions[child.tabID])
+            XCTAssertFalse(restored === child)
+            XCTAssertEqual(restored.activeAgentSessionID, id)
+            try await AsyncTestWait.waitUntil("Materialized saved child reaches fake controller", timeout: 8) { (restored.codexController as? WedgeFakeCodexController)?.startedTurnCount == 1 }
+            let controller = try XCTUnwrap(restored.codexController as? WedgeFakeCodexController)
+            XCTAssertEqual(controller.startedTexts.count, 1)
+            XCTAssertFalse(controller.startedTexts[0].contains("pre-restart task must not replay"))
+            XCTAssertEqual(f.window.workspaceManager.activeWorkspace?.composeTabs.map(\.id), tabs?.map(\.id))
+        }
+        for abort in ["remove", "cancel"] {
+            try await withRoute { f in
+                let original = try await f.restoredChild(reload: true)
+                let id = try XCTUnwrap(original.activeAgentSessionID)
+                let tabID = original.tabID
+                f.vm.test_removeSession(tabID: tabID)
+                weak var materialized: AgentTabSession?
+                f.beforeReadiness = {
+                    materialized = f.vm.sessions[tabID]
+                    XCTAssertNotNil(materialized)
+                    if abort == "remove" { f.vm.test_removeSession(tabID: tabID) }
+                    else { withUnsafeCurrentTask { $0?.cancel() } }
+                }
+                let response = try await f.transport.callTool(name: "agent_run", arguments: ["op": "steer", "session_id": id.uuidString, "message": "Must not submit", "wait": false, "_rawJSON": true])
+                XCTAssertTrue(response.rawJSON.contains("error"), response.rawJSON)
+                XCTAssertEqual(f.submissions, 0)
+                XCTAssertEqual(f.armEntries, 0)
+                try await AsyncTestWait.waitUntil("Aborted materialized producer settles", timeout: 5) { ComputerUseChildProof.holder == nil }
+                if abort == "remove" {
+                    try await AsyncTestWait.waitUntil("Removed witness is genuinely weak", timeout: 5) { materialized == nil }
+                }
+            }
+        }
+    }
+
+    func testRestoredControlActivationRequiresItsExactWitness() async throws {
+        for variant in ["absent", "generic", "stale"] {
+            try await withRoute { f in
+                let child = try await f.restoredChild()
+                let id = try XCTUnwrap(child.activeAgentSessionID)
+                let proof = try ComputerUseChildProof(owner: f.vm, parent: f.parent, configuration: { .init(enabled: true, modelID: f.computerUseModelID, modelAvailable: true) })
+                if variant == "stale" {
+                    try proof.captureRestoredChild(child, entry: XCTUnwrap(f.vm.sessionIndex[id]))
+                    child.stopState.invalidateScheduledStarts()
+                }
+                try proof.reserve()
+                proof.child = child
+                if variant != "absent" { child.computerUseChildProof = proof }
+                child.hasLoadedPersistedState = false
+                do {
+                    _ = try await f.vm.mcpActivateControlContext(forTabID: child.tabID, sessionID: id, originatingConnectionID: f.transport.connectionID, startPending: true, computerUseProof: variant == "absent" ? nil : proof)
+                    XCTFail("Nil-handle activation borrowed invalid proof: \(variant)")
+                } catch { XCTAssertTrue(error.localizedDescription.contains(ComputerUseChildProof.denied)) }
+                XCTAssertFalse(child.hasLoadedPersistedState)
+                XCTAssertNil(child.mcpControlContext)
+                XCTAssertFalse(child.mcpFollowUpRunPending)
+                proof.retire()
+                await proof.producerSettled()?.value
+                XCTAssertNil(ComputerUseChildProof.holder)
+            }
+        }
+    }
+
+    func testRestoredAcceptedInstructionSurvivesBookkeepingFailure() async throws {
+        try await withRoute(realSteer: true, realStarter: true) { f in
+            let child = try await f.restoredChild()
+            let id = try XCTUnwrap(child.activeAgentSessionID)
+            f.beforeSteerDispatch = { f.window.apiSettingsViewModel.isCodexConnected = true }
+            f.afterSteerDispatch = { throw MCPError.invalidParams("Injected post-submit failure") }
+            let response = try await f.transport.callTool(name: "agent_run", arguments: ["op": "steer", "session_id": id.uuidString, "message": "Accepted task", "wait": false, "_rawJSON": true])
+            XCTAssertTrue(response.rawJSON.contains("Injected post-submit failure"), response.rawJSON)
+            try await AsyncTestWait.waitUntil("Accepted restored instruction survives", timeout: 8) { (child.codexController as? WedgeFakeCodexController)?.startedTurnCount == 1 }
+            let controller = try XCTUnwrap(child.codexController as? WedgeFakeCodexController)
+            XCTAssertEqual(controller.shutdownCount, 0)
+            XCTAssertNotNil(child.mcpControlContext)
+            XCTAssertNotNil(ComputerUseChildProof.holder)
         }
     }
 

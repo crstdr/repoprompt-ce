@@ -405,6 +405,7 @@ struct AgentRunMCPToolService {
         var testAgentModeViewModel: AgentModeViewModel?
         var testComputerUseConfiguration: (@MainActor () -> ComputerUseChildProof.Configuration)?
         var testArmComputerUseChild: ((AgentTabSession, ComputerUseChildProof) async throws -> Void)?
+        var testBeforeRestoredChildReadiness: (() async throws -> Void)?
         var testAfterTargetResolution: ((AgentModeViewModel.MCPSessionTarget) async -> Void)?
         var testBeforeExplicitTabWorktreeValidation: (() -> Void)?
         var testBeforeWorktreeBindingCommit: (() async -> Void)?
@@ -1667,16 +1668,25 @@ struct AgentRunMCPToolService {
         let agentModeVM = resolvedAgentModeViewModel(targetWindow)
         let expectedWorkspaceID = targetWindow.workspaceManager.activeWorkspaceID
         var computerUseProof: ComputerUseChildProof?
-        if let raw = normalizedString(args["session_id"]), let sessionID = UUID(uuidString: raw),
-           let child = agentModeVM.mcpControlledSession(sessionID: sessionID), child.isComputerUseChild, !child.runState.isActive
-        {
-            computerUseProof = try? captureComputerUseProof(owner: agentModeVM)
+        if let raw = normalizedString(args["session_id"]), let sessionID = UUID(uuidString: raw) {
+            if let child = agentModeVM.mcpControlledSession(sessionID: sessionID), child.isComputerUseChild, !child.runState.isActive {
+                computerUseProof = try? captureComputerUseProof(owner: agentModeVM)
+            } else if let entry = agentModeVM.sessionIndex[sessionID], entry.purpose == "computerUse",
+                      let proof = try? captureComputerUseProof(owner: agentModeVM),
+                      (try? proof.captureRestoredChild(entry: entry)) != nil
+            {
+                computerUseProof = proof
+            }
         }
         var computerUseAccepted = false
         defer {
-            if computerUseProof?.child != nil {
-                if !computerUseAccepted { computerUseProof?.retire() }
-                computerUseProof?.producerSettled()
+            if let computerUseProof {
+                if computerUseProof.hasRestoredChild {
+                    computerUseProof.producerSettled(retireUnacceptedStart: !computerUseAccepted)
+                } else if computerUseProof.child != nil {
+                    if !computerUseAccepted { computerUseProof.retire() }
+                    computerUseProof.producerSettled()
+                }
             }
         }
         let metadata = await captureRequestMetadata()
@@ -1691,26 +1701,77 @@ struct AgentRunMCPToolService {
         let workflow = try resolveWorkflow(args: args)
         if agentModeVM.mcpControlledSession(sessionID: sessionID)?.isComputerUseChild == true,
            agentModeVM.mcpControlledSession(sessionID: sessionID)?.runState.isActive == true { throw MCPError.invalidParams(ComputerUseChildProof.busy) }
-        if agentModeVM.sessionIndex[sessionID]?.purpose != nil || agentModeVM.mcpControlledSession(sessionID: sessionID)?.isComputerUseChild == true {
+        var restoredResolution: SteerControlResolution?
+        if agentModeVM.sessionIndex[sessionID]?.purpose != nil || (try? agentModeVM.authoritativeLiveSession(for: sessionID))?.isComputerUseChild == true {
             guard let proof = computerUseProof, proof.parentIsCurrent,
-                  let child = agentModeVM.mcpControlledSession(sessionID: sessionID), child.isComputerUseChild,
-                  child.parentSessionID == proof.parent.activeAgentSessionID, !child.runState.isActive,
-                  child.codexController == nil, !child.mcpFollowUpRunPending, args["workflow_id"] == nil, args["workflow_name"] == nil,
-                  CodexModelSpecifier(raw: child.selectedModelRaw).baseModel == CodexModelSpecifier(raw: String(proof.modelID.dropFirst("codexExec:".count))).baseModel,
-                  child.selectedReasoningEffortRaw == "high" else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
-            try proof.requireCurrentRoute()
-            try proof.reserve()
-            proof.child = child
-            child.computerUseChildProof = proof
-            #if DEBUG
-                if let testArmComputerUseChild { try await testArmComputerUseChild(child, proof) }
-                else { try await agentModeVM.armComputerUseChild(session: child, proof: proof) }
-            #else
-                try await agentModeVM.armComputerUseChild(session: child, proof: proof)
-            #endif
-            try proof.requireCurrentRoute()
+                  args["workflow_id"] == nil, args["workflow_name"] == nil else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+            do {
+                if proof.hasRestoredChild {
+                    guard let child = proof.restoredSession, proof.restoredChildIsCurrent() else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+                    try proof.requireCurrentRoute()
+                    try proof.reserve()
+                    guard let workspace = targetWindow.workspaceManager.activeWorkspace, workspace.id == expectedWorkspaceID,
+                          let parentID = proof.parent.activeAgentSessionID,
+                          let children = try await AgentSessionDataService.shared.computerUseChildIDs(for: parentID, workspace: workspace),
+                          children == [sessionID], proof.restoredChildIsCurrent()
+                    else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+                    try proof.requireCurrentRoute()
+                    #if DEBUG
+                        try await testBeforeRestoredChildReadiness?()
+                    #endif
+                    guard proof.restoredChildIsCurrent() else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+                    let prepared = await agentModeVM.ensureSessionReady(tabID: child.tabID, expectedSession: child)
+                    guard prepared === child, child.hasLoadedPersistedState, proof.restoredChildIsCurrent(),
+                          child.isComputerUseChild, child.parentSessionID == parentID,
+                          child.selectedAgent == .codexExec,
+                          proof.matchesConfiguration(model: child.selectedModelRaw, effort: child.selectedReasoningEffortRaw),
+                          !child.runState.isActive, !child.mcpFollowUpRunPending, child.codexController == nil,
+                          !child.hasBindingBlockingInteraction, child.pendingInstructions.isEmpty
+                    else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+                    try proof.requireCurrentRoute()
+                    proof.child = child
+                    child.computerUseChildProof = proof
+                    let context = try await agentModeVM.mcpActivateControlContext(
+                        forTabID: child.tabID, sessionID: sessionID, originatingConnectionID: metadata.connectionID,
+                        startPending: true, markSessionAsMCPOriginated: false, requireInactiveRunState: true, computerUseProof: proof
+                    )
+                    restoredResolution = .init(session: child, reactivatedTarget: nil, reactivatedControlIdentity: .init(sessionID: context.sessionID, activationID: context.activationID, registration: context.registration))
+                }
+                guard proof.parentIsCurrent,
+                      let child = agentModeVM.mcpControlledSession(sessionID: sessionID), child.isComputerUseChild,
+                      child.parentSessionID == proof.parent.activeAgentSessionID, !child.runState.isActive,
+                      child.codexController == nil,
+                      !child.mcpFollowUpRunPending || (restoredResolution?.session === child && proof.restoredChildIsCurrent())
+                else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+                if proof.hasRestoredChild {
+                    guard proof.matchesConfiguration(model: child.selectedModelRaw, effort: child.selectedReasoningEffortRaw) else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+                } else {
+                    guard CodexModelSpecifier(raw: child.selectedModelRaw).baseModel == CodexModelSpecifier(raw: String(proof.modelID.dropFirst("codexExec:".count))).baseModel,
+                          child.selectedReasoningEffortRaw == "high" else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+                }
+                try proof.requireCurrentRoute()
+                if restoredResolution == nil { try proof.reserve() }
+                proof.child = child
+                child.computerUseChildProof = proof
+                #if DEBUG
+                    if let testArmComputerUseChild { try await testArmComputerUseChild(child, proof) }
+                    else { try await agentModeVM.armComputerUseChild(session: child, proof: proof) }
+                #else
+                    try await agentModeVM.armComputerUseChild(session: child, proof: proof)
+                #endif
+                try proof.requireCurrentRoute()
+            } catch {
+                if let identity = restoredResolution?.reactivatedControlIdentity {
+                    await Task { @MainActor in
+                        await agentModeVM.mcpCleanupReactivatedControlContextIfCurrent(
+                            sessionID: identity.sessionID, activationID: identity.activationID, registration: identity.registration, reactivatedTarget: nil
+                        )
+                    }.value
+                }
+                throw error
+            }
         }
-        if let resident = try agentModeVM.mcpResidentTarget(sessionID: sessionID) {
+        if restoredResolution == nil, let resident = try agentModeVM.mcpResidentTarget(sessionID: sessionID) {
             let shouldWait = parseBool(args["wait"]) ?? (args["timeout_seconds"] != nil)
             guard !shouldWait else { throw MCPError.invalidParams(AgentModeViewModel.mcpResidentWaitError) }
             let delivery = try await agentModeVM.mcpSubmitResidentTask(
@@ -1730,13 +1791,16 @@ struct AgentRunMCPToolService {
                     ? "Ignoring timeout_seconds because wait=false; the steering instruction was accepted without waiting." : nil
             )
         }
-        let resolution = try await ensureSteerControlContext(
-            sessionID: sessionID,
-            targetWindow: targetWindow,
-            agentModeVM: agentModeVM,
-            metadata: metadata,
-            expectedWorkspaceID: expectedWorkspaceID
-        )
+        let resolution: SteerControlResolution = if let restoredResolution { restoredResolution }
+        else {
+            try await ensureSteerControlContext(
+                sessionID: sessionID,
+                targetWindow: targetWindow,
+                agentModeVM: agentModeVM,
+                metadata: metadata,
+                expectedWorkspaceID: expectedWorkspaceID
+            )
+        }
         let delivery: AgentModeViewModel.MCPInstructionDispatch
         let snapshot: AgentRunMCPSnapshot
         do {
@@ -1815,13 +1879,19 @@ struct AgentRunMCPToolService {
                 snapshot = await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM)
             }
         } catch {
-            if let identity = resolution.reactivatedControlIdentity {
-                await agentModeVM.mcpCleanupReactivatedControlContextIfCurrent(
-                    sessionID: identity.sessionID,
-                    activationID: identity.activationID,
-                    registration: identity.registration,
-                    reactivatedTarget: resolution.reactivatedTarget
-                )
+            if let identity = resolution.reactivatedControlIdentity,
+               !(computerUseProof?.hasRestoredChild == true && computerUseProof?.hasSubmittedInstruction == true)
+            {
+                let cleanup: @MainActor () async -> Void = {
+                    await agentModeVM.mcpCleanupReactivatedControlContextIfCurrent(
+                        sessionID: identity.sessionID,
+                        activationID: identity.activationID,
+                        registration: identity.registration,
+                        reactivatedTarget: resolution.reactivatedTarget
+                    )
+                }
+                if computerUseProof?.hasRestoredChild == true { await Task { @MainActor in await cleanup() }.value }
+                else { await cleanup() }
             }
             throw error
         }
