@@ -15,6 +15,86 @@ final class OpenCodeACPModelDiscoveryTests: XCTestCase {
         }
     }
 
+    func testMergedCatalogUsesDeterministicWinnersAndShrinksOnlyOneContext() async throws {
+        AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: .openCode) }
+        let client = MutableCatalogClient()
+        let service = OpenCodeACPModelPollingService(client: client)
+        addTeardownBlock { await service.shutdown() }
+        func option(_ raw: String, _ label: String) -> AgentModelOption {
+            .init(rawValue: raw, displayName: label, description: nil, isPlaceholderDefault: false, isProviderDefault: false)
+        }
+        func parameterSet(_ raw: String, _ value: String) -> ACPModelParameterSet {
+            .init(baseModelRaw: raw, parameters: [
+                .init(kind: .thinking, configID: "effort", displayName: "Effort", choices: [.init(rawValue: value, displayName: value)], currentValueRaw: value)
+            ])
+        }
+        await client.set("/z", options: [option("shared", "Z label"), option("z-only", "Z")], current: "shared", parameterSets: [parameterSet("shared", "z")])
+        await client.set("/a", options: [option("SHARED", "A label"), option("a-only", "A"), option("z-only", "A Z")], current: "SHARED", parameterSets: [parameterSet("SHARED", "a")])
+        _ = try await service.discoverOnce(workspacePath: "/z")
+        _ = try await service.discoverOnce(workspacePath: "/a")
+        var merged = try XCTUnwrap(AgentACPModelRegistry.shared.resolvedSnapshot(for: .openCode))
+        XCTAssertEqual(merged.options.count, 3)
+        XCTAssertEqual(merged.option(matching: "shared")?.displayName, "A label")
+        XCTAssertEqual(merged.currentModelRaw, "SHARED")
+        XCTAssertEqual(merged.modelParameterSets.first?.parameters.first?.currentValueRaw, "a")
+        let firstArrivalOrderResult = merged
+        await client.set("/z", options: [option("shared", "Z label")], current: "shared")
+        _ = try await service.discoverOnce(workspacePath: "/z")
+        merged = try XCTUnwrap(AgentACPModelRegistry.shared.resolvedSnapshot(for: .openCode))
+        XCTAssertEqual(merged.options.count, 3)
+        XCTAssertTrue(merged.contains(rawModel: "z-only")) // The other context still contributes it.
+        await client.set("/a", options: [option("SHARED", "A label"), option("a-only", "A")], current: "SHARED", parameterSets: [parameterSet("SHARED", "a")])
+        _ = try await service.discoverOnce(workspacePath: "/a")
+        merged = try XCTUnwrap(AgentACPModelRegistry.shared.resolvedSnapshot(for: .openCode))
+        XCTAssertEqual(merged.options.count, 2)
+        XCTAssertTrue(merged.contains(rawModel: "a-only"))
+        XCTAssertFalse(merged.contains(rawModel: "z-only"))
+        await client.set("/a", options: [], current: nil)
+        _ = try await service.discoverOnce(workspacePath: "/a")
+        XCTAssertEqual(AgentACPModelRegistry.shared.resolvedSnapshot(for: .openCode), merged)
+        await service.shutdown()
+
+        AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
+        await client.set("/z", options: [option("shared", "Z label"), option("z-only", "Z")], current: "shared", parameterSets: [parameterSet("shared", "z")])
+        await client.set("/a", options: [option("SHARED", "A label"), option("a-only", "A"), option("z-only", "A Z")], current: "SHARED", parameterSets: [parameterSet("SHARED", "a")])
+        let reversed = OpenCodeACPModelPollingService(client: client)
+        addTeardownBlock { await reversed.shutdown() }
+        _ = try await reversed.discoverOnce(workspacePath: "/a")
+        _ = try await reversed.discoverOnce(workspacePath: "/z")
+        XCTAssertEqual(AgentACPModelRegistry.shared.resolvedSnapshot(for: .openCode), firstArrivalOrderResult)
+        await client.set(nil, options: [option("shared", "Nil label")], current: "shared")
+        _ = try await reversed.discoverOnce(workspacePath: nil)
+        XCTAssertEqual(AgentACPModelRegistry.shared.resolvedSnapshot(for: .openCode)?.option(matching: "shared")?.displayName, "Nil label")
+        await reversed.shutdown()
+    }
+
+    func testParameterJobContributionSurvivesEvictionAndColdFallbackShrinksOnFirstLiveCatalog() async throws {
+        AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: .openCode) }
+        let client = MutableCatalogClient()
+        func option(_ raw: String) -> AgentModelOption {
+            .init(rawValue: raw, displayName: raw, description: nil, isPlaceholderDefault: false, isProviderDefault: false)
+        }
+        await client.set("/a", options: [option("a")], current: "a")
+        await client.set("/z", options: [option("z")], current: "z")
+        let first = OpenCodeACPModelPollingService(client: client)
+        addTeardownBlock { await first.shutdown() }
+        _ = try await first.discoverModelParametersOnce(workspacePath: "/z", modelRaw: "z", forceRefresh: true)
+        _ = try await first.discoverOnce(workspacePath: "/a")
+        XCTAssertEqual(AgentACPModelRegistry.shared.resolvedSnapshot(for: .openCode)?.options.count, 2)
+        await first.shutdown()
+        AgentACPModelRegistry.shared.test_clearMemoryPreservingStore(providerID: .openCode)
+        let second = OpenCodeACPModelPollingService(client: client)
+        addTeardownBlock { await second.shutdown() }
+        let cached = await second.latestSnapshot()
+        XCTAssertEqual(cached?.models.options.count, 2)
+        XCTAssertEqual(cached?.isLiveDiscovery, false)
+        let live = try await second.discoverOnce(workspacePath: "/a")
+        XCTAssertEqual(live?.models.options.map(\.rawValue), ["a"])
+        await second.shutdown()
+    }
+
     func testRefreshOutcomesDistinguishChangedUnchangedEmptyAndFailure() async {
         AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
         defer { AgentACPModelRegistry.shared.test_reset(providerID: .openCode) }
@@ -888,10 +968,20 @@ private func XCTAssertThrowsErrorAsync(
     } catch {}
 }
 
-/// A controllable, gated `OpenCodeACPModelDiscoveryClient` for orchestration tests: it
-/// exercises the polling service's job/coalescing/eviction/cancellation logic without any
-/// Python subprocess or wire protocol. Barriers (`waitForCallCount`, `waitForIdle`) are used
-/// only through the file's `bound*` wrappers so they always have a bounded failure exit.
+/// Supplies mutable catalogs by workspace without launching a provider.
+private actor MutableCatalogClient: OpenCodeACPModelDiscoveryClient {
+    private var catalogs: [String: ACPDiscoveredSessionModels] = [:]
+
+    func set(_ workspace: String?, options: [AgentModelOption], current: String?, parameterSets: [ACPModelParameterSet] = []) {
+        catalogs[workspace ?? ""] = ACPDiscoveredSessionModels(options: options, currentModelRaw: current, modelParameterSets: parameterSets)
+    }
+
+    func discoverModels(workspacePath: String?, modelRaw: String?) async throws -> OpenCodeACPModelDiscoveryResult? {
+        guard let catalog = catalogs[workspacePath ?? ""] else { return nil }
+        return OpenCodeACPModelDiscoveryResult(catalog: catalog, parameterState: modelRaw == nil ? nil : .noUsableParameters)
+    }
+}
+
 private actor ScriptedDiscoveryClient: OpenCodeACPModelDiscoveryClient {
     init() {}
 

@@ -271,6 +271,10 @@ actor OpenCodeACPModelPollingService {
     // Catalog broadcast state.
     private var catalogContinuations: [UUID: AsyncStream<Snapshot>.Continuation] = [:]
     private var latest: Snapshot?
+    // Completed catalog jobs have no workspace-lifetime owner; keep their last good
+    // contributions until shutdown, including catalogs obtained by parameter jobs.
+    private var contextCatalogs: [String?: ACPDynamicProviderRecord] = [:]
+    private var mergedCatalog: ACPDynamicProviderRecord?
 
     /// Demand-scoped parameter observations, keyed by (workspace, canonical model).
     private var observations: [OpenCodeACPModelParameterKey: Observation] = [:]
@@ -512,6 +516,8 @@ actor OpenCodeACPModelPollingService {
 
     func shutdown(finishSubscribers: Bool = true) async {
         isShutdown = true
+        contextCatalogs.removeAll()
+        mergedCatalog = nil
         refreshTask?.cancel()
         refreshTask = nil
         // Cancel the active probe task but do NOT reap it here (its `finishJob` reaps); do
@@ -564,7 +570,18 @@ actor OpenCodeACPModelPollingService {
     @discardableResult
     private func publishCatalog(_ discovered: ACPDiscoveredSessionModels, entry: JobEntry, key: JobKey) -> Snapshot? {
         guard !isShutdown else { return nil }
-        let attribution = AgentACPModelRegistry.shared.updateDiscoveredModels(discovered, for: .openCode, jobOrdinal: entry.ordinal)
+        // The logged canonical count is per context; change and broadcast describe the union.
+        let contextRecord = ACPDynamicModelStore.canonicalProviderRecord(from: discovered, providerID: .openCode)
+        var attribution = AgentACPModelRegistry.CatalogUpdateAttribution(didChange: false, effectiveChanged: false, canonicalCount: contextRecord?.options.count ?? 0)
+        if let contextRecord, contextCatalogs[key.workspacePath] != contextRecord {
+            contextCatalogs[key.workspacePath] = contextRecord
+            if let combined = makeMergedCatalog(), combined != mergedCatalog,
+               let snapshot = ACPDynamicModelStore.snapshot(from: combined)
+            {
+                attribution = AgentACPModelRegistry.shared.updateDiscoveredModels(snapshot, for: .openCode, jobOrdinal: entry.ordinal)
+                mergedCatalog = combined
+            }
+        }
         let normalized = AgentACPModelRegistry.shared.resolvedSnapshot(for: .openCode)
         let hadPrior = latest != nil
         let priorWasLive = latest?.isLiveDiscovery == true
@@ -572,22 +589,22 @@ actor OpenCodeACPModelPollingService {
             AgentACPModelRegistry.shared.recordOpenCodeCatalogJob(fields: [
                 "job": entry.ordinal, "kind": key.parameterKey == nil ? 1 : 2, "origin": entry.origins,
                 "requested": entry.requestedContext, "actual": entry.actualContext, "outcome": 2,
-                "raw": discovered.options.count, "canonical": attribution.canonicalCount,
+                "raw": discovered.options.count, "canonical": contextRecord?.options.count ?? 0,
                 "changed": attribution.didChange ? 1 : 0, "effectiveChanged": attribution.effectiveChanged ? 1 : 0,
                 "broadcast": 0, "hadPrior": hadPrior ? 1 : 0, "priorLive": priorWasLive ? 1 : 0, "subscribers": catalogContinuations.count
             ])
             return nil
         }
         let snapshot = Snapshot(models: normalized, fetchedAt: Date(), isLiveDiscovery: true)
-        // The registry was updated unconditionally above; the model-equality guard only avoids
-        // redundant subscriber spam. The fresh snapshot is still recorded in `latest`.
+        // The registry changes only with the effective union; unchanged refreshes still
+        // refresh `latest` and promote a cached snapshot to live when needed.
         let shouldBroadcast = latest?.models != snapshot.models || latest?.isLiveDiscovery == false
         latest = snapshot
         AgentACPModelRegistry.shared.recordOpenCodeCatalogJob(fields: [
             "job": entry.ordinal, "kind": key.parameterKey == nil ? 1 : 2, "origin": entry.origins,
             "requested": entry.requestedContext, "actual": entry.actualContext,
             "outcome": discovered.options.isEmpty ? 2 : 1,
-            "raw": discovered.options.count, "canonical": attribution.canonicalCount,
+            "raw": discovered.options.count, "canonical": contextRecord?.options.count ?? 0,
             "changed": attribution.didChange ? 1 : 0, "effectiveChanged": attribution.effectiveChanged ? 1 : 0,
             "broadcast": shouldBroadcast ? 1 : 0, "hadPrior": hadPrior ? 1 : 0, "priorLive": priorWasLive ? 1 : 0,
             "subscribers": catalogContinuations.count
@@ -598,6 +615,49 @@ actor OpenCodeACPModelPollingService {
             }
         }
         return snapshot
+    }
+
+    private func makeMergedCatalog() -> ACPDynamicProviderRecord? {
+        let contexts = contextCatalogs.keys.sorted { left, right in
+            switch (left, right) {
+            case (nil, nil): false
+            case (nil, _): true
+            case (_, nil): false
+            case let (left?, right?): left.utf8.lexicographicallyPrecedes(right.utf8)
+            }
+        }
+        var options: [ACPDynamicModelRecord] = []
+        var parameterSets: [ACPModelParameterSet] = []
+        var seen: Set<String> = []
+        var hasKnownParameters = false
+        for context in contexts {
+            guard let record = contextCatalogs[context] else { continue }
+            let setsByModel = Dictionary(grouping: record.modelParameterSets ?? [], by: { $0.baseModelRaw.lowercased() })
+            for option in record.options {
+                let identity = option.rawValue.lowercased()
+                guard seen.insert(identity).inserted else { continue }
+                options.append(option)
+                if record.modelParameterSets != nil {
+                    hasKnownParameters = true
+                    parameterSets.append(contentsOf: setsByModel[identity] ?? [])
+                }
+            }
+        }
+        let currentContext = contexts.compactMap { context -> (ACPDynamicProviderRecord, String)? in
+            guard let record = contextCatalogs[context], let current = record.currentModelRaw,
+                  let option = options.first(where: { $0.rawValue.caseInsensitiveCompare(current) == .orderedSame })
+            else { return nil }
+            return (record, option.rawValue)
+        }.first
+        let candidate = ACPDynamicProviderRecord(
+            providerID: ACPProviderID.openCode.rawValue,
+            currentModelRaw: currentContext?.1,
+            currentEffortRaw: currentContext?.0.currentEffortRaw,
+            options: options,
+            modelParameterSets: hasKnownParameters ? parameterSets : nil
+        )
+        guard let snapshot = ACPDynamicModelStore.snapshot(from: candidate) else { return nil }
+        return ACPDynamicModelStore.canonicalProviderRecord(from: snapshot, providerID: .openCode)
     }
 
     private func registrySnapshotAfterWarmingStore() async -> Snapshot? {

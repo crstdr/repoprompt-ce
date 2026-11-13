@@ -9,11 +9,11 @@ import XCTest
 final class AgentRepromptSettingsTests: XCTestCase {
     private struct ContextCatalogClient: OpenCodeACPModelDiscoveryClient {
         func discoverModels(workspacePath: String?, modelRaw _: String?) async throws -> OpenCodeACPModelDiscoveryResult? {
-            let name = workspacePath?.hasSuffix("workspace-b") == true ? "catalog-b" : "catalog-a"
-            let options: [AgentModelOption] = [
-                .init(rawValue: name, displayName: name, description: nil, isPlaceholderDefault: false, isProviderDefault: true)
-            ]
-            return OpenCodeACPModelDiscoveryResult(catalog: ACPDiscoveredSessionModels(options: options, currentModelRaw: name), parameterState: nil)
+            let count = workspacePath?.hasSuffix("-large") == true ? 393 : 38
+            let options: [AgentModelOption] = (0 ..< count).map { index in
+                .init(rawValue: "model-\(index)", displayName: "Model \(index)", description: nil, isPlaceholderDefault: false, isProviderDefault: index == 0)
+            }
+            return OpenCodeACPModelDiscoveryResult(catalog: ACPDiscoveredSessionModels(options: options, currentModelRaw: "model-0"), parameterState: nil)
         }
     }
 
@@ -163,7 +163,7 @@ final class AgentRepromptSettingsTests: XCTestCase {
         print("picker attribution fixture: owners=36 updates=252 lines=\(lines.count) wall_ms=\(elapsed * 1000)")
     }
 
-    func testOpenCodeCatalogChangesFanOutToThirtySixOwners() async throws {
+    func testOpenCodeUnionAvoidsFanOutAcrossThirtySevenContexts() async throws {
         AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
         AgentACPModelRegistry.shared.installOpenCodeCatalogJobRecorder { fields in
             StartupPhaseLog.mark(.openCodeCatalogJob, fields: fields)
@@ -182,7 +182,7 @@ final class AgentRepromptSettingsTests: XCTestCase {
         addTeardownBlock { await service.shutdown() }
         var owners: [APISettingsViewModel] = []
         var iterators: [AsyncStream<OpenCodeACPModelPollingService.Snapshot>.Iterator] = []
-        for window in 1 ... 36 {
+        for window in 1 ... 37 {
             let (_, api) = try fixture(window: window)
             api.isOpenCodeConnected = true
             owners.append(api)
@@ -193,36 +193,54 @@ final class AgentRepromptSettingsTests: XCTestCase {
         _ = try await service.discoverOnce(workspacePath: nil)
         for index in iterators.indices {
             let snapshot = await iterators[index].next()
-            XCTAssertEqual(snapshot?.models.options.first?.rawValue, "catalog-a")
+            XCTAssertEqual(snapshot?.models.options.count, 38)
             await owners[index].updateAvailableModels(trigger: .providerModelSubscription, sourceProvider: .openCode, openCodeDelivery: snapshot?.isReplay == true ? 2 : 1)
         }
-        for (path, expected) in [("/workspace-b", "catalog-b"), ("/workspace-a", "catalog-a")] {
-            _ = try await service.discoverOnce(workspacePath: path)
-            XCTAssertEqual(AgentACPModelRegistry.shared.resolvedSnapshot(for: .openCode)?.options.first?.rawValue, expected)
-            for index in iterators.indices {
-                let snapshot = await iterators[index].next()
-                XCTAssertEqual(snapshot?.models.options.first?.rawValue, expected)
-                await owners[index].updateAvailableModels(trigger: .providerModelSubscription, sourceProvider: .openCode, openCodeDelivery: 1)
+        var referenceCount = 38
+        var referenceBroadcasts = 1
+        let start = ProcessInfo.processInfo.systemUptime
+        for context in 0 ..< 36 {
+            let suffix = context.isMultiple(of: 2) ? "large" : "small"
+            let nextReferenceCount = context.isMultiple(of: 2) ? 393 : 38
+            if nextReferenceCount != referenceCount { referenceBroadcasts += 1 }
+            referenceCount = nextReferenceCount
+            _ = try await service.discoverOnce(workspacePath: "/context-\(context)-\(suffix)")
+            XCTAssertEqual(AgentACPModelRegistry.shared.resolvedSnapshot(for: .openCode)?.options.count, 393)
+            if context == 0 {
+                for index in iterators.indices {
+                    let snapshot = await iterators[index].next()
+                    XCTAssertEqual(snapshot?.models.options.count, 393)
+                    await owners[index].updateAvailableModels(trigger: .providerModelSubscription, sourceProvider: .openCode, openCodeDelivery: 1)
+                }
             }
         }
         let lines = recorder.snapshot()
-        XCTAssertEqual(lines.count, 108)
-        XCTAssertTrue(lines.allSatisfy { $0.split(separator: " ").contains("openCodeModels=1") && $0.split(separator: " ").contains("sourceProvider=1") })
+        XCTAssertEqual(lines.count, 74)
+        XCTAssertTrue(lines.prefix(37).allSatisfy { $0.split(separator: " ").contains("openCodeModels=38") })
+        XCTAssertTrue(lines.suffix(37).allSatisfy { $0.split(separator: " ").contains("openCodeModels=393") })
+        XCTAssertTrue(lines.allSatisfy { $0.split(separator: " ").contains("sourceProvider=1") })
         let jobs = recorder.jobs()
-        let bJob = try XCTUnwrap(jobs.last { $0.contains("actual=1 ") && $0.contains("origin=4 ") })
-        let aJob = try XCTUnwrap(jobs.last { $0.contains("actual=2 ") && $0.contains("origin=4 ") })
-        func jobOrdinal(_ line: String) -> String? {
-            line.split(separator: " ").first { $0.hasPrefix("job=") }.map { String($0.dropFirst(4)) }
+        let broadcasts = jobs.filter { $0.split(separator: " ").contains("broadcast=1") }
+        XCTAssertEqual(broadcasts.count, 2)
+        func field(_ name: String, in line: String) -> String? {
+            line.split(separator: " ").first { $0.hasPrefix("\(name)=") }.map { String($0.dropFirst(name.count + 1)) }
         }
-        let bOrdinal = try XCTUnwrap(jobOrdinal(bJob))
-        let aOrdinal = try XCTUnwrap(jobOrdinal(aJob))
-        XCTAssertTrue(lines.dropFirst(36).prefix(36).allSatisfy { $0.split(separator: " ").contains(Substring("openCodeJob=\(bOrdinal)")) })
-        XCTAssertTrue(lines.suffix(36).allSatisfy { $0.split(separator: " ").contains(Substring("openCodeJob=\(aOrdinal)")) })
-        XCTAssertTrue([bJob, aJob].allSatisfy { $0.contains("broadcast=1 ") && $0.contains("canonical=1 ") && $0.contains("effectiveChanged=1 ") })
-        XCTAssertFalse(jobs.joined().contains("workspace-"))
-        XCTAssertFalse(jobs.joined().contains("catalog-"))
-        print("openCode attribution job sample: \(bJob)")
-        if let line = lines.dropFirst(36).first { print("openCode attribution update sample: \(line)") }
+        let initial = try XCTUnwrap(broadcasts.first)
+        let expansion = try XCTUnwrap(broadcasts.last)
+        XCTAssertEqual(field("canonical", in: initial), "38")
+        XCTAssertEqual(field("canonical", in: expansion), "393")
+        XCTAssertEqual(field("effectiveChanged", in: initial), "1")
+        XCTAssertEqual(field("effectiveChanged", in: expansion), "1")
+        let initialJob = try XCTUnwrap(field("job", in: initial))
+        let expansionJob = try XCTUnwrap(field("job", in: expansion))
+        XCTAssertTrue(lines.prefix(37).allSatisfy { field("openCodeJob", in: $0) == initialJob })
+        XCTAssertTrue(lines.suffix(37).allSatisfy { field("openCodeJob", in: $0) == expansionJob })
+        XCTAssertEqual(String(AgentACPModelRegistry.shared.openCodeSnapshotWithJobOrdinal().1), expansionJob)
+        XCTAssertTrue(jobs.allSatisfy { ["38", "393"].contains(field("canonical", in: $0) ?? "") })
+        XCTAssertFalse(jobs.joined().contains("context-"))
+        XCTAssertEqual(referenceBroadcasts, 37)
+        let elapsedMS = (ProcessInfo.processInfo.systemUptime - start) * 1000
+        print("openCode union fixture: contexts=37 owners=37 reference_last_writer_broadcasts=\(referenceBroadcasts) reference_updates=\(referenceBroadcasts * 37) after_broadcasts=2 after_updates=\(lines.count) wall_ms=\(elapsedMS)")
         await service.shutdown()
     }
 
