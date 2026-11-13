@@ -16,6 +16,26 @@ final class AppPlatformUtilityRecoveryTests: XCTestCase {
     }
 
     @MainActor
+    func testQueuedURLWindowOpeningDecision() {
+        func shouldOpen(_ launched: Bool, _ available: Bool, _ live: Bool, _ pendingBefore: Bool, _ pendingAfter: Bool) -> Bool {
+            AppDelegate.shouldOpenWindowForQueuedURLs(
+                finishedLaunching: launched,
+                openerAvailable: available,
+                hasLiveWindows: live,
+                hadPendingURLs: pendingBefore,
+                hasPendingURLs: pendingAfter
+            )
+        }
+
+        XCTAssertTrue(shouldOpen(true, true, false, false, true))
+        XCTAssertFalse(shouldOpen(false, true, false, false, true))
+        XCTAssertFalse(shouldOpen(true, false, false, false, true))
+        XCTAssertFalse(shouldOpen(true, true, true, false, true))
+        XCTAssertFalse(shouldOpen(true, true, false, true, true))
+        XCTAssertFalse(shouldOpen(true, true, false, false, false))
+    }
+
+    @MainActor
     func testForwardOpenURLsPreservesOrderAndDuplicates() async throws {
         let first = try XCTUnwrap(URL(string: "repoprompt-ce://prompt?content=first"))
         let second = try XCTUnwrap(URL(string: "repoprompt://open/example"))

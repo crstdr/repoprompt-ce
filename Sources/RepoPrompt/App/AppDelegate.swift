@@ -44,6 +44,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
 
     /// App startup owns one explicit registration attempt; readiness only observes it.
     private var domainRuntimeStartupTask: Task<Void, Never>?
+    private var finishedLaunching = false
     private(set) var domainRuntimeStartupFailureDescription: String?
     private var globalMCPRegistrationOperation: GlobalMCPRegistrationOperation = {
         try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
@@ -150,11 +151,33 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     // MARK: - NSApplicationDelegate
 
     func application(_ application: NSApplication, open urls: [URL]) {
+        let finishedLaunching = finishedLaunching
         Task { @MainActor in
+            let manager = WindowStatesManager.shared
+            let hadPendingURLs = !manager.pendingURLs.isEmpty
             await Self.forwardOpenURLs(urls) { url in
                 await AppDeepLinkRouter.shared.route(url: url)
             }
+            if Self.shouldOpenWindowForQueuedURLs(
+                finishedLaunching: finishedLaunching,
+                openerAvailable: AppWindowOpener.shared.isAvailable,
+                hasLiveWindows: manager.allWindows.contains { !$0.isClosing },
+                hadPendingURLs: hadPendingURLs,
+                hasPendingURLs: !manager.pendingURLs.isEmpty
+            ) {
+                AppWindowOpener.shared.requestMainWindowFromDock()
+            }
         }
+    }
+
+    static func shouldOpenWindowForQueuedURLs(
+        finishedLaunching: Bool,
+        openerAvailable: Bool,
+        hasLiveWindows: Bool,
+        hadPendingURLs: Bool,
+        hasPendingURLs: Bool
+    ) -> Bool {
+        finishedLaunching && openerAvailable && !hasLiveWindows && !hadPendingURLs && hasPendingURLs
     }
 
     static func forwardOpenURLs(_ urls: [URL], route: (URL) async -> Void) async {
@@ -170,6 +193,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        finishedLaunching = true
         let launchConfiguration = AppLaunchConfiguration.current
         ProcessTermination.resetAppTerminationFastPath()
         terminationSignalRouter.install()
