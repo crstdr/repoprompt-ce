@@ -185,22 +185,52 @@ enum CursorAIModelCatalog {
     /// Resolve requested labels against one captured catalog, including bracket overrides.
     static func pickerDisplayNames(for modelRaws: [String]) -> [String: String] {
         let snapshot = resolvedSnapshot()
+        let advertisedIDs = Set(snapshot?.options.map(\.rawValue) ?? [])
+        var discoveredByIdentity: [String: AgentModelOption] = [:]
+        for option in snapshot?.options ?? [] where !isAutoOption(option) {
+            let identity = canonicalIdentity(option.rawValue)
+            if discoveredByIdentity[identity] == nil { discoveredByIdentity[identity] = option }
+        }
         var labels: [String: String] = [:]
         for raw in modelRaws {
-            if let option = option(matching: raw, snapshot: snapshot) { labels[raw] = option.displayName }
+            if let option = option(matching: raw, snapshot: snapshot, advertisedIDs: advertisedIDs, discoveredByIdentity: discoveredByIdentity) {
+                labels[raw] = option.displayName
+            }
         }
         return labels
     }
 
-    private static func option(matching modelRaw: String, snapshot: ACPDiscoveredSessionModels?) -> AgentModelOption? {
-        let advertisedIDs = Set(snapshot?.options.map(\.rawValue) ?? [])
+    #if DEBUG
+        static func test_unindexedPickerDisplayNames(for modelRaws: [String]) -> [String: String] {
+            let snapshot = resolvedSnapshot()
+            var labels: [String: String] = [:]
+            for raw in modelRaws {
+                if let option = option(matching: raw, snapshot: snapshot) { labels[raw] = option.displayName }
+            }
+            return labels
+        }
+    #endif
+
+    private static func option(
+        matching modelRaw: String,
+        snapshot: ACPDiscoveredSessionModels?,
+        advertisedIDs: Set<String>? = nil,
+        discoveredByIdentity: [String: AgentModelOption]? = nil
+    ) -> AgentModelOption? {
+        let advertisedIDs = advertisedIDs ?? Set(snapshot?.options.map(\.rawValue) ?? [])
         guard let specifier = try? ModelSpecifier(raw: modelRaw, advertisedModelIDs: advertisedIDs) else { return nil }
         let identity = canonicalIdentity(specifier.baseModelRaw)
         guard !identity.isEmpty else { return nil }
         if identity == autoIdentity {
             return specifier.overrides.isEmpty ? autoOption : nil
         }
-        guard let snapshot, let discovered = discoveredOption(matching: identity, in: snapshot) else { return nil }
+        guard let snapshot else { return nil }
+        let discovered: AgentModelOption? = if let discoveredByIdentity {
+            discoveredByIdentity[identity]
+        } else {
+            discoveredOption(matching: identity, in: snapshot)
+        }
+        guard let discovered else { return nil }
         let base = projectedOption(discovered)
         guard !specifier.overrides.isEmpty else { return base }
         // Membership, validation, and labels all use this call's single captured snapshot.
