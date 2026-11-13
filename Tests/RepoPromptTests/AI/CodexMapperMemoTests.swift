@@ -51,14 +51,25 @@ final class CodexMapperMemoTests: XCTestCase {
         let key = "CodexDynamicModelRecords"
         let original = records()
         let duplicate = CodexDynamicModelRecord(id: "GPT-6.1-SOL", model: "other", displayName: "é", description: "changed", isDefault: false, supportedReasoningEfforts: [.init(reasoningEffort: "ultra", description: "extra")], defaultReasoningEffort: "ultra", serviceTiers: [.init(id: "ultrafast", name: "Fast", description: "speed")])
-        let inputs = [original, [duplicate] + original, Array(original.reversed()) + [duplicate], [], [CodexDynamicModelRecord(id: "e\u{301}", model: "é", displayName: "e\u{301}", description: "changed", isDefault: true)]]
+        func unicodeRecord(_ spelling: String) -> CodexDynamicModelRecord {
+            CodexDynamicModelRecord(id: spelling, model: spelling, displayName: spelling, description: spelling, isDefault: true, supportedReasoningEfforts: [.init(reasoningEffort: spelling, description: spelling)], defaultReasoningEffort: spelling)
+        }
+        let composed = [unicodeRecord("é")]
+        let decomposed = [unicodeRecord("e\u{301}")]
+        XCTAssertNotEqual(try JSONEncoder().encode(composed), try JSONEncoder().encode(decomposed))
+        let inputs = [original, [duplicate] + original, Array(original.reversed()) + [duplicate], [], composed, decomposed, composed]
         for input in inputs {
             try a.set(JSONEncoder().encode(input), forKey: key)
             let expected = CodexDynamicModelMapper.options(from: input)
             for _ in 0 ..< 2 {
                 let actual = CodexDynamicModelStore.modelOptions(defaults: a)
                 XCTAssertEqual(actual, expected)
-                XCTAssertEqual(actual.map { Array($0.displayName.utf8) }, expected.map { Array($0.displayName.utf8) })
+                func bytes(_ options: [CodexDynamicModelOption]) -> [[[UInt8]]] {
+                    options.map { option in
+                        ([option.id, option.baseID, option.displayName, option.description] + option.supportedReasoningEffortRawValues + [option.defaultReasoningEffortRawValue].compactMap(\.self)).map { Array($0.utf8) }
+                    }
+                }
+                XCTAssertEqual(bytes(actual), bytes(expected))
             }
         }
         a.set(Data("malformed".utf8), forKey: key)
@@ -82,11 +93,17 @@ final class CodexMapperMemoTests: XCTestCase {
         }
         XCTAssertEqual(mismatches, 0)
         // Force a miss, then replace the exact store payload during computation.
-        try a.set(JSONEncoder().encode([duplicate] + original), forKey: key)
+        let capturedData = try JSONEncoder().encode([duplicate] + original)
+        a.set(capturedData, forKey: key)
         let captured = CodexDynamicModelStore.test_modelOptions(defaults: a) { a.set(dataB, forKey: key) }
         XCTAssertEqual(captured, CodexDynamicModelMapper.options(from: [duplicate] + original))
-        XCTAssertEqual(CodexDynamicModelStore.modelOptions(defaults: a), expectedB)
+        a.set(capturedData, forKey: key) // No store read between replacement and restoration.
         var recomputed = false
+        XCTAssertEqual(CodexDynamicModelStore.test_modelOptions(defaults: a) { recomputed = true }, captured)
+        XCTAssertTrue(recomputed, "A result computed for a replaced payload must not be installed")
+        a.set(dataB, forKey: key)
+        XCTAssertEqual(CodexDynamicModelStore.modelOptions(defaults: a), expectedB)
+        recomputed = false
         XCTAssertEqual(CodexDynamicModelStore.test_modelOptions(defaults: a) { recomputed = true }, expectedB)
         XCTAssertFalse(recomputed)
 
