@@ -149,6 +149,20 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
 
     // MARK: - NSApplicationDelegate
 
+    func application(_ application: NSApplication, open urls: [URL]) {
+        Task { @MainActor in
+            await Self.forwardOpenURLs(urls) { url in
+                await AppDeepLinkRouter.shared.route(url: url)
+            }
+        }
+    }
+
+    static func forwardOpenURLs(_ urls: [URL], route: (URL) async -> Void) async {
+        for url in urls {
+            await route(url)
+        }
+    }
+
     func applicationWillFinishLaunching(_ notification: Notification) {
         // The notification delegate must be installed before launch finishes so a click that launched
         // the app is delivered. This does not prompt for authorization (that stays in didFinishLaunching).

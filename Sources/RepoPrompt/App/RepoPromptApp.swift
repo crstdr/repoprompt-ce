@@ -164,14 +164,6 @@ struct RepoPromptSwiftUIApp: App {
                 // Override environment font
                 .environment(\.font, fontScale.preset.font)
                 .environment(\.repoPromptFontScalePreset, fontScale.preset)
-                // Advertise URL handling on existing windows so SwiftUI does not create
-                // an extra scene before the global deep-link router can choose the target.
-                .handlesExternalEvents(preferring: ["*"], allowing: ["*"])
-                .onOpenURL { incomingURL in
-                    Task { @MainActor in
-                        await AppDeepLinkRouter.shared.route(url: incomingURL)
-                    }
-                }
         }
         // .windowStyle(.hiddenTitleBar)
         .windowStyle(.automatic)
