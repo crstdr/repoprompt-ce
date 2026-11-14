@@ -30,7 +30,7 @@ final class AppWindowOpener: ObservableObject {
     private init() {}
 
     /// Installs the openWindow action from a SwiftUI view.
-    /// Installed by MainWindowCommands, including before any window exists.
+    /// MainWindowCommands supports zero-window startup; WindowContentView also installs on appearance.
     func install(openMainWindow: @escaping () -> Void) {
         openMainWindowImpl = openMainWindow
 
