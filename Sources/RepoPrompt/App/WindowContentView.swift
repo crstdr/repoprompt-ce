@@ -18,7 +18,6 @@ struct WindowContentView: View {
     }
 
     @EnvironmentObject var sparkleManager: SparkleUpdaterManager
-    @Environment(\.openWindow) private var openWindow
 
     /// The WindowState itself (your big manager of fileManager, promptManager, etc.)
     @StateObject private var windowState = WindowState(
@@ -62,10 +61,7 @@ struct WindowContentView: View {
                     }
                 }
 
-                // Install the openWindow action into AppWindowOpener for programmatic window creation
-                AppWindowOpener.shared.install {
-                    openWindow(id: "main")
-                }
+                AppWindowOpener.shared.mainWindowRegistered()
             }
             // Cleanup if the window goes away
             .onDisappear {

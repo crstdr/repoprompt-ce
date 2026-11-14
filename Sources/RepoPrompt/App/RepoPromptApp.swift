@@ -165,6 +165,7 @@ struct RepoPromptSwiftUIApp: App {
                 .environment(\.font, fontScale.preset.font)
                 .environment(\.repoPromptFontScalePreset, fontScale.preset)
         }
+        .handlesExternalEvents(matching: [])
         // .windowStyle(.hiddenTitleBar)
         .windowStyle(.automatic)
         .windowToolbarStyle(.unified)
@@ -172,11 +173,7 @@ struct RepoPromptSwiftUIApp: App {
             UpdateMenu(sparkleManager: appDelegate.sparkleManager)
 
             // Replace SwiftUI's automatic Cmd-N; otherwise it keeps reserving the key after a remap.
-            CommandGroup(replacing: .newItem) {
-                Button(shortcutDisplay.title("New Workspace Window", for: .newWorkspaceWindow)) {
-                    AppWindowOpener.shared.requestMainWindowFromDock()
-                }
-            }
+            MainWindowCommands(title: shortcutDisplay.title("New Workspace Window", for: .newWorkspaceWindow))
 
             // macOS standard "Settings…" (⌘,) menu item
             CommandGroup(replacing: .appSettings) {
