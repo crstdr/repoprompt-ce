@@ -1336,8 +1336,8 @@ omitted rather than shown as zero once elapsed. `agent_session_link` is unchange
 
 Periodic waking is a separate, default-off observer-session preference, not notification admission
 spacing. It applies only while the session has at least one live outbound oversight relationship.
-The compact `Wake periodically when idle` checkbox and adjacent picker offer 10/30/60/120/360 minutes
-(default 30). The existing routine-limit checkbox likewise keeps its picker on the same row. The entire
+The compact `Wake after being idle for:` checkbox and adjacent picker offer 10/30 minutes and
+1/2/3/6/12/24 hours (default 30 minutes). The existing routine-limit checkbox likewise keeps its picker on the same row. The entire
 wake-controls block is visible only with outbound oversight; inbound-only sessions do not show it.
 Hiding these controls does not clear the session's saved preferences.
 
