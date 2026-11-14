@@ -115,9 +115,105 @@ final class ComputerUseChildProof: Equatable {
     }
 
     private let configuration: @MainActor () -> Configuration
+    private struct RestoredChild {
+        weak var session: AgentTabSession?
+        let sessionID: UUID
+        let bindingGeneration: UInt64
+        let stopFence: AgentRunStartStopFence
+        var activation: AgentModeViewModel.AgentMCPControlContext?
+    }
+
+    private var restoredChild: RestoredChild?
+    var hasRestoredChild: Bool {
+        restoredChild != nil
+    }
+
+    var restoredSession: AgentTabSession? {
+        restoredChild?.session
+    }
+
+    func captureRestoredChild(entry: AgentSessionIndexEntry) throws {
+        guard parentIsCurrent, entry.purpose == "computerUse",
+              entry.parentSessionID == parent.activeAgentSessionID,
+              entry.agentKindRaw == AgentProviderKind.codexExec.rawValue,
+              matchesConfiguration(model: entry.agentModelRaw, effort: entry.agentReasoningEffortRaw),
+              let workspace = owner.workspaceManager?.activeWorkspace, workspace.id == creationKey.workspaceID,
+              workspace.composeTabs.contains(where: { $0.id == entry.tabID && $0.activeAgentSessionID == entry.id }),
+              owner.preparedSessionRuntimes?.hasPreparedRuntime(entry.id) != true,
+              !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: entry.id),
+              !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: entry.id)
+        else { throw MCPError.invalidParams(Self.denied) }
+        // An explicit saved binding may have no runtime yet. This creates neither a tab nor a saved session.
+        let existing = try owner.authoritativeLiveSession(for: entry.id)
+        guard let session = existing ?? owner.session(for: entry.tabID, createIfNeeded: false) else { throw MCPError.invalidParams(Self.denied) }
+        try captureRestoredChild(session, entry: entry)
+    }
+
+    func captureRestoredChild(_ session: AgentTabSession, entry: AgentSessionIndexEntry) throws {
+        guard restoredChild == nil, session.mcpControlContext == nil,
+              entry.purpose == "computerUse", entry.parentSessionID == parent.activeAgentSessionID,
+              entry.id == session.activeAgentSessionID, entry.tabID == session.tabID,
+              entry.agentKindRaw == AgentProviderKind.codexExec.rawValue,
+              matchesConfiguration(model: entry.agentModelRaw, effort: entry.agentReasoningEffortRaw),
+              isOpenChild(session, sessionID: entry.id), !session.runState.isActive,
+              !session.mcpFollowUpRunPending, session.codexController == nil,
+              !session.hasBindingBlockingInteraction, session.pendingInstructions.isEmpty
+        else { throw MCPError.invalidParams(Self.denied) }
+        if session.hasLoadedPersistedState {
+            guard session.isComputerUseChild, session.parentSessionID == parent.activeAgentSessionID,
+                  session.selectedAgent == .codexExec,
+                  matchesConfiguration(model: session.selectedModelRaw, effort: session.selectedReasoningEffortRaw)
+            else { throw MCPError.invalidParams(Self.denied) }
+        }
+        restoredChild = .init(session: session, sessionID: entry.id, bindingGeneration: session.bindingTransitionGeneration, stopFence: AgentRunStartStopFence(session: session))
+    }
+
+    func matchesConfiguration(model: String?, effort: String?) -> Bool {
+        let selected = CodexModelSpecifier(raw: model)
+        let configured = CodexModelSpecifier(raw: String(modelID.dropFirst("codexExec:".count)))
+        return selected.baseModel != nil && selected.baseModel == configured.baseModel
+            && selected.serviceTier == nil && configured.serviceTier == nil
+            && (selected.reasoningEffort == nil || selected.reasoningEffort == .high)
+            && (configured.reasoningEffort == nil || configured.reasoningEffort == .high)
+            && CodexReasoningEffort.parse(effort) == .high
+    }
+
+    private func isOpenChild(_ session: AgentTabSession, sessionID: UUID) -> Bool {
+        owner.sessions[session.tabID] === session && session.activeAgentSessionID == sessionID
+            && owner.preparedSessionRuntimes?.hasPreparedRuntime(sessionID) != true
+            && owner.workspaceManager?.activeWorkspace?.composeTabs.contains(where: { $0.id == session.tabID && $0.activeAgentSessionID == sessionID }) == true
+            && !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: sessionID)
+            && !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: sessionID)
+    }
+
+    func restoredChildIsCurrent() -> Bool {
+        guard let restoredChild else { return false }
+        guard let session = restoredChild.session else { return false }
+        return parentIsCurrent && isOpenChild(session, sessionID: restoredChild.sessionID)
+            && session.bindingTransitionGeneration == restoredChild.bindingGeneration
+            && restoredChild.stopFence.permitsStart(of: session)
+            && (restoredChild.activation.map { session.mcpControlContext?.activationID == $0.activationID && session.mcpControlContext?.registration == $0.registration } ?? (session.mcpControlContext == nil))
+    }
+
+    func permitsRestoredControlActivation(_ session: AgentTabSession) -> Bool {
+        restoredChild?.session === session && restoredChild?.activation == nil
+            && restoredChildIsCurrent() && permits(session)
+            && !session.runState.isActive && !session.mcpFollowUpRunPending
+            && session.codexController == nil && !session.hasBindingBlockingInteraction
+            && session.pendingInstructions.isEmpty
+    }
+
+    func didActivateRestoredControl(_ context: AgentModeViewModel.AgentMCPControlContext) {
+        restoredChild?.activation = context
+    }
+
     private var runRouteFence: ComputerUseRunRouteFence?
     var hasNetworkRunRouteFence: Bool {
         runRouteFence != nil
+    }
+
+    var hasSubmittedInstruction: Bool {
+        runRouteFence?.hasSubmitted == true
     }
 
     static func capture(owner: AgentModeViewModel, configuration: @escaping @MainActor () -> Configuration = { currentConfiguration }) throws -> ComputerUseChildProof {
@@ -220,6 +316,7 @@ final class ComputerUseChildProof: Equatable {
 
     func permits(_ session: AgentTabSession) -> Bool {
         !retiring && Self.holder === self && parentIsCurrent && child === session
+            && (restoredChild == nil || (restoredChild?.session === session && restoredChildIsCurrent() && matchesConfiguration(model: session.selectedModelRaw, effort: session.selectedReasoningEffortRaw)))
             && owner.sessions[session.tabID] === session && session.purpose == "computerUse"
             && session.computerUseChildProof === self
             && session.parentSessionID == parent.activeAgentSessionID && session.selectedAgent == .codexExec

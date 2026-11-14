@@ -7972,13 +7972,19 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     /// Ensures a session exists for the given tab ID and loads any persisted state.
     /// Used by MCP tool handlers to ensure session is ready before accessing it.
-    func ensureSessionReady(tabID: UUID, reconnectActiveProviders: Bool = false) async -> TabSession {
+    func ensureSessionReady(tabID: UUID, reconnectActiveProviders: Bool = false, expectedSession: TabSession? = nil) async -> TabSession {
+        if let expectedSession {
+            guard sessions[tabID] === expectedSession,
+                  let expectedID = expectedSession.activeAgentSessionID,
+                  workspaceManager?.activeAgentSessionID(forTabID: tabID) == expectedID,
+                  preparedSessionRuntimes?.hasPreparedRuntime(expectedID) != true else { return expectedSession }
+        }
         let owners = preparedSessionRuntimes
         let visibleSessionID = workspaceManager?.activeAgentSessionID(forTabID: tabID)
         let preparedVisitID = workspaceManager?.isSessionRuntimeProjection != true
             ? visibleSessionID.flatMap { owners?.hasPreparedRuntime($0) == true ? $0 : nil } : nil
         if let preparedVisitID, owners?.claimPreparedRuntimeVisit(preparedVisitID) != true {
-            return session(for: tabID)
+            return expectedSession ?? session(for: tabID)
         }
         defer {
             if let preparedVisitID {
@@ -7990,6 +7996,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
            let owners,
            await !(owners.releasePreparedOversightOwnerForVisit(sessionID: id, preparingReplacement: false))
         {
+            if let expectedSession { return expectedSession }
             // Keep one writer while the run settles; the user's visit is resumed by the
             // owner's existing run-state observation, without a second click or polling timer.
             let workspaceID = workspaceManager?.activeWorkspaceID
@@ -8001,7 +8008,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
             return session(for: tabID)
         }
-        let session = session(for: tabID)
+        if let expectedSession {
+            guard sessions[tabID] === expectedSession,
+                  let expectedID = expectedSession.activeAgentSessionID,
+                  workspaceManager?.activeAgentSessionID(forTabID: tabID) == expectedID,
+                  preparedSessionRuntimes?.hasPreparedRuntime(expectedID) != true else { return expectedSession }
+        }
+        let session = expectedSession ?? session(for: tabID)
 
         // Load persisted session if we haven't already.
         if !session.hasLoadedPersistedState {
@@ -12081,21 +12094,35 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         creationHandle: AgentSessionCreationHandle? = nil,
         computerUseProof: ComputerUseChildProof? = nil
     ) async throws -> AgentMCPControlContext {
+        let restoredExpectedSession: TabSession?
+        if creationHandle == nil,
+           computerUseProof != nil || sessions[tabID]?.isComputerUseChild == true || sessionIndex[sessionID]?.purpose == "computerUse"
+        {
+            guard let proof = computerUseProof, proof.hasRestoredChild,
+                  let restored = proof.restoredSession, restored.tabID == tabID,
+                  restored.activeAgentSessionID == sessionID, proof.permitsRestoredControlActivation(restored)
+            else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+            restoredExpectedSession = restored
+        } else { restoredExpectedSession = nil }
         let admittedWindow = WindowStatesManager.shared.window(withID: windowID)
         var residentActivationTarget: MCPResidentTarget? = nil
         if creationHandle == nil {
             residentActivationTarget = try await mcpPreflightResidentActivation(sessionID: sessionID, admittedWindow: admittedWindow)
         }
-        let session = await ensureSessionReady(tabID: tabID)
+        if let restoredExpectedSession,
+           computerUseProof?.permitsRestoredControlActivation(restoredExpectedSession) != true { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+        let session = await ensureSessionReady(tabID: tabID, expectedSession: restoredExpectedSession)
         guard sessions[tabID] === session,
               session.activeAgentSessionID == sessionID,
               !session.bindingTransitionInProgress
         else {
             throw MCPError.invalidParams("The requested agent session binding changed before MCP control activation.")
         }
-        if session.isComputerUseChild {
-            guard creationHandle != nil, computerUseProof === session.computerUseChildProof,
-                  computerUseProof?.permits(session) == true else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+        if session.isComputerUseChild || computerUseProof != nil {
+            guard computerUseProof === session.computerUseChildProof,
+                  computerUseProof?.permits(session) == true,
+                  creationHandle != nil || computerUseProof?.permitsRestoredControlActivation(session) == true
+            else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
         }
         try requireSessionConfigurationAdmission(session, creationHandle: creationHandle)
         if requireInactiveRunState, session.runState.isActive {
@@ -12115,7 +12142,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let activationBindingToken = session.currentRestorationBindingToken
         var activationOwnership: MCPActivationOwnership = .resident
         func requireActivationOwner() throws {
-            if session.isComputerUseChild, computerUseProof?.permits(session) != true { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+            if session.isComputerUseChild || computerUseProof != nil,
+               computerUseProof?.permits(session) != true { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
             guard sessions[tabID] === session,
                   session.currentRestorationBindingToken == activationBindingToken
             else {
@@ -12233,8 +12261,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         var didOverrideAutoEdit = false
         // Observers can publish as soon as control is installed. Establish pending status before
         // setup suspends, so an idle session cannot publish a sticky terminal snapshot for this start.
+        if creationHandle == nil, session.isComputerUseChild || computerUseProof != nil {
+            guard computerUseProof?.permitsRestoredControlActivation(session) == true else {
+                await cleanupFailedRegistration()
+                throw MCPError.invalidParams(ComputerUseChildProof.denied)
+            }
+        }
         session.mcpFollowUpRunPending = startPending
         session.mcpControlContext = activatedContext
+        if computerUseProof?.restoredSession === session { computerUseProof?.didActivateRestoredControl(activatedContext) }
         // Publication transfers ownership from the app-owned admission to this exact control context.
         activationOwnership = .installed(context: activatedContext, generation: activationGeneration)
         func releaseFailedInstalledActivation() async {
