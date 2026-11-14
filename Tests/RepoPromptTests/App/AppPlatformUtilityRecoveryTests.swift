@@ -56,6 +56,35 @@ final class AppPlatformUtilityRecoveryTests: XCTestCase {
     }
 
     @MainActor
+    func testEitherWindowInstallerDrainsPendingRequestsOnlyOnce() {
+        let opener = AppWindowOpener.shared
+        defer { opener.resetForTesting() }
+        for commandsFirst in [true, false] {
+            for urlRequest in [true, false] {
+                opener.resetForTesting()
+                var commandsOpened = 0
+                var windowOpened = 0
+                let commandsInstall = { opener.install { commandsOpened += 1 } }
+                let windowInstall = { opener.install { windowOpened += 1 } }
+                if urlRequest {
+                    opener.requestWindowForQueuedURLs(hasLiveWindows: false, hasPendingURLs: true)
+                } else {
+                    opener.requestMainWindowFromDock()
+                }
+                if commandsFirst {
+                    commandsInstall()
+                    windowInstall()
+                } else {
+                    windowInstall()
+                    commandsInstall()
+                }
+                XCTAssertEqual(commandsOpened, commandsFirst ? 1 : 0)
+                XCTAssertEqual(windowOpened, commandsFirst ? 0 : 1)
+            }
+        }
+    }
+
+    @MainActor
     func testForwardOpenURLsPreservesOrderAndDuplicates() async throws {
         let first = try XCTUnwrap(URL(string: "repoprompt-ce://prompt?content=first"))
         let second = try XCTUnwrap(URL(string: "repoprompt://open/example"))
