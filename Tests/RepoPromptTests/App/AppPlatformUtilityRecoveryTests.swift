@@ -16,23 +16,72 @@ final class AppPlatformUtilityRecoveryTests: XCTestCase {
     }
 
     @MainActor
-    func testQueuedURLWindowOpeningDecision() {
-        func shouldOpen(_ launched: Bool, _ available: Bool, _ live: Bool, _ pendingBefore: Bool, _ pendingAfter: Bool) -> Bool {
-            AppDelegate.shouldOpenWindowForQueuedURLs(
-                finishedLaunching: launched,
-                openerAvailable: available,
-                hasLiveWindows: live,
-                hadPendingURLs: pendingBefore,
-                hasPendingURLs: pendingAfter
-            )
-        }
+    func testQueuedURLWindowWaitsForOpenerAndCoalescesUntilRegistration() {
+        let opener = AppWindowOpener.shared
+        opener.resetForTesting()
+        defer { opener.resetForTesting() }
+        var opened = 0
+        opener.requestWindowForQueuedURLs(hasLiveWindows: true, hasPendingURLs: true)
+        opener.requestWindowForQueuedURLs(hasLiveWindows: false, hasPendingURLs: false)
+        XCTAssertEqual(opener.pendingDockWindowRequestCount, 0)
+        opener.requestWindowForQueuedURLs(hasLiveWindows: false, hasPendingURLs: true)
+        opener.requestWindowForQueuedURLs(hasLiveWindows: false, hasPendingURLs: true)
+        XCTAssertTrue(opener.pendingURLWindowRequest)
+        opener.install { opened += 1 }
+        opener.install { opened += 1 }
+        XCTAssertEqual(opened, 1)
+        opener.requestWindowForQueuedURLs(hasLiveWindows: false, hasPendingURLs: true)
+        XCTAssertEqual(opened, 1)
+        opener.mainWindowRegistered()
+        opener.requestWindowForQueuedURLs(hasLiveWindows: false, hasPendingURLs: true)
+        XCTAssertEqual(opened, 2)
+    }
 
-        XCTAssertTrue(shouldOpen(true, true, false, false, true))
-        XCTAssertFalse(shouldOpen(false, true, false, false, true))
-        XCTAssertFalse(shouldOpen(true, false, false, false, true))
-        XCTAssertFalse(shouldOpen(true, true, true, false, true))
-        XCTAssertFalse(shouldOpen(true, true, false, true, true))
-        XCTAssertFalse(shouldOpen(true, true, false, false, false))
+    @MainActor
+    func testRegistrationRetiresURLBootstrapButPreservesExplicitWindowRequest() {
+        let opener = AppWindowOpener.shared
+        opener.resetForTesting()
+        defer { opener.resetForTesting() }
+        var opened = 0
+        opener.requestWindowForQueuedURLs(hasLiveWindows: false, hasPendingURLs: true)
+        opener.mainWindowRegistered()
+        opener.install { opened += 1 }
+        XCTAssertEqual(opened, 0)
+        opener.resetForTesting()
+        opener.requestWindowForQueuedURLs(hasLiveWindows: false, hasPendingURLs: true)
+        opener.requestMainWindowFromDock()
+        opener.mainWindowRegistered()
+        opener.install { opened += 1 }
+        XCTAssertEqual(opened, 1)
+    }
+
+    @MainActor
+    func testEitherWindowInstallerDrainsPendingRequestsOnlyOnce() {
+        let opener = AppWindowOpener.shared
+        defer { opener.resetForTesting() }
+        for commandsFirst in [true, false] {
+            for urlRequest in [true, false] {
+                opener.resetForTesting()
+                var commandsOpened = 0
+                var windowOpened = 0
+                let commandsInstall = { opener.install { commandsOpened += 1 } }
+                let windowInstall = { opener.install { windowOpened += 1 } }
+                if urlRequest {
+                    opener.requestWindowForQueuedURLs(hasLiveWindows: false, hasPendingURLs: true)
+                } else {
+                    opener.requestMainWindowFromDock()
+                }
+                if commandsFirst {
+                    commandsInstall()
+                    windowInstall()
+                } else {
+                    windowInstall()
+                    commandsInstall()
+                }
+                XCTAssertEqual(commandsOpened, commandsFirst ? 1 : 0)
+                XCTAssertEqual(windowOpened, commandsFirst ? 0 : 1)
+            }
+        }
     }
 
     @MainActor
