@@ -1389,6 +1389,12 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 let vm = fixture.viewModel
                 let session = fixture.sourceSession
                 fixture.window.promptManager.apiSettingsViewModel?.isCodexConnected = true
+                let assistantIndex = try XCTUnwrap(session.items.firstIndex { $0.kind == .assistant })
+                _ = try session.removeItem(at: assistantIndex)
+                session.providerSessionID = "existing-source-session"
+                fixture.window.promptManager.promptText = "Initial context from the workspace"
+                XCTAssertFalse(vm.shouldIncludeInitialThreadContext(for: session))
+                XCTAssertTrue(vm.shouldIncludeInitialThreadContext(for: session, assumeFreshProvider: true))
                 let draft = "continue the investigation"
                 vm.storeDraftText(for: session.tabID, draft)
                 let model = AgentModel.gpt61SolMedium.rawValue
@@ -1406,6 +1412,11 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     return XCTFail("The previewed draft must remain admissible")
                 }
                 let initial = try XCTUnwrap(preparation?.initialThreadInput)
+                XCTAssertTrue(initial.contains("<current_prompt_content>\nInitial context from the workspace\n</current_prompt_content>"))
+                XCTAssertEqual(
+                    preview.budget?.codexCarrierScalars,
+                    AgentProviderHandover.codexCarrierAllowance(composedInput: initial, parkedNote: session.selfCompactState.parkedNote?.frame)
+                )
                 XCTAssertLessThanOrEqual((payload + "\n\n" + initial).unicodeScalars.count, AgentProviderHandover.codexMaximumInputScalars)
             }
         }

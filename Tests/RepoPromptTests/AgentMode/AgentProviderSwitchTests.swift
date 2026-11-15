@@ -630,7 +630,7 @@
 
         func testCodexCompleteInputBudgetFallsBackToNewestTurnsAtScale() throws {
             let transcript = AgentTranscript(turns: [
-                fixture(request: String(repeating: "a", count: 900_000)),
+                fixture(request: String(repeating: "a", count: 880_000)),
                 fixture(request: String(repeating: "b", count: 150_000))
             ])
             let projection = try Handover.project(transcript)
@@ -638,6 +638,8 @@
             let allowance = Handover.codexCarrierAllowance(composedInput: input, parkedNote: nil)
             let budget = Handover.Budget(catalogWindow: 10_000_000, instructions: [], composedInput: input, isPreview: true, codexCarrierScalars: allowance)
             let full = Handover.history(projection, source: source(), historyReference: nil)
+            let unrestricted = Handover.Budget(catalogWindow: 10_000_000, instructions: [], composedInput: input, isPreview: true)
+            XCTAssertTrue(unrestricted.fits(full), "The carrier and token limits must not cause the fallback")
             XCTAssertFalse(budget.fits(full))
             let recent = try XCTUnwrap(Handover.newestCompleteTurns(projection, source: source(), historyReference: nil, budget: budget))
             XCTAssertEqual(recent.turnIndices, [1])
