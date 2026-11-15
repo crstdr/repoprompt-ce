@@ -25084,9 +25084,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     func buildInitialThreadMessageIfNeeded(
         tabID: UUID,
         session: TabSession,
-        initialMessage: String
+        initialMessage: String,
+        assumeFreshProvider: Bool = false
     ) async -> String {
-        guard shouldIncludeInitialThreadContext(for: session) else {
+        guard shouldIncludeInitialThreadContext(for: session, assumeFreshProvider: assumeFreshProvider) else {
             return initialMessage
         }
         let context = await initialThreadContext(tabID: tabID, session: session)
@@ -25108,8 +25109,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return block
     }
 
-    func shouldIncludeInitialThreadContext(for session: TabSession) -> Bool {
-        guard session.providerSessionID == nil else { return false }
+    func shouldIncludeInitialThreadContext(for session: TabSession, assumeFreshProvider: Bool = false) -> Bool {
+        guard assumeFreshProvider || session.providerSessionID == nil else { return false }
         guard !session.items.contains(where: Self.itemBlocksInitialThreadContext) else { return false }
         let userMessageCount = session.items.enumerated().reduce(into: 0) { partialResult, entry in
             let (index, item) = entry
