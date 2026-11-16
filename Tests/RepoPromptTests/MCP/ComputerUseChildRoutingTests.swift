@@ -487,6 +487,47 @@ final class ComputerUseChildRoutingTests: XCTestCase {
         }
     }
 
+    func testComputerUseSteerValidationAlwaysEmitsOnce() async throws {
+        for kind in ["controlled", "restored", "ordinary"] {
+            for (failure, expectedMessage, reason) in [
+                ("missing", "message is required.", "argument_steer_message"),
+                ("type", "message is required.", "argument_steer_message"),
+                ("blank", "message is required.", "argument_steer_message"),
+                ("workflow", "Specify either workflow_id or workflow_name", "argument_steer_workflow"),
+                ("worktree", "agent_run worktree arguments are only supported with op=start.", "argument_worktree_operation"),
+                ("benchmark", "The worktree startup benchmark token is only supported with agent_run op=start.", "argument_benchmark_operation")
+            ] {
+                try await withRoute(realSteer: true, realStarter: true) { f in
+                    let child = try await (kind == "restored" ? f.restoredChild(reload: true) : f.controlledChild(computerUse: kind != "ordinary"))
+                    let id = try XCTUnwrap(child.activeAgentSessionID).uuidString
+                    var args: [String: Any] = ["op": "steer", "session_id": id, "wait": false, "_rawJSON": true]
+                    if failure == "type" { args["message"] = 42 }
+                    if failure == "blank" { args["message"] = "   " }
+                    if failure == "workflow" {
+                        args["message"] = "PRIVATE_STEER_VALIDATION_MARKER"
+                        args["workflow_id"] = UUID().uuidString
+                        args["workflow_name"] = "PRIVATE_STEER_VALIDATION_MARKER"
+                    }
+                    if failure == "worktree" { args["worktree"] = "PRIVATE_STEER_VALIDATION_MARKER" }
+                    if failure == "benchmark" { args["_worktree_startup_benchmark_token"] = "PRIVATE_STEER_VALIDATION_MARKER" }
+                    ComputerUseRunDiagnostic.beginCaptureForTesting()
+                    defer { _ = ComputerUseRunDiagnostic.endCaptureForTesting() }
+                    let response = try await f.transport.callTool(name: "agent_run", arguments: args)
+                    let lines = ComputerUseRunDiagnostic.endCaptureForTesting()
+                    XCTAssertTrue(response.rawJSON.contains(expectedMessage), response.rawJSON)
+                    XCTAssertEqual(lines.count, kind == "ordinary" ? 0 : 1, "\(kind), \(failure)")
+                    if kind != "ordinary" {
+                        XCTAssertTrue(lines.first?.contains("reason=\(reason) ") == true)
+                    }
+                    XCTAssertFalse(lines.joined().contains("PRIVATE_STEER_VALIDATION_MARKER"))
+                    XCTAssertEqual(f.armEntries, 0)
+                    XCTAssertEqual(f.submissions, 0)
+                    XCTAssertNil(child.codexController)
+                }
+            }
+        }
+    }
+
     func testNetworkIdleComputerUseSteerAcceptsOneFakeNativeTurn() async throws {
         try await withRoute(realSteer: true, realStarter: true) { f in
             let child = try await f.controlledChild()

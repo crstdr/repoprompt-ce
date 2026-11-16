@@ -16,6 +16,10 @@ package final class ComputerUseRunDiagnostic: @unchecked Sendable {
         case argument_keys
         case argument_operation
         case argument_type
+        case argument_steer_message
+        case argument_steer_workflow
+        case argument_worktree_operation
+        case argument_benchmark_operation
         case arm_admission
         case arm_permits
         case arm_runtime
@@ -135,9 +139,14 @@ package final class ComputerUseRunDiagnostic: @unchecked Sendable {
         return original
     }
 
-    private func record(_ reason: Reason, provisional isProvisional: Bool) {
+    package static func recordIfInterested<T>(_ reason: Reason, _ original: T) -> T {
+        scope.get()?.record(reason, provisional: speculative.get(), requiresInterest: true)
+        return original
+    }
+
+    private func record(_ reason: Reason, provisional isProvisional: Bool, requiresInterest: Bool = false) {
         lock.withLock {
-            guard !finished else { return }
+            guard !finished, !requiresInterest || interested else { return }
             interested = true
             if isProvisional { if provisional == nil { provisional = reason } }
             else if first == nil { first = reason }
@@ -147,6 +156,11 @@ package final class ComputerUseRunDiagnostic: @unchecked Sendable {
     /// A swallowed steer probe is an observation until the target requires CU authority.
     package static func probe<T>(_ operation: () throws -> T) -> T? {
         speculative.withValue(true) { try? operation() }
+    }
+
+    /// Interest does not promote a swallowed probe failure into the call's refusal.
+    package func markInterested() {
+        lock.withLock { if !finished { interested = true } }
     }
 
     package func promoteProbe() {

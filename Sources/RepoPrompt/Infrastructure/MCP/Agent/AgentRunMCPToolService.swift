@@ -460,6 +460,14 @@ struct AgentRunMCPToolService {
             displayVersion: Self.computerUseBuild.0, buildVersion: Self.computerUseBuild.1
         )
         return try await ComputerUseRunDiagnostic.scope.withValue(diagnostic) {
+            // Use the dispatched window observation, not an earlier authorization/window check.
+            if normalizedString(args["op"])?.lowercased() == "steer",
+               let raw = normalizedString(args["session_id"]), let sessionID = UUID(uuidString: raw),
+               let windowID = context?.dispatchAuthorization?.windowIdentity?.windowID,
+               let window = WindowStatesManager.shared.window(withID: windowID)
+            {
+                noteComputerUseSteerTarget(sessionID, in: window.agentModeViewModel)
+            }
             do {
                 let result = try await executeDiagnosed(args: args)
                 diagnostic.finish(success: true)
@@ -476,11 +484,11 @@ struct AgentRunMCPToolService {
         _ = try Self.computerUseRequested(args: args, operation: op)
         #if DEBUG
             if op != "start", args["_worktree_startup_benchmark_token"] != nil {
-                throw MCPError.invalidParams("The worktree startup benchmark token is only supported with agent_run op=start.")
+                throw ComputerUseRunDiagnostic.recordIfInterested(.argument_benchmark_operation, MCPError.invalidParams("The worktree startup benchmark token is only supported with agent_run op=start."))
             }
         #endif
         if op != "start", startWorktreeCoordinator.containsArguments(args) {
-            throw MCPError.invalidParams("agent_run worktree arguments are only supported with op=start.")
+            throw ComputerUseRunDiagnostic.recordIfInterested(.argument_worktree_operation, MCPError.invalidParams("agent_run worktree arguments are only supported with op=start."))
         }
         switch op {
         case "start":
@@ -1702,12 +1710,22 @@ struct AgentRunMCPToolService {
         return .object(result)
     }
 
+    private func noteComputerUseSteerTarget(_ sessionID: UUID, in owner: AgentModeViewModel) {
+        // Observe existing metadata/runtime only; never activate or authorize a target here.
+        if owner.sessionIndex[sessionID]?.purpose == "computerUse"
+            || owner.sessions.values.contains(where: { $0.activeAgentSessionID == sessionID && $0.isComputerUseChild })
+        {
+            ComputerUseRunDiagnostic.scope.get()?.markInterested()
+        }
+    }
+
     private func executeSteer(args: [String: Value]) async throws -> Value {
         let targetWindow = try requireTargetWindow()
         let agentModeVM = resolvedAgentModeViewModel(targetWindow)
         let expectedWorkspaceID = targetWindow.workspaceManager.activeWorkspaceID
         var computerUseProof: ComputerUseChildProof?
         if let raw = normalizedString(args["session_id"]), let sessionID = UUID(uuidString: raw) {
+            noteComputerUseSteerTarget(sessionID, in: agentModeVM)
             if let child = agentModeVM.mcpControlledSession(sessionID: sessionID), child.isComputerUseChild, !child.runState.isActive {
                 computerUseProof = ComputerUseRunDiagnostic.probe { try captureComputerUseProof(owner: agentModeVM) }
             } else if let entry = agentModeVM.sessionIndex[sessionID], entry.purpose == "computerUse",
@@ -1736,8 +1754,12 @@ struct AgentRunMCPToolService {
             agentModeVM: agentModeVM,
             metadata: metadata
         )
-        let text = try resolveMessage(args["message"], name: "message")
-        let workflow = try resolveWorkflow(args: args)
+        let text: String
+        do { text = try resolveMessage(args["message"], name: "message") }
+        catch { throw ComputerUseRunDiagnostic.recordIfInterested(.argument_steer_message, error) }
+        let workflow: AgentWorkflowDefinition?
+        do { workflow = try resolveWorkflow(args: args) }
+        catch { throw ComputerUseRunDiagnostic.recordIfInterested(.argument_steer_workflow, error) }
         if agentModeVM.mcpControlledSession(sessionID: sessionID)?.isComputerUseChild == true,
            agentModeVM.mcpControlledSession(sessionID: sessionID)?.runState.isActive == true { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.service_executeSteer_1, ComputerUseChildProof.busy)) }
         var restoredResolution: SteerControlResolution?
@@ -3851,6 +3873,7 @@ struct AgentRunMCPToolService {
             targetWindow: targetWindow,
             agentModeVM: agentModeVM
         )
+        if operation == .runSteer { noteComputerUseSteerTarget(sessionID, in: agentModeVM) }
         try await authorizeControlTargets(
             operation: operation,
             sessionIDs: [sessionID],
