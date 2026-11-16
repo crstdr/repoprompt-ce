@@ -2,6 +2,7 @@ import Foundation
 import MCP
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
+import RepoPromptShared
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
@@ -70,6 +71,32 @@ final class ComputerUseChildSafetyTests: XCTestCase {
             await proof.producerSettled()?.value
         }
         try await super.tearDown()
+    }
+
+    func testChildArmDiagnosticPreservesRefusal() async throws {
+        for runtimeFails in [true, false] {
+            let f = try fixture(preflight: { runtimeFails ? "PRIVATE_RUNTIME_MARKER" : nil })
+            try f.proof.reserve()
+            if !runtimeFails { f.parent.computerUseParentGrant = nil }
+            let diagnostic = ComputerUseRunDiagnostic(backend: .app, operation: "start", invocationID: UUID(), interested: true, tags: [], keyCount: 0)
+            ComputerUseRunDiagnostic.beginCaptureForTesting()
+            defer { _ = ComputerUseRunDiagnostic.endCaptureForTesting() }
+            await ComputerUseRunDiagnostic.scope.withValue(diagnostic) {
+                do {
+                    try await f.coordinator.armComputerUseChild(session: f.child, proof: f.proof)
+                    XCTFail("Expected refusal")
+                } catch {
+                    XCTAssertTrue(error.localizedDescription.contains(ComputerUseChildProof.denied))
+                    diagnostic.finish(success: false)
+                }
+            }
+            let lines = ComputerUseRunDiagnostic.endCaptureForTesting()
+            XCTAssertEqual(lines.count, 1)
+            XCTAssertTrue(lines.first?.contains("reason=\(runtimeFails ? "arm_runtime" : "arm_permits") ") == true)
+            XCTAssertFalse(lines.joined().contains("PRIVATE_RUNTIME_MARKER"))
+            XCTAssertFalse(f.child.isCodexComputerUseArmed)
+            await f.finish()
+        }
     }
 
     func testIndependentPolicyAndFixedProfile() {

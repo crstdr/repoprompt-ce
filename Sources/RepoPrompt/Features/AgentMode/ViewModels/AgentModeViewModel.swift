@@ -4110,7 +4110,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
               computerUseComposerProps(session: session).isVisible else { return CodexComputerUseWorkflow.ineligibleMessage }
         guard GlobalSettingsStore.shared.computerUseMasterEnabled, !parentGrant || ComputerUseChildProof.enabled else {
             NotificationCenter.default.post(name: .showComputerUseSettingsTab, object: nil, userInfo: ["windowID": windowID])
-            return parentGrant ? ComputerUseChildProof.denied : CodexComputerUseWorkflow.disabledMessage
+            return parentGrant ? ComputerUseRunDiagnostic.record(.vm_armComputerUseForLocalUser_1, ComputerUseChildProof.denied) : CodexComputerUseWorkflow.disabledMessage
         }
         if session.isCodexComputerUseArmed {
             return nil
@@ -4168,7 +4168,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
               session.currentRestorationBindingToken == armedBindingToken,
               session.operationAdmissionFailureMessage == nil else { return CodexComputerUseWorkflow.ineligibleMessage }
         if parentGrant {
-            guard ComputerUseChildProof.enabled else { return ComputerUseChildProof.denied }
+            guard ComputerUseChildProof.enabled else { return ComputerUseRunDiagnostic.record(.local_arm_policy, ComputerUseChildProof.denied) }
             session.computerUseParentGrant = UUID()
             return nil
         }
@@ -11736,7 +11736,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let configurationBindingToken = session.currentRestorationBindingToken
         func requireConfigurationAdmission() throws {
             if session.isComputerUseChild {
-                guard creationHandle != nil, session.computerUseChildProof?.permits(session) == true else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+                guard creationHandle != nil, session.computerUseChildProof?.permits(session) == true else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.vm_requireConfigurationAdmission_1, ComputerUseChildProof.denied)) }
             }
             try requireSessionConfigurationAdmission(session, creationHandle: creationHandle)
             guard sessions[tabID] === session,
@@ -12101,7 +12101,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             guard let proof = computerUseProof, proof.hasRestoredChild,
                   let restored = proof.restoredSession, restored.tabID == tabID,
                   restored.activeAgentSessionID == sessionID, proof.permitsRestoredControlActivation(restored)
-            else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+            else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.vm_mcpActivateControlContext_1, ComputerUseChildProof.denied)) }
             restoredExpectedSession = restored
         } else { restoredExpectedSession = nil }
         let admittedWindow = WindowStatesManager.shared.window(withID: windowID)
@@ -12110,7 +12110,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             residentActivationTarget = try await mcpPreflightResidentActivation(sessionID: sessionID, admittedWindow: admittedWindow)
         }
         if let restoredExpectedSession,
-           computerUseProof?.permitsRestoredControlActivation(restoredExpectedSession) != true { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+           computerUseProof?.permitsRestoredControlActivation(restoredExpectedSession) != true { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.vm_mcpActivateControlContext_2, ComputerUseChildProof.denied)) }
         let session = await ensureSessionReady(tabID: tabID, expectedSession: restoredExpectedSession)
         guard sessions[tabID] === session,
               session.activeAgentSessionID == sessionID,
@@ -12122,7 +12122,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             guard computerUseProof === session.computerUseChildProof,
                   computerUseProof?.permits(session) == true,
                   creationHandle != nil || computerUseProof?.permitsRestoredControlActivation(session) == true
-            else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+            else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.vm_mcpActivateControlContext_3, ComputerUseChildProof.denied)) }
         }
         try requireSessionConfigurationAdmission(session, creationHandle: creationHandle)
         if requireInactiveRunState, session.runState.isActive {
@@ -12143,7 +12143,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         var activationOwnership: MCPActivationOwnership = .resident
         func requireActivationOwner() throws {
             if session.isComputerUseChild || computerUseProof != nil,
-               computerUseProof?.permits(session) != true { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+               computerUseProof?.permits(session) != true { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.vm_requireActivationOwner_1, ComputerUseChildProof.denied)) }
             guard sessions[tabID] === session,
                   session.currentRestorationBindingToken == activationBindingToken
             else {
@@ -12264,7 +12264,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if creationHandle == nil, session.isComputerUseChild || computerUseProof != nil {
             guard computerUseProof?.permitsRestoredControlActivation(session) == true else {
                 await cleanupFailedRegistration()
-                throw MCPError.invalidParams(ComputerUseChildProof.denied)
+                throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.activate_final_proof, ComputerUseChildProof.denied))
             }
         }
         session.mcpFollowUpRunPending = startPending
@@ -13472,7 +13472,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     private func withMCPInstructionSubmission(session: TabSession, workflow: AgentWorkflowDefinition?, proof: ComputerUseChildProof?, operation: () -> UserTurnSubmissionResult) throws -> UserTurnSubmissionResult {
         if session.isComputerUseChild {
-            guard let proof else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+            guard let proof else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.vm_withMCPInstructionSubmission_1, ComputerUseChildProof.denied)) }
             return try proof.withInstructionSubmission(session) { withMCPWorkflowOverride(session: session, workflow: workflow, operation: operation) }
         }
         return withMCPWorkflowOverride(session: session, workflow: workflow, operation: operation)
@@ -13498,7 +13498,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         if session.isComputerUseChild {
             guard computerUseProof === session.computerUseChildProof, computerUseProof?.permits(session) == true,
-                  nativePreparedTurn == nil, !session.runState.isActive else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+                  nativePreparedTurn == nil, !session.runState.isActive else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.vm_mcpDispatchInstruction_1, ComputerUseChildProof.denied)) }
         }
         try validateInitialStart?()
         let dispatchBindingToken = session.currentRestorationBindingToken
@@ -19716,11 +19716,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if session.isComputerUseChild {
             guard !isLocalComposerInput, computerUseProof === session.computerUseChildProof,
                   computerUseProof?.permits(session) == true, session.hasLoadedPersistedState,
-                  !session.runState.isActive else { return .blocked(message: ComputerUseChildProof.denied) }
+                  !session.runState.isActive else { return .blocked(message: ComputerUseRunDiagnostic.record(.vm_submitUserTurn_1, ComputerUseChildProof.denied)) }
         }
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if session.selectedAgent != .codexExec, ["/computer-use", "/computer-use off"].contains(trimmedText) {
-            guard isLocalComposerInput, session.parentSessionID == nil else { return .blocked(message: ComputerUseChildProof.denied) }
+            guard isLocalComposerInput, session.parentSessionID == nil else { return .blocked(message: ComputerUseRunDiagnostic.record(.vm_submitUserTurn_2, ComputerUseChildProof.denied)) }
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 if trimmedText.hasSuffix(" off"), session.computerUseParentGrant == nil { return }
@@ -20689,7 +20689,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             guard !isLocalComposerInput, managedTurn == nil, nativePreparedTurn == nil,
                   providerSwitchPreparation == nil, session.pendingHandoff.providerSwitchDelivery == nil,
                   computerUseProof === session.computerUseChildProof,
-                  computerUseProof?.permits(session) == true else { return .blocked(message: ComputerUseChildProof.denied) }
+                  computerUseProof?.permits(session) == true else { return .blocked(message: ComputerUseRunDiagnostic.record(.vm_submitPreparedUserTurn_1, ComputerUseChildProof.denied)) }
         }
         guard repromptedText == nil || (isLocalComposerInput && managedTurn == nil) else { return .blocked(message: "Re-prompt is local composer input only.") }
         let trimmedText = repromptedText ?? originalText
@@ -22663,8 +22663,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                   directStartOptions.computerUseProof === session.computerUseChildProof,
                   directStartOptions.computerUseProof?.permits(session) == true
             else {
-                startOutcome?.recordStartFailure(message: ComputerUseChildProof.denied)
-                return .failed(message: ComputerUseChildProof.denied)
+                startOutcome?.recordStartFailure(message: ComputerUseRunDiagnostic.record(.vm_startAgentRun_1, ComputerUseChildProof.denied))
+                return .failed(message: ComputerUseRunDiagnostic.record(.vm_startAgentRun_2, ComputerUseChildProof.denied))
             }
         }
         if session.pendingHandoff.providerSwitchDelivery != nil, providerSwitchPreparation == nil {
@@ -22773,7 +22773,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
               session.currentRestorationBindingToken == originalBindingToken,
               workspaceManager?.activeWorkspaceID == originalWorkspaceID,
               originalStopFence.permitsStart(of: session) else { return nil }
-        if session.isComputerUseChild, directStartOptions.computerUseProof?.permits(session) != true { return .failed(message: ComputerUseChildProof.denied) }
+        if session.isComputerUseChild, directStartOptions.computerUseProof?.permits(session) != true { return .failed(message: ComputerUseRunDiagnostic.record(.start_run_prepared_proof, ComputerUseChildProof.denied)) }
         if let message = session.operationAdmissionFailureMessage {
             startOutcome?.recordStartFailure(message: message)
             return .failed(message: message)
