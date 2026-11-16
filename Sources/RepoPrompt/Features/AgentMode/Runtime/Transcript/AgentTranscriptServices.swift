@@ -3138,6 +3138,9 @@ enum AgentTranscriptIO {
         var turns: [AgentTranscriptTurn] = []
         var currentTurn: AgentTranscriptTurn?
         var currentSpan: AgentTranscriptProviderResponseSpan?
+        // The observed span array is not read until flush. Accumulate locally to avoid
+        // copying its growing activity prefix on every observed-property append.
+        var currentSpanActivities: [AgentTranscriptActivity] = []
         var pendingStableExecutionIDsByToolName: [String: [String]] = [:]
         let processingContext = AgentToolResultProcessingContext()
 
@@ -3157,6 +3160,10 @@ enum AgentTranscriptIO {
         func flushCurrentTurn(isCompleted: Bool, terminalState: AgentSessionRunState?) {
             guard var turn = currentTurn else { return }
             if var span = currentSpan {
+                if !currentSpanActivities.isEmpty {
+                    span.activities = currentSpanActivities
+                }
+                currentSpanActivities = []
                 finalizeSpan(&span, isCompleted: isCompleted)
                 turn.responseSpans.append(span)
             }
@@ -3218,7 +3225,7 @@ enum AgentTranscriptIO {
                 continue
             }
             ensureCurrentTurn(for: item)
-            guard var span = currentSpan else { continue }
+            guard currentSpan != nil else { continue }
             var toolExecution = AgentTranscriptToolNormalizer.toolExecution(for: item, context: processingContext)
             if var resolvedToolExecution = toolExecution {
                 let normalizedToolName = AgentTranscriptToolNormalizer.normalizedToolName(item.toolName) ?? ""
@@ -3243,9 +3250,8 @@ enum AgentTranscriptIO {
                 role: role(for: item),
                 sealsAssistantBoundary: sealsAssistantBoundary(for: item, toolExecution: toolExecution)
             )
-            span.activities.append(activity)
-            span.lastActivityAt = item.timestamp
-            currentSpan = span
+            currentSpanActivities.append(activity)
+            currentSpan?.lastActivityAt = item.timestamp
             currentTurn?.lastActivityAt = item.timestamp
         }
         let shouldCloseTrailingTurn = !(terminalState?.isActive ?? false)
