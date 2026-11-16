@@ -60,6 +60,8 @@ struct WorkspaceCodemapRootStatusSnapshot: Hashable {
     let rootEpoch: WorkspaceCodemapRootEpoch
     let availability: WorkspaceCodemapRootAvailability
     let isGenerationSuspended: Bool
+    /// Derived admission policy for sidebar presentation only; does not change graph availability.
+    let isNonGitCodeMapsPolicyDisabled: Bool
     let coverage: WorkspaceCodemapGraphCatalogCoverage?
     let graphRevision: UInt64?
     let appliedGeneration: WorkspaceCodemapSelectionGraphContributionGeneration
