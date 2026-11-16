@@ -14,6 +14,7 @@ package struct DomainInteractionRequest: Hashable, Sendable {
     package let runID: UUID?
     package let payload: [String: Value]
     package let deadline: Date
+    package let renewalTimeoutSeconds: TimeInterval?
 
     package init(
         id: UUID = UUID(),
@@ -22,7 +23,8 @@ package struct DomainInteractionRequest: Hashable, Sendable {
         invocationID: UUID? = nil,
         runID: UUID? = nil,
         payload: [String: Value],
-        deadline: Date
+        deadline: Date,
+        renewalTimeoutSeconds: TimeInterval? = nil
     ) {
         self.id = id
         self.toolName = toolName
@@ -31,6 +33,7 @@ package struct DomainInteractionRequest: Hashable, Sendable {
         self.runID = runID
         self.payload = payload
         self.deadline = deadline
+        self.renewalTimeoutSeconds = renewalTimeoutSeconds
     }
 }
 
@@ -68,7 +71,7 @@ package struct DomainInteractionBrokerSnapshot: Sendable {
 }
 
 package actor DomainInteractionBroker {
-    private final class ProviderDeadlineArbiter: @unchecked Sendable {
+    package final class Deadline: @unchecked Sendable {
         struct ProviderResolution: Sendable {
             let result: DomainInteractionResult
             let ignoredLateResponse: Bool
@@ -76,25 +79,66 @@ package actor DomainInteractionBroker {
 
         private let lock = NSLock()
         private var isResolved = false
+        private var effectiveDeadline: Date
+        package let originalTimeoutSeconds: TimeInterval?
+        private let hardDeadline: Date
+
+        // Bound abandoned activity by the configured Codex MCP lifetime, never shortening T.
+        package static let maximumRenewableLifetime: TimeInterval = 10_000
+        package static let settlementGrace: TimeInterval = 1
+
+        package init(deadline: Date, renewalTimeoutSeconds: TimeInterval? = nil) {
+            effectiveDeadline = deadline
+            originalTimeoutSeconds = renewalTimeoutSeconds
+            if let timeout = renewalTimeoutSeconds {
+                hardDeadline = deadline.addingTimeInterval(max(0, Self.maximumRenewableLifetime - timeout))
+            } else {
+                hardDeadline = deadline
+            }
+        }
+
+        package func acceptanceDeadline() -> Date? {
+            lock.withLock { isResolved ? nil : effectiveDeadline }
+        }
+
+        package func countdownAnchor() -> Date? {
+            lock.withLock {
+                guard !isResolved, let timeout = originalTimeoutSeconds else { return nil }
+                return effectiveDeadline.addingTimeInterval(-Self.settlementGrace - timeout)
+            }
+        }
+
+        /// Activity renews the idle budget, not the settlement grace or the total lifetime cap.
+        @discardableResult
+        package func renew(at now: Date = Date()) -> Date? {
+            lock.withLock {
+                guard !isResolved, let timeout = originalTimeoutSeconds,
+                      now < effectiveDeadline.addingTimeInterval(-Self.settlementGrace)
+                else { return nil }
+                effectiveDeadline = max(effectiveDeadline, min(
+                    now.addingTimeInterval(timeout + Self.settlementGrace), hardDeadline
+                ))
+                return effectiveDeadline
+            }
+        }
 
         func claimProviderCompletion(
             at completedAt: Date,
-            deadline: Date,
             result: DomainInteractionResult
         ) -> ProviderResolution? {
             lock.withLock {
                 guard !isResolved else { return nil }
                 isResolved = true
-                if case .response = result, completedAt >= deadline {
+                if case .response = result, completedAt >= effectiveDeadline {
                     return ProviderResolution(result: .timedOut, ignoredLateResponse: true)
                 }
                 return ProviderResolution(result: result, ignoredLateResponse: false)
             }
         }
 
-        func claimTimeout() -> Bool {
+        func claimTimeout(at now: Date = Date()) -> Bool {
             lock.withLock {
-                guard !isResolved else { return false }
+                guard !isResolved, now >= effectiveDeadline else { return false }
                 isResolved = true
                 return true
             }
@@ -109,7 +153,7 @@ package actor DomainInteractionBroker {
         let request: DomainInteractionRequest
         let generation: UInt64
         let provider: DomainInteractionProvider
-        let arbiter: ProviderDeadlineArbiter
+        let arbiter: Deadline
         let continuation: CheckedContinuation<DomainInteractionResult, Never>
         var providerTask: Task<Void, Never>?
         var timeoutTask: Task<Void, Never>?
@@ -182,7 +226,10 @@ package actor DomainInteractionBroker {
                     continuation.resume(returning: .failed("duplicate interaction request id"))
                     return
                 }
-                let arbiter = ProviderDeadlineArbiter()
+                let arbiter = Deadline(
+                    deadline: request.deadline,
+                    renewalTimeoutSeconds: provider.kind == .appUI ? request.renewalTimeoutSeconds : nil
+                )
                 pending[request.id] = Pending(
                     request: request,
                     generation: generation,
@@ -193,7 +240,9 @@ package actor DomainInteractionBroker {
                 let providerTask = Task { [weak self] in
                     let result: DomainInteractionResult
                     do {
-                        let value = try await provider.present(request)
+                        let value = try await DomainInteractionPresentationContext.deadlineTaskLocal.withValue(arbiter) {
+                            try await provider.present(request)
+                        }
                         result = .response(value, provider: provider.kind)
                     } catch is CancellationError {
                         result = .cancelled
@@ -202,7 +251,6 @@ package actor DomainInteractionBroker {
                     }
                     let resolution = arbiter.claimProviderCompletion(
                         at: Date(),
-                        deadline: request.deadline,
                         result: result
                     )
                     guard let resolution else {
@@ -216,15 +264,20 @@ package actor DomainInteractionBroker {
                         result: resolution.result
                     )
                 }
-                let delay = max(0, request.deadline.timeIntervalSinceNow)
                 let timeoutTask = Task { [weak self] in
-                    do {
-                        try await Task.sleep(for: .seconds(delay))
-                    } catch {
-                        return
+                    // A renewal can move the deadline while asleep. Re-read the same authority;
+                    // stale wakeups cannot claim timeout and require no polling or new task.
+                    while let deadline = arbiter.acceptanceDeadline() {
+                        do {
+                            try await Task.sleep(for: .seconds(min(3_600, max(0, deadline.timeIntervalSinceNow))))
+                        } catch {
+                            return
+                        }
+                        if arbiter.claimTimeout() {
+                            await self?.timeout(requestID: request.id, generation: generation)
+                            return
+                        }
                     }
-                    guard arbiter.claimTimeout() else { return }
-                    await self?.timeout(requestID: request.id, generation: generation)
                 }
                 if var record = pending[request.id], record.generation == generation {
                     record.providerTask = providerTask
@@ -270,6 +323,8 @@ package actor DomainInteractionBroker {
             record.arbiter.invalidate()
             record.providerTask?.cancel()
             record.timeoutTask?.cancel()
+        }
+        for record in records {
             await record.provider.cancel(record.request.id)
             record.continuation.resume(returning: .cancelled)
         }
