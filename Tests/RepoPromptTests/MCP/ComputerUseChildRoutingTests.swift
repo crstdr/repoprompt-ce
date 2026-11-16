@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptShared
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
@@ -27,6 +28,8 @@ final class ComputerUseChildRoutingTests: XCTestCase {
         var startEntries = 0
         var armEntries = 0
         var readinessEntries = 0
+        var diagnosticPolicyEnabled = true
+        var diagnosticModelAvailable = true
         var computerUseModelID = "codexExec:gpt-6.1-sol-high"
         var beforeReadiness: (() async throws -> Void)?
         var beforeArm: (() async throws -> Void)?
@@ -155,7 +158,7 @@ final class ComputerUseChildRoutingTests: XCTestCase {
                     reason: .sourceCaptureFailed("Test-owned transport fixture")
                 )))
             }
-            service.testComputerUseConfiguration = { [self] in .init(enabled: true, modelID: computerUseModelID, modelAvailable: true) }
+            service.testComputerUseConfiguration = { [self] in .init(enabled: diagnosticPolicyEnabled, modelID: computerUseModelID, modelAvailable: diagnosticModelAvailable) }
             service.testBeforeRestoredChildReadiness = { [self] in
                 readinessEntries += 1
                 try await beforeReadiness?()
@@ -490,11 +493,17 @@ final class ComputerUseChildRoutingTests: XCTestCase {
             let id = try XCTUnwrap(child.activeAgentSessionID)
             let message = "Network idle CU steer accepted exactly once"
             f.beforeSteerDispatch = { f.window.apiSettingsViewModel.isCodexConnected = true }
+            ComputerUseRunDiagnostic.beginCaptureForTesting()
+            defer { _ = ComputerUseRunDiagnostic.endCaptureForTesting() }
             let response = try await f.transport.callTool(name: "agent_run", arguments: [
                 "op": "steer", "session_id": id.uuidString,
                 "message": message, "wait": false, "_rawJSON": true
             ])
             XCTAssertFalse(response.rawJSON.contains("\"isError\":true"), response.rawJSON)
+            let diagnosticLines = ComputerUseRunDiagnostic.endCaptureForTesting()
+            XCTAssertEqual(diagnosticLines.count, 1)
+            XCTAssertTrue(diagnosticLines.first?.contains("op=steer") == true)
+            XCTAssertTrue(diagnosticLines.first?.contains("outcome=ok reason=none") == true)
             try await AsyncTestWait.waitUntil("Network steer reaches fake native controller", timeout: 8) {
                 (child.codexController as? WedgeFakeCodexController)?.startedTurnCount == 1
             }
@@ -524,11 +533,17 @@ final class ComputerUseChildRoutingTests: XCTestCase {
                 let tabs = f.window.workspaceManager.activeWorkspace?.composeTabs.map(\.id)
                 let sessionCount = f.vm.sessions.count
                 f.beforeSteerDispatch = { f.window.apiSettingsViewModel.isCodexConnected = true }
+                ComputerUseRunDiagnostic.beginCaptureForTesting()
+                defer { _ = ComputerUseRunDiagnostic.endCaptureForTesting() }
                 let response = try await f.transport.callTool(name: "agent_run", arguments: [
                     "op": "steer", "session_id": id.uuidString,
                     "message": "Restored child fake turn", "wait": false, "_rawJSON": true
                 ])
                 XCTAssertFalse(response.rawJSON.contains("\"isError\":true"), response.rawJSON)
+                let diagnosticLines = ComputerUseRunDiagnostic.endCaptureForTesting()
+                XCTAssertEqual(diagnosticLines.count, 1)
+                XCTAssertTrue(diagnosticLines.first?.contains("op=steer") == true)
+                XCTAssertTrue(diagnosticLines.first?.contains("outcome=ok reason=none") == true)
                 try await AsyncTestWait.waitUntil("Restored child reaches fake controller", timeout: 8) {
                     (child.codexController as? WedgeFakeCodexController)?.startedTurnCount == 1
                 }
@@ -1004,10 +1019,43 @@ final class ComputerUseChildRoutingTests: XCTestCase {
         }
     }
 
+    func testNetworkDiagnosticReasonsAndPrivacy() async throws {
+        for reason in ["init_grant", "init_policy", "init_model_available", "argument_keys"] {
+            try await withRoute(provider: .cursor) { f in
+                var args = start
+                let marker = "PRIVATE_MARKER_/Users/secret/model-and-session-name"
+                args["message"] = marker
+                if reason == "init_grant" { f.parent.computerUseParentGrant = nil }
+                if reason == "init_policy" { f.diagnosticPolicyEnabled = false }
+                if reason == "init_model_available" { f.diagnosticModelAvailable = false }
+                if reason == "argument_keys" {
+                    args["session_name"] = marker
+                    args[marker] = marker
+                }
+                ComputerUseRunDiagnostic.beginCaptureForTesting()
+                defer { _ = ComputerUseRunDiagnostic.endCaptureForTesting() }
+                let response = try await f.transport.callTool(name: "agent_run", arguments: args)
+                let lines = ComputerUseRunDiagnostic.endCaptureForTesting()
+                XCTAssertEqual(lines.count, 1, reason)
+                let line = try XCTUnwrap(lines.first)
+                XCTAssertTrue(line.contains("reason=\(reason) "), line)
+                XCTAssertFalse(line.contains(marker))
+                XCTAssertTrue(response.rawJSON.contains(reason == "argument_keys" ? "Computer Use start accepts only" : ComputerUseChildProof.denied))
+                XCTAssertEqual(f.startEntries, 0)
+                XCTAssertEqual(f.submissions, 0)
+            }
+        }
+    }
+
     func testNetworkComputerUseStartPreservesCallingParent() async throws {
         for provider in [AgentProviderKind.claudeCode, .cursor] {
             try await withRoute(provider: provider) { f in
+                ComputerUseRunDiagnostic.beginCaptureForTesting()
+                defer { _ = ComputerUseRunDiagnostic.endCaptureForTesting() }
                 let response = try await f.transport.callTool(name: "agent_run", arguments: start)
+                let lines = ComputerUseRunDiagnostic.endCaptureForTesting()
+                XCTAssertEqual(lines.count, 1)
+                XCTAssertTrue(lines.first?.contains("outcome=ok reason=none") == true)
                 XCTAssertFalse(response.rawJSON.contains("\"isError\":true"), response.rawJSON)
                 XCTAssertTrue(response.rawJSON.contains("completed"), response.rawJSON)
                 XCTAssertEqual(f.submissions, 1)
@@ -1130,6 +1178,8 @@ final class ComputerUseChildRoutingTests: XCTestCase {
             try await withRoute(install: install) { f in
                 f.parent.computerUseParentGrant = nil
                 let routing: [String: Any] = install ? [:] : ["_windowID": f.window.windowID]
+                ComputerUseRunDiagnostic.beginCaptureForTesting()
+                defer { _ = ComputerUseRunDiagnostic.endCaptureForTesting() }
                 let response = try await f.transport.callTool(name: "agent_run", arguments: [
                     "op": "start", "model_id": "codexExec:gpt-6.1-sol-high", "message": "Ordinary fake task", "inherit_worktree": false, "detach": true, "_rawJSON": true
                 ].merging(routing) { _, new in new })
@@ -1143,6 +1193,7 @@ final class ComputerUseChildRoutingTests: XCTestCase {
                 ].merging(routing) { _, new in new })
                 XCTAssertFalse(steered.rawJSON.contains("\"isError\":true"), steered.rawJSON)
                 XCTAssertEqual(f.submissions, 2)
+                XCTAssertEqual(ComputerUseRunDiagnostic.endCaptureForTesting(), [])
             }
         }
     }

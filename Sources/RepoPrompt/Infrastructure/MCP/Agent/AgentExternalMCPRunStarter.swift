@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptShared
 
 @MainActor
 enum AgentExternalMCPRunStarter {
@@ -220,7 +221,7 @@ enum AgentExternalMCPRunStarter {
             )
             if activatedSession.isComputerUseChild {
                 try requirePendingStart()
-                guard let computerUseProof else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+                guard let computerUseProof else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.external_arm_proof_missing, ComputerUseChildProof.denied)) }
                 try await agentModeVM.armComputerUseChild(session: activatedSession, proof: computerUseProof)
                 try requirePendingStart()
             }
@@ -266,7 +267,7 @@ enum AgentExternalMCPRunStarter {
 
             try agentModeVM.requireMCPControlOwnership(sessionID: sessionID, expectedContext: ownedActivation)
             if activatedSession.isComputerUseChild {
-                guard let computerUseProof else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+                guard let computerUseProof else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.external_dispatch_proof_missing, ComputerUseChildProof.denied)) }
                 try computerUseProof.markInstructionDispatch(activatedSession)
             }
             let delivery: AgentModeViewModel.MCPInstructionDispatch = if let dispatchInstruction {

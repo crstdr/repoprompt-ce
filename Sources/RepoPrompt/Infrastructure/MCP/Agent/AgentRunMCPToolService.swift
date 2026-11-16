@@ -446,7 +446,32 @@ struct AgentRunMCPToolService {
     var forwardOversightSteer: (([String: Value], RequestMetadata) async throws -> Value)?
     private enum OversightSteerRouting: Error { case required(RequestMetadata) }
 
+    private static let computerUseBuild = (
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+    )
+
     func execute(args: [String: Value]) async throws -> Value {
+        let context = MCPInvocationContextBridge.current
+        let diagnostic = ComputerUseRunDiagnostic(
+            backend: .app, operation: normalizedString(args["op"])?.lowercased() ?? "wait",
+            invocationID: context?.invocationID, interested: args["computer_use"] != nil && args["computer_use"] != .bool(false),
+            tags: Self.computerUseDiagnosticTags(args), keyCount: args.count,
+            displayVersion: Self.computerUseBuild.0, buildVersion: Self.computerUseBuild.1
+        )
+        return try await ComputerUseRunDiagnostic.scope.withValue(diagnostic) {
+            do {
+                let result = try await executeDiagnosed(args: args)
+                diagnostic.finish(success: true)
+                return result
+            } catch {
+                diagnostic.finish(success: false)
+                throw error
+            }
+        }
+    }
+
+    private func executeDiagnosed(args: [String: Value]) async throws -> Value {
         let op = normalizedString(args["op"])?.lowercased() ?? "wait"
         _ = try Self.computerUseRequested(args: args, operation: op)
         #if DEBUG
@@ -488,12 +513,26 @@ struct AgentRunMCPToolService {
         }
     }
 
+    nonisolated static func computerUseDiagnosticTags(_ args: [String: Value]) -> [ComputerUseRunDiagnostic.Tag] {
+        ComputerUseRunDiagnostic.keys.map { key in
+            guard let value = args[key] else { return .absent }
+            switch value {
+            case .null: return .null
+            case .bool: return .bool
+            case .string, .data: return .string
+            case .int, .double: return .number
+            case .object: return .object
+            case .array: return .array
+            }
+        }
+    }
+
     static func computerUseRequested(args: [String: Value], operation: String) throws -> Bool {
         guard let flag = args["computer_use"] else { return false }
-        guard operation == "start" else { throw MCPError.invalidParams("computer_use is valid only for start.") }
-        guard case let .bool(enabled) = flag else { throw MCPError.invalidParams("Computer Use start accepts only message, timeout, and detach.") }
+        guard operation == "start" else { throw ComputerUseRunDiagnostic.record(.argument_operation, MCPError.invalidParams("computer_use is valid only for start.")) }
+        guard case let .bool(enabled) = flag else { throw ComputerUseRunDiagnostic.record(.argument_type, MCPError.invalidParams("Computer Use start accepts only message, timeout, and detach.")) }
         if enabled, !Set(args.keys).isSubset(of: ["op", "computer_use", "message", "timeout", "detach"]) {
-            throw MCPError.invalidParams("Computer Use start accepts only message, timeout, and detach.")
+            throw ComputerUseRunDiagnostic.record(.argument_keys, MCPError.invalidParams("Computer Use start accepts only message, timeout, and detach."))
         }
         return enabled
     }
@@ -821,10 +860,10 @@ struct AgentRunMCPToolService {
                   resolveSpawnParentSessionIDFromSourceTabID != nil, spawnParentSessionID == proof.parent.activeAgentSessionID,
                   let parentID = spawnParentSessionID,
                   let children = try await AgentSessionDataService.shared.computerUseChildIDs(for: parentID, workspace: workspace),
-                  proof.parentIsCurrent, children.count <= 1 else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+                  proof.parentIsCurrent, children.count <= 1 else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.start_parent_child_index, ComputerUseChildProof.denied)) }
             try proof.requireCurrentRoute()
             if let childID = children.first {
-                throw MCPError.invalidParams(ComputerUseChildProof.existingChildMessage(childID))
+                throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.start_existing_child, ComputerUseChildProof.existingChildMessage(childID)))
             }
             try proof.reserve()
         }
@@ -847,7 +886,7 @@ struct AgentRunMCPToolService {
             proof.creationTarget = target
             try proof.requireCurrentRoute()
             let child = agentModeVM.session(for: target.tabID)
-            guard let pinnedModel = CodexModelSpecifier(raw: String(proof.modelID.dropFirst("codexExec:".count))).baseModel else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+            guard let pinnedModel = CodexModelSpecifier(raw: String(proof.modelID.dropFirst("codexExec:".count))).baseModel else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.start_pinned_model, ComputerUseChildProof.denied)) }
             child.selectedAgent = .codexExec
             child.selectedModelRaw = pinnedModel
             child.selectedReasoningEffortRaw = "high"
@@ -856,7 +895,7 @@ struct AgentRunMCPToolService {
             proof.child = child
             guard proof.permits(child) else {
                 await agentModeVM.mcpDiscardSessionTarget(target)
-                throw MCPError.invalidParams(ComputerUseChildProof.denied)
+                throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.start_child_permits, ComputerUseChildProof.denied))
             }
         }
         await DelegationSpawnAdmission.stamp(
@@ -1670,10 +1709,10 @@ struct AgentRunMCPToolService {
         var computerUseProof: ComputerUseChildProof?
         if let raw = normalizedString(args["session_id"]), let sessionID = UUID(uuidString: raw) {
             if let child = agentModeVM.mcpControlledSession(sessionID: sessionID), child.isComputerUseChild, !child.runState.isActive {
-                computerUseProof = try? captureComputerUseProof(owner: agentModeVM)
+                computerUseProof = ComputerUseRunDiagnostic.probe { try captureComputerUseProof(owner: agentModeVM) }
             } else if let entry = agentModeVM.sessionIndex[sessionID], entry.purpose == "computerUse",
-                      let proof = try? captureComputerUseProof(owner: agentModeVM),
-                      (try? proof.captureRestoredChild(entry: entry)) != nil
+                      let proof = ComputerUseRunDiagnostic.probe { try captureComputerUseProof(owner: agentModeVM) },
+                ComputerUseRunDiagnostic.probe { try proof.captureRestoredChild(entry: entry) } != nil
             {
                 computerUseProof = proof
             }
@@ -1700,26 +1739,27 @@ struct AgentRunMCPToolService {
         let text = try resolveMessage(args["message"], name: "message")
         let workflow = try resolveWorkflow(args: args)
         if agentModeVM.mcpControlledSession(sessionID: sessionID)?.isComputerUseChild == true,
-           agentModeVM.mcpControlledSession(sessionID: sessionID)?.runState.isActive == true { throw MCPError.invalidParams(ComputerUseChildProof.busy) }
+           agentModeVM.mcpControlledSession(sessionID: sessionID)?.runState.isActive == true { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.service_executeSteer_1, ComputerUseChildProof.busy)) }
         var restoredResolution: SteerControlResolution?
         if agentModeVM.sessionIndex[sessionID]?.purpose != nil || (try? agentModeVM.authoritativeLiveSession(for: sessionID))?.isComputerUseChild == true {
+            ComputerUseRunDiagnostic.scope.get()?.promoteProbe()
             guard let proof = computerUseProof, proof.parentIsCurrent,
-                  args["workflow_id"] == nil, args["workflow_name"] == nil else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+                  args["workflow_id"] == nil, args["workflow_name"] == nil else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.service_executeSteer_2, ComputerUseChildProof.denied)) }
             do {
                 if proof.hasRestoredChild {
-                    guard let child = proof.restoredSession, proof.restoredChildIsCurrent() else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+                    guard let child = proof.restoredSession, proof.restoredChildIsCurrent() else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.service_executeSteer_3, ComputerUseChildProof.denied)) }
                     try proof.requireCurrentRoute()
                     try proof.reserve()
                     guard let workspace = targetWindow.workspaceManager.activeWorkspace, workspace.id == expectedWorkspaceID,
                           let parentID = proof.parent.activeAgentSessionID,
                           let children = try await AgentSessionDataService.shared.computerUseChildIDs(for: parentID, workspace: workspace),
                           children == [sessionID], proof.restoredChildIsCurrent()
-                    else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+                    else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.service_executeSteer_4, ComputerUseChildProof.denied)) }
                     try proof.requireCurrentRoute()
                     #if DEBUG
                         try await testBeforeRestoredChildReadiness?()
                     #endif
-                    guard proof.restoredChildIsCurrent() else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+                    guard proof.restoredChildIsCurrent() else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.service_executeSteer_5, ComputerUseChildProof.denied)) }
                     let prepared = await agentModeVM.ensureSessionReady(tabID: child.tabID, expectedSession: child)
                     guard prepared === child, child.hasLoadedPersistedState, proof.restoredChildIsCurrent(),
                           child.isComputerUseChild, child.parentSessionID == parentID,
@@ -1727,7 +1767,7 @@ struct AgentRunMCPToolService {
                           proof.matchesConfiguration(model: child.selectedModelRaw, effort: child.selectedReasoningEffortRaw),
                           !child.runState.isActive, !child.mcpFollowUpRunPending, child.codexController == nil,
                           !child.hasBindingBlockingInteraction, child.pendingInstructions.isEmpty
-                    else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+                    else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.service_executeSteer_6, ComputerUseChildProof.denied)) }
                     try proof.requireCurrentRoute()
                     proof.child = child
                     child.computerUseChildProof = proof
@@ -1742,12 +1782,12 @@ struct AgentRunMCPToolService {
                       child.parentSessionID == proof.parent.activeAgentSessionID, !child.runState.isActive,
                       child.codexController == nil,
                       !child.mcpFollowUpRunPending || (restoredResolution?.session === child && proof.restoredChildIsCurrent())
-                else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+                else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.steer_controlled_child, ComputerUseChildProof.denied)) }
                 if proof.hasRestoredChild {
-                    guard proof.matchesConfiguration(model: child.selectedModelRaw, effort: child.selectedReasoningEffortRaw) else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+                    guard proof.matchesConfiguration(model: child.selectedModelRaw, effort: child.selectedReasoningEffortRaw) else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.steer_restored_model, ComputerUseChildProof.denied)) }
                 } else {
                     guard CodexModelSpecifier(raw: child.selectedModelRaw).baseModel == CodexModelSpecifier(raw: String(proof.modelID.dropFirst("codexExec:".count))).baseModel,
-                          child.selectedReasoningEffortRaw == "high" else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+                          child.selectedReasoningEffortRaw == "high" else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.steer_model_effort, ComputerUseChildProof.denied)) }
                 }
                 try proof.requireCurrentRoute()
                 if restoredResolution == nil { try proof.reserve() }

@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 import RepoPromptSettingsCore
+import RepoPromptShared
 
 /// CU-local transport fence. The network actor revokes before authority writes; submission
 /// and revocation share a lock. It stops owning route validity after instruction submission.
@@ -52,14 +53,14 @@ final class ComputerUseRunRouteFence: @unchecked Sendable {
               ObjectIdentifier(window.mcpServer) == identity.serverViewModelIdentity,
               window.mcpServer.hasCurrentRunRouteMapping(runID: token.runID, connectionID: token.connectionID, expectedTabID: endpoint.tabID),
               window.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint
-        else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+        else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.proof_requireCurrent_1, ComputerUseChildProof.denied)) }
     }
 
     @MainActor
     func withInstructionSubmission(_ submit: () throws -> AgentModeViewModel.UserTurnSubmissionResult) throws -> AgentModeViewModel.UserTurnSubmissionResult {
         try requireCurrent()
         return try lock.withLock {
-            guard valid, !submitted, !Task.isCancelled else { throw MCPError.invalidParams(ComputerUseChildProof.denied) }
+            guard valid, !submitted, !Task.isCancelled else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.proof_withInstructionSubmission_1, ComputerUseChildProof.denied)) }
             let result = try submit()
             submitted = result == .submitted
             return result
@@ -142,10 +143,10 @@ final class ComputerUseChildProof: Equatable {
               owner.preparedSessionRuntimes?.hasPreparedRuntime(entry.id) != true,
               !AgentSessionDeletionRegistry.shared.isDeletionInProgress(sessionID: entry.id),
               !AgentSessionDeletionRegistry.shared.isPermanentlyDeleted(sessionID: entry.id)
-        else { throw MCPError.invalidParams(Self.denied) }
+        else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.proof_captureRestoredChild_1, Self.denied)) }
         // An explicit saved binding may have no runtime yet. This creates neither a tab nor a saved session.
         let existing = try owner.authoritativeLiveSession(for: entry.id)
-        guard let session = existing ?? owner.session(for: entry.tabID, createIfNeeded: false) else { throw MCPError.invalidParams(Self.denied) }
+        guard let session = existing ?? owner.session(for: entry.tabID, createIfNeeded: false) else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.proof_captureRestoredChild_2, Self.denied)) }
         try captureRestoredChild(session, entry: entry)
     }
 
@@ -158,12 +159,12 @@ final class ComputerUseChildProof: Equatable {
               isOpenChild(session, sessionID: entry.id), !session.runState.isActive,
               !session.mcpFollowUpRunPending, session.codexController == nil,
               !session.hasBindingBlockingInteraction, session.pendingInstructions.isEmpty
-        else { throw MCPError.invalidParams(Self.denied) }
+        else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.proof_captureRestoredChild_3, Self.denied)) }
         if session.hasLoadedPersistedState {
             guard session.isComputerUseChild, session.parentSessionID == parent.activeAgentSessionID,
                   session.selectedAgent == .codexExec,
                   matchesConfiguration(model: session.selectedModelRaw, effort: session.selectedReasoningEffortRaw)
-            else { throw MCPError.invalidParams(Self.denied) }
+            else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.proof_captureRestoredChild_4, Self.denied)) }
         }
         restoredChild = .init(session: session, sessionID: entry.id, bindingGeneration: session.bindingTransitionGeneration, stopFence: AgentRunStartStopFence(session: session))
     }
@@ -217,13 +218,13 @@ final class ComputerUseChildProof: Equatable {
     }
 
     static func capture(owner: AgentModeViewModel, configuration: @escaping @MainActor () -> Configuration = { currentConfiguration }) throws -> ComputerUseChildProof {
-        guard let context = MCPInvocationContextBridge.current, case .network = context.origin,
-              let candidate = context.dispatchAuthorization?.windowIdentity?.computerUseRunRouteCandidate,
-              candidate.matches(context) else { throw MCPError.invalidParams(denied) }
+        guard let context = MCPInvocationContextBridge.current, case .network = context.origin else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.capture_context, denied)) }
+        guard let candidate = context.dispatchAuthorization?.windowIdentity?.computerUseRunRouteCandidate else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.capture_candidate_absent, denied)) }
+        guard candidate.matches(context) else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.capture_candidate_mismatch, denied)) }
         try candidate.requireCurrent()
         let route = candidate.token
-        guard route.observerEndpoint == owner.agentSessionLinkObserverEndpoint(tabID: route.observerEndpoint.tabID),
-              let parent = owner.sessions[route.observerEndpoint.tabID], parent.runID == route.runID else { throw MCPError.invalidParams(denied) }
+        guard route.observerEndpoint == owner.agentSessionLinkObserverEndpoint(tabID: route.observerEndpoint.tabID) else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.capture_endpoint, denied)) }
+        guard let parent = owner.sessions[route.observerEndpoint.tabID], parent.runID == route.runID else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.capture_parent_run, denied)) }
         let proof = try ComputerUseChildProof(owner: owner, parent: parent, configuration: configuration)
         proof.runRouteFence = candidate
         return proof
@@ -254,12 +255,17 @@ final class ComputerUseChildProof: Equatable {
 
     init(owner: AgentModeViewModel, parent: AgentTabSession, configuration: @escaping @MainActor () -> Configuration = { currentConfiguration }) throws {
         let configured = configuration()
-        guard let grant = parent.computerUseParentGrant, parent.parentSessionID == nil,
-              !parent.isComputerUseChild, parent.selectedAgent != .codexExec,
-              owner.sessions[parent.tabID] === parent, parent.activeAgentSessionID != nil,
-              parent.persistentSessionBindingIdentity != nil,
-              let endpoint = owner.agentSessionLinkObserverEndpoint(tabID: parent.tabID), configured.enabled, configured.modelAvailable,
-              ["codexExec:gpt-6.1-terra-high", "codexExec:gpt-6.1-sol-high"].contains(configured.modelID) else { throw MCPError.invalidParams(Self.denied) }
+        guard let grant = parent.computerUseParentGrant else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.init_grant, Self.denied)) }
+        guard parent.parentSessionID == nil else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.init_parent, Self.denied)) }
+        guard !parent.isComputerUseChild else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.init_child, Self.denied)) }
+        guard parent.selectedAgent != .codexExec else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.init_provider, Self.denied)) }
+        guard owner.sessions[parent.tabID] === parent else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.init_owner, Self.denied)) }
+        guard parent.activeAgentSessionID != nil else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.init_session, Self.denied)) }
+        guard parent.persistentSessionBindingIdentity != nil else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.init_binding, Self.denied)) }
+        guard let endpoint = owner.agentSessionLinkObserverEndpoint(tabID: parent.tabID) else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.init_endpoint, Self.denied)) }
+        guard configured.enabled else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.init_policy, Self.denied)) }
+        guard configured.modelAvailable else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.init_model_available, Self.denied)) }
+        guard ["codexExec:gpt-6.1-terra-high", "codexExec:gpt-6.1-sol-high"].contains(configured.modelID) else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.init_model_allowed, Self.denied)) }
         creationKey = CreationKey(workspaceID: endpoint.workspaceID, parentID: endpoint.sessionID)
         self.configuration = configuration
         modelID = configured.modelID
@@ -291,26 +297,26 @@ final class ComputerUseChildProof: Equatable {
     }
 
     func claimCreation() throws {
-        guard !retiring, parentIsCurrent else { throw MCPError.invalidParams(Self.denied) }
+        guard !retiring, parentIsCurrent else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.proof_claimCreation_1, Self.denied)) }
         if let existing = Self.creationClaims[creationKey] {
             if existing.creationTarget == nil, let id = existing.child?.activeAgentSessionID {
-                throw MCPError.invalidParams(Self.existingChildMessage(id))
+                throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.proof_claimCreation_2, Self.existingChildMessage(id)))
             }
-            throw MCPError.invalidParams(Self.busy)
+            throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.proof_claimCreation_3, Self.busy))
         }
         Self.creationClaims[creationKey] = self
     }
 
     func acceptCreation() throws {
-        guard !retiring || nativeAttemptID != nil else { throw MCPError.invalidParams(Self.denied) }
+        guard !retiring || nativeAttemptID != nil else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.proof_acceptCreation_1, Self.denied)) }
         if let creationTarget { owner.mcpAcceptSessionTarget(creationTarget) }
         creationTarget = nil
     }
 
     func reserve() throws {
-        guard !retiring, parentIsCurrent else { throw MCPError.invalidParams(Self.denied) }
+        guard !retiring, parentIsCurrent else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.proof_reserve_1, Self.denied)) }
         guard Self.holder == nil,
-              !WindowStatesManager.shared.allWindows.contains(where: \.agentModeViewModel.computerUseControllerOrRetirementExists) else { throw MCPError.invalidParams(Self.busy) }
+              !WindowStatesManager.shared.allWindows.contains(where: \.agentModeViewModel.computerUseControllerOrRetirementExists) else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.proof_reserve_2, Self.busy)) }
         Self.holder = self
     }
 
@@ -327,7 +333,7 @@ final class ComputerUseChildProof: Equatable {
     }
 
     func markInstructionDispatch(_ session: AgentTabSession) throws {
-        guard permits(session) else { throw MCPError.invalidParams(Self.denied) }
+        guard permits(session) else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.proof_markInstructionDispatch_1, Self.denied)) }
         instructionDispatchEntered = true
     }
 

@@ -945,13 +945,47 @@ actor DirectHeadlessAgentBackend: DomainAgentCapabilityBackend {
         return try .mcp(snapshot.toValue())
     }
 
-    nonisolated static func validateComputerUseFlag(_ args: [String: Value], operation: String) throws {
+    nonisolated static func computerUseDiagnosticTags(_ args: [String: Value]) -> [ComputerUseRunDiagnostic.Tag] {
+        ComputerUseRunDiagnostic.keys.map { key in
+            guard let value = args[key] else { return .absent }
+            switch value {
+            case .null: return .null
+            case .bool: return .bool
+            case .string, .data: return .string
+            case .int, .double: return .number
+            case .object: return .object
+            case .array: return .array
+            }
+        }
+    }
+
+    nonisolated static func validateComputerUseFlag(_ args: [String: Value], operation: String, invocationID: UUID? = nil) throws {
+        let diagnostic = ComputerUseRunDiagnostic(
+            backend: .directHeadless,
+            operation: operation,
+            invocationID: invocationID,
+            interested: args["computer_use"] != nil && args["computer_use"] != .bool(false),
+            tags: computerUseDiagnosticTags(args),
+            keyCount: args.count
+        )
+        try ComputerUseRunDiagnostic.scope.withValue(diagnostic) {
+            do {
+                try validateComputerUseFlagDiagnosed(args, operation: operation)
+                diagnostic.finish(success: true)
+            } catch {
+                diagnostic.finish(success: false)
+                throw error
+            }
+        }
+    }
+
+    private nonisolated static func validateComputerUseFlagDiagnosed(_ args: [String: Value], operation: String) throws {
         guard let flag = args["computer_use"] else { return }
-        guard operation == "start" else { throw MCPError.invalidParams("computer_use is valid only for start.") }
-        guard case let .bool(enabled) = flag else { throw MCPError.invalidParams("Computer Use start accepts only message, timeout, and detach.") }
+        guard operation == "start" else { throw ComputerUseRunDiagnostic.record(.headless_operation, MCPError.invalidParams("computer_use is valid only for start.")) }
+        guard case let .bool(enabled) = flag else { throw ComputerUseRunDiagnostic.record(.headless_type, MCPError.invalidParams("Computer Use start accepts only message, timeout, and detach.")) }
         if enabled {
-            guard Set(args.keys).isSubset(of: ["op", "computer_use", "message", "timeout", "detach"]) else { throw MCPError.invalidParams("Computer Use start accepts only message, timeout, and detach.") }
-            throw MCPError.invalidParams("Enable Computer Use and Other chats in Settings, then allow it in the calling chat.")
+            guard Set(args.keys).isSubset(of: ["op", "computer_use", "message", "timeout", "detach"]) else { throw ComputerUseRunDiagnostic.record(.headless_keys, MCPError.invalidParams("Computer Use start accepts only message, timeout, and detach.")) }
+            throw ComputerUseRunDiagnostic.record(.headless_unavailable, MCPError.invalidParams("Enable Computer Use and Other chats in Settings, then allow it in the calling chat."))
         }
     }
 
@@ -961,7 +995,7 @@ actor DirectHeadlessAgentBackend: DomainAgentCapabilityBackend {
         defaultAgent: String
     ) async throws -> DomainPhysicalToolResult {
         let op = args["op"]?.stringValue ?? "start"
-        try Self.validateComputerUseFlag(args, operation: op)
+        try Self.validateComputerUseFlag(args, operation: op, invocationID: request.securityContext?.invocationID)
         switch op {
         case "start":
             var normalized = args

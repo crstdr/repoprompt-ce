@@ -276,8 +276,14 @@ final class DirectHeadlessCompositionTests: XCTestCase {
     }
 
     func testHeadlessLaunchRejectsUnsupportedModelParametersBeforeProviderStartup() throws {
-        for (operation, flag) in [("start", Value.bool(true)), ("wait", .bool(false)), ("start", .string("true"))] {
+        for (operation, flag, reason) in [("start", Value.bool(true), "headless_unavailable"), ("wait", .bool(false), "headless_operation"), ("start", .string("PRIVATE_FLAG_MARKER"), "headless_type")] {
+            ComputerUseRunDiagnostic.beginCaptureForTesting()
             XCTAssertThrowsError(try DirectHeadlessAgentBackend.validateComputerUseFlag(["computer_use": flag], operation: operation))
+            let lines = ComputerUseRunDiagnostic.endCaptureForTesting()
+            XCTAssertEqual(lines.count, 1)
+            XCTAssertTrue(lines.first?.contains("backend=direct_headless") == true)
+            XCTAssertTrue(lines.first?.contains("reason=\(reason) ") == true)
+            XCTAssertFalse(lines.joined().contains("PRIVATE_FLAG_MARKER"))
         }
         XCTAssertNoThrow(try DirectHeadlessAgentBackend.validateComputerUseFlag(["computer_use": .bool(false)], operation: "start"))
         XCTAssertThrowsError(try DirectHeadlessProviderCoordinator.resolvedLaunchMessage(args: [

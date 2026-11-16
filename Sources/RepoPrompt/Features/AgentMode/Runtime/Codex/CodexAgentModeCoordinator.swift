@@ -3,6 +3,7 @@ import MCP
 import RepoPromptFoundation
 import RepoPromptInstrumentation
 import RepoPromptSettingsCore
+import RepoPromptShared
 #if canImport(Darwin)
     import Darwin
 #endif
@@ -2384,15 +2385,15 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
 
     private func computerUseAdmissionMessage(session: AgentTabSession, checkRuntime: Bool = true) -> String? {
         if session.isComputerUseChild {
-            guard session.computerUseChildProof?.permits(session) == true else { return ComputerUseChildProof.denied }
-        } else if !CodexComputerUseWorkflow.isEnabled { return CodexComputerUseWorkflow.disabledMessage }
+            guard session.computerUseChildProof?.permits(session) == true else { return ComputerUseRunDiagnostic.admission(.admission_proof, ComputerUseChildProof.denied) }
+        } else if !CodexComputerUseWorkflow.isEnabled { return ComputerUseRunDiagnostic.admission(.admission_disabled, CodexComputerUseWorkflow.disabledMessage) }
         guard session.selectedAgent == .codexExec, session.parentSessionID == nil || session.isComputerUseChild,
               viewModel?.sessions[session.tabID] === session,
               session.codexComputerUseOwnershipTransitionHolds.isEmpty,
-              codexControllerRetirementTaskByTabID[session.tabID]?.includesComputerUse != true else { return CodexComputerUseWorkflow.ineligibleMessage }
-        if checkRuntime, let message = computerUseRuntimeUnavailableMessage() { return message }
-        guard !computerUseReservedEntryExists() else { return CodexComputerUseWorkflow.collisionMessage }
-        guard computerUseCompanionReady() else { return CodexComputerUseWorkflow.unavailableMessage }
+              codexControllerRetirementTaskByTabID[session.tabID]?.includesComputerUse != true else { return ComputerUseRunDiagnostic.admission(.admission_ineligible, CodexComputerUseWorkflow.ineligibleMessage) }
+        if checkRuntime, let message = computerUseRuntimeUnavailableMessage() { return ComputerUseRunDiagnostic.admission(.admission_runtime, message) }
+        guard !computerUseReservedEntryExists() else { return ComputerUseRunDiagnostic.admission(.admission_collision, CodexComputerUseWorkflow.collisionMessage) }
+        guard computerUseCompanionReady() else { return ComputerUseRunDiagnostic.admission(.admission_companion, CodexComputerUseWorkflow.unavailableMessage) }
         return nil
     }
 
@@ -2420,11 +2421,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
 
     func armComputerUseChild(session: AgentTabSession, proof: ComputerUseChildProof) async throws {
         let runtimeMessage = await computerUseRuntimePreflight()
-        guard proof.permits(session), runtimeMessage == nil,
-              computerUseAdmissionMessage(session: session) == nil
-        else {
-            throw MCPError.invalidParams(ComputerUseChildProof.denied)
-        }
+        guard proof.permits(session) else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.arm_permits, ComputerUseChildProof.denied)) }
+        guard runtimeMessage == nil else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.arm_runtime, ComputerUseChildProof.denied)) }
+        guard ComputerUseRunDiagnostic.admissionScope.withValue(true, operation: { computerUseAdmissionMessage(session: session) }) == nil else { throw MCPError.invalidParams(ComputerUseRunDiagnostic.record(.arm_admission, ComputerUseChildProof.denied)) }
         _ = stageCodexComputerUseActivationIfNeeded(session: session)
         cancelCodexIdleShutdown(for: session.tabID)
     }
@@ -6869,7 +6868,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     ) async {
         guard session.operationAdmissionFailureMessage == nil else { return }
         if session.isComputerUseChild, session.computerUseChildProof?.permits(session) != true || session.pendingCodexComputerUseActivation == nil {
-            await failCodexStartupBeforeLaunch(session: session, error: MCPError.invalidParams(ComputerUseChildProof.denied), reason: "computer-use-child-admission")
+            await failCodexStartupBeforeLaunch(session: session, error: MCPError.invalidParams(ComputerUseRunDiagnostic.record(.native_ensureCodexNativeSession_1, ComputerUseChildProof.denied)), reason: "computer-use-child-admission")
             return
         }
         let managedSessionFence = CodexManagedSessionFence.shared
