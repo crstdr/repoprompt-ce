@@ -81,20 +81,11 @@ package actor DomainInteractionBroker {
         private var isResolved = false
         private var effectiveDeadline: Date
         package let originalTimeoutSeconds: TimeInterval?
-        private let hardDeadline: Date
-
-        // Bound abandoned activity by the configured Codex MCP lifetime, never shortening T.
-        package static let maximumRenewableLifetime: TimeInterval = 10_000
         package static let settlementGrace: TimeInterval = 1
 
         package init(deadline: Date, renewalTimeoutSeconds: TimeInterval? = nil) {
             effectiveDeadline = deadline
             originalTimeoutSeconds = renewalTimeoutSeconds
-            if let timeout = renewalTimeoutSeconds {
-                hardDeadline = deadline.addingTimeInterval(max(0, Self.maximumRenewableLifetime - timeout))
-            } else {
-                hardDeadline = deadline
-            }
         }
 
         package func acceptanceDeadline() -> Date? {
@@ -108,16 +99,14 @@ package actor DomainInteractionBroker {
             }
         }
 
-        /// Activity renews the idle budget, not the settlement grace or the total lifetime cap.
+        /// Activity renews the full idle budget before settlement begins.
         @discardableResult
         package func renew(at now: Date = Date()) -> Date? {
             lock.withLock {
                 guard !isResolved, let timeout = originalTimeoutSeconds,
                       now < effectiveDeadline.addingTimeInterval(-Self.settlementGrace)
                 else { return nil }
-                effectiveDeadline = max(effectiveDeadline, min(
-                    now.addingTimeInterval(timeout + Self.settlementGrace), hardDeadline
-                ))
+                effectiveDeadline = now.addingTimeInterval(timeout + Self.settlementGrace)
                 return effectiveDeadline
             }
         }

@@ -33,27 +33,8 @@ final class DomainInteractionBrokerTests: XCTestCase {
         XCTAssertNil(deadline.countdownAnchor())
     }
 
-    func testRepeatedActivityEndsAtCallerDerivedLifetimeCap() throws {
-        XCTAssertEqual(DomainInteractionBroker.Deadline.maximumRenewableLifetime, 10_000)
-        let start = Date(timeIntervalSince1970: 1_000)
-        let deadline = DomainInteractionBroker.Deadline(
-            deadline: start.addingTimeInterval(301), renewalTimeoutSeconds: 300
-        )
-        for elapsed in stride(from: 200, through: 10_000, by: 200) {
-            _ = deadline.renew(at: start.addingTimeInterval(Double(elapsed)))
-        }
-        let cap = start.addingTimeInterval(10_001)
-        XCTAssertEqual(deadline.acceptanceDeadline(), cap)
-        XCTAssertEqual(deadline.countdownAnchor()?.addingTimeInterval(300), cap.addingTimeInterval(-1))
-        XCTAssertNil(deadline.renew(at: cap.addingTimeInterval(-1)), "The settlement grace cannot reopen a question")
-        XCTAssertTrue(deadline.claimTimeout(at: cap))
-        XCTAssertNil(deadline.renew(at: cap))
-    }
-
-    func testCapNeverShortensLargerOriginalTimeoutAndFixedRequestsDoNotRenew() {
+    func testFixedRequestsDoNotRenew() {
         let end = Date(timeIntervalSince1970: 20_000)
-        let long = DomainInteractionBroker.Deadline(deadline: end, renewalTimeoutSeconds: 20_000)
-        XCTAssertEqual(long.renew(at: end.addingTimeInterval(-100)), end)
         let fixed = DomainInteractionBroker.Deadline(deadline: end)
         XCTAssertNil(fixed.renew(at: end.addingTimeInterval(-100)))
         XCTAssertEqual(fixed.acceptanceDeadline(), end)
