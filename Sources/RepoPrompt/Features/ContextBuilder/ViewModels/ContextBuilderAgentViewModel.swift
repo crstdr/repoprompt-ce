@@ -294,6 +294,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         var pendingAskUserRunID: UUID?
         /// Task for question timeout handling
         var askUserTimeoutTask: Task<Void, Never>?
+        var askUserDeadline: DomainInteractionBroker.Deadline?
         /// Generation token for timeout reset/cancellation races
         var pendingAskUserTimeoutGeneration: UInt64 = 0
 
@@ -5789,31 +5790,24 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             throw ContextBuilderGenerationError.askUserAlreadyPending
         }
 
-        let pending = AgentAskUserPendingState(
-            interaction: interaction,
-            timeoutStartedAt: interaction.askedAt
-        )
-        session.pendingAskUser = pending
-        session.pendingAskUserRunID = record.runID
-
-        // Auto-focus the window and switch to the correct compose tab when question is pending.
-        // Await to ensure tab switch completes and UI bindings are updated before continuing.
-        let didFocusAndPublish = await focusWindowForQuestion(tabID: tabID)
-        guard sessions[tabID] === session,
-              session.pendingAskUser?.interaction.id == interaction.id,
-              session.pendingAskUserRunID == record.runID,
-              acceptsEvents(from: record)
-        else {
-            if session.pendingAskUserRunID == record.runID {
-                session.pendingAskUser = nil
-                session.pendingAskUserRunID = nil
-            }
+        let deadline = DomainInteractionPresentationContext.deadline
+        // Finish revealing before installing the card and its continuation together.
+        _ = await focusWindowForQuestion(tabID: tabID)
+        try Task.checkCancellation()
+        guard sessions[tabID] === session, acceptsEvents(from: record) else {
             throw CancellationError()
         }
-        if !didFocusAndPublish {
-            // Fallback: ensure pendingAskUser is published even when we cannot focus/switch.
-            updateRuntimeBindings(from: session)
+        guard session.pendingAskUser == nil else {
+            throw ContextBuilderGenerationError.askUserAlreadyPending
         }
+        if let deadline, deadline.acceptanceDeadline() == nil { throw CancellationError() }
+        let anchor = deadline?.countdownAnchor() ?? interaction.askedAt
+        session.pendingAskUser = AgentAskUserPendingState(
+            interaction: interaction,
+            timeoutStartedAt: anchor
+        )
+        session.pendingAskUserRunID = record.runID
+        updateRuntimeBindings(from: session)
 
         let logQuestion = interaction.questions.count == 1
             ? interaction.questions[0].question
@@ -5836,13 +5830,14 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     continuation.resume(throwing: CancellationError())
                     return
                 }
+                session.askUserDeadline = deadline
                 session.askUserContinuation = continuation
                 schedulePendingAskUserTimeout(
                     for: session,
                     interactionID: interaction.id,
                     runID: record.runID,
                     timeoutSeconds: interaction.timeoutSeconds,
-                    startedAt: interaction.askedAt
+                    startedAt: anchor
                 )
             }
         } onCancel: {
@@ -5892,12 +5887,19 @@ final class ContextBuilderAgentViewModel: ObservableObject {
               session.askUserContinuation != nil
         else { return }
 
+        let anchor: Date
+        if let deadline = session.askUserDeadline {
+            guard deadline.renew() != nil, let renewedAnchor = deadline.countdownAnchor() else { return }
+            anchor = renewedAnchor
+        } else {
+            anchor = Date()
+        }
         schedulePendingAskUserTimeout(
             for: session,
             interactionID: interactionID,
             runID: runID,
             timeoutSeconds: pending.interaction.timeoutSeconds,
-            startedAt: Date()
+            startedAt: anchor
         )
         updateRuntimeBindings(from: session)
     }
@@ -5916,11 +5918,13 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             pending.timeoutStartedAt = startedAt
             session.pendingAskUser = pending
         }
-        let sleepNanoseconds = UInt64(max(0, timeoutSeconds) * 1_000_000_000)
+        let delay = session.askUserDeadline == nil
+            ? max(0, timeoutSeconds)
+            : max(0, startedAt.addingTimeInterval(timeoutSeconds).timeIntervalSinceNow)
 
         session.askUserTimeoutTask = Task { @MainActor [weak self, weak session] in
             do {
-                try await Task.sleep(nanoseconds: sleepNanoseconds)
+                try await Task.sleep(for: .seconds(delay))
             } catch {
                 return
             }
@@ -5935,6 +5939,17 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                   let continuation = session.askUserContinuation
             else { return }
 
+            if let deadline = session.askUserDeadline {
+                guard let anchor = deadline.countdownAnchor() else { return }
+                if anchor.addingTimeInterval(timeoutSeconds) > Date() {
+                    schedulePendingAskUserTimeout(
+                        for: session, interactionID: interactionID, runID: runID,
+                        timeoutSeconds: timeoutSeconds, startedAt: anchor
+                    )
+                    updateRuntimeBindings(from: session)
+                    return
+                }
+            }
             invalidatePendingAskUserTimeout(for: session)
             session.pendingAskUser = nil
             session.pendingAskUserRunID = nil
@@ -5955,6 +5970,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         session.pendingAskUserTimeoutGeneration &+= 1
         session.askUserTimeoutTask?.cancel()
         session.askUserTimeoutTask = nil
+        session.askUserDeadline = nil
         if var pending = session.pendingAskUser {
             pending.timeoutStartedAt = nil
             session.pendingAskUser = pending

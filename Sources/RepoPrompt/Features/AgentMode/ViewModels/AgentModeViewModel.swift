@@ -24624,9 +24624,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         try interaction.validate()
         try rejectAskUserIfBlockingInteractionExists(in: session)
 
+        try Task.checkCancellation()
+        let deadline = DomainInteractionPresentationContext.deadline
+        if let deadline, deadline.acceptanceDeadline() == nil { throw CancellationError() }
+        let anchor = deadline?.countdownAnchor() ?? interaction.askedAt
         let pending = AgentAskUserPendingState(
             interaction: interaction,
-            timeoutStartedAt: interaction.askedAt
+            timeoutStartedAt: anchor
         )
         session.pendingAskUser = pending
         reconcileInteractiveRunState(session)
@@ -24641,12 +24645,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     continuation.resume(throwing: CancellationError())
                     return
                 }
+                session.askUserDeadline = deadline
                 session.askUserContinuation = continuation
                 schedulePendingAskUserTimeout(
                     for: session,
                     interactionID: interaction.id,
                     timeoutSeconds: interaction.timeoutSeconds,
-                    startedAt: interaction.askedAt
+                    startedAt: anchor
                 )
             }
         } onCancel: {
@@ -24703,11 +24708,18 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
               session.askUserContinuation != nil
         else { return }
 
+        let anchor: Date
+        if let deadline = session.askUserDeadline {
+            guard deadline.renew() != nil, let renewedAnchor = deadline.countdownAnchor() else { return }
+            anchor = renewedAnchor
+        } else {
+            anchor = Date()
+        }
         schedulePendingAskUserTimeout(
             for: session,
             interactionID: interactionID,
             timeoutSeconds: pending.interaction.timeoutSeconds,
-            startedAt: Date()
+            startedAt: anchor
         )
 
         if tabID == currentTabID {
@@ -24728,11 +24740,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             pending.timeoutStartedAt = startedAt
             session.pendingAskUser = pending
         }
-        let sleepNanoseconds = UInt64(max(0, timeoutSeconds) * 1_000_000_000)
+        let delay = session.askUserDeadline == nil
+            ? max(0, timeoutSeconds)
+            : max(0, startedAt.addingTimeInterval(timeoutSeconds).timeIntervalSinceNow)
 
         session.askUserTimeoutTask = Task { @MainActor [weak self, weak session] in
             do {
-                try await Task.sleep(nanoseconds: sleepNanoseconds)
+                try await Task.sleep(for: .seconds(delay))
             } catch {
                 return
             }
@@ -24745,6 +24759,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                   let continuation = session.askUserContinuation
             else { return }
 
+            if let deadline = session.askUserDeadline {
+                guard let anchor = deadline.countdownAnchor() else { return }
+                if anchor.addingTimeInterval(timeoutSeconds) > Date() {
+                    schedulePendingAskUserTimeout(
+                        for: session, interactionID: interactionID,
+                        timeoutSeconds: timeoutSeconds, startedAt: anchor
+                    )
+                    updateBindingsFromSession(session)
+                    return
+                }
+            }
             invalidatePendingAskUserTimeout(for: session)
             session.pendingAskUser = nil
             session.askUserContinuation = nil
@@ -24764,6 +24789,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session.pendingAskUserTimeoutGeneration &+= 1
         session.askUserTimeoutTask?.cancel()
         session.askUserTimeoutTask = nil
+        session.askUserDeadline = nil
         if var pending = session.pendingAskUser {
             pending.timeoutStartedAt = nil
             session.pendingAskUser = pending
