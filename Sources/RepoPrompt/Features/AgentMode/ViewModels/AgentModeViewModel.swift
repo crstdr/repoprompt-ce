@@ -553,6 +553,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     @Published private(set) var sessions: [UUID: TabSession] = [:] {
         didSet {
             for tabID in oldValue.keys where sessions[tabID] == nil {
+                ui.transcript.clearDisclosureChoices(for: tabID)
                 if sidebarRemovedRuntimeTabIDs.count < 128 {
                     sidebarRemovedRuntimeTabIDs.insert(tabID)
                 } else if !sidebarRemovedRuntimeTabIDs.contains(tabID) {
@@ -8234,6 +8235,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session.createdByOverseerSessionID = nil
         session.organizationalParentID = nil
         session.delegationScopeID = nil
+        ui.transcript.clearDisclosureChoices(for: session.tabID)
         session.setItemsSilently([], reason: .routeActivation)
         session.clearDerivedTranscriptCaches()
         session.hasSentFirstMessage = false
@@ -25428,6 +25430,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         guard let session = sessions[tabID] else { return }
         closeOracleBackground(for: session)
 
+        ui.transcript.clearDisclosureChoices(for: tabID)
         session.setItemsSilently([], reason: .clearedChat)
         session.clearDerivedTranscriptCaches()
         session.pendingFileAttachments.removeAll()

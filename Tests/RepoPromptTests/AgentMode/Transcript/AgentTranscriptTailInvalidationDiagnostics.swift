@@ -116,6 +116,50 @@
             XCTAssertFalse(first.binding(for: control, fallback: .constant(true)).wrappedValue)
         }
 
+        func testRemovingSessionClearsOnlyItsDisclosureChoices() {
+            let vm = AgentModeViewModel(testWindowID: -995, codexControllerFactory: { _, _, _, _, _, _ in
+                preconditionFailure("This test never starts a provider")
+            })
+            defer { vm.presentationWorkGate.close() }
+            let removedTab = UUID()
+            let retainedTab = UUID()
+            _ = vm.session(for: removedTab)
+            _ = vm.session(for: retainedTab)
+            let item = UUID()
+            let removed = AgentTranscriptDisclosureScope(store: vm.ui.transcript, workspaceID: nil, tabID: removedTab, itemID: item)
+            let retained = AgentTranscriptDisclosureScope(store: vm.ui.transcript, workspaceID: nil, tabID: retainedTab, itemID: item)
+            removed.binding(for: "reply", fallback: .constant(false)).wrappedValue = true
+            retained.binding(for: "reply", fallback: .constant(false)).wrappedValue = true
+
+            vm.test_removeSession(tabID: removedTab)
+
+            XCTAssertFalse(removed.hasChoice(for: "reply"))
+            XCTAssertTrue(retained.binding(for: "reply", fallback: .constant(false)).wrappedValue)
+        }
+
+        func testAutomaticExpansionOnRecreationCannotReplaceExplicitCollapse() {
+            let store = AgentTranscriptUIStore()
+            let tab = UUID()
+            let item = UUID()
+            let first = AgentTranscriptDisclosureScope(store: store, workspaceID: nil, tabID: tab, itemID: item)
+            let control = "ContextBuilderCallCard"
+            var localExpansion = false
+            let fallback = Binding(get: { localExpansion }, set: { localExpansion = $0 })
+            first.binding(for: control, fallback: fallback, recordsChoice: false).wrappedValue = true
+            XCTAssertTrue(localExpansion)
+            XCTAssertFalse(first.hasChoice(for: control))
+            first.binding(for: control, fallback: fallback).wrappedValue = false
+
+            let recreated = AgentTranscriptDisclosureScope(store: store, workspaceID: nil, tabID: tab, itemID: item)
+            var remountedExpansion = false
+            let remounted = Binding(get: { remountedExpansion }, set: { remountedExpansion = $0 })
+            let automatic = recreated.binding(for: control, fallback: remounted, recordsChoice: false)
+            automatic.wrappedValue = true
+            XCTAssertFalse(automatic.wrappedValue)
+            XCTAssertFalse(remountedExpansion)
+            XCTAssertTrue(recreated.hasChoice(for: control))
+        }
+
         func testRevealWorkDoesNotGrowWithHistory() async throws {
             let short = try await countRevealWork(turns: 6)
             let long = try await countRevealWork(turns: 60)
