@@ -186,11 +186,11 @@ enum CodexChromePluginProvisioning {
     }
 
     /// Promote only an installer-produced cache. The installer's config contains a persistent grant.
-    static func promote(stagingHome: URL, destinationHome: URL, expectedFiles: [String: Data] = [:]) throws {
+    static func promote(stagingHome: URL, destinationHome: URL, expectedFiles: [String: Data]) throws {
         let manager = FileManager.default
         let source = stagingHome.appendingPathComponent(installationPath, isDirectory: true)
         let installed = try installation(in: source)
-        guard expectedFiles.allSatisfy({ installed.files[$0.key] == $0.value }) else {
+        guard installed.files == expectedFiles else {
             throw Failure.invalidInstallation
         }
         let destination = destinationHome.appendingPathComponent(installationPath, isDirectory: true)
@@ -213,6 +213,7 @@ enum CodexChromePluginProvisioning {
         let pending = parent.appendingPathComponent(".chrome-\(UUID().uuidString)", isDirectory: true)
         defer { try? manager.removeItem(at: pending) }
         try manager.copyItem(at: source, to: pending)
+        guard try installation(in: pending) == installed else { throw Failure.invalidInstallation }
         do {
             try manager.moveItem(at: pending, to: destination)
         } catch {

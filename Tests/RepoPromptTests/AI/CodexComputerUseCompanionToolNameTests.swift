@@ -122,8 +122,8 @@ final class CodexChromePluginProvisioningTests: XCTestCase {
             let other = staging.appendingPathComponent("plugins/cache/openai-bundled/documents")
             try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
 
-            try CodexChromePluginProvisioning.promote(stagingHome: staging, destinationHome: destination)
-            try CodexChromePluginProvisioning.promote(stagingHome: staging, destinationHome: destination)
+            try CodexChromePluginProvisioning.promote(stagingHome: staging, destinationHome: destination, expectedFiles: fixtureInventory)
+            try CodexChromePluginProvisioning.promote(stagingHome: staging, destinationHome: destination, expectedFiles: fixtureInventory)
 
             let installedManifest = destination.appendingPathComponent("plugins/cache/openai-bundled/chrome/1.0/.codex-plugin/plugin.json")
             XCTAssertEqual(try Data(contentsOf: installedManifest), try Data(contentsOf: manifest))
@@ -134,11 +134,11 @@ final class CodexChromePluginProvisioningTests: XCTestCase {
 
     func testMissingOrDifferentCacheFailsClosed() throws {
         try withHomes { staging, destination in
-            XCTAssertThrowsError(try CodexChromePluginProvisioning.promote(stagingHome: staging, destinationHome: destination))
+            XCTAssertThrowsError(try CodexChromePluginProvisioning.promote(stagingHome: staging, destinationHome: destination, expectedFiles: fixtureInventory))
             let manifest = try self.makeInstallation(in: staging)
             let existing = try self.makeInstallation(in: destination)
             try Data("{\"name\":\"chrome\",\"version\":\"different\"}".utf8).write(to: existing)
-            XCTAssertThrowsError(try CodexChromePluginProvisioning.promote(stagingHome: staging, destinationHome: destination))
+            XCTAssertThrowsError(try CodexChromePluginProvisioning.promote(stagingHome: staging, destinationHome: destination, expectedFiles: fixtureInventory))
             XCTAssertNotEqual(try Data(contentsOf: manifest), try Data(contentsOf: existing))
         }
     }
@@ -196,19 +196,43 @@ final class CodexChromePluginProvisioningTests: XCTestCase {
             let client = root.appendingPathComponent("scripts/browser-client.mjs")
             try FileManager.default.removeItem(at: skill)
             try FileManager.default.removeItem(at: client)
-            XCTAssertThrowsError(try CodexChromePluginProvisioning.promote(stagingHome: staging, destinationHome: destination))
+            XCTAssertThrowsError(try CodexChromePluginProvisioning.promote(stagingHome: staging, destinationHome: destination, expectedFiles: fixtureInventory))
             try Data("skill".utf8).write(to: skill)
-            XCTAssertThrowsError(try CodexChromePluginProvisioning.promote(stagingHome: staging, destinationHome: destination))
+            XCTAssertThrowsError(try CodexChromePluginProvisioning.promote(stagingHome: staging, destinationHome: destination, expectedFiles: fixtureInventory))
         }
     }
 
-    func testOrdinaryLaunchFallsBackToStaticDisableForMalformedConfig() throws {
+    func testOrdinaryLaunchDisablesReservedServersWhenConfigCannotBeReadOrParsed() throws {
         try withHomes { _, destination in
             let config = destination.appendingPathComponent("config.toml")
-            try Data("[mcp_servers.node_repl]\ncommand = [\n".utf8).write(to: config)
-            XCTAssertEqual(try CodexAppServerClient.computerUseProcessConfigArgs(computerUseEnabled: false, configURL: config), ["-c", "\(CodexChromePluginProvisioning.disabledPluginKey)=false"])
-            XCTAssertThrowsError(try CodexAppServerClient.computerUseProcessConfigArgs(computerUseEnabled: true, configURL: config))
+            for invalid in [Data([0xff]), Data("[mcp_servers.node_repl]\ncommand = [\n".utf8)] {
+                try invalid.write(to: config)
+                XCTAssertEqual(try CodexAppServerClient.computerUseProcessConfigArgs(computerUseEnabled: false, configURL: config), [
+                    "-c", "mcp_servers.computer-use.enabled=false",
+                    "-c", "mcp_servers.node_repl.enabled=false",
+                    "-c", "\(CodexChromePluginProvisioning.disabledPluginKey)=false"
+                ])
+                XCTAssertThrowsError(try CodexAppServerClient.computerUseProcessConfigArgs(computerUseEnabled: true, configURL: config))
+            }
         }
+    }
+
+    func testPromotionRejectsUnverifiedExtraFile() throws {
+        try withHomes { staging, destination in
+            let manifest = try makeInstallation(in: staging)
+            let root = manifest.deletingLastPathComponent().deletingLastPathComponent()
+            try Data("unexpected".utf8).write(to: root.appendingPathComponent("scripts/extra.mjs"))
+            XCTAssertThrowsError(try CodexChromePluginProvisioning.promote(stagingHome: staging, destinationHome: destination, expectedFiles: fixtureInventory))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: destination.appendingPathComponent("plugins/cache/openai-bundled/chrome").path))
+        }
+    }
+
+    private var fixtureInventory: [String: Data] {
+        [
+            ".codex-plugin/plugin.json": Data("{\"name\":\"chrome\",\"version\":\"1.0\"}".utf8),
+            "skills/chrome/SKILL.md": Data("fixture".utf8),
+            "scripts/browser-client.mjs": Data("fixture".utf8)
+        ]
     }
 
     private func makeInstallation(in home: URL) throws -> URL {

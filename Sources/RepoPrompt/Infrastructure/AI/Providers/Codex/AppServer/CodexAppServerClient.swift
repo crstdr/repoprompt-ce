@@ -1623,8 +1623,11 @@ actor CodexAppServerClient {
         } catch {
             guard !computerUseEnabled else { throw error }
             Logger(subsystem: "com.repoprompt", category: "CodexChromePlugin")
-                .notice("Codex config could not be read or parsed; applying static Chrome disable only")
-            return try computerUseProcessConfigArgs(computerUseEnabled: false, serverEntries: [])
+                .notice("Codex config could not be read or parsed; disabling Chrome and reserved MCP servers")
+            let reserved = ["computer-use", CodexChromePluginProvisioning.serverName].map { name in
+                CodexIntegrationConfiguration.ServerEntry(rawName: name, normalizedName: name, cliPathComponent: name)
+            }
+            return try computerUseProcessConfigArgs(computerUseEnabled: false, serverEntries: reserved)
         }
         return try computerUseProcessConfigArgs(computerUseEnabled: computerUseEnabled, serverEntries: entries)
     }
