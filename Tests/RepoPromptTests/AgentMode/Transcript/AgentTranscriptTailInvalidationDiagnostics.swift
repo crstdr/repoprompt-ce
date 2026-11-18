@@ -93,6 +93,127 @@
             let description: String
         }
 
+        func testDisclosureChoiceSurvivesRecreatedRow() {
+            let store = AgentTranscriptUIStore()
+            let workspaceID = UUID()
+            let tabID = UUID()
+            let itemID = UUID()
+            let control = "CollapsibleAssistantTranscriptContent"
+            var firstLocalValue = false
+            let first = AgentTranscriptDisclosureScope(store: store, workspaceID: workspaceID, tabID: tabID, itemID: itemID)
+            let firstBinding = first.binding(for: control, fallback: Binding(get: { firstLocalValue }, set: { firstLocalValue = $0 }))
+            XCTAssertFalse(firstBinding.wrappedValue)
+            XCTAssertFalse(first.hasChoice(for: control))
+            firstBinding.wrappedValue = true
+
+            // A newly mounted row starts with a fresh local default, but reads the existing choice.
+            let recreated = AgentTranscriptDisclosureScope(store: store, workspaceID: workspaceID, tabID: tabID, itemID: itemID)
+            XCTAssertTrue(recreated.binding(for: control, fallback: .constant(false)).wrappedValue)
+            XCTAssertFalse(recreated.binding(for: "CodePreview", fallback: .constant(false)).wrappedValue)
+            let otherTab = AgentTranscriptDisclosureScope(store: store, workspaceID: workspaceID, tabID: UUID(), itemID: itemID)
+            XCTAssertFalse(otherTab.binding(for: control, fallback: .constant(false)).wrappedValue)
+            recreated.binding(for: control, fallback: .constant(true)).wrappedValue = false
+            XCTAssertFalse(first.binding(for: control, fallback: .constant(true)).wrappedValue)
+        }
+
+        func testRemovingSessionClearsOnlyItsDisclosureChoices() {
+            let vm = AgentModeViewModel(testWindowID: -995, codexControllerFactory: { _, _, _, _, _, _ in
+                preconditionFailure("This test never starts a provider")
+            })
+            defer { vm.presentationWorkGate.close() }
+            let removedTab = UUID()
+            let retainedTab = UUID()
+            _ = vm.session(for: removedTab)
+            _ = vm.session(for: retainedTab)
+            let item = UUID()
+            let removed = AgentTranscriptDisclosureScope(store: vm.ui.transcript, workspaceID: nil, tabID: removedTab, itemID: item)
+            let retained = AgentTranscriptDisclosureScope(store: vm.ui.transcript, workspaceID: nil, tabID: retainedTab, itemID: item)
+            removed.binding(for: "reply", fallback: .constant(false)).wrappedValue = true
+            retained.binding(for: "reply", fallback: .constant(false)).wrappedValue = true
+
+            vm.test_removeSession(tabID: removedTab)
+
+            XCTAssertFalse(removed.hasChoice(for: "reply"))
+            XCTAssertTrue(retained.binding(for: "reply", fallback: .constant(false)).wrappedValue)
+        }
+
+        func testAutomaticExpansionOnRecreationCannotReplaceExplicitCollapse() {
+            let store = AgentTranscriptUIStore()
+            let tab = UUID()
+            let item = UUID()
+            let first = AgentTranscriptDisclosureScope(store: store, workspaceID: nil, tabID: tab, itemID: item)
+            let control = "ContextBuilderCallCard"
+            var localExpansion = false
+            let fallback = Binding(get: { localExpansion }, set: { localExpansion = $0 })
+            first.binding(for: control, fallback: fallback, recordsChoice: false).wrappedValue = true
+            XCTAssertTrue(localExpansion)
+            XCTAssertFalse(first.hasChoice(for: control))
+            first.binding(for: control, fallback: fallback).wrappedValue = false
+
+            let recreated = AgentTranscriptDisclosureScope(store: store, workspaceID: nil, tabID: tab, itemID: item)
+            var remountedExpansion = false
+            let remounted = Binding(get: { remountedExpansion }, set: { remountedExpansion = $0 })
+            let automatic = recreated.binding(for: control, fallback: remounted, recordsChoice: false)
+            automatic.wrappedValue = true
+            XCTAssertFalse(automatic.wrappedValue)
+            XCTAssertFalse(remountedExpansion)
+            XCTAssertTrue(recreated.hasChoice(for: control))
+        }
+
+        func testRevealWorkDoesNotGrowWithHistory() async throws {
+            let short = try await countRevealWork(turns: 6)
+            let long = try await countRevealWork(turns: 60)
+            XCTAssertGreaterThanOrEqual(long.rows, short.rows * 8, "The long fixture must expose its history to the renderer")
+            XCTAssertLessThanOrEqual(long.built, short.built + 5)
+            XCTAssertLessThanOrEqual(long.measured, short.measured + 5)
+        }
+
+        private func countRevealWork(turns: Int) async throws -> (rows: Int, built: Int, measured: Int) {
+            let recorder = Recorder()
+            AgentTranscriptTailRenderProbe.sink = { recorder.receive($0) }
+            let fixture = try await makeFixture(turns: turns, recorder: recorder, startsPresentationHidden: true)
+            defer {
+                AgentTranscriptTailRenderProbe.sink = nil
+                fixture.window.contentView = nil
+                fixture.window.close()
+            }
+            let last = try XCTUnwrap(fixture.source.last?.id)
+            XCTAssertNil(recorder.bodies[last])
+            // Supply an intentionally uncompressed presentation. The production retention policy
+            // can otherwise reduce 300 source messages to 64 rows before the host sees them.
+            let vm = fixture.state.agentModeViewModel
+            let blocks = fixture.source.map { item in
+                AgentTranscriptRenderBlock(
+                    id: item.id.uuidString, kind: item.kind == .user ? .request : .standaloneAssistant,
+                    turnID: item.id, retentionTier: .full, rows: [item], isArchived: false
+                )
+            }
+            let session = vm.session(for: fixture.tabID)
+            session.transcriptProjection = .init(workingBlocks: blocks, workingRows: fixture.source)
+            vm.test_publishTranscriptPresentation(tabID: fixture.tabID, forceRevision: true)
+            let hiddenBodies = recorder.bodies.count
+            let hiddenMeasurements = recorder.counts.count(where: { ($0.value["size"] ?? 0) > 0 })
+            recorder.bodies = [:]
+            recorder.counts = [:]
+            fixture.state.agentModeViewModel.presentationWorkGate.setVisible(true)
+            var serial = recorder.serial
+            var changedAt = ProcessInfo.processInfo.systemUptime
+            try await wait(fixture, seconds: 8, gate: "revealed tail and settled realization") {
+                if serial != recorder.serial {
+                    serial = recorder.serial
+                    changedAt = ProcessInfo.processInfo.systemUptime
+                }
+                return recorder.bodies[last] != nil && ProcessInfo.processInfo.systemUptime - changedAt >= 0.25
+            }
+            let rows = fixture.store.snapshot.presentation.visibleRows.count
+            let built = recorder.bodies.count
+            let measured = recorder.counts.count(where: { ($0.value["size"] ?? 0) > 0 })
+            let sizes = recorder.counts.values.reduce(0) { $0 + ($1["size"] ?? 0) }
+            let bodyCalls = recorder.bodies.values.reduce(0, +)
+            print("TRANSCRIPT_REVEAL turns=\(turns) rows=\(rows) hiddenBuilt=\(hiddenBodies) hiddenMeasured=\(hiddenMeasurements) built=\(built) measured=\(measured) bodyCalls=\(bodyCalls) sizeCalls=\(sizes)")
+            return (rows, built, measured)
+        }
+
         func testRowBoundaryKeepsNativeIdentitySelectionAndDeliversChangedInputs() async throws {
             let oldAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
@@ -101,7 +222,7 @@
             }
             let recorder = Recorder()
             AgentTranscriptTailRenderProbe.sink = { recorder.receive($0) }
-            let fixture = try await makeFixture(turns: 10, recorder: recorder)
+            let fixture = try await makeFixture(turns: 10, recorder: recorder, viewportHeight: 2600)
             defer { fixture.window.contentView = nil
                 fixture.window.close()
             }
@@ -240,15 +361,15 @@
             }
             let recorder = Recorder()
             AgentTranscriptTailRenderProbe.sink = { recorder.receive($0) }
-            let fixture = try await makeFixture(turns: 10, recorder: recorder)
+            let fixture = try await makeFixture(turns: 10, recorder: recorder, viewportHeight: 2600)
             defer { fixture.window.contentView = nil
                 fixture.window.close()
             }
             let userID = fixture.source[45].id
             let tailID = fixture.source[49].id
-            let ordinaryID = fixture.source[41].id
-            let loginID = fixture.source[42].id
-            let bashID = fixture.source[43].id
+            let ordinaryID = fixture.source[46].id
+            let loginID = fixture.source[47].id
+            let bashID = fixture.source[48].id
             try await wait(fixture, seconds: 60, gate: "rich native witness") { self.hasRichWitness(userID, in: fixture) }
             var next = fixture.store.snapshot
             for (id, message) in [(ordinaryID, "Ordinary settled error"), (loginID, CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage)] {
@@ -634,10 +755,14 @@
                 // A scheduler/coalescer servicing interval, never a substitute for the readiness oracle.
                 try await Task.sleep(for: .milliseconds(20))
             }
+            XCTFail("Transcript fixture did not reach: \(gate)")
             throw GateFailure(description: gate)
         }
 
-        private func makeFixture(turns: Int, recorder: Recorder, workload: Workload = .richConclusion) async throws -> Fixture {
+        private func makeFixture(
+            turns: Int, recorder: Recorder, workload: Workload = .richConclusion,
+            startsPresentationHidden: Bool = false, viewportHeight: CGFloat = 800
+        ) async throws -> Fixture {
             _ = NSApplication.shared
             let state = WindowState(
                 agentModeViewModelFactory: { windowID, prompt, manager, server in
@@ -691,6 +816,9 @@
                     sequenceIndex: source[index].sequenceIndex - 1
                 ), at: index)
             }
+            if startsPresentationHidden {
+                vm.presentationWorkGate.setVisible(false)
+            }
             session.runState = .running
             session.items = source
             session.nextSequenceIndex = (source.last?.sequenceIndex ?? -1) + 1
@@ -710,7 +838,7 @@
                     browser: { _ in throw Refused.providerLaunch }, deviceCode: { _ in throw Refused.providerLaunch }
                 )
             ).environment(\.agentWindowIsFocused, false)
-            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1000, height: 800), styleMask: [.titled], backing: .buffered, defer: false)
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1000, height: viewportHeight), styleMask: [.titled], backing: .buffered, defer: false)
             window.isReleasedWhenClosed = false
             let host = CountingHost(rootView: AnyView(parent))
             window.contentView = host

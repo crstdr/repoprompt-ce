@@ -6,7 +6,7 @@ struct ContextBuilderCallCard: View {
     let item: AgentChatItem
     private let context: ContextBuilderCardContext
     @ObservedObject private var contextBuilderAgentVM: ContextBuilderAgentViewModel
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("ContextBuilderCallCard") private var isExpanded = false
 
     init(item: AgentChatItem, context: ContextBuilderCardContext) {
         self.item = item
@@ -147,7 +147,7 @@ struct ContextBuilderResultCard: View {
     let item: AgentChatItem
     private let context: ContextBuilderCardContext
     @ObservedObject private var contextBuilderAgentVM: ContextBuilderAgentViewModel
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("ContextBuilderResultCard") private var isExpanded = false
 
     init(item: AgentChatItem, context: ContextBuilderCardContext) {
         self.item = item
