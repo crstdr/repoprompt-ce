@@ -308,8 +308,8 @@ final class CodexNativeSessionController {
     private var computerUseScopePrepared = false
     private var computerUseAcceptedClientPath: String?
     private var effectiveComputerUseServerNames: [String] = []
-    private var chromeThreadOverrides: [String: Any] = [:]
-    var computerUseChromeEligible = false
+    private var chromeCandidate: (configURL: URL, digest: String)?
+    var computerUseChromeAuthority: @MainActor () -> Bool = { false }
     private static let runningOutputTruncationMarker = "\n...(output truncated)...\n"
     private static let removedSyntheticNotificationMethods: Set<String> = [
         "item/file_change/output_delta",
@@ -1859,6 +1859,7 @@ final class CodexNativeSessionController {
                 timeout: timeout
             ) { requestValueStyle in
                 var requestParams = params
+                requestParams["config"] = await chromeAdjustedBindingConfig(configOverrides)
                 requestParams["approvalPolicy"] = effectiveApprovalPolicy.appServerRequestValue(style: requestValueStyle)
                 requestParams["sandbox"] = options.sandboxModeProvider().appServerRequestValue(style: requestValueStyle)
                 requestParams["approvalsReviewer"] = effectiveApprovalReviewer.appServerRequestValue
@@ -1908,6 +1909,7 @@ final class CodexNativeSessionController {
             timeout: timeout
         ) { requestValueStyle in
             var requestParams = params
+            requestParams["config"] = await chromeAdjustedBindingConfig(configOverrides)
             requestParams["approvalPolicy"] = effectiveApprovalPolicy.appServerRequestValue(style: requestValueStyle)
             requestParams["sandbox"] = options.sandboxModeProvider().appServerRequestValue(style: requestValueStyle)
             requestParams["approvalsReviewer"] = effectiveApprovalReviewer.appServerRequestValue
@@ -3128,25 +3130,27 @@ final class CodexNativeSessionController {
         let config = try await performRequest(method: "config/read", params: params, timeout: options.requestTimeout)
         effectiveComputerUseServerNames = try Self.reservedComputerUseServerNames(config)
         try Self.validateComputerUseConfiguration(config)
-        chromeThreadOverrides = [:]
-        guard computerUseChromeEligible, !options.computerUseHumanOnly else { return }
+        chromeCandidate = nil
+        guard !options.computerUseHumanOnly, await computerUseChromeAuthority() else { return }
         let runtime: CodexRuntimeAuthority.Runtime = if let preparedRuntime {
             preparedRuntime
         } else {
             try await client.prepareRuntimeForLaunch()
         }
         let name = CodexChromePluginProvisioning.serverName
+        let configURL = runtime.statePaths.codexHome.appendingPathComponent("config.toml")
         let entries = options.mcpServerEntriesProvider()
         let approved = entries.filter { $0.normalizedName.caseInsensitiveCompare(name) == .orderedSame }
         guard approved.count == 1, approved.first?.rawName == name,
-              CodexAgentToolPreferences.mcpServerEnabled(normalizedName: name),
               let effective = config["config"] as? [String: Any],
               let servers = effective["mcp_servers"] as? [String: Any],
               servers.keys.filter({ $0.caseInsensitiveCompare(name) == .orderedSame }).count == 1,
               let node = servers[name] as? [String: Any],
               let owned = try? CodexUserMCPImport.ownedServerDefinition(
-                  named: name, configURL: runtime.statePaths.codexHome.appendingPathComponent("config.toml")
+                  named: name, configURL: configURL
               ),
+              let digest = CodexChromePluginProvisioning.definitionDigest(owned),
+              CodexAgentToolPreferences.chromeNodeReplApproved(digest: digest),
               CodexChromePluginProvisioning.matchesOwnedTransport(node, owned: owned),
               let command = node["command"] as? String, command.hasPrefix("/"),
               RuntimeCodeSigningDetector.validatesStaticCode(
@@ -3162,17 +3166,39 @@ final class CodexNativeSessionController {
             CodexChromePluginProvisioning.logUnavailableGrant()
             return
         }
-        if await CodexChromePluginProvisioning.prepare(runtime: runtime),
-           CodexAgentToolPreferences.mcpServerEnabled(normalizedName: name)
-        {
-            chromeThreadOverrides = eligible
+        if await CodexChromePluginProvisioning.prepare(runtime: runtime) {
+            chromeCandidate = (configURL, digest)
         }
+    }
+
+    private func chromeAdjustedBindingConfig(_ base: [String: Any]) async -> [String: Any]? {
+        let unchanged = base.isEmpty ? nil : base
+        guard computerUseRequiresUserReview, let candidate = chromeCandidate,
+              !Task.isCancelled, await computerUseChromeAuthority() else { return unchanged }
+        var params: [String: Any] = ["includeLayers": false]
+        if let directory = workspacePaths.executionDirectory { params["cwd"] = directory }
+        let name = CodexChromePluginProvisioning.serverName
+        guard let response = try? await performRequest(method: "config/read", params: params, timeout: options.requestTimeout),
+              let config = response["config"] as? [String: Any],
+              let servers = config["mcp_servers"] as? [String: Any],
+              servers.keys.filter({ $0.caseInsensitiveCompare(name) == .orderedSame }).count == 1,
+              let node = servers[name] as? [String: Any],
+              !Task.isCancelled, await computerUseChromeAuthority(),
+              let owned = try? CodexUserMCPImport.ownedServerDefinition(named: name, configURL: candidate.configURL),
+              CodexChromePluginProvisioning.definitionDigest(owned) == candidate.digest,
+              CodexAgentToolPreferences.chromeNodeReplApproved(digest: candidate.digest),
+              CodexChromePluginProvisioning.matchesOwnedTransport(node, owned: owned),
+              let command = node["command"] as? String, command.hasPrefix("/"),
+              RuntimeCodeSigningDetector.validatesStaticCode(at: URL(fileURLWithPath: command), requirementSource: CodexComputerUseWorkflow.openAISigningRequirement)
+        else { return unchanged }
+        let chrome = CodexChromePluginProvisioning.threadOverrides(config: config, armedDirect: true, approved: true, installed: true)
+        return chrome.isEmpty ? unchanged : base.merging(chrome) { _, chrome in chrome }
     }
 
     private func runtimeConfigOverrides() async throws -> [String: Any] {
         let overrides = await options.configOverridesProvider()
         return try Self.computerUseRuntimeConfigOverrides(
-            overrides.merging(chromeThreadOverrides) { _, chrome in chrome },
+            overrides,
             computerUseEnabled: computerUseRequiresUserReview,
             acceptedClientPath: computerUseAcceptedClientPath,
             effectiveServerNames: effectiveComputerUseServerNames
@@ -5068,6 +5094,12 @@ final class CodexNativeSessionController {
         func test_computerUseApprovalPolicy() async throws -> (CodexAgentToolPreferences.ApprovalPolicy, CodexAgentToolPreferences.ApprovalReviewer) {
             try await updateClientProcessLaunchPolicy()
             return (effectiveApprovalPolicy, effectiveApprovalReviewer)
+        }
+
+        func test_chromeBindingConfig(configURL: URL, digest: String) async throws -> [String: Any]? {
+            try await updateClientProcessLaunchPolicy()
+            chromeCandidate = (configURL, digest)
+            return await chromeAdjustedBindingConfig(["features.plugins": false])
         }
 
         func test_computerUseStartupConfig() async throws -> [String: Any] {

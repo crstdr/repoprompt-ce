@@ -148,6 +148,16 @@ enum CodexUserMCPImport {
         return object
     }
 
+    static func checkedServerEntries(configURL: URL) throws -> [CodexIntegrationConfiguration.ServerEntry] {
+        guard let contents = try read(configURL, missingAllowed: true) else { return [] }
+        let (parsed, _) = try sections(in: contents)
+        let mcp = parsed.filter { $0.path.first == "mcp_servers" && $0.path.count >= 2 }
+        for entries in Dictionary(grouping: mcp, by: { $0.path[1] }).values {
+            try validate(entries)
+        }
+        return CodexIntegrationConfiguration.mcpServerEntries(from: contents)
+    }
+
     static func ownedServerDefinition(named name: String, configURL: URL) throws -> [String: CodexUserMCPImportValidation.Value]? {
         guard let contents = try read(configURL, missingAllowed: true) else { return nil }
         let (sections, _) = try sections(in: contents)

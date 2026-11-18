@@ -687,7 +687,7 @@ final class CodexComputerUseWorkflowTests: XCTestCase {
         await client.stop()
     }
 
-    func testOrdinaryProcessLaunchRejectsUnreadableReservedServerConfiguration() async throws {
+    func testOrdinaryProcessLaunchToleratesUnreadableReservedServerConfiguration() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("off-start-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -721,12 +721,31 @@ final class CodexComputerUseWorkflowTests: XCTestCase {
         await client.updateProcessLaunchPolicy(featurePolicy: .defaultDisabled, modelReasoningSummary: nil)
         do {
             try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await client.startIfNeeded() }
-            XCTFail("Ordinary launch must reject unreadable config before spawn")
+            XCTFail("The inert fixture must exit instead of initializing")
         } catch {
-            XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path), "Reserved-server checks must not treat unreadable config as empty")
+            XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path), "Unreadable config must not prevent ordinary spawn")
             XCTAssertEqual(try Data(contentsOf: configURL), Data([0xFF]))
         }
         await client.stop()
+    }
+
+    func testChromeBindingRechecksAuthorityAfterEffectiveConfigRead() async throws {
+        let controller = makeController(options: .agentModeDefault(
+            computerUseEnabledProvider: { true }, computerUseClientPathProvider: { "/fixture/companion" }, mcpServerEntriesProvider: { [] }
+        ), requestExecutor: { method, _, _ in
+            XCTAssertEqual(method, "config/read")
+            return ["config": ["mcp_servers": ["node_repl": ["command": "/fixture/node_repl"]]]]
+        })
+        var checks = 0
+        controller.computerUseChromeAuthority = {
+            checks += 1
+            return checks == 1
+        }
+        let fixtureURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let binding = try await controller.test_chromeBindingConfig(configURL: fixtureURL, digest: "fixture")
+        XCTAssertEqual(checks, 2)
+        XCTAssertEqual(binding?["features.plugins"] as? Bool, false)
+        XCTAssertNil(binding?["mcp_servers.node_repl.enabled"])
     }
 
     func testArmedEffectiveLayerCollisionAtControllerBoundary() async throws {

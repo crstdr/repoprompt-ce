@@ -1,3 +1,4 @@
+import CryptoKit
 import Darwin
 import Foundation
 import OSLog
@@ -53,6 +54,18 @@ enum CodexChromePluginProvisioning {
                 return false
             }
         }.value
+    }
+
+    static func definitionDigest(_ owned: [String: CodexUserMCPImportValidation.Value]) -> String? {
+        guard let data = try? JSONSerialization.data(withJSONObject: owned.mapValues(jsonValue), options: [.sortedKeys]) else {
+            return nil
+        }
+        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func definitionDigest(configURL: URL) -> String? {
+        guard let owned = try? CodexUserMCPImport.ownedServerDefinition(named: serverName, configURL: configURL) else { return nil }
+        return definitionDigest(owned)
     }
 
     static func matchesOwnedTransport(_ effective: [String: Any], owned: [String: CodexUserMCPImportValidation.Value]) -> Bool {
@@ -123,8 +136,26 @@ enum CodexChromePluginProvisioning {
         guard let quotedPath = String(data: source, encoding: .utf8) else { throw Failure.installFailed }
         let config = "[marketplaces.openai-bundled]\nsource_type = \"local\"\nsource = \(quotedPath.replacingOccurrences(of: "\\/", with: "/"))\n"
         try config.write(to: staging.appendingPathComponent("config.toml"), atomically: true, encoding: .utf8)
+        let expectedFiles = try bundledChromeFiles(in: stagedMarketplace)
         try install(staging)
-        try promote(stagingHome: staging, destinationHome: destinationHome)
+        try promote(stagingHome: staging, destinationHome: destinationHome, expectedFiles: expectedFiles)
+    }
+
+    private static func bundledChromeFiles(in marketplace: URL) throws -> [String: Data] {
+        let manifest = marketplace.appendingPathComponent(".agents/plugins/marketplace.json")
+        let contents = try Data(contentsOf: manifest)
+        guard let metadata = try JSONSerialization.jsonObject(with: contents) as? [String: Any],
+              let plugins = metadata["plugins"] as? [[String: Any]],
+              let chrome = plugins.first(where: { $0["name"] as? String == "chrome" }),
+              let path = (chrome["source"] as? String) ?? (chrome["source"] as? [String: Any])?["path"] as? String,
+              !path.hasPrefix("/") else { throw Failure.invalidInstallation }
+        let root = marketplace.resolvingSymlinksInPath().standardizedFileURL
+        let package = marketplace.appendingPathComponent(path).resolvingSymlinksInPath().standardizedFileURL
+        guard package.path.hasPrefix(root.path + "/") else { throw Failure.invalidInstallation }
+        var files: [String: Data] = [:]
+        try collectFiles(in: package, files: &files)
+        guard !files.isEmpty else { throw Failure.invalidInstallation }
+        return files
     }
 
     private static func install(using executable: URL, stagingHome: URL) throws {
@@ -155,10 +186,13 @@ enum CodexChromePluginProvisioning {
     }
 
     /// Promote only an installer-produced cache. The installer's config contains a persistent grant.
-    static func promote(stagingHome: URL, destinationHome: URL) throws {
+    static func promote(stagingHome: URL, destinationHome: URL, expectedFiles: [String: Data] = [:]) throws {
         let manager = FileManager.default
         let source = stagingHome.appendingPathComponent(installationPath, isDirectory: true)
         let installed = try installation(in: source)
+        guard expectedFiles.allSatisfy({ installed.files[$0.key] == $0.value }) else {
+            throw Failure.invalidInstallation
+        }
         let destination = destinationHome.appendingPathComponent(installationPath, isDirectory: true)
         let parent = destination.deletingLastPathComponent()
         let root = destinationHome.resolvingSymlinksInPath()
@@ -228,19 +262,24 @@ enum CodexChromePluginProvisioning {
             throw Failure.invalidInstallation
         }
         var files: [String: Data] = [:]
-        try collectFiles(in: version, relativeTo: version, files: &files)
+        try collectFiles(in: version, files: &files)
+        guard files.contains(where: { path, data in
+            path.hasPrefix("skills/") && path.hasSuffix("/SKILL.md") && !data.isEmpty
+        }), files["scripts/browser-client.mjs"]?.isEmpty == false else {
+            throw Failure.invalidInstallation
+        }
         return Installation(directory: version.lastPathComponent, files: files)
     }
 
-    private static func collectFiles(in directory: URL, relativeTo root: URL, files: inout [String: Data]) throws {
+    private static func collectFiles(in directory: URL, prefix: String = "", files: inout [String: Data]) throws {
         let keys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey]
         for child in try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: Array(keys)) {
             let values = try child.resourceValues(forKeys: keys)
             guard values.isSymbolicLink == false else { throw Failure.invalidInstallation }
+            let path = prefix + child.lastPathComponent
             if values.isDirectory == true {
-                try collectFiles(in: child, relativeTo: root, files: &files)
+                try collectFiles(in: child, prefix: path + "/", files: &files)
             } else if values.isRegularFile == true {
-                let path = String(child.path.dropFirst(root.path.count + 1))
                 files[path] = try Data(contentsOf: child, options: .mappedIfSafe)
             } else {
                 throw Failure.invalidInstallation

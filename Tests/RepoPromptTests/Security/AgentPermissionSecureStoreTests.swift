@@ -441,6 +441,26 @@ final class AgentPermissionSecureStoreTests: XCTestCase {
         XCTAssertEqual(saved.permissionLevel(), .autoEdit)
     }
 
+    func testChromeNodeReplGrantIsBoundToApprovedDefinition() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let config = directory.appendingPathComponent("config.toml")
+        let initial = "[mcp_servers.node_repl]\ncommand = \"/fixture/node_repl\"\nargs = [\"original\"]\n[mcp_servers.node_repl.env]\nMODE = \"chrome\"\n"
+        try initial.write(to: config, atomically: true, encoding: .utf8)
+        let store = makeStore(secureStrings: FakeSecurePlainStringStore())
+        let original = try XCTUnwrap(CodexChromePluginProvisioning.definitionDigest(configURL: config))
+        _ = store.updateCodexPermissions { $0.mcpServerTogglesByNormalizedName = ["node_repl": true] }
+        XCTAssertFalse(CodexAgentToolPreferences.chromeNodeReplApproved(digest: original, secureStore: store))
+        CodexAgentToolPreferences.setMCPServerEnabled(normalizedName: "node_repl", isEnabled: true, secureStore: store, configURL: config)
+        XCTAssertTrue(CodexAgentToolPreferences.chromeNodeReplApproved(digest: original, secureStore: store))
+        try initial.replacingOccurrences(of: "original", with: "changed").write(to: config, atomically: true, encoding: .utf8)
+        let changed = try XCTUnwrap(CodexChromePluginProvisioning.definitionDigest(configURL: config))
+        XCTAssertFalse(CodexAgentToolPreferences.chromeNodeReplApproved(digest: changed, secureStore: store))
+        XCTAssertTrue(CodexAgentToolPreferences.disableImportedMCPServers(["node_repl"], secureStore: store))
+        XCTAssertFalse(CodexAgentToolPreferences.chromeNodeReplApproved(digest: original, secureStore: store))
+    }
+
     private func makeStore(
         secureStrings: FakeSecurePlainStringStore,
         notificationCenter: NotificationCenter = NotificationCenter()

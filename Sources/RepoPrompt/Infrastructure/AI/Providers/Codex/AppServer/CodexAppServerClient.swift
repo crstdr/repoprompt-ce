@@ -1,6 +1,7 @@
 import Darwin
 import Darwin.POSIX.fcntl
 import Foundation
+import OSLog
 import RepoPromptProcess
 import RepoPromptProviderQuota
 
@@ -1615,6 +1616,19 @@ actor CodexAppServerClient {
         return args
     }
 
+    static func computerUseProcessConfigArgs(computerUseEnabled: Bool, configURL: URL) throws -> [String] {
+        let entries: [CodexIntegrationConfiguration.ServerEntry]
+        do {
+            entries = try CodexUserMCPImport.checkedServerEntries(configURL: configURL)
+        } catch {
+            guard !computerUseEnabled else { throw error }
+            Logger(subsystem: "com.repoprompt", category: "CodexChromePlugin")
+                .notice("Codex config could not be read or parsed; applying static Chrome disable only")
+            return try computerUseProcessConfigArgs(computerUseEnabled: false, serverEntries: [])
+        }
+        return try computerUseProcessConfigArgs(computerUseEnabled: computerUseEnabled, serverEntries: entries)
+    }
+
     private func startProcess(startupAuthority: UInt64) async throws {
         try ProviderProcessLaunchPolicy.check()
         let runtime = try await prepareRuntimeForLaunch()
@@ -1656,14 +1670,8 @@ actor CodexAppServerClient {
         // Read the actual launch home, not personal Codex settings. Reserved servers
         // are disabled at process scope before any thread can opt in.
         let runtimeConfigURL = runtime.statePaths.codexHome.appendingPathComponent("config.toml")
-        let runtimeConfig = if FileManager.default.fileExists(atPath: runtimeConfigURL.path) {
-            try String(contentsOf: runtimeConfigURL, encoding: .utf8)
-        } else {
-            ""
-        }
         processOverrides += try Self.computerUseProcessConfigArgs(
-            computerUseEnabled: config.processFeaturePolicy.computerUseEnabled,
-            serverEntries: CodexIntegrationConfiguration.mcpServerEntries(from: runtimeConfig)
+            computerUseEnabled: config.processFeaturePolicy.computerUseEnabled, configURL: runtimeConfigURL
         )
         let args = processOverrides + ["app-server"]
         let launchDirectory = CLIProcessConfiguration.resolvedWorkingDirectory(

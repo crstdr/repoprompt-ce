@@ -7135,7 +7135,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     contextWindowSelection
                 )
                 if let nativeController = controller as? CodexNativeSessionController {
-                    nativeController.computerUseChromeEligible = desiredFeatureState.computerUseChromeEligible
+                    nativeController.computerUseChromeAuthority = { [weak session, weak nativeController] in
+                        guard let session, let nativeController, let computerUseActivationID else { return false }
+                        return session.selectedAgent == .codexExec
+                            && session.codexController === nativeController
+                            && session.pendingCodexComputerUseActivation?.id == computerUseActivationID
+                            && session.canUseArmedCodexChrome
+                    }
                 }
                 guard managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken) else {
                     logCodex("[AgentModeVM][CodexLogout] retiring controller created after managed sign-out invalidated its session token tab=\(session.tabID)")

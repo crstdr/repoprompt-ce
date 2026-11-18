@@ -123,6 +123,7 @@ struct SecureCodexPermissionDocument: Codable, Equatable {
     var approvalReviewerRaw: String?
     var bashToolEnabled: Bool?
     var mcpServerTogglesByNormalizedName: [String: Bool]?
+    var chromeNodeReplDefinitionDigest: String?
 
     init(
         schemaVersion: Int = currentSchemaVersion,
