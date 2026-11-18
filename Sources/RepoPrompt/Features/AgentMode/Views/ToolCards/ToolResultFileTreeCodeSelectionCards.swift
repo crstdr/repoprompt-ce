@@ -154,7 +154,7 @@ enum FileTreeCardPresentationBuilder {
 
 struct FileTreeResultCard: View {
     let item: AgentChatItem
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("FileTreeResultCard") private var isExpanded = false
 
     private var dto: ToolResultDTOs.FileTreeDTO? {
         ToolJSON.decode(ToolResultDTOs.FileTreeDTO.self, from: item.toolResultJSON)
@@ -187,7 +187,7 @@ struct FileTreeResultCard: View {
 
 struct CodeStructureResultCard: View {
     let item: AgentChatItem
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("CodeStructureResultCard") private var isExpanded = false
 
     private var dto: ToolResultDTOs.CodeStructureReplyDTO? {
         ToolJSON.decode(ToolResultDTOs.CodeStructureReplyDTO.self, from: item.toolResultJSON)
@@ -265,7 +265,7 @@ struct CodeStructureResultCard: View {
 
 struct ManageSelectionResultCard: View {
     let item: AgentChatItem
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("ManageSelectionResultCard") private var isExpanded = false
 
     private var dto: ToolResultDTOs.SelectionReply? {
         ToolJSON.decode(ToolResultDTOs.SelectionReply.self, from: item.toolResultJSON)
@@ -336,7 +336,7 @@ struct ManageSelectionResultCard: View {
 
 struct WorkspaceContextResultCard: View {
     let item: AgentChatItem
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("WorkspaceContextResultCard") private var isExpanded = false
 
     private var dto: ToolResultDTOs.PromptContextDTO? {
         ToolJSON.decode(ToolResultDTOs.PromptContextDTO.self, from: item.toolResultJSON)

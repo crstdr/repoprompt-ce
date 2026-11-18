@@ -4,7 +4,7 @@ import SwiftUI
 
 struct ReadFileResultCard: View {
     let item: AgentChatItem
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("ReadFileResultCard") private var isExpanded = false
 
     private var dto: ToolResultDTOs.ReadFileReply? {
         ToolJSON.decode(ToolResultDTOs.ReadFileReply.self, from: item.toolResultJSON)
@@ -53,7 +53,7 @@ struct ReadFileResultCard: View {
 
 struct NativeReadResultCard: View {
     let item: AgentChatItem
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("NativeReadResultCard") private var isExpanded = false
 
     private var args: ToolArgsDTOs.NativeReadArgs? {
         ToolJSON.decodeArgs(ToolArgsDTOs.NativeReadArgs.self, from: item.toolArgsJSON)
@@ -86,7 +86,7 @@ struct NativeReadResultCard: View {
 
 struct FileSearchResultCard: View {
     let item: AgentChatItem
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("FileSearchResultCard") private var isExpanded = false
 
     private var dto: ToolResultDTOs.SearchResultDTO? {
         ToolJSON.decode(ToolResultDTOs.SearchResultDTO.self, from: item.toolResultJSON)
@@ -143,7 +143,7 @@ struct FileSearchResultCard: View {
 struct WebSearchResultCard: View {
     let item: AgentChatItem
     let normalizedToolName: String
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("WebSearchResultCard") private var isExpanded = false
 
     init(item: AgentChatItem, normalizedToolName: String = "search") {
         self.item = item
@@ -173,7 +173,7 @@ struct WebSearchResultCard: View {
 struct NativeToolResultCard: View {
     let item: AgentChatItem
     let normalizedToolName: String?
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("NativeToolResultCard") private var isExpanded = false
 
     var body: some View {
         let presentation = NativeToolCardPresentationBuilder.build(item: item, normalizedToolName: normalizedToolName)
@@ -247,7 +247,7 @@ enum NativeToolCardPresentationBuilder {
 
 struct FileActionResultCard: View {
     let item: AgentChatItem
-    @State private var isExpanded = false
+    @AgentTranscriptDisclosure("FileActionResultCard") private var isExpanded = false
 
     private var dto: ToolResultDTOs.FileActionReply? {
         ToolJSON.decode(ToolResultDTOs.FileActionReply.self, from: item.toolResultJSON)
