@@ -6977,7 +6977,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             goalSupportEnabled: wantsGoalSupport,
             reasoningSummariesEnabled: wantsReasoningSummaries,
             memoriesEnabled: wantsMemories,
-            capabilities: wantsComputerUse ? .computerUse : wantsCapabilities
+            capabilities: wantsComputerUse ? .computerUse : wantsCapabilities,
+            computerUseChromeEligible: wantsComputerUse && session.canUseArmedCodexChrome
         )
         if let existingController = session.codexController,
            session.codexControllerFeatureState != desiredFeatureState
@@ -7093,7 +7094,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 goalSupportEnabled: !session.isComputerUseChild && CodexGoalSupport.isEnabled,
                 reasoningSummariesEnabled: CodexReasoningSummaries.isEnabled,
                 memoriesEnabled: !session.isComputerUseChild && CodexMemories.isEnabled,
-                capabilities: refreshedWantsComputerUse ? .computerUse : codexCapabilitiesForLaunch(session.isMCPRelated)
+                capabilities: refreshedWantsComputerUse ? .computerUse : codexCapabilitiesForLaunch(session.isMCPRelated),
+                computerUseChromeEligible: refreshedWantsComputerUse && session.canUseArmedCodexChrome
             )
 
             if let existingController = session.codexController,
@@ -7132,6 +7134,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     desiredFeatureState.capabilities,
                     contextWindowSelection
                 )
+                if let nativeController = controller as? CodexNativeSessionController {
+                    nativeController.computerUseChromeEligible = desiredFeatureState.computerUseChromeEligible
+                }
                 guard managedSessionFence.allowsCodexSessionInstallation(sessionInstallationToken) else {
                     logCodex("[AgentModeVM][CodexLogout] retiring controller created after managed sign-out invalidated its session token tab=\(session.tabID)")
                     await controller.shutdown()

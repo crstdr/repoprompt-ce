@@ -1601,10 +1601,14 @@ actor CodexAppServerClient {
         serverEntries: [MCPIntegrationHelper.CodexServerEntry]
     ) throws -> [String] {
         let reserved = serverEntries.filter { $0.normalizedName.caseInsensitiveCompare("computer-use") == .orderedSame }
+        let chromeServers = serverEntries.filter {
+            $0.normalizedName.caseInsensitiveCompare(CodexChromePluginProvisioning.serverName) == .orderedSame
+        }
         guard !computerUseEnabled || reserved.isEmpty else {
             throw ClientError.executableUnavailable(CodexComputerUseWorkflow.collisionMessage)
         }
-        var args = reserved.flatMap { ["-c", "mcp_servers.\($0.cliPathComponent).enabled=false"] }
+        var args = (reserved + chromeServers).flatMap { ["-c", "mcp_servers.\($0.cliPathComponent).enabled=false"] }
+        args += ["-c", "\(CodexChromePluginProvisioning.disabledPluginKey)=false"]
         if computerUseEnabled {
             args += ["-c", "approval_policy=\"on-request\"", "-c", "approvals_reviewer=\"user\""]
         }
@@ -1648,21 +1652,19 @@ actor CodexAppServerClient {
             if let message = computerUseRuntimeUnavailableMessage(runtime.executableURL) {
                 throw ClientError.executableUnavailable(message)
             }
-            // No suspension between presence-dependent overrides and spawn. This does not
-            // claim atomicity against independent writers of the owned configuration.
-            // Read the actual armed launch runtime, not a personal/default home. A reserved
-            // saved definition cannot be safely cleared through recursively merged overrides.
-            let runtimeConfigURL = runtime.statePaths.codexHome.appendingPathComponent("config.toml")
-            let runtimeConfig = if FileManager.default.fileExists(atPath: runtimeConfigURL.path) {
-                try String(contentsOf: runtimeConfigURL, encoding: .utf8)
-            } else {
-                ""
-            }
-            processOverrides += try Self.computerUseProcessConfigArgs(
-                computerUseEnabled: true,
-                serverEntries: CodexIntegrationConfiguration.mcpServerEntries(from: runtimeConfig)
-            )
         }
+        // Read the actual launch home, not personal Codex settings. Reserved servers
+        // are disabled at process scope before any thread can opt in.
+        let runtimeConfigURL = runtime.statePaths.codexHome.appendingPathComponent("config.toml")
+        let runtimeConfig = if FileManager.default.fileExists(atPath: runtimeConfigURL.path) {
+            try String(contentsOf: runtimeConfigURL, encoding: .utf8)
+        } else {
+            ""
+        }
+        processOverrides += try Self.computerUseProcessConfigArgs(
+            computerUseEnabled: config.processFeaturePolicy.computerUseEnabled,
+            serverEntries: CodexIntegrationConfiguration.mcpServerEntries(from: runtimeConfig)
+        )
         let args = processOverrides + ["app-server"]
         let launchDirectory = CLIProcessConfiguration.resolvedWorkingDirectory(
             config.processLaunchDirectory

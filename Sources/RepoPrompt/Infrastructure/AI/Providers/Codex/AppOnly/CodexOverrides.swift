@@ -249,7 +249,8 @@ enum CodexOverrides {
 
                 let normalizedName = entry.normalizedName
                 let isRepoPrompt = normalizedName == normalizedRepoPrompt
-                let shouldEnable = isRepoPrompt || normalizedEnabled.contains(normalizedName)
+                let shouldEnable = isRepoPrompt || (normalizedEnabled.contains(normalizedName)
+                    && normalizedName.caseInsensitiveCompare(CodexChromePluginProvisioning.serverName) != .orderedSame)
                 if shouldEnable {
                     if isRepoPrompt {
                         didEnableRepoPrompt = true

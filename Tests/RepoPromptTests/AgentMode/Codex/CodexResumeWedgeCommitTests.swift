@@ -760,6 +760,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         let vm = fixture.viewModel
         let session = fixture.session
         session.runState = .idle
+        XCTAssertTrue(session.canUseArmedCodexChrome)
         session.isMCPOriginated = true
         session.createdByOverseerSessionID = UUID()
         session.mcpControlActivationGeneration = 1
@@ -776,8 +777,12 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         XCTAssertEqual(session.pendingCodexComputerUseActivation?.id, activation)
         let admitted = await fixture.coordinator.test_computerUseForNextTurn(session: session)
         XCTAssertTrue(admitted)
+        XCTAssertFalse(session.canUseArmedCodexChrome)
+        session.isMCPOriginated = false
+        XCTAssertFalse(session.canUseArmedCodexChrome, "Prior MCP control continues to exclude Chrome")
         await vm.toggleComputerUse(tabID: session.tabID, expectedSessionIdentity: ObjectIdentifier(session))
         session.parentSessionID = UUID()
+        XCTAssertFalse(session.canUseArmedCodexChrome)
         await vm.toggleComputerUse(tabID: session.tabID, expectedSessionIdentity: ObjectIdentifier(session))
         XCTAssertFalse(session.isCodexComputerUseArmed)
         let childMessage = await vm.armComputerUseForLocalUser(session: session)

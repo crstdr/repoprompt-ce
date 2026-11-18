@@ -2,6 +2,7 @@ import Foundation
 import OSLog
 import RepoPromptFoundation
 import RepoPromptInstrumentation
+import RepoPromptSecureStorage
 
 private actor CodexInboundStreamTaskStartGate {
     private var continuation: CheckedContinuation<Void, Never>?
@@ -307,6 +308,8 @@ final class CodexNativeSessionController {
     private var computerUseScopePrepared = false
     private var computerUseAcceptedClientPath: String?
     private var effectiveComputerUseServerNames: [String] = []
+    private var chromeThreadOverrides: [String: Any] = [:]
+    var computerUseChromeEligible = false
     private static let runningOutputTruncationMarker = "\n...(output truncated)...\n"
     private static let removedSyntheticNotificationMethods: Set<String> = [
         "item/file_change/output_delta",
@@ -2054,7 +2057,8 @@ final class CodexNativeSessionController {
             // Armed scopes must reject effective collisions before thread creation initializes MCP.
             // Ordinary starts retain their existing configuration path without an extra RPC.
             if computerUseRequiresUserReview {
-                try await inspectComputerUseEffectiveConfiguration()
+                try await inspectComputerUseEffectiveConfiguration(runtime: runtime)
+                try Task.checkCancellation()
             }
             await ensureInboundStreamsStarted()
 
@@ -3115,19 +3119,60 @@ final class CodexNativeSessionController {
         }
     }
 
-    private func inspectComputerUseEffectiveConfiguration() async throws {
+    private func inspectComputerUseEffectiveConfiguration(runtime preparedRuntime: CodexRuntimeAuthority.Runtime? = nil) async throws {
         guard computerUseRequiresUserReview else { return }
         var params: [String: Any] = ["includeLayers": false]
-        if let executionDirectory = workspacePaths.executionDirectory { params["cwd"] = executionDirectory }
+        if let executionDirectory = workspacePaths.executionDirectory {
+            params["cwd"] = executionDirectory
+        }
         let config = try await performRequest(method: "config/read", params: params, timeout: options.requestTimeout)
         effectiveComputerUseServerNames = try Self.reservedComputerUseServerNames(config)
-        if computerUseRequiresUserReview { try Self.validateComputerUseConfiguration(config) }
+        try Self.validateComputerUseConfiguration(config)
+        chromeThreadOverrides = [:]
+        guard computerUseChromeEligible, !options.computerUseHumanOnly else { return }
+        let runtime: CodexRuntimeAuthority.Runtime = if let preparedRuntime {
+            preparedRuntime
+        } else {
+            try await client.prepareRuntimeForLaunch()
+        }
+        let name = CodexChromePluginProvisioning.serverName
+        let entries = options.mcpServerEntriesProvider()
+        let approved = entries.filter { $0.normalizedName.caseInsensitiveCompare(name) == .orderedSame }
+        guard approved.count == 1, approved.first?.rawName == name,
+              CodexAgentToolPreferences.mcpServerEnabled(normalizedName: name),
+              let effective = config["config"] as? [String: Any],
+              let servers = effective["mcp_servers"] as? [String: Any],
+              servers.keys.filter({ $0.caseInsensitiveCompare(name) == .orderedSame }).count == 1,
+              let node = servers[name] as? [String: Any],
+              let owned = try? CodexUserMCPImport.ownedServerDefinition(
+                  named: name, configURL: runtime.statePaths.codexHome.appendingPathComponent("config.toml")
+              ),
+              CodexChromePluginProvisioning.matchesOwnedTransport(node, owned: owned),
+              let command = node["command"] as? String, command.hasPrefix("/"),
+              RuntimeCodeSigningDetector.validatesStaticCode(
+                  at: URL(fileURLWithPath: command),
+                  requirementSource: CodexComputerUseWorkflow.openAISigningRequirement
+              )
+        else {
+            CodexChromePluginProvisioning.logUnavailableGrant()
+            return
+        }
+        let eligible = CodexChromePluginProvisioning.threadOverrides(config: effective, armedDirect: true, approved: true, installed: true)
+        guard !eligible.isEmpty else {
+            CodexChromePluginProvisioning.logUnavailableGrant()
+            return
+        }
+        if await CodexChromePluginProvisioning.prepare(runtime: runtime),
+           CodexAgentToolPreferences.mcpServerEnabled(normalizedName: name)
+        {
+            chromeThreadOverrides = eligible
+        }
     }
 
     private func runtimeConfigOverrides() async throws -> [String: Any] {
         let overrides = await options.configOverridesProvider()
         return try Self.computerUseRuntimeConfigOverrides(
-            overrides,
+            overrides.merging(chromeThreadOverrides) { _, chrome in chrome },
             computerUseEnabled: computerUseRequiresUserReview,
             acceptedClientPath: computerUseAcceptedClientPath,
             effectiveServerNames: effectiveComputerUseServerNames
