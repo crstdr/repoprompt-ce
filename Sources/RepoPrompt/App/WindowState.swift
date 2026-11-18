@@ -892,6 +892,10 @@ class WindowState: ObservableObject {
         // ordinary run, save, endpoint and MCP owners above are retained without UI startup work.
         if isPreparedSessionOwner { return }
 
+        workspaceManager.isUnusedAutomaticChat = { [weak oracleViewModel] id in
+            oracleViewModel?.isUnusedImplicitDefaultChat(id) == true
+        }
+
         // Set up additional actions
         setupSendPromptAction()
         #if DEBUG
@@ -2327,7 +2331,7 @@ class WindowState: ObservableObject {
         }
 
         if workspaceManager.activeWorkspaceID != route.workspaceID {
-            let switchResult = await workspaceManager.requestWorkspaceSwitch(to: targetWorkspace, saveState: true)
+            let switchResult = await requestAgentDeepLinkWorkspaceSwitch(to: targetWorkspace)
             if !switchResult.didSwitch {
                 return .workspaceSwitchBlocked(switchResult.message)
             }
@@ -2390,6 +2394,12 @@ class WindowState: ObservableObject {
             agentModeViewModel.revealPendingNotificationInteraction(tabID: route.tabID)
         }
         return .routed
+    }
+
+    func requestAgentDeepLinkWorkspaceSwitch(to workspace: WorkspaceModel) async -> WorkspaceSwitchResult {
+        await workspaceManager.requestWorkspaceSwitch(
+            to: workspace, saveState: true, reason: WorkspaceManagerViewModel.agentDeepLinkSwitchReason
+        )
     }
 
     /// Whether the given agent session is the transcript the user is looking at in this window.
