@@ -146,8 +146,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     func syncTranscriptUIState() {
         if presentationWorkGate.shouldBuild(), prepareQuietTranscriptDisplay() {
-            let snapshot = makeTranscriptUISnapshot()
-            ui.transcript.update(snapshot)
+            ui.transcript.update(makeTranscriptUISnapshot())
+        } else {
+            // A terminal quiet commit can invalidate a packet held while hidden. Its existing
+            // phase-end refresh submits the next safe packet.
+            ui.transcript.discardPendingPresentation()
         }
         // The same publication point reports the initial selected restoration to the sidebar join and
         // propagates owner-pending transitions to the sidebar projection (§5.3/§5.5).

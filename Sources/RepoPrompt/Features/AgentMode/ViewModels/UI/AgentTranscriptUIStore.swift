@@ -3,7 +3,11 @@ import RepoPromptInstrumentation
 
 struct AgentTranscriptUISnapshot: Equatable {
     var currentTabID: UUID?
-    var presentation: AgentTranscriptPresentationSnapshot
+    var presentation: AgentTranscriptPresentationSnapshot {
+        didSet { renderEntries = nil }
+    }
+
+    var renderEntries: AgentTranscriptRenderEntries?
     var isHydrated: Bool
     var presentationRevision: Int
     var displayMaskRevision: UInt64 = 0
@@ -62,27 +66,35 @@ final class AgentTranscriptUIStore: ObservableObject {
     @Published private(set) var snapshot: AgentTranscriptUISnapshot = .empty
     var didPublishPresentation: (() -> Void)?
     var shouldPublishPresentation: (() -> Bool)?
-    private var latestSnapshot: AgentTranscriptUISnapshot = .empty
-    private var isPublishing = false
+    private var pendingSnapshot: AgentTranscriptUISnapshot?
+    private var publishingSnapshot: AgentTranscriptUISnapshot?
 
     func update(_ snapshot: AgentTranscriptUISnapshot) {
-        latestSnapshot = snapshot
-        guard !isPublishing else { return }
-        isPublishing = true
-        defer { isPublishing = false }
-        while self.snapshot != latestSnapshot {
+        var snapshot = snapshot
+        if snapshot.renderEntries == nil {
+            snapshot.renderEntries = .init(blocks: snapshot.presentation.visibleBlocks)
+        }
+        // Compare at submission, not when visibility releases a pending publication.
+        pendingSnapshot = snapshot == (publishingSnapshot ?? self.snapshot) ? nil : snapshot
+        flushPresentation()
+    }
+
+    func discardPendingPresentation() {
+        pendingSnapshot = nil
+    }
+
+    func flushPresentation() {
+        guard publishingSnapshot == nil else { return }
+        while let next = pendingSnapshot {
             guard shouldPublishPresentation?() ?? true else { return }
-            publish(latestSnapshot)
+            pendingSnapshot = nil
+            publishingSnapshot = next
+            publish(next)
+            publishingSnapshot = nil
         }
     }
 
     private func publish(_ snapshot: AgentTranscriptUISnapshot) {
-        guard self.snapshot != snapshot else {
-            #if DEBUG
-                perfRecorder.recordStoreUpdate("transcript", published: false)
-            #endif
-            return
-        }
         #if DEBUG
             perfRecorder.recordStoreUpdate(
                 "transcript",

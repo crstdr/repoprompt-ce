@@ -2216,12 +2216,21 @@ struct AgentModeChatDetailView: View {
         modernScrollableContentBase(proxy: proxy, viewportHeight: viewportHeight)
     }
 
+    private struct TranscriptScrollMountID: Hashable {
+        let revision: Int
+        let hasTranscript: Bool
+    }
+
     @available(macOS 15.0, *)
     private func modernScrollableContentBase(proxy: ScrollViewProxy, viewportHeight: CGFloat) -> some View {
         ScrollView {
             messageListContent(viewportHeight: viewportHeight, proxy: proxy)
         }
-        .id(transcriptScrollResetRevision)
+        .defaultScrollAnchor(.bottom, for: .initialOffset)
+        .id(TranscriptScrollMountID(
+            revision: transcriptScrollResetRevision,
+            hasTranscript: transcriptSnapshot.panePresentation == .transcript
+        ))
         .accessibilityIdentifier("agentTranscript.scrollView")
         .transaction { txn in
             if didChatChange { txn.disablesAnimations = true }
@@ -2321,11 +2330,12 @@ struct AgentModeChatDetailView: View {
         }
     }
 
+    @ViewBuilder
     private func messageListContent(
         viewportHeight: CGFloat,
         proxy: ScrollViewProxy
     ) -> some View {
-        messagesStack()
+        let content = messagesStack()
             .onReceive(agentModeVM.ui.composer.$pendingSubmissions) { pendingSubmissions in
                 guard let tabID = currentTabID,
                       let pending = pendingSubmissions.values.first(where: { $0.destinationTabID == tabID }),
@@ -2346,15 +2356,23 @@ struct AgentModeChatDetailView: View {
                 alignment: transcriptSnapshot.panePresentation == .transcript ? .topLeading : .center
             )
         #if DEBUG
-            .onPreferenceChange(AgentToolCardRenderStatePreferenceKey.self) { states in
-                visibleToolCardRenderStatesByID = states
-                publishStressTelemetrySnapshot()
+            if stressHarness != nil {
+                content
+                    .environment(\.collectsAgentToolCardRenderStates, true)
+                    .onPreferenceChange(AgentToolCardRenderStatePreferenceKey.self) { states in
+                        visibleToolCardRenderStatesByID = states
+                        publishStressTelemetrySnapshot()
+                    }
+            } else {
+                content
             }
+        #else
+            content
         #endif
     }
 
     private func messagesStack() -> some View {
-        VStack(alignment: .leading, spacing: 12) {
+        LazyVStack(alignment: .leading, spacing: 12) {
             messageRowsContent
         }
     }
@@ -2599,13 +2617,30 @@ struct AgentModeChatDetailView: View {
             recentAssistantItemIDs: renderMetadata.recentAssistantItemIDs,
             interactionBlockerVisible: isInteractionBlockerVisible
         )
-        ForEach(blocks) { block in
-            transcriptBlockView(block: block, renderContext: renderContext)
-                .id(block.id)
+        ForEach(transcriptSnapshot.renderEntries?.entries ?? []) { entry in
+            VStack(alignment: .leading, spacing: 0) {
+                if let item = entry.item {
+                    let transcript = transcriptSnapshot
+                    transcriptRowView(
+                        item: item,
+                        block: entry.block,
+                        renderContext: renderContext,
+                        autoExpandEnabled: toolCardAutoExpandEnabled(
+                            for: entry.block, lockTargetID: transcript.presentation.metadata.dynamicSummaryLockTargetTurnID
+                        ),
+                        transcript: transcript,
+                        runInteraction: runInteractionSnapshot
+                    )
+                } else {
+                    transcriptBlockView(entry: entry, renderContext: renderContext)
+                }
+            }
+            .padding(.top, entry.isFirstInBlock ? 0 : -4)
+            .id(entry.isFirstInBlock ? AnyHashable(entry.block.id) : AnyHashable(entry.id))
             #if DEBUG
                 .modifier(AgentChatStressReadingProbeModifier(
-                    isEnabled: stressHarness?.readingProbe != nil,
-                    blockID: block.id,
+                    isEnabled: entry.isFirstInBlock && stressHarness?.readingProbe != nil,
+                    blockID: entry.block.id,
                     onFrameChange: recordStressReadingFrame(blockID:frame:)
                 ))
             #endif
@@ -2614,7 +2649,8 @@ struct AgentModeChatDetailView: View {
     }
 
     @ViewBuilder
-    private func transcriptBlockView(block: AgentTranscriptRenderBlock, renderContext: TranscriptRenderContext) -> some View {
+    private func transcriptBlockView(entry: AgentTranscriptRenderEntries.Entry, renderContext: TranscriptRenderContext) -> some View {
+        let block = entry.block
         #if DEBUG
             let _ = AgentTranscriptTailRenderProbe.sink?(.block(block.id))
         #endif
@@ -2687,18 +2723,17 @@ struct AgentModeChatDetailView: View {
                         }
                         .buttonStyle(.plain)
                     }
-                    if isExpanded, let groupedHistory = block.groupedHistory {
-                        let totalRows = groupedHistory.sections.reduce(0) { $0 + $1.childBlocks.reduce(0) { $0 + $1.rows.count } }
-                        let useScroll = totalRows > 5
+                    if isExpanded {
+                        let useScroll = entry.groupedRowCount > 5
                         Group {
                             if useScroll {
                                 ScrollView {
-                                    expandedGroupedContent(sections: groupedHistory.sections, renderContext: renderContext)
+                                    expandedGroupedContent(entries: entry.groupedChildren, renderContext: renderContext)
                                         .frame(maxWidth: .infinity, alignment: .leading)
                                 }
                                 .frame(maxHeight: 260)
                             } else {
-                                expandedGroupedContent(sections: groupedHistory.sections, renderContext: renderContext)
+                                expandedGroupedContent(entries: entry.groupedChildren, renderContext: renderContext)
                                     .frame(maxWidth: .infinity, alignment: .leading)
                             }
                         }
@@ -2989,7 +3024,7 @@ struct AgentModeChatDetailView: View {
         let transcript = transcriptSnapshot
         let runInteraction = runInteractionSnapshot
         let lockTargetID = transcript.presentation.metadata.dynamicSummaryLockTargetTurnID
-        return VStack(alignment: .leading, spacing: 6) {
+        return LazyVStack(alignment: .leading, spacing: 6) {
             ForEach(block.rows) { item in
                 transcriptRowView(
                     item: item,
@@ -3003,74 +3038,62 @@ struct AgentModeChatDetailView: View {
         }
     }
 
-    private func expandedGroupedContent(sections: [AgentTranscriptGroupedSection], renderContext: TranscriptRenderContext) -> some View {
+    private func expandedGroupedContent(
+        entries: [AgentTranscriptRenderEntries.GroupEntry], renderContext: TranscriptRenderContext
+    ) -> some View {
         let transcript = transcriptSnapshot
         let runInteraction = runInteractionSnapshot
         let lockTargetID = transcript.presentation.metadata.dynamicSummaryLockTargetTurnID
-        return VStack(alignment: .leading, spacing: 8) {
-            ForEach(sections) { section in
-                groupedHistorySectionView(section: section, renderContext: renderContext, transcript: transcript, runInteraction: runInteraction, lockTargetID: lockTargetID)
-            }
-        }
-    }
-
-    private func groupedHistorySectionView(
-        section: AgentTranscriptGroupedSection,
-        renderContext: TranscriptRenderContext,
-        transcript: AgentTranscriptUISnapshot,
-        runInteraction: AgentRunInteractionUISnapshot,
-        lockTargetID: UUID?
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            // Section header — compact inline
-            if section.title != nil || section.clusterSummary != nil {
-                HStack(spacing: 5) {
-                    if let icon = section.icon {
-                        Image(systemName: icon)
-                            .font(.system(size: 9))
-                            .foregroundStyle(.tertiary)
-                    }
-                    if let title = section.title {
-                        Text(title)
-                            .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .semibold))
-                            .foregroundStyle(.secondary)
-                    }
-                    if let summary = section.clusterSummary, summary.toolCount > 0 {
-                        Text("\(summary.toolCount)")
-                            .font(fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .semibold))
-                            .foregroundColor(.secondary)
-                            .padding(.horizontal, 4)
-                            .padding(.vertical, 1)
-                            .background(Color.secondary.opacity(0.10))
-                            .cornerRadius(3)
-                    }
-                    // Inline tool chips in section header
-                    if let toolGroups = section.clusterSummary?.toolGroups, !toolGroups.isEmpty {
-                        Text("·")
-                            .font(.system(size: 8))
-                            .foregroundStyle(.quaternary)
-                        clusterToolChips(groups: toolGroups)
-                    }
-                    Spacer(minLength: 0)
-                }
-            }
-            // Child blocks — compact spacing
-            ForEach(section.childBlocks) { childBlock in
-                VStack(alignment: .leading, spacing: 4) {
-                    ForEach(childBlock.rows) { item in
+        return LazyVStack(alignment: .leading, spacing: 0) {
+            ForEach(entries) { entry in
+                VStack(alignment: .leading, spacing: 0) {
+                    switch entry.content {
+                    case let .header(section):
+                        groupedHistorySectionHeader(section)
+                    case let .row(block, item):
                         transcriptRowView(
-                            item: item,
-                            block: childBlock,
-                            renderContext: renderContext,
-                            autoExpandEnabled: toolCardAutoExpandEnabled(for: item, in: childBlock, lockTargetID: lockTargetID),
-                            transcript: transcript,
-                            runInteraction: runInteraction
+                            item: item, block: block, renderContext: renderContext,
+                            autoExpandEnabled: toolCardAutoExpandEnabled(for: item, in: block, lockTargetID: lockTargetID),
+                            transcript: transcript, runInteraction: runInteraction
                         )
                     }
                 }
+                .padding(.top, entry.spacingBefore)
             }
         }
-        .padding(.vertical, 2)
+        .padding(.bottom, 2)
+    }
+
+    private func groupedHistorySectionHeader(_ section: AgentTranscriptGroupedSection) -> some View {
+        HStack(spacing: 5) {
+            if let icon = section.icon {
+                Image(systemName: icon)
+                    .font(.system(size: 9))
+                    .foregroundStyle(.tertiary)
+            }
+            if let title = section.title {
+                Text(title)
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+            }
+            if let summary = section.clusterSummary, summary.toolCount > 0 {
+                Text("\(summary.toolCount)")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .semibold))
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 1)
+                    .background(Color.secondary.opacity(0.10))
+                    .cornerRadius(3)
+            }
+            // Inline tool chips in section header
+            if let toolGroups = section.clusterSummary?.toolGroups, !toolGroups.isEmpty {
+                Text("·")
+                    .font(.system(size: 8))
+                    .foregroundStyle(.quaternary)
+                clusterToolChips(groups: toolGroups)
+            }
+            Spacer(minLength: 0)
+        }
     }
 
     /// Tool type chips — renders pre-computed groups from the model, no grouping logic here.
