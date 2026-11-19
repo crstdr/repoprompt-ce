@@ -37,15 +37,21 @@ final class AgentSessionLinkActivityRecorderTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: url.path + "-shm"))
     }
 
-    func testCorruptDatabaseRecreatesAndLockedWriteIsDropped() async throws {
+    func testCorruptFileIsPreservedAndLockedWriteIsDropped() async throws {
         let url = try temporaryDatabase()
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
-        try Data("not SQLite".utf8).write(to: url)
+        let original = Data("not SQLite".utf8)
+        try original.write(to: url)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
         let recorder = Recorder(databaseURL: url, interval: .milliseconds(25))
         let link = Recorder.Link(id: UUID(), observer: UUID(), target: UUID())
         await recorder.record(.wake, links: [link], at: date(10)).value
         try await settle(recorder)
+        let backups = try FileManager.default.contentsOfDirectory(
+            at: url.deletingLastPathComponent(), includingPropertiesForKeys: nil
+        ).filter { $0.lastPathComponent.hasPrefix(url.lastPathComponent + ".corrupt-") }
+        XCTAssertEqual(backups.count, 1)
+        XCTAssertEqual(try Data(contentsOf: XCTUnwrap(backups.first)), original)
         let db = try SessionCatalogDatabase(url: url)
         let revision = try db.integer("SELECT revision FROM activity_state")
         XCTAssertEqual(revision, 1)

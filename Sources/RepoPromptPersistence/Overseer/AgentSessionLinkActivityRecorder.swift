@@ -141,7 +141,7 @@ package actor AgentSessionLinkActivityRecorder {
             throw SessionCatalogError.invalidRecord
         }
         guard flock(directoryFD, LOCK_EX | LOCK_NB) == 0 else { throw SessionCatalogError.filesystem(errno) }
-        let paths = try ["", "-journal", "-wal", "-shm"].compactMap { suffix -> String? in
+        let existingSuffixes = try ["", "-journal", "-wal", "-shm"].compactMap { suffix -> String? in
             let path = url.path + suffix
             var info = stat()
             if lstat(path, &info) != 0 {
@@ -153,15 +153,18 @@ package actor AgentSessionLinkActivityRecorder {
             guard (info.st_mode & S_IFMT) == S_IFREG, info.st_nlink == 1,
                   info.st_uid == geteuid(), info.st_mode & 0o077 == 0
             else { throw SessionCatalogError.invalidRecord }
-            return path
+            return suffix
         }
         do {
             try writeTransaction(batch, to: url)
         } catch let SessionCatalogError.database(code) where [SQLITE_CORRUPT, SQLITE_NOTADB].contains(code & 0xFF) {
-            // SQLite closed the failed connection before we got here. Never remove a symlink,
-            // hard link, foreign owner's file, or directory during best-effort recovery.
-            for path in paths.reversed() where unlink(path) != 0 && errno != ENOENT {
-                throw SessionCatalogError.filesystem(errno)
+            // SQLite closed the failed connection. A corrupt header cannot establish ownership,
+            // so preserve the files under a shared backup name. Move the main file last.
+            let backup = url.path + ".corrupt-" + UUID().uuidString
+            for suffix in existingSuffixes.reversed() {
+                if renamex_np(url.path + suffix, backup + suffix, UInt32(RENAME_EXCL)) != 0, errno != ENOENT {
+                    throw SessionCatalogError.filesystem(errno)
+                }
             }
             try writeTransaction(batch, to: url)
         }
