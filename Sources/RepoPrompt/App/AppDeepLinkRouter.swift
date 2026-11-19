@@ -337,7 +337,6 @@ final class AppDeepLinkRouter {
         }
     }
 
-    @discardableResult
     private func routeWorkspace(_ route: WorkspaceDeepLinkRoute, sourceURL: URL) async {
         let id = route.workspaceID
         guard !windowStatesManager.isTerminating, !Task.isCancelled else { return }
@@ -434,6 +433,7 @@ final class AppDeepLinkRouter {
         }
     }
 
+    @discardableResult
     private func routeAgentSession(_ route: AgentSessionDeepLinkRoute, sourceURL: URL?) async -> AgentSessionRouteResult {
         let liveWindows = windowStatesManager.allWindows.filter { !$0.isClosing }
         if let app = NSApp {
