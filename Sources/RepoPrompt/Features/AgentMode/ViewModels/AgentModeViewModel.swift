@@ -6688,9 +6688,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         _ requestedSessionID: UUID,
         to targetSession: TabSession,
         expectedTransition: PersistentBindingTransitionToken? = nil,
-        requiresHydration: Bool = false
+        requiresHydration: Bool = false,
+        workspaceLink: Bool = false
     ) async throws -> AgentPersistentSessionBindingIdentity {
-        if workspaceManager?.isSessionRuntimeProjection != true,
+        func checkPreparedOwner() throws {
+            if workspaceLink, preparedSessionRuntimes?.hasPreparedRuntime(requestedSessionID) == true {
+                throw PersistentBindingMutationError.blockedByOwnership
+            }
+        }
+        try checkPreparedOwner()
+        if !workspaceLink, workspaceManager?.isSessionRuntimeProjection != true,
            let owners = preparedSessionRuntimes,
            await !(owners.releasePreparedOversightOwnerForVisit(sessionID: requestedSessionID, preparingReplacement: false))
         {
@@ -6713,6 +6720,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return binding
         }
         guard await awaitOracleBackgroundDrain(for: targetSession) else { throw PersistentBindingMutationError.blockedByOwnership }
+        try checkPreparedOwner()
 
         let existingSourceTabID: UUID? = switch persistentBindingResolution(for: requestedSessionID) {
         case let .unique(tabID): tabID
@@ -6722,6 +6730,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let sourceSession = existingSourceTabID.flatMap { sessions[$0] }
         if let sourceSession, sourceSession !== targetSession {
             guard await awaitOracleBackgroundDrain(for: sourceSession) else { throw PersistentBindingMutationError.blockedByOwnership }
+            try checkPreparedOwner()
         }
         let targetCurrentSessionID = targetSession.activeAgentSessionID
 
@@ -6776,12 +6785,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if await bindingHasOwnership(targetSession, sessionID: targetCurrentSessionID) {
             throw PersistentBindingMutationError.blockedByOwnership
         }
+        try checkPreparedOwner()
         if let sourceSession, sourceSession !== targetSession,
            await bindingHasOwnership(sourceSession, sessionID: requestedSessionID)
         {
             throw PersistentBindingMutationError.blockedByOwnership
         }
 
+        try checkPreparedOwner()
         guard persistentBindingTransitionIsCurrent(targetToken) else {
             throw PersistentBindingMutationError.staleTransition
         }
@@ -6791,6 +6802,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let targetHasRegistration = await AgentRunSessionStore.hasActiveRegistration(
             sessionID: targetCurrentSessionID ?? requestedSessionID
         )
+        try checkPreparedOwner()
         guard !bindingHasSynchronousOwnership(targetSession),
               !targetHasRegistration
         else {
@@ -6800,6 +6812,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let sourceHasRegistration = await AgentRunSessionStore.hasActiveRegistration(
                 sessionID: requestedSessionID
             )
+            try checkPreparedOwner()
             guard !bindingHasSynchronousOwnership(sourceSession),
                   !sourceHasRegistration
             else {
@@ -6807,6 +6820,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
         }
 
+        if workspaceLink, let targetCurrentSessionID, targetCurrentSessionID != requestedSessionID {
+            await releaseSessionWorktreeOwnership(sessionID: targetCurrentSessionID)
+            try checkPreparedOwner()
+            guard persistentBindingTransitionIsCurrent(targetToken),
+                  sourceToken.map({ persistentBindingTransitionIsCurrent($0) }) ?? true
+            else {
+                throw PersistentBindingMutationError.staleTransition
+            }
+        }
         if let workspaceManager {
             guard workspaceManager.activeAgentSessionID(forTabID: targetSession.tabID) == targetCurrentSessionID else {
                 throw PersistentBindingMutationError.staleTransition
@@ -6829,7 +6851,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
         }
 
-        if let targetCurrentSessionID, targetCurrentSessionID != requestedSessionID {
+        if !workspaceLink, let targetCurrentSessionID, targetCurrentSessionID != requestedSessionID {
             await releaseSessionWorktreeOwnership(sessionID: targetCurrentSessionID)
         }
         if requiresHydration {
@@ -8049,10 +8071,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     func activateRoutedAgentSession(
         tabID: UUID,
         sessionID: UUID?,
-        workspace: WorkspaceModel
+        workspace: WorkspaceModel,
+        workspaceLink: Bool = false
     ) async -> AgentRouteSessionActivationResult {
         let owners = preparedSessionRuntimes
-        let preparedVisitID = workspaceManager?.isSessionRuntimeProjection != true
+        if workspaceLink, let sessionID, owners?.hasPreparedRuntime(sessionID) == true {
+            return .blockedByActiveDifferentSession
+        }
+        let preparedVisitID = !workspaceLink && workspaceManager?.isSessionRuntimeProjection != true
             ? sessionID.flatMap { owners?.hasPreparedRuntime($0) == true ? $0 : nil } : nil
         if let preparedVisitID, owners?.claimPreparedRuntimeVisit(preparedVisitID) != true {
             return .blockedByActiveDifferentSession
@@ -8075,6 +8101,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return .blockedByActiveDifferentSession
         }
         guard let sessionID else {
+            guard !workspaceLink else { return .sessionNotFound }
             let session = await ensureSessionReady(tabID: tabID, reconnectActiveProviders: true)
             return sessions[tabID] === session && session.operationAdmissionFailureMessage == nil
                 ? .ready : .sessionNotFound
@@ -8082,7 +8109,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         let currentBinding = sessions[tabID]?.activeAgentSessionID
             ?? workspaceManager?.activeAgentSessionID(forTabID: tabID, inWorkspaceID: workspace.id)
-        if currentBinding == sessionID {
+        func finishWorkspaceLink(_ session: TabSession) -> AgentRouteSessionActivationResult {
+            guard preparedSessionRuntimes?.hasPreparedRuntime(sessionID) != true else { return .blockedByActiveDifferentSession }
+            guard sessions[tabID] === session, session.activeAgentSessionID == sessionID,
+                  session.permitsBoundOperationAndSave else { return .sessionNotFound }
+            if tabID == currentTabID { applySessionToBindings(session) }
+            return .ready
+        }
+        if currentBinding == sessionID, workspaceLink, let session = sessions[tabID], session.hasLoadedPersistedState {
+            return finishWorkspaceLink(session)
+        }
+        if currentBinding == sessionID, !workspaceLink {
             let session = await ensureSessionReady(tabID: tabID, reconnectActiveProviders: true)
             return sessions[tabID] === session && session.activeAgentSessionID == sessionID
                 && session.permitsBoundOperationAndSave ? .ready : .sessionNotFound
@@ -8127,7 +8164,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let routePrepareStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
         do {
-            guard let preparedPayload = try await dataService.preparePersistedHydration(hydrationRequest) else {
+            guard let preparedPayload = try await dataService.preparePersistedHydration(hydrationRequest, createFolder: !workspaceLink) else {
                 #if DEBUG
                     restorePerfRecorder.event(
                         "agentSessionHydration.routeActivationPrepare",
@@ -8179,6 +8216,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
 
         let persistedSession = payload.persistedSession
+        if workspaceLink {
+            guard preparedSessionRuntimes?.hasPreparedRuntime(sessionID) != true else { return .blockedByActiveDifferentSession }
+            guard !Task.isCancelled, !hasPreparedForWindowClose, workspaceManager?.activeWorkspaceID == workspace.id,
+                  workspaceManager?.isSwitchingWorkspace == false else { return .sessionNotFound }
+            if currentBinding != sessionID, persistedSession.workspaceID == nil || persistedSession.composeTabID == nil {
+                return .sessionNotFound
+            }
+        }
         if let persistedWorkspaceID = persistedSession.workspaceID,
            persistedWorkspaceID != workspace.id
         {
@@ -8195,7 +8240,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 sessionID,
                 to: session,
                 expectedTransition: transitionToken,
-                requiresHydration: true
+                requiresHydration: true,
+                workspaceLink: workspaceLink
             )
         } catch PersistentBindingMutationError.blockedByOwnership {
             return .blockedByActiveDifferentSession
@@ -8203,6 +8249,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return .sessionNotFound
         }
 
+        if workspaceLink, preparedSessionRuntimes?.hasPreparedRuntime(sessionID) == true {
+            return .blockedByActiveDifferentSession
+        }
         prepareSessionForRouteActivation(session)
         guard let binding = session.persistentSessionBindingIdentity else {
             return .sessionNotFound
@@ -8220,6 +8269,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return .sessionNotFound
         }
         settlePersistedLoadAttempt(routeAttempt, exit: .payloadApplied)
+        if workspaceLink { return finishWorkspaceLink(session) }
         let hydrated = await ensureSessionReady(tabID: tabID, reconnectActiveProviders: true)
         return sessions[tabID] === hydrated && hydrated.activeAgentSessionID == sessionID
             && hydrated.permitsBoundOperationAndSave ? .ready : .sessionNotFound
