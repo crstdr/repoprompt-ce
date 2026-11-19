@@ -523,6 +523,12 @@ enum CodexAgentToolPreferences {
         if isRepoPromptServer(normalizedName) {
             return true
         }
+        if normalizedKey(normalizedName) == CodexChromePluginProvisioning.serverName {
+            return chromeNodeReplApproved(
+                digest: CodexChromePluginProvisioning.definitionDigest(configURL: CodexIntegrationConfiguration.configURL()),
+                defaults: defaults, secureStore: secureStore
+            )
+        }
         if let secureStore = resolvedSecureStore(defaults: defaults, secureStore: secureStore) {
             return secureStore.codexPermissions().mcpServerEnabled(normalizedName: normalizedName)
         }
@@ -530,20 +536,31 @@ enum CodexAgentToolPreferences {
         return storedMCPServerToggles(defaults: defaults)[key] ?? false
     }
 
+    static func chromeNodeReplApproved(digest: String?, defaults: UserDefaults = .standard, secureStore: AgentPermissionSecureStore? = nil) -> Bool {
+        guard let digest, let store = resolvedSecureStore(defaults: defaults, secureStore: secureStore) else { return false }
+        let document = store.codexPermissions()
+        return document.mcpServerEnabled(normalizedName: CodexChromePluginProvisioning.serverName)
+            && document.chromeNodeReplDefinitionDigest == digest
+    }
+
     static func setMCPServerEnabled(
         normalizedName: String,
         isEnabled: Bool,
         defaults: UserDefaults = .standard,
-        secureStore: AgentPermissionSecureStore? = nil
+        secureStore: AgentPermissionSecureStore? = nil,
+        configURL: URL = CodexIntegrationConfiguration.configURL()
     ) {
         if isRepoPromptServer(normalizedName) {
             return
         }
         let key = normalizedKey(normalizedName)
+        let isChromeServer = key == CodexChromePluginProvisioning.serverName
+        let digest = isChromeServer && isEnabled ? CodexChromePluginProvisioning.definitionDigest(configURL: configURL) : nil
         if let secureStore = resolvedSecureStore(defaults: defaults, secureStore: secureStore) {
             secureStore.updateCodexPermissions { document in
                 var toggles = document.mcpServerTogglesByNormalizedName ?? [:]
-                toggles[key] = isEnabled
+                if isChromeServer { document.chromeNodeReplDefinitionDigest = digest }
+                toggles[key] = isEnabled && (!isChromeServer || digest != nil)
                 document.mcpServerTogglesByNormalizedName = toggles
             }
             return
@@ -562,6 +579,7 @@ enum CodexAgentToolPreferences {
                 for key in keys {
                     toggles[key] = false
                 }
+                if keys.contains(CodexChromePluginProvisioning.serverName) { document.chromeNodeReplDefinitionDigest = nil }
                 document.mcpServerTogglesByNormalizedName = toggles
             }
         }

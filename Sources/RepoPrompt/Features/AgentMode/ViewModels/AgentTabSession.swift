@@ -1633,6 +1633,11 @@ final class AgentTabSession: ObservableObject {
         var reasoningSummariesEnabled: Bool
         var memoriesEnabled: Bool
         var capabilities: CodexCapabilitySettings = .disabled
+        var computerUseChromeEligible = false
+    }
+
+    var canUseArmedCodexChrome: Bool {
+        !isMCPRelated && !isComputerUseChild && !permissionProfile.codexSuppressesThirdPartyMCPServers
     }
 
     // In-memory authority for this chat, never written to AgentSession persistence. Runtime

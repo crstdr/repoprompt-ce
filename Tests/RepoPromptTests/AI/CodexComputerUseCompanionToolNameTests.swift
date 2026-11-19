@@ -112,3 +112,150 @@ final class CodexComputerUseCompanionToolNameTests: XCTestCase {
         XCTAssertFalse(MCPIntegrationHelper.isComputerUseCompanionToolName(nil))
     }
 }
+
+final class CodexChromePluginProvisioningTests: XCTestCase {
+    func testPromotesOnlyChromeCacheAndIsIdempotent() throws {
+        try withHomes { staging, destination in
+            let manifest = try self.makeInstallation(in: staging)
+            let config = Data("[plugins.\"chrome@openai-bundled\"]\nenabled = true\n".utf8)
+            try config.write(to: staging.appendingPathComponent("config.toml"))
+            let other = staging.appendingPathComponent("plugins/cache/openai-bundled/documents")
+            try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
+
+            try CodexChromePluginProvisioning.promote(stagingHome: staging, destinationHome: destination, expectedFiles: fixtureInventory)
+            try CodexChromePluginProvisioning.promote(stagingHome: staging, destinationHome: destination, expectedFiles: fixtureInventory)
+
+            let installedManifest = destination.appendingPathComponent("plugins/cache/openai-bundled/chrome/1.0/.codex-plugin/plugin.json")
+            XCTAssertEqual(try Data(contentsOf: installedManifest), try Data(contentsOf: manifest))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: destination.appendingPathComponent("config.toml").path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: destination.appendingPathComponent("plugins/cache/openai-bundled/documents").path))
+        }
+    }
+
+    func testMissingOrDifferentCacheFailsClosed() throws {
+        try withHomes { staging, destination in
+            XCTAssertThrowsError(try CodexChromePluginProvisioning.promote(stagingHome: staging, destinationHome: destination, expectedFiles: fixtureInventory))
+            let manifest = try self.makeInstallation(in: staging)
+            let existing = try self.makeInstallation(in: destination)
+            try Data("{\"name\":\"chrome\",\"version\":\"different\"}".utf8).write(to: existing)
+            XCTAssertThrowsError(try CodexChromePluginProvisioning.promote(stagingHome: staging, destinationHome: destination, expectedFiles: fixtureInventory))
+            XCTAssertNotEqual(try Data(contentsOf: manifest), try Data(contentsOf: existing))
+        }
+    }
+
+    func testStagingInstallerDoesNotPublishItsConfig() throws {
+        try withHomes { fixture, destination in
+            let marketplace = fixture.appendingPathComponent("bundled")
+            let manifest = marketplace.appendingPathComponent(".agents/plugins/marketplace.json")
+            try FileManager.default.createDirectory(at: manifest.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data("{\"plugins\":[{\"name\":\"chrome\",\"source\":\"./chrome\"}]}".utf8).write(to: manifest)
+            let source = try makeInstallation(in: fixture).deletingLastPathComponent().deletingLastPathComponent()
+            let package = marketplace.appendingPathComponent("chrome")
+            try FileManager.default.copyItem(at: source, to: package)
+            let supportingAsset = package.appendingPathComponent("scripts/extension-ids.json")
+            try Data("{}".utf8).write(to: supportingAsset)
+            XCTAssertThrowsError(try CodexChromePluginProvisioning.stageAndPromote(marketplace: marketplace, destinationHome: destination) { staging in
+                _ = try makeInstallation(in: staging)
+            })
+            try CodexChromePluginProvisioning.stageAndPromote(marketplace: marketplace, destinationHome: destination) { staging in
+                let configURL = staging.appendingPathComponent("config.toml")
+                XCTAssertTrue(try String(contentsOf: configURL, encoding: .utf8).contains("[marketplaces.openai-bundled]"))
+                let installed = try self.makeInstallation(in: staging).deletingLastPathComponent().deletingLastPathComponent()
+                try FileManager.default.copyItem(at: supportingAsset, to: installed.appendingPathComponent("scripts/extension-ids.json"))
+                try Data("enabled = true".utf8).write(to: configURL)
+            }
+            XCTAssertFalse(FileManager.default.fileExists(atPath: destination.appendingPathComponent("config.toml").path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: destination.appendingPathComponent("plugins/cache/openai-bundled/chrome/1.0").path))
+        }
+    }
+
+    func testChromeAndNodeRequireArmedDirectApprovedInstalledRoute() {
+        let config: [String: Any] = [
+            "mcp_servers": ["node_repl": ["command": "/fixture/node_repl"]],
+            "plugins": ["documents@openai-bundled": ["enabled": true], "other@marketplace": ["enabled": true]]
+        ]
+        let overrides = CodexChromePluginProvisioning.threadOverrides(config: config, armedDirect: true, approved: true, installed: true)
+        XCTAssertEqual(overrides[CodexChromePluginProvisioning.disabledPluginKey] as? Bool, true)
+        XCTAssertEqual(overrides["plugins.\"documents@openai-bundled\".enabled"] as? Bool, false)
+        XCTAssertEqual(overrides["plugins.\"other@marketplace\".enabled"] as? Bool, false)
+        XCTAssertEqual(overrides["plugins._default.enabled"] as? Bool, false)
+        XCTAssertEqual(overrides["mcp_servers.node_repl.enabled"] as? Bool, true)
+        XCTAssertEqual(overrides["mcp_servers.node_repl.env.BROWSER_USE_AVAILABLE_BACKENDS"] as? String, "chrome")
+        XCTAssertEqual(overrides["mcp_servers.node_repl.default_tools_approval_mode"] as? String, "prompt")
+        XCTAssertTrue(CodexChromePluginProvisioning.threadOverrides(config: config, armedDirect: false, approved: true, installed: true).isEmpty)
+        XCTAssertTrue(CodexChromePluginProvisioning.threadOverrides(config: config, armedDirect: true, approved: false, installed: true).isEmpty)
+        XCTAssertTrue(CodexChromePluginProvisioning.threadOverrides(config: config, armedDirect: true, approved: true, installed: false).isEmpty)
+        XCTAssertTrue(CodexChromePluginProvisioning.threadOverrides(config: [:], armedDirect: true, approved: true, installed: true).isEmpty)
+    }
+
+    func testCacheMustContainChromeSkillAndBrowserClient() throws {
+        try withHomes { staging, destination in
+            let manifest = try makeInstallation(in: staging)
+            let root = manifest.deletingLastPathComponent().deletingLastPathComponent()
+            let skill = root.appendingPathComponent("skills/chrome/SKILL.md")
+            let client = root.appendingPathComponent("scripts/browser-client.mjs")
+            try FileManager.default.removeItem(at: skill)
+            try FileManager.default.removeItem(at: client)
+            XCTAssertThrowsError(try CodexChromePluginProvisioning.promote(stagingHome: staging, destinationHome: destination, expectedFiles: fixtureInventory))
+            try Data("skill".utf8).write(to: skill)
+            XCTAssertThrowsError(try CodexChromePluginProvisioning.promote(stagingHome: staging, destinationHome: destination, expectedFiles: fixtureInventory))
+        }
+    }
+
+    func testOrdinaryLaunchDisablesReservedServersWhenConfigCannotBeReadOrParsed() throws {
+        try withHomes { _, destination in
+            let config = destination.appendingPathComponent("config.toml")
+            for invalid in [Data([0xff]), Data("[mcp_servers.node_repl]\ncommand = [\n".utf8)] {
+                try invalid.write(to: config)
+                XCTAssertEqual(try CodexAppServerClient.computerUseProcessConfigArgs(computerUseEnabled: false, configURL: config), [
+                    "-c", "mcp_servers.computer-use.enabled=false",
+                    "-c", "mcp_servers.node_repl.enabled=false",
+                    "-c", "\(CodexChromePluginProvisioning.disabledPluginKey)=false"
+                ])
+                XCTAssertThrowsError(try CodexAppServerClient.computerUseProcessConfigArgs(computerUseEnabled: true, configURL: config))
+            }
+        }
+    }
+
+    func testPromotionRejectsUnverifiedExtraFile() throws {
+        try withHomes { staging, destination in
+            let manifest = try makeInstallation(in: staging)
+            let root = manifest.deletingLastPathComponent().deletingLastPathComponent()
+            try Data("unexpected".utf8).write(to: root.appendingPathComponent("scripts/extra.mjs"))
+            XCTAssertThrowsError(try CodexChromePluginProvisioning.promote(stagingHome: staging, destinationHome: destination, expectedFiles: fixtureInventory))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: destination.appendingPathComponent("plugins/cache/openai-bundled/chrome").path))
+        }
+    }
+
+    private var fixtureInventory: [String: Data] {
+        [
+            ".codex-plugin/plugin.json": Data("{\"name\":\"chrome\",\"version\":\"1.0\"}".utf8),
+            "skills/chrome/SKILL.md": Data("fixture".utf8),
+            "scripts/browser-client.mjs": Data("fixture".utf8)
+        ]
+    }
+
+    private func makeInstallation(in home: URL) throws -> URL {
+        let directory = home.appendingPathComponent("plugins/cache/openai-bundled/chrome/1.0/.codex-plugin")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let manifest = directory.appendingPathComponent("plugin.json")
+        try Data("{\"name\":\"chrome\",\"version\":\"1.0\"}".utf8).write(to: manifest)
+        let root = directory.deletingLastPathComponent()
+        for path in ["skills/chrome/SKILL.md", "scripts/browser-client.mjs"] {
+            let file = root.appendingPathComponent(path)
+            try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data("fixture".utf8).write(to: file)
+        }
+        return manifest
+    }
+
+    private func withHomes(_ body: (URL, URL) throws -> Void) throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let staging = root.appendingPathComponent("staging")
+        let destination = root.appendingPathComponent("destination")
+        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        try body(staging, destination)
+    }
+}

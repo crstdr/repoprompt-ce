@@ -98,7 +98,8 @@ enum CodexUserMCPImport {
 
     /// Validate the supported MCP schema as well as syntax before appending anything. In particular,
     /// balanced delimiters alone would accept missing values, duplicate keys, and table/key conflicts.
-    private static func validate(_ sections: [Section]) throws {
+    @discardableResult
+    private static func validate(_ sections: [Section]) throws -> [String: CodexUserMCPImportValidation.Value] {
         typealias Value = CodexUserMCPImportValidation.Value
         var object: [String: Value] = [:]
         var tables = Set<[String]>()
@@ -144,6 +145,25 @@ enum CodexUserMCPImport {
             }
         }
         try CodexUserMCPImportValidation.validate(object)
+        return object
+    }
+
+    static func checkedServerEntries(configURL: URL) throws -> [CodexIntegrationConfiguration.ServerEntry] {
+        guard let contents = try read(configURL, missingAllowed: true) else { return [] }
+        let (parsed, _) = try sections(in: contents)
+        let mcp = parsed.filter { $0.path.first == "mcp_servers" && $0.path.count >= 2 }
+        for entries in Dictionary(grouping: mcp, by: { $0.path[1] }).values {
+            try validate(entries)
+        }
+        return CodexIntegrationConfiguration.mcpServerEntries(from: contents)
+    }
+
+    static func ownedServerDefinition(named name: String, configURL: URL) throws -> [String: CodexUserMCPImportValidation.Value]? {
+        guard let contents = try read(configURL, missingAllowed: true) else { return nil }
+        let (sections, _) = try sections(in: contents)
+        let matched = sections.filter { $0.path.count >= 2 && $0.path[0] == "mcp_servers" && normalized($0.path[1]) == name }
+        guard !matched.isEmpty, matched.allSatisfy({ !$0.invalid && $0.path[1] == name }) else { return nil }
+        return try validate(matched)
     }
 
     private static func insert(_ value: CodexUserMCPImportValidation.Value, at path: [String], into object: inout [String: CodexUserMCPImportValidation.Value]) throws {
