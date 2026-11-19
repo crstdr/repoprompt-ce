@@ -5223,6 +5223,72 @@ import XCTest
             }
         }
 
+        func testWorkspaceLinkRefusesPreparedOwnerAppearingDuringHydration() async throws {
+            final class Registry: PreparedAgentSessionRuntimeRegistry {
+                var preparedID: UUID?
+                var visits = 0
+
+                func addingPreparedRuntimeCarriers(to snapshot: AgentSessionCarrierResolver.Snapshot, sessionIDs: Set<UUID>?, windowIDs: Set<Int>) -> AgentSessionCarrierResolver.Snapshot {
+                    snapshot
+                }
+
+                func hasPreparedRuntime(_ sessionID: UUID) -> Bool {
+                    preparedID == sessionID
+                }
+
+                func claimPreparedRuntimeVisit(_ sessionID: UUID) -> Bool {
+                    visits += 1
+                    return false
+                }
+
+                func finishPreparedRuntimeVisit(_ sessionID: UUID) {}
+                func releasePreparedOversightOwnerForVisit(sessionID: UUID, preparingReplacement: Bool) async -> Bool {
+                    visits += 1
+                    return false
+                }
+
+                func queuePreparedRuntimeVisit(_ sessionID: UUID, resume: @escaping @MainActor () async -> Void) {
+                    visits += 1
+                }
+
+                func beginPreparedOversightPreparation(_ id: UUID) {}
+                func endPreparedOversightPreparation(_ id: UUID) {}
+                func prepareScopedSavedTarget(_ sessionID: UUID, isStillAuthorized: @escaping @MainActor () -> Bool) async -> Bool {
+                    false
+                }
+            }
+
+            let tabs = [ComposeTabState(name: "Selected"), ComposeTabState(name: "Destination")]
+            var workspace = Fixture.model(id: Fixture.requestedID, name: "Saved workspace")
+            workspace.composeTabs = tabs
+            workspace.activeComposeTabID = tabs[0].id
+            let requestedSessionID = UUID()
+            try await Fixture.run(seeds: [Fixture.model(id: Fixture.defaultID, name: "Default", isSystem: true), workspace]) { f in
+                let window = f.makeWindow()
+                let manager = window.workspaceManager
+                await manager.awaitInitialized()
+                let switched = await manager.requestWorkspaceSwitch(to: workspace, silent: true)
+                XCTAssertTrue(switched.didSwitch)
+                let active = try XCTUnwrap(manager.activeWorkspace)
+                let payload = AgentSession(id: requestedSessionID, workspaceID: active.id, composeTabID: tabs[1].id, name: "Saved", agentKind: AgentProviderKind.claudeCode.rawValue)
+                _ = try await AgentSessionDataService.shared.saveAgentSession(payload, for: active)
+                let bindingBefore = manager.activeAgentSessionID(forTabID: tabs[1].id)
+                let registry = Registry()
+                window.agentModeViewModel.preparedSessionRuntimes = registry
+                await AgentSessionDataService.shared.test_setAfterHydrationPrepareHook { id in
+                    guard id == requestedSessionID else { return }
+                    await MainActor.run { registry.preparedID = id }
+                }
+                let result = await window.navigateAgentDeepLinkTab(tabs[1].id, sessionID: requestedSessionID, workspaceID: active.id, workspaceLink: true)
+                await AgentSessionDataService.shared.test_setAfterHydrationPrepareHook(nil)
+                XCTAssertEqual(registry.preparedID, requestedSessionID)
+                XCTAssertEqual(registry.visits, 0)
+                XCTAssertEqual(result, .blockedByActiveDifferentSession)
+                XCTAssertEqual(manager.activeAgentSessionID(forTabID: tabs[1].id), bindingBefore)
+                XCTAssertEqual(window.promptManager.activeComposeTabID, tabs[0].id)
+            }
+        }
+
         func testAgentDeepLinkDepartureDoesNotSaveUntouchedStartupDefault() async throws {
             let agentTabs = (0 ..< 2).map { ComposeTabState(name: "Agent \($0)", activeAgentSessionID: UUID()) }
             var target = Fixture.model(id: Fixture.requestedID, name: "Link target")
