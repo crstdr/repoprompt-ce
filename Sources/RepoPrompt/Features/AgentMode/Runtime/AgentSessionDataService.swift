@@ -1611,8 +1611,8 @@ actor AgentSessionDataService {
     }
 
     /// Load an agent session by ID without scanning the session directory.
-    func loadAgentSession(id: UUID, for workspace: WorkspaceModel) async throws -> AgentSession? {
-        let agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
+    func loadAgentSession(id: UUID, for workspace: WorkspaceModel, createFolder: Bool = true) async throws -> AgentSession? {
+        let agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace, create: createFolder)
         let filename = "AgentSession-\(id.uuidString).json"
         let fileURL = agentSessionsFolder.appendingPathComponent(filename)
 
@@ -1928,12 +1928,12 @@ actor AgentSessionDataService {
     // MARK: - Folder Helpers
 
     /// Creates (if needed) and returns the "AgentSessions" subfolder for the given workspace.
-    private func ensureAgentSessionsFolder(for workspace: WorkspaceModel) throws -> URL {
-        let baseFolder = try workspaceFolderURL(for: workspace)
+    private func ensureAgentSessionsFolder(for workspace: WorkspaceModel, create: Bool = true) throws -> URL {
+        let baseFolder = try workspaceFolderURL(for: workspace, create: create)
         let agentSessionsFolder = baseFolder.appendingPathComponent("AgentSessions")
         try AppProfileLocations.current.validateMetadataFile(agentSessionsFolder)
 
-        if !FileManager.default.fileExists(atPath: agentSessionsFolder.path) {
+        if create, !FileManager.default.fileExists(atPath: agentSessionsFolder.path) {
             try FileManager.default.createDirectory(at: agentSessionsFolder, withIntermediateDirectories: true)
         }
         return agentSessionsFolder
@@ -1956,10 +1956,10 @@ actor AgentSessionDataService {
     }
 
     /// Return the main folder for the workspace.
-    private func workspaceFolderURL(for workspace: WorkspaceModel) throws -> URL {
+    private func workspaceFolderURL(for workspace: WorkspaceModel, create: Bool = true) throws -> URL {
         let workspaceDir = resolvedWorkspaceFolderURL(for: workspace)
         try AppProfileLocations.current.validateMetadataFile(workspaceDir)
-        if !FileManager.default.fileExists(atPath: workspaceDir.path) {
+        if create, !FileManager.default.fileExists(atPath: workspaceDir.path) {
             try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
         }
         return workspaceDir

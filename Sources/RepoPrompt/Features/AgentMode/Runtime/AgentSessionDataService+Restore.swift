@@ -556,7 +556,7 @@ extension AgentSessionDataService {
     }
 
     func preparePersistedHydration(
-        _ request: AgentSessionHydrationRequest
+        _ request: AgentSessionHydrationRequest, createFolder: Bool = true
     ) async throws -> AgentSessionHydrationPayload? {
         #if DEBUG
             let prepareStartMS = restorePerfRecorder.timestampMSIfEnabled()
@@ -598,7 +598,8 @@ extension AgentSessionDataService {
             #endif
             guard let agentSession = try await loadAgentSession(
                 id: request.sessionID,
-                for: request.workspace
+                for: request.workspace,
+                createFolder: createFolder
             ) else {
                 #if DEBUG
                     if let loadStartMS {

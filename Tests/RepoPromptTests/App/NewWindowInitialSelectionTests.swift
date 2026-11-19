@@ -5175,6 +5175,54 @@ import XCTest
             }
         }
 
+        func testWorkspaceLinkSilentSwitchRestoresTabsAndIgnoresMissingSession() async throws {
+            final class ActiveWork: WorkspaceSwitchSessionProvider {
+                var count = 1
+                var cancellations = 0
+                func switchSessionItems() -> [WorkspaceSwitchSessionItem] {
+                    [WorkspaceSwitchSessionItem(id: "test", count: count, singularLabel: "test session", pluralLabel: "test sessions")]
+                }
+
+                func cancelSwitchSessions() async {
+                    cancellations += 1
+                }
+            }
+            let defaultWorkspace = Fixture.model(id: Fixture.defaultID, name: "Default", isSystem: true)
+            let tabs = [ComposeTabState(name: "Saved first"), ComposeTabState(name: "Saved second")]
+            var workspace = Fixture.model(id: Fixture.requestedID, name: "Saved workspace")
+            workspace.composeTabs = tabs
+            workspace.activeComposeTabID = tabs[0].id
+            try await Fixture.run(seeds: [defaultWorkspace, workspace]) { f in
+                let window = f.makeWindow()
+                let manager = window.workspaceManager
+                await manager.awaitInitialized()
+                await manager.awaitInitialWorkspaceActivationCompletion()
+                _ = try await f.awaitCaughtUpWithCatalogBaseline(window)
+                let work = ActiveWork()
+                manager.registerSwitchSessionProvider(work)
+                let blocked = await manager.requestWorkspaceSwitch(
+                    to: workspace, reason: WorkspaceManagerViewModel.agentDeepLinkSwitchReason, silent: true
+                )
+                XCTAssertFalse(blocked.didSwitch)
+                XCTAssertEqual(manager.activeWorkspaceID, defaultWorkspace.id)
+                XCTAssertFalse(manager.hasPendingSwitchConfirmation)
+                XCTAssertNil(manager.pendingWorkspaceSwitchBlockedNotice)
+                XCTAssertEqual(work.cancellations, 0)
+
+                work.count = 0
+                let reopened = await manager.requestWorkspaceSwitch(
+                    to: workspace, reason: WorkspaceManagerViewModel.agentDeepLinkSwitchReason, silent: true
+                )
+                XCTAssertTrue(reopened.didSwitch)
+                XCTAssertEqual(window.promptManager.activeComposeTabID, tabs[0].id)
+                let stale = await window.navigateAgentDeepLinkTab(
+                    tabs[1].id, sessionID: UUID(), workspaceID: workspace.id, workspaceLink: true
+                )
+                XCTAssertEqual(stale, .sessionUnavailable)
+                XCTAssertEqual(window.promptManager.activeComposeTabID, tabs[0].id)
+            }
+        }
+
         func testAgentDeepLinkDepartureDoesNotSaveUntouchedStartupDefault() async throws {
             let agentTabs = (0 ..< 2).map { ComposeTabState(name: "Agent \($0)", activeAgentSessionID: UUID()) }
             var target = Fixture.model(id: Fixture.requestedID, name: "Link target")

@@ -8049,9 +8049,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     func activateRoutedAgentSession(
         tabID: UUID,
         sessionID: UUID?,
-        workspace: WorkspaceModel
+        workspace: WorkspaceModel,
+        workspaceLink: Bool = false
     ) async -> AgentRouteSessionActivationResult {
         let owners = preparedSessionRuntimes
+        if workspaceLink, let sessionID, owners?.hasPreparedRuntime(sessionID) == true {
+            return .blockedByActiveDifferentSession
+        }
         let preparedVisitID = workspaceManager?.isSessionRuntimeProjection != true
             ? sessionID.flatMap { owners?.hasPreparedRuntime($0) == true ? $0 : nil } : nil
         if let preparedVisitID, owners?.claimPreparedRuntimeVisit(preparedVisitID) != true {
@@ -8082,7 +8086,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         let currentBinding = sessions[tabID]?.activeAgentSessionID
             ?? workspaceManager?.activeAgentSessionID(forTabID: tabID, inWorkspaceID: workspace.id)
-        if currentBinding == sessionID {
+        if currentBinding == sessionID, !workspaceLink || sessions[tabID]?.hasLoadedPersistedState == true {
             let session = await ensureSessionReady(tabID: tabID, reconnectActiveProviders: true)
             return sessions[tabID] === session && session.activeAgentSessionID == sessionID
                 && session.permitsBoundOperationAndSave ? .ready : .sessionNotFound
@@ -8127,7 +8131,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let routePrepareStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
         do {
-            guard let preparedPayload = try await dataService.preparePersistedHydration(hydrationRequest) else {
+            guard let preparedPayload = try await dataService.preparePersistedHydration(hydrationRequest, createFolder: !workspaceLink) else {
                 #if DEBUG
                     restorePerfRecorder.event(
                         "agentSessionHydration.routeActivationPrepare",
@@ -8179,6 +8183,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
 
         let persistedSession = payload.persistedSession
+        if workspaceLink {
+            guard !Task.isCancelled, !hasPreparedForWindowClose, workspaceManager?.activeWorkspaceID == workspace.id,
+                  workspaceManager?.isSwitchingWorkspace == false else { return .sessionNotFound }
+            if currentBinding != sessionID, persistedSession.workspaceID == nil || persistedSession.composeTabID == nil {
+                return .sessionNotFound
+            }
+        }
         if let persistedWorkspaceID = persistedSession.workspaceID,
            persistedWorkspaceID != workspace.id
         {
