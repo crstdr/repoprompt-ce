@@ -67,13 +67,19 @@ def list_suite_methods(
     *,
     skip_build: bool = False,
 ) -> dict[str, tuple[str, ...]]:
-    result = subprocess.run(
-        [swift_binary, "test", "list", *(["--skip-build"] if skip_build else [])],
-        check=True,
-        capture_output=True,
-        cwd=cwd,
-        text=True,
-    )
+    if not skip_build:
+        subprocess.run([swift_binary, "build", "--build-tests"], check=True, cwd=cwd)
+    # Listing can initialize the test bundle just like running it. Only compilation
+    # may use the developer environment; do not retry discovery outside this home.
+    with tempfile.TemporaryDirectory(prefix="rpce-discovery-") as directory:
+        result = subprocess.run(
+            [swift_binary, "test", "list", "--skip-build"],
+            check=True,
+            capture_output=True,
+            cwd=cwd,
+            text=True,
+            env=isolated_suite_environment(Path(directory), "discovery"),
+        )
     return parse_suite_methods(result.stdout)
 
 

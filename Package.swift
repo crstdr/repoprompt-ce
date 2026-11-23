@@ -116,6 +116,7 @@ var repoPromptTestDependencies: [Target.Dependency] = [
     "RepoPromptMCPCore",
     "RepoPromptShared",
     "RepoPromptTestSupport",
+    "RepoPromptTestSandboxPreflight",
     "RepoPromptWorkspaceCore",
     .product(name: "Markdown", package: "swift-markdown")
 ]
@@ -472,6 +473,7 @@ let package = Package(
         .testTarget(
             name: "RepoPromptMCPCoreTests",
             dependencies: [
+                "RepoPromptTestSandboxPreflight",
                 "RepoPromptMCPCore",
                 "RepoPromptDomainRuntime",
                 "RepoPromptShared",
@@ -480,6 +482,12 @@ let package = Package(
                 .product(name: "MCP", package: "swift-sdk")
             ],
             path: "Tests/RepoPromptMCPCoreTests"
+        ),
+        .target(
+            name: "RepoPromptTestSandboxPreflight",
+            path: "Tests/RepoPromptTestSandboxPreflight",
+            publicHeadersPath: "include",
+            linkerSettings: [.linkedFramework("CoreFoundation")]
         ),
         // Test-only helpers shared across test targets. Production targets must never depend on it.
         .target(

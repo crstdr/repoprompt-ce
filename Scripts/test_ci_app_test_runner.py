@@ -371,6 +371,16 @@ class HostedShardTests(unittest.TestCase):
             found = runner.list_suite_methods('swift', Path('/checkout'), skip_build=True)
         self.assertEqual(found, {'RepoPromptTests.ExampleTests': ('RepoPromptTests.ExampleTests/testOne',)})
         self.assertEqual(run.call_args.args[0], ['swift', 'test', 'list', '--skip-build'])
+        environment = run.call_args.kwargs['env']
+        self.assertEqual(environment['HOME'], environment['CFFIXED_USER_HOME'])
+        self.assertEqual(Path(environment['HOME']).parent, Path(environment['REPOPROMPT_TEST_SANDBOX_ROOT']))
+
+    def test_discovery_never_executes_without_isolation(self) -> None:
+        with mock.patch.object(runner, 'isolated_suite_environment', side_effect=OSError('fixture')), \
+             mock.patch.object(runner.subprocess, 'run') as run:
+            with self.assertRaises(OSError):
+                runner.list_suite_methods('swift', Path('/checkout'), skip_build=True)
+        run.assert_not_called()
 
 
 class TransferredBuildTests(unittest.TestCase):

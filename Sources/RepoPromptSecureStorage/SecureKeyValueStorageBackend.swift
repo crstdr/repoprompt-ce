@@ -127,6 +127,12 @@ package enum SecureKeyValueStorageFactory {
     }()
 
     package static func defaultBackend() -> SecureKeyValueStorageBackend {
+        #if DEBUG
+            if let sandbox = ProcessInfo.processInfo.environment["REPOPROMPT_TEST_SANDBOX_ROOT"],
+               FileManager.default.fileExists(atPath: sandbox + "/.issue944-test-sandbox") {
+                return EphemeralSecureKeyValueStore.shared
+            }
+        #endif
         guard officialOverrideApplies(to: cachedSelection.decision.domain) else {
             return cachedSelection.backend
         }
