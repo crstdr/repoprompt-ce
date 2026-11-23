@@ -300,6 +300,27 @@ final class AppPlatformUtilityRecoveryTests: XCTestCase {
         )
     }
 
+    func testLocalSelfSignedSparkleUsesAppcastDiscoveryWithoutStartingInstaller() {
+        XCTAssertEqual(
+            SparkleUpdaterManager.startDecision(
+                sparkleConfigurationValid: true,
+                discoveryEnabled: false,
+                identityMigrationBlockedMessage: nil,
+                localDiscoveryOnly: true
+            ),
+            .discoveryOnly
+        )
+        XCTAssertEqual(
+            SparkleUpdaterManager.userInitiatedUpdateAction(
+                discoveryEnabled: true,
+                sparkleConfigurationValid: true,
+                identityMigrationBlockedMessage: nil,
+                localDiscoveryOnly: true
+            ),
+            .appcastDiscovery
+        )
+    }
+
     func testAgentSessionDeepLinkURLRoundTripsAndRejectsInvalidScopedRoutes() throws {
         let route = try AgentSessionDeepLinkRoute(
             windowID: 7,

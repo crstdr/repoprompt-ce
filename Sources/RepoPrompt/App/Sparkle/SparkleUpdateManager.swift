@@ -158,11 +158,6 @@ final class SparkleUpdaterManager: ObservableObject {
     /// UserDefaults key for RepoPrompt's passive appcast-check preference.
     private nonisolated static let passiveAppcastChecksKey = "RepoPromptPassiveAppcastChecksEnabled"
 
-    /// Expose updater for settings UI
-    var updater: SPUUpdater {
-        updaterController.updater
-    }
-
     @Published var canCheckForUpdates = false
     @Published private(set) var availableUpdate: AvailableUpdateNotice?
     @Published private(set) var sparkleConfigurationValid = true
@@ -197,23 +192,26 @@ final class SparkleUpdaterManager: ObservableObject {
         updatesDisabledMessage ?? updateInstallationBlockedMessage
     }
 
+    private let localDiscoveryOnly = Bundle.main.object(forInfoDictionaryKey: "RepoPromptSigningMode") as? String == "local-self-signed"
+
     var canDiscoverUpdates: Bool {
         discoveryEnabled && sparkleConfigurationValid &&
-            (updateInstallationBlockedMessage != nil || canCheckForUpdates)
+            (localDiscoveryOnly || updateInstallationBlockedMessage != nil || canCheckForUpdates)
     }
 
     var canInstallAvailableUpdate: Bool {
-        updaterStarted && sparkleConfigurationValid && updateInstallationBlockedMessage == nil
+        !localDiscoveryOnly && updaterStarted && sparkleConfigurationValid && updateInstallationBlockedMessage == nil
     }
 
     var migrationRecoveryDownloadsURL: URL? {
-        Self.recoveryDownloadsURL(
+        guard !localDiscoveryOnly else { return nil }
+        return Self.recoveryDownloadsURL(
             identityMigrationBlockedMessage: updateInstallationBlockedMessage
         )
     }
 
     var isDiscoveryOnly: Bool {
-        discoveryEnabled && !updaterStarted && updateInstallationBlockedMessage != nil
+        discoveryEnabled && !updaterStarted && (localDiscoveryOnly || updateInstallationBlockedMessage != nil)
     }
 
     var canInitiateUpdateCheck: Bool {
@@ -225,7 +223,8 @@ final class SparkleUpdaterManager: ObservableObject {
     }
 
     var manualUpdateDownloadURL: URL? {
-        Self.manualDownloadURL(
+        guard !localDiscoveryOnly else { return nil }
+        return Self.manualDownloadURL(
             for: availableUpdate,
             identityMigrationBlockedMessage: updateInstallationBlockedMessage
         )
@@ -334,7 +333,8 @@ final class SparkleUpdaterManager: ObservableObject {
         switch Self.startDecision(
             sparkleConfigurationValid: sparkleConfigurationValid,
             discoveryEnabled: discoveryEnabled,
-            identityMigrationBlockedMessage: updateInstallationBlockedMessage
+            identityMigrationBlockedMessage: updateInstallationBlockedMessage,
+            localDiscoveryOnly: localDiscoveryOnly
         ) {
         case .ignore:
             return
@@ -368,19 +368,21 @@ final class SparkleUpdaterManager: ObservableObject {
     nonisolated static func startDecision(
         sparkleConfigurationValid: Bool,
         discoveryEnabled: Bool,
-        identityMigrationBlockedMessage: String?
+        identityMigrationBlockedMessage: String?,
+        localDiscoveryOnly: Bool = false
     ) -> SparkleUpdaterStartDecision {
         guard sparkleConfigurationValid, !discoveryEnabled else { return .ignore }
-        return identityMigrationBlockedMessage == nil ? .start : .discoveryOnly
+        return !localDiscoveryOnly && identityMigrationBlockedMessage == nil ? .start : .discoveryOnly
     }
 
     nonisolated static func userInitiatedUpdateAction(
         discoveryEnabled: Bool,
         sparkleConfigurationValid: Bool,
-        identityMigrationBlockedMessage: String?
+        identityMigrationBlockedMessage: String?,
+        localDiscoveryOnly: Bool = false
     ) -> SparkleUserInitiatedUpdateAction {
         guard discoveryEnabled, sparkleConfigurationValid else { return .unavailable }
-        return identityMigrationBlockedMessage == nil ? .sparkle : .appcastDiscovery
+        return !localDiscoveryOnly && identityMigrationBlockedMessage == nil ? .sparkle : .appcastDiscovery
     }
 
     private static func loadPassiveAppcastChecksPreference(defaultingTo sparkleAutomaticChecks: Bool) -> Bool {
@@ -886,7 +888,8 @@ final class SparkleUpdaterManager: ObservableObject {
             switch Self.userInitiatedUpdateAction(
                 discoveryEnabled: discoveryEnabled,
                 sparkleConfigurationValid: sparkleConfigurationValid,
-                identityMigrationBlockedMessage: updateInstallationBlockedMessage
+                identityMigrationBlockedMessage: updateInstallationBlockedMessage,
+                localDiscoveryOnly: localDiscoveryOnly
             ) {
             case .appcastDiscovery:
                 Task {
@@ -901,10 +904,11 @@ final class SparkleUpdaterManager: ObservableObject {
     }
 
     func installUpdate() {
-        guard Self.userInitiatedUpdateAction(
+        guard updaterStarted, Self.userInitiatedUpdateAction(
             discoveryEnabled: discoveryEnabled,
             sparkleConfigurationValid: sparkleConfigurationValid,
-            identityMigrationBlockedMessage: updateInstallationBlockedMessage
+            identityMigrationBlockedMessage: updateInstallationBlockedMessage,
+            localDiscoveryOnly: localDiscoveryOnly
         ) == .sparkle else { return }
         beginUserInitiatedSparkleCheck()
     }
@@ -932,6 +936,7 @@ final class SparkleUpdaterManager: ObservableObject {
     }
 
     private func beginUserInitiatedSparkleCheck() {
+        guard updaterStarted, !localDiscoveryOnly else { return }
         if let activeRequest = userInitiatedObserverState.activeRequest {
             guard !updaterController.updater.sessionInProgress else { return }
             finishUserInitiatedSparkleCheck(request: activeRequest)
