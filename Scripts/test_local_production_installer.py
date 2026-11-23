@@ -115,6 +115,31 @@ class LocalProductionInstallerTests(unittest.TestCase):
 
 
 
+    def test_bundle_digest_detects_mutations_and_rejects_escaping_links(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "original.app"
+            source.mkdir()
+            payload = source / "payload"
+            payload.write_text("original", encoding="utf-8")
+            (source / "alias").symlink_to("payload")
+            staged = Path(directory) / "staged.app"
+            shutil.copytree(source, staged, symlinks=True)
+
+            def digest(path: Path) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [sys.executable, str(SCRIPT_DIR / "local_production_artifact_digest.py"), str(path)],
+                    capture_output=True, text=True, check=False,
+                )
+
+            original = digest(source)
+            identical = digest(staged)
+            self.assertEqual((original.returncode, identical.returncode), (0, 0))
+            self.assertEqual(original.stdout, identical.stdout)
+            (staged / "payload").write_text("replacement", encoding="utf-8")
+            self.assertNotEqual(original.stdout, digest(staged).stdout)
+            (staged / "escape").symlink_to("../original.app/payload")
+            self.assertNotEqual(digest(staged).returncode, 0)
+
     def test_local_entitlements_and_packaging_require_fingerprint_metadata(self) -> None:
         template = ROOT_DIR / "AppBundle" / "RepoPrompt.local-self-signed.entitlements.template"
         with template.open("rb") as handle:
@@ -553,6 +578,8 @@ class LocalProductionInstallerTests(unittest.TestCase):
             exit 0
             """,
         )
+        # The fake DEVELOPER_DIR must not reach the system Python developer-tool shim.
+        (bin_dir / "python3").symlink_to(Path(sys.executable).resolve())
         self.write_stub(bin_dir, "pgrep", "exit 1\n")
         self.write_stub(bin_dir, "ditto", 'cp -R "$1" "$2"\n')
         self.write_stub(

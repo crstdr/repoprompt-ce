@@ -11,6 +11,11 @@ set +a
 LOCAL_SELF_SIGNED_CERTIFICATE_NAME="RepoPrompt CE Local Self-Signed Code Signing"
 LOCAL_PRODUCTION_INSTALL_DIR="${LOCAL_PRODUCTION_INSTALL_DIR:-/Applications}"
 LOCAL_PRODUCTION_APP="$LOCAL_PRODUCTION_INSTALL_DIR/$DISPLAY_NAME.app"
+LOCAL_PRODUCTION_MODE="${LOCAL_PRODUCTION_MODE:-build-install}"
+case "$LOCAL_PRODUCTION_MODE" in
+    build-install|package-only|install-only) ;;
+    *) printf 'Invalid LOCAL_PRODUCTION_MODE\n' >&2; exit 64 ;;
+esac
 LOCAL_CERTIFICATE_DAYS="${LOCAL_CERTIFICATE_DAYS:-3650}"
 LOCAL_SIGNING_IDENTITY_REGISTRY_PATH="${LOCAL_SIGNING_IDENTITY_REGISTRY_PATH:-$HOME/Library/Application Support/RepoPrompt CE/local-signing-identity-v1.json}"
 LOCAL_SIGNING_IDENTITY_SHA256="${LOCAL_SIGNING_IDENTITY_SHA256:-}"
@@ -198,7 +203,7 @@ rollback_transaction() {
     return "$rollback_failed"
 }
 
-[[ "${CONFIRM_LOCAL_PRODUCTION_INSTALL:-}" == "1" ]] ||
+[[ "$LOCAL_PRODUCTION_MODE" == "package-only" || "${CONFIRM_LOCAL_PRODUCTION_INSTALL:-}" == "1" ]] ||
     fail "Set CONFIRM_LOCAL_PRODUCTION_INSTALL=1 to build and replace the local production app in $LOCAL_PRODUCTION_INSTALL_DIR."
 
 for command in codesign ditto openssl plutil python3 security shasum swift; do
@@ -207,16 +212,22 @@ done
 [[ -f "$LOCAL_SIGNING_IDENTITY_TOOL" ]] || fail "Missing local signing identity tool: $LOCAL_SIGNING_IDENTITY_TOOL"
 [[ -x "$FULL_XCODE_RESOLVER" ]] || fail "Missing full-Xcode resolver: $FULL_XCODE_RESOLVER"
 
-DEVELOPER_DIR="$("$FULL_XCODE_RESOLVER")"
-export DEVELOPER_DIR
-printf 'Local production Xcode developer directory: %s\n' "$DEVELOPER_DIR"
+if [[ "$LOCAL_PRODUCTION_MODE" != "install-only" ]]; then
+    DEVELOPER_DIR="$("$FULL_XCODE_RESOLVER")"
+    export DEVELOPER_DIR
+    printf 'Local production Xcode developer directory: %s\n' "$DEVELOPER_DIR"
+fi
 
 LOGIN_KEYCHAIN="$(security default-keychain -d user | sed -e 's/^[[:space:]]*"//' -e 's/"[[:space:]]*$//')"
 [[ -n "$LOGIN_KEYCHAIN" && -f "$LOGIN_KEYCHAIN" ]] || fail "Could not resolve the user's default login keychain."
 
 TMP_DIR="$(mktemp -d)"
-mkdir -p "$(dirname "$LOCAL_SIGNING_IDENTITY_REGISTRY_PATH")"
-chmod 700 "$(dirname "$LOCAL_SIGNING_IDENTITY_REGISTRY_PATH")"
+if [[ "$LOCAL_PRODUCTION_MODE" == "build-install" ]]; then
+    mkdir -p "$(dirname "$LOCAL_SIGNING_IDENTITY_REGISTRY_PATH")"
+    chmod 700 "$(dirname "$LOCAL_SIGNING_IDENTITY_REGISTRY_PATH")"
+else
+    [[ -f "$LOCAL_SIGNING_IDENTITY_REGISTRY_PATH" ]] || fail "Split modes require an existing signing registry."
+fi
 REGISTRY_LOCK_CANDIDATE="$LOCAL_SIGNING_IDENTITY_REGISTRY_PATH.lock"
 mkdir "$REGISTRY_LOCK_CANDIDATE" 2>/dev/null || fail "Another local production install is active, or a stale lock must be inspected: $REGISTRY_LOCK_CANDIDATE"
 REGISTRY_LOCK_DIR="$REGISTRY_LOCK_CANDIDATE"
@@ -245,6 +256,10 @@ python3 "${PLAN_ARGS[@]}" > "$PLAN_PATH"
 IDENTITY_ACTION="$(json_field "$PLAN_PATH" action)"
 LOCAL_SIGNING_SERVICE_GENERATION="$(json_field "$PLAN_PATH" serviceGeneration)"
 REGISTRY_NEEDS_WRITE="$(json_field "$PLAN_PATH" registryNeedsWrite)"
+if [[ "$LOCAL_PRODUCTION_MODE" != "build-install" ]]; then
+    [[ "$IDENTITY_ACTION" == "use" && "$REGISTRY_NEEDS_WRITE" == "0" ]] ||
+        fail "Split modes require a matching registered identity; they do not mint or rotate certificates."
+fi
 
 if [[ "$IDENTITY_ACTION" == "mint" ]]; then
     if [[ "$ROTATE_LOCAL_SIGNING_IDENTITY" == "1" || "$ROTATE_LOCAL_SIGNING_IDENTITY" == "true" ]]; then
@@ -278,14 +293,27 @@ printf 'Local signing identity action: %s\n' "$IDENTITY_ACTION"
 printf 'Selected local certificate SHA-256: %s\n' "$SELECTED_CERTIFICATE_SHA256"
 printf 'Selected local signing compatibility generation: v%s\n' "$LOCAL_SIGNING_SERVICE_GENERATION"
 
-LOCAL_SELF_SIGNED_RELEASE=1 \
-    LOCAL_SIGNING_CERTIFICATE_SHA1="$SIGN_IDENTITY" \
-    LOCAL_SIGNING_CERTIFICATE_SHA256="$SELECTED_CERTIFICATE_SHA256" \
-    LOCAL_SIGNING_SERVICE_GENERATION="$LOCAL_SIGNING_SERVICE_GENERATION" \
-    SIGN_IDENTITY="$SIGN_IDENTITY" \
-    "$ROOT_DIR/Scripts/package_app.sh" release
+if [[ "$LOCAL_PRODUCTION_MODE" == "install-only" ]]; then
+    SOURCE_APP="${LOCAL_PRODUCTION_ARTIFACT:-}"
+    [[ "$SOURCE_APP" == /* && "$SOURCE_APP" != "$LOCAL_PRODUCTION_APP" ]] || fail "Pass an absolute staged artifact path."
+    [[ "${LOCAL_PRODUCTION_ARTIFACT_DIGEST:-}" =~ ^[a-f0-9]{64}$ ]] || fail "Pass the digest printed by package-only."
+    [[ -d "$SOURCE_APP" && ! -L "$SOURCE_APP" ]] || fail "Artifact must be a real bundle directory."
+    if xattr -p com.apple.quarantine "$SOURCE_APP" >/dev/null 2>&1; then
+        fail "Refusing a quarantined artifact."
+    fi
+else
+    LOCAL_SELF_SIGNED_RELEASE=1 \
+        LOCAL_SIGNING_CERTIFICATE_SHA1="$SIGN_IDENTITY" \
+        LOCAL_SIGNING_CERTIFICATE_SHA256="$SELECTED_CERTIFICATE_SHA256" \
+        LOCAL_SIGNING_SERVICE_GENERATION="$LOCAL_SIGNING_SERVICE_GENERATION" \
+        SIGN_IDENTITY="$SIGN_IDENTITY" \
+        "$ROOT_DIR/Scripts/package_app.sh" release
+    SOURCE_APP="$ROOT_DIR/.build/release/$APP_NAME.app"
+fi
 
-SOURCE_APP="$ROOT_DIR/.build/release/$APP_NAME.app"
+artifact_digest() {
+    python3 "$ROOT_DIR/Scripts/local_production_artifact_digest.py" "$1"
+}
 [[ -d "$SOURCE_APP" ]] || fail "Missing packaged local production app: $SOURCE_APP"
 [[ "$(plutil -extract RepoPromptSigningMode raw "$SOURCE_APP/Contents/Info.plist")" == "local-self-signed" ]] ||
     fail "Packaged app is missing the local self-signed signing-mode marker."
@@ -300,6 +328,19 @@ DESIGNATED_REQUIREMENT="$(codesign -d -r- "$SOURCE_APP" 2>&1 | sed -n 's/^design
 grep -F -i -- "$SIGN_IDENTITY" <<< "$DESIGNATED_REQUIREMENT" >/dev/null ||
     fail "Packaged app designated requirement is not pinned to the selected certificate."
 printf 'Packaged designated requirement: %s\n' "$DESIGNATED_REQUIREMENT"
+if [[ "$LOCAL_PRODUCTION_MODE" != "build-install" ]]; then
+    plist="$SOURCE_APP/Contents/Info.plist"
+    [[ "$(plutil -extract CFBundleIdentifier raw "$plist")" == "$BUNDLE_ID" ]] || fail "Unexpected artifact bundle identifier."
+    [[ "$(plutil -extract CFBundleShortVersionString raw "$plist")" == "$MARKETING_VERSION" ]] || fail "Unexpected artifact version."
+    [[ "$(plutil -extract CFBundleVersion raw "$plist")" == "$BUILD_NUMBER" ]] || fail "Unexpected artifact build number."
+    DIGEST="$(artifact_digest "$SOURCE_APP")"
+    if [[ "$LOCAL_PRODUCTION_MODE" == "package-only" ]]; then
+        printf 'Artifact: %s\nArtifact SHA-256: %s\nBundle: %s (%s) %s\nSigning mode: local-self-signed\n' \
+            "$SOURCE_APP" "$DIGEST" "$MARKETING_VERSION" "$BUILD_NUMBER" "$BUNDLE_ID"
+        exit 0
+    fi
+    [[ "$DIGEST" == "$LOCAL_PRODUCTION_ARTIFACT_DIGEST" ]] || fail "Artifact differs from the inspected bundle."
+fi
 
 if pgrep -f "$LOCAL_PRODUCTION_APP/Contents/MacOS/$APP_NAME" >/dev/null 2>&1; then
     fail "Quit $DISPLAY_NAME before replacing $LOCAL_PRODUCTION_APP."
@@ -309,6 +350,12 @@ mkdir -p "$LOCAL_PRODUCTION_INSTALL_DIR"
 STAGED_DIR="$(mktemp -d "$LOCAL_PRODUCTION_INSTALL_DIR/.$DISPLAY_NAME.app.installing.XXXXXX")"
 STAGED_APP="$STAGED_DIR/$DISPLAY_NAME.app"
 ditto "$SOURCE_APP" "$STAGED_APP"
+if [[ "$LOCAL_PRODUCTION_MODE" == "install-only" ]]; then
+    [[ "$(artifact_digest "$STAGED_APP")" == "$LOCAL_PRODUCTION_ARTIFACT_DIGEST" ]] || fail "Staged bundle differs from the inspected artifact."
+    if pgrep -f "$LOCAL_PRODUCTION_APP/Contents/MacOS/$APP_NAME" >/dev/null 2>&1; then
+        fail "Quit $DISPLAY_NAME before replacing $LOCAL_PRODUCTION_APP."
+    fi
+fi
 codesign --verify --deep --strict --verbose=2 "$STAGED_APP"
 codesign --verify --deep --strict --verbose=2 -R="$LOCAL_SIGNING_REQUIREMENT" "$STAGED_APP"
 printf 'Installing fingerprint %s with designated requirement: %s\n' "$SELECTED_CERTIFICATE_SHA256" "$DESIGNATED_REQUIREMENT"
