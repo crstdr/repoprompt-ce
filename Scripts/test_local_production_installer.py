@@ -140,6 +140,36 @@ class LocalProductionInstallerTests(unittest.TestCase):
             (staged / "escape").symlink_to("../original.app/payload")
             self.assertNotEqual(digest(staged).returncode, 0)
 
+    def test_split_modes_verify_inspected_bytes_without_repackaging(self) -> None:
+        _, context = self.run_installer([certificate(SHA1_A, SHA256_A)], expected_sha1=SHA1_A)
+        environment = context['env']
+        installed = context['install_dir'] / 'RepoPrompt CE.app' / 'payload.txt'
+        installed.write_text('old\n', encoding='utf-8')
+        registry = context['registry'].read_bytes()
+        environment['LOCAL_PRODUCTION_MODE'] = 'package-only'
+        package = self.invoke(context)
+        self.assertEqual(package.returncode, 0, package.stderr)
+        self.assertEqual(installed.read_text(), 'old\n')
+        self.assertEqual(context['registry'].read_bytes(), registry)
+        artifact = Path(environment['FAKE_BUILD_DIR']) / 'RepoPrompt.app'
+        digest = re.search(r'Artifact SHA-256: ([0-9a-f]{64})', package.stdout).group(1)
+        context['package_capture'].unlink()
+        environment.update({
+            'LOCAL_PRODUCTION_MODE': 'install-only',
+            'LOCAL_PRODUCTION_ARTIFACT': str(artifact),
+            'LOCAL_PRODUCTION_ARTIFACT_DIGEST': '0' * 64,
+        })
+        failed = self.invoke(context)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn('differs from the inspected bundle', failed.stderr)
+        self.assertEqual(installed.read_text(), 'old\n')
+        environment['LOCAL_PRODUCTION_ARTIFACT_DIGEST'] = digest
+        install = self.invoke(context)
+        self.assertEqual(install.returncode, 0, install.stderr)
+        self.assertFalse(context['package_capture'].exists())
+        self.assertEqual(installed.read_text(), 'new\n')
+        self.assertEqual(context['registry'].read_bytes(), registry)
+
     def test_local_entitlements_and_packaging_require_fingerprint_metadata(self) -> None:
         template = ROOT_DIR / "AppBundle" / "RepoPrompt.local-self-signed.entitlements.template"
         with template.open("rb") as handle:
@@ -424,6 +454,7 @@ class LocalProductionInstallerTests(unittest.TestCase):
         scripts.mkdir(parents=True)
         shutil.copy2(SCRIPT_DIR / "install_local_production.sh", scripts / "install_local_production.sh")
         shutil.copy2(SCRIPT_DIR / "local_signing_identity.py", scripts / "local_signing_identity.py")
+        shutil.copy2(SCRIPT_DIR / "local_production_artifact_digest.py", scripts / "local_production_artifact_digest.py")
         shutil.copy2(
             SCRIPT_DIR / "resolve_full_xcode_developer_dir.sh",
             scripts / "resolve_full_xcode_developer_dir.sh",
@@ -460,7 +491,8 @@ class LocalProductionInstallerTests(unittest.TestCase):
                 encoding="utf-8",
             )
         (root / "version.env").write_text(
-            'APP_NAME=RepoPrompt\nDISPLAY_NAME="RepoPrompt CE"\nBUNDLE_ID=com.pvncher.repoprompt.ce\n',
+            'APP_NAME=RepoPrompt\nDISPLAY_NAME="RepoPrompt CE"\nBUNDLE_ID=com.pvncher.repoprompt.ce\n'
+            'MARKETING_VERSION=1.10.0\nBUILD_NUMBER=44\n',
             encoding="utf-8",
         )
 
@@ -509,6 +541,9 @@ class LocalProductionInstallerTests(unittest.TestCase):
                 cat > "$app/Contents/Info.plist" <<EOF
                 <?xml version="1.0" encoding="UTF-8"?>
                 <plist version="1.0"><dict>
+                  <key>CFBundleIdentifier</key><string>com.pvncher.repoprompt.ce</string>
+                  <key>CFBundleShortVersionString</key><string>1.10.0</string>
+                  <key>CFBundleVersion</key><string>44</string>
                   <key>RepoPromptSigningMode</key><string>local-self-signed</string>
                   <key>RepoPromptLocalSigningCertificateSHA256</key><string>$LOCAL_SIGNING_CERTIFICATE_SHA256</string>
                   <key>RepoPromptLocalSecureStorageGeneration</key><string>$LOCAL_SIGNING_SERVICE_GENERATION</string>

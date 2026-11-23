@@ -192,7 +192,7 @@ final class SparkleUpdaterManager: ObservableObject {
         updatesDisabledMessage ?? updateInstallationBlockedMessage
     }
 
-    private let localDiscoveryOnly = Bundle.main.object(forInfoDictionaryKey: "RepoPromptSigningMode") as? String == "local-self-signed"
+    let localDiscoveryOnly = Bundle.main.object(forInfoDictionaryKey: "RepoPromptSigningMode") as? String == "local-self-signed"
 
     var canDiscoverUpdates: Bool {
         discoveryEnabled && sparkleConfigurationValid &&

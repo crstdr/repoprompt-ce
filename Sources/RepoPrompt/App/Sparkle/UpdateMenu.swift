@@ -18,7 +18,7 @@ struct UpdateMenu: Commands {
 
     var body: some Commands {
         CommandGroup(after: .appInfo) {
-            if let availableUpdate = sparkleManager.availableUpdate {
+            if let availableUpdate = sparkleManager.availableUpdate, !sparkleManager.localDiscoveryOnly {
                 if sparkleManager.canInstallAvailableUpdate {
                     Button(shortcutDisplay.title(availableUpdate.menuInstallTitle, for: .checkForUpdates)) {
                         sparkleManager.installUpdate()

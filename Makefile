@@ -127,7 +127,7 @@ run:
 	./Scripts/run.sh
 
 test:
-	swift test
+	$(MAKE) dev-test
 
 # Deliberately serial even under make -j: fail before starting the next phase.
 # This is an iteration check, not a replacement for preflight or full CI.

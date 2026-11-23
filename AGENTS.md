@@ -249,7 +249,7 @@ Direct / uncoordinated commands — use only when the daemon is unavailable but 
 ```bash
 make build
 make run
-make test
+python3 Scripts/ci_app_test_runner.py --local
 ```
 
 These do not claim daemon lanes or lifecycle supersession, so when multiple agents are active they can build, launch, or run style tooling over each other; a direct launch may reopen the app after a coordinated stop. The Finder launcher requires `python3` and does not provide an uncoordinated no-Python fallback because safe lifecycle actions require exact debug-executable identity checks. Prefer the `dev-*` aliases when the daemon is available. The manual `rpce-cli-debug` commands above remain valid for direct live MCP validation.
@@ -332,7 +332,7 @@ make dev-build
 
 Run the smallest relevant daemon build/test command above to validate a change. If the change affects packaging, the MCP server, the MCP CLI, Agent Mode, or any feature that depends on the running app, follow it with the live CE MCP smoke flow above.
 
-Direct `swift test --filter <name>` and `swift build --product <name>` still work and produce the same result, but they are uncoordinated — use them only when the daemon is unavailable (for example, no `python3`), and avoid them when other agents may be building.
+Use `make test` or `make dev-test` for the isolated test route. Direct `swift test` does not set up the test home and is refused by the app test bundles. If the daemon is unavailable but Python is available, use `python3 Scripts/ci_app_test_runner.py --local --filter <name>`. Direct `swift build --product <name>` is also uncoordinated; avoid concurrent builds.
 
 Use `make dev-run` (or `make run`) only when it is safe to stop any existing RepoPrompt instance and launch the local debug app.
 
