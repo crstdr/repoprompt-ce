@@ -59,15 +59,27 @@ struct AgentChatTitleClusterView: View {
     @ObservedObject var model: AgentChatTitleClusterModel
     let menuSnapshot: () -> AgentChatOptionsMenuSnapshot?
     let menuActions: AgentChatOptionsMenuActions
+    /// Colours the workspace the title shows; offered only while the state allows it.
+    let onSetWorkspaceColor: (WorkspaceColor?) -> Void
 
     var body: some View {
         HStack(spacing: 4) {
-            Text(model.state.title)
-                .font(.system(size: 13, weight: .semibold))
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .frame(maxWidth: 520)
-                .accessibilityIdentifier("AgentChatTitle")
+            HStack(spacing: 6) {
+                if let workspaceColor = model.state.workspaceColor {
+                    WorkspaceColorDot(color: workspaceColor)
+                }
+                Text(model.state.title)
+                    .font(.system(size: 13, weight: .semibold))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: 520)
+                    .accessibilityIdentifier("AgentChatTitle")
+            }
+            .contentShape(Rectangle())
+            .workspaceColorContextMenu(
+                selection: model.state.workspaceColor,
+                onSelect: model.state.allowsWorkspaceColorMenu ? onSetWorkspaceColor : nil
+            )
 
             if model.state.showsChatOptions {
                 AgentChatOptionsMenuButton(
