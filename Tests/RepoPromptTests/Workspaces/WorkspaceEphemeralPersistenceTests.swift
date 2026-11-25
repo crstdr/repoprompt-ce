@@ -528,6 +528,47 @@ import XCTest
             XCTAssertTrue(FileManager.default.fileExists(atPath: manager.workspaceFileURL(for: created).path))
         }
 
+        func testWorkspaceColorPersistsNotifiesAndReloadsInAnotherWindow() async throws {
+            let workspace = WorkspaceModel(name: "Colored project", repoPaths: [])
+            try writeWorkspace(workspace)
+            try writeLegacyIndex([workspace])
+            let writer = makeManager(windowID: -801)
+            let reader = makeManager(windowID: -802)
+            await writer.awaitInitialized()
+            await reader.awaitInitialized()
+            let url = writer.workspaceFileURL(for: workspace)
+            /// The writer flushes before notifying, so the notice must find the colour on disk.
+            func diskColor() -> String? {
+                (try? JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])?["color"] as? String
+            }
+
+            let notified = expectation(forNotification: .workspaceListDidChange, object: nil) { notification in
+                notification.userInfo?["managerID"] is UUID && diskColor() == "teal"
+            }
+            notified.assertForOverFulfill = false
+            let readerAdopted = expectation(description: "another window reloads the colour from disk")
+            readerAdopted.assertForOverFulfill = false
+            let subscription = reader.$workspaces.sink { workspaces in
+                if workspaces.first(where: { $0.id == workspace.id })?.color == "teal" {
+                    readerAdopted.fulfill()
+                }
+            }
+            try writer.setWorkspaceColor(XCTUnwrap(writer.workspace(withID: workspace.id)), color: .teal)
+            XCTAssertEqual(writer.workspace(withID: workspace.id)?.workspaceColor, .teal, "optimistic in-memory update")
+            await fulfillment(of: [notified, readerAdopted], timeout: 10)
+            subscription.cancel()
+            XCTAssertEqual(try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: url)).color, "teal")
+
+            let cleared = expectation(forNotification: .workspaceListDidChange, object: nil) { _ in
+                diskColor() == nil
+            }
+            cleared.assertForOverFulfill = false
+            try writer.setWorkspaceColor(XCTUnwrap(writer.workspace(withID: workspace.id)), color: nil)
+            await fulfillment(of: [cleared], timeout: 10)
+            let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+            XCTAssertNil(object["color"], "None removes the key instead of writing an empty value")
+        }
+
         func testExplicitLibraryChoicePersistsAcrossReload() async throws {
             let workspace = WorkspaceModel(name: "Automation project", repoPaths: [], isSavedWorkspace: false)
             try writeWorkspace(workspace)

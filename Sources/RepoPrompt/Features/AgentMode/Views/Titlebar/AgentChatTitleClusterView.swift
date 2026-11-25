@@ -11,6 +11,10 @@ final class AgentChatTitleClusterModel: ObservableObject {
         /// The native chat-options menu dismisses the moment an item is chosen, so success feedback
         /// for Copy Session ID cannot live on the menu itself.
         var copiedNotice: String?
+        /// Colour of the workspace the title shows; nil draws no dot.
+        var workspaceColor: WorkspaceColor?
+        /// Whether the title offers the Workspace Color menu (false for System or no workspace).
+        var allowsWorkspaceColorMenu = false
     }
 
     @Published private(set) var state: State
@@ -20,11 +24,18 @@ final class AgentChatTitleClusterModel: ObservableObject {
         state = State(title: title, showsChatOptions: false, copiedNotice: nil)
     }
 
-    func update(title: String, showsChatOptions: Bool) {
+    func update(
+        title: String,
+        showsChatOptions: Bool,
+        workspaceColor: WorkspaceColor? = nil,
+        allowsWorkspaceColorMenu: Bool = false
+    ) {
         let nextState = State(
             title: title,
             showsChatOptions: showsChatOptions,
-            copiedNotice: state.copiedNotice
+            copiedNotice: state.copiedNotice,
+            workspaceColor: workspaceColor,
+            allowsWorkspaceColorMenu: allowsWorkspaceColorMenu
         )
         guard state != nextState else { return }
         state = nextState
