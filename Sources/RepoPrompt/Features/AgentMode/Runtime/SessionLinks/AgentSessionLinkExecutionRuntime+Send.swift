@@ -283,7 +283,7 @@ extension AgentSessionLinkExecutionRuntime {
                   sessionID: sessionID, expectedWorkspaceID: proof.admission.writerIdentity.workspaceID
               ),
               writer.scope === scope, writer.session === session,
-              (writer.identity == proof.admission.writerIdentity || writer.restoration == proof.binding),
+              writer.identity == proof.admission.writerIdentity,
               writer.identity.workspaceID == proof.admission.writerIdentity.workspaceID,
               writer.isCurrent else { return nil }
         return writer
@@ -291,8 +291,11 @@ extension AgentSessionLinkExecutionRuntime {
 
     func providerSwitchAcquirePhysicalDispatch(session: TabSession, dispatchID: AgentSessionLinkPromptDispatchID) -> Bool {
         // An accepted marker fences the retained carrier, but ordinary provider input is
-        // carrier-free and must not be mistaken for a second physical handover.
-        if session.pendingHandoff.providerSwitchAcceptedID != nil { return true }
+        // carrier-free and must not be mistaken for a second physical handover. A duplicate
+        // acquisition of the exact accepted dispatch remains rejected.
+        if session.pendingHandoff.providerSwitchAcceptedID != nil {
+            return !session.pendingHandoff.isStagedForSend
+        }
         guard session.pendingHandoff.providerSwitchDelivery != nil else { return true }
         guard session.pendingHandoff.providerSwitchDelivery == .sending,
               session.pendingHandoff.isStagedForSend else { return false }
@@ -325,6 +328,15 @@ extension AgentSessionLinkExecutionRuntime {
               proof.runID == nil || proof.runID == revision.expectedRunID
         else { return }
         session.pendingHandoff.providerSwitchDispatch = nil
+        if var record = providerSwitchConfirmationRecords[session.activeAgentSessionID ?? session.tabID],
+           record.runID == revision.expectedRunID || record.runOwnership == revision.ownership
+        {
+            record.terminalResolved = true
+            providerSwitchConfirmationRecords[session.activeAgentSessionID ?? session.tabID] = record
+            if session.pendingHandoff.providerSwitchAcceptedID != nil {
+                providerSwitchReconcileConfirmation(for: session, markerAlreadyDurable: session.isDirty == false)
+            }
+        }
     }
 
     func providerSwitchRecordPhysicalAcceptance(session: TabSession, context: AgentSessionLinkDispatchContext?) {
@@ -342,7 +354,16 @@ extension AgentSessionLinkExecutionRuntime {
             providerSwitchReconcileConfirmation(for: session, markerAlreadyDurable: false)
             return
         }
-        session.pendingHandoff.providerSwitchAcceptedID = UUID()
+        let acceptedID = UUID()
+        session.pendingHandoff.providerSwitchAcceptedID = acceptedID
+        providerSwitchConfirmationRecords[session.activeAgentSessionID ?? session.tabID] = .init(
+            acceptedID: acceptedID,
+            binding: staged.binding,
+            runOwnership: staged.runOwnership,
+            runID: staged.runID,
+            terminalResolved: staged.runOwnership == nil && staged.runID == nil
+        )
+        session.pendingHandoff.isStagedForSend = false
         session.providerSwitchConfirmationSaveFailed = false
         session.isDirty = true
         providerSwitchReconcileConfirmation(for: session, markerAlreadyDurable: false)

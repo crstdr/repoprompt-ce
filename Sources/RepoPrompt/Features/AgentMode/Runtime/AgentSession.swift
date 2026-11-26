@@ -551,8 +551,19 @@ struct AgentSession: Codable, Identifiable {
         createdByOverseerSessionID = try container.decodeIfPresent(UUID.self, forKey: .createdByOverseerSessionID)
         organizationalParentID = try container.decodeIfPresent(UUID.self, forKey: .organizationalParentID)
         delegationScopeID = try container.decodeIfPresent(UUID.self, forKey: .delegationScopeID)
-        pendingHandoffProviderSwitchDelivery = try container.decodeIfPresent(AgentProviderSwitchDelivery.self, forKey: .pendingHandoffProviderSwitchDelivery)
-        providerSwitchAcceptedID = try? container.decode(UUID.self, forKey: .providerSwitchAcceptedID)
+        let decodedDelivery = try container.decodeIfPresent(AgentProviderSwitchDelivery.self, forKey: .pendingHandoffProviderSwitchDelivery)
+        let acceptedKeyPresent = container.contains(.providerSwitchAcceptedID)
+        let decodedAcceptedID = try? container.decode(UUID.self, forKey: .providerSwitchAcceptedID)
+        if acceptedKeyPresent, decodedDelivery == .ready {
+            pendingHandoffProviderSwitchDelivery = .sending
+            providerSwitchAcceptedID = nil
+        } else if decodedAcceptedID != nil, decodedDelivery != .sending {
+            pendingHandoffProviderSwitchDelivery = decodedDelivery
+            providerSwitchAcceptedID = nil
+        } else {
+            pendingHandoffProviderSwitchDelivery = decodedDelivery
+            providerSwitchAcceptedID = decodedAcceptedID
+        }
         pendingHandoffPayload = try container.decodeIfPresent(String.self, forKey: .pendingHandoffPayload)
         pendingHandoffAwaitsLocalClaudeOverflowInput = try container.decodeIfPresent(Bool.self, forKey: .pendingHandoffAwaitsLocalClaudeOverflowInput)
         pendingHandoffCreatedAt = try container.decodeIfPresent(Date.self, forKey: .pendingHandoffCreatedAt)

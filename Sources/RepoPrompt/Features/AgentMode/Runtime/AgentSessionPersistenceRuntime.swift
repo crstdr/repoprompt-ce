@@ -601,14 +601,30 @@ final class AgentSessionPersistenceRuntime {
         guard queue.begin(sessionID: sessionID) else {
             return .failure(.init(operation: .save, tabID: writer.session.tabID, message: "A save for this session is already in flight."))
         }
+        let session = writer.session
         defer {
             defer { scope?.noteSettlementChanged() }
             if queue.finish(sessionID: sessionID), let currentOwner = currentOwner(for: sessionID) {
                 scheduleSave(for: currentOwner.tabID)
             }
+            if session.providerSwitchConfirmationSaveFailed == false,
+               let acceptedID = session.pendingHandoff.providerSwitchAcceptedID,
+               scope?.linkExecution?.providerSwitchConfirmationFlights[
+                   .init(sessionID: sessionID, acceptedID: acceptedID)
+               ] == nil
+            {
+                scope?.linkExecution?.providerSwitchReconcileConfirmation(for: session, markerAlreadyDurable: true)
+            }
         }
-        let session = writer.session
-        let projectedPayload = rebuildPayload?() ?? payload
+        let projectedPayload: AgentSession
+        if let rebuildPayload {
+            guard let rebuilt = rebuildPayload() else {
+                return .failure(.init(operation: .save, tabID: session.tabID, message: "The provider-switch confirmation projection is stale."))
+            }
+            projectedPayload = rebuilt
+        } else {
+            projectedPayload = payload
+        }
         let projectedItemCount = rebuildPayload == nil ? canonicalItemCount : projectedPayload.effectiveCanonicalItemCount
         session.saveDebounceTask?.cancel()
         session.saveDebounceTask = nil

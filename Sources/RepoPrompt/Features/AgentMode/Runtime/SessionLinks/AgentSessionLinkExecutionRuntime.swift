@@ -55,10 +55,22 @@ final class AgentSessionLinkExecutionRuntime {
     var pendingSendEffects: [UUID: PendingSendEffect] = [:]
     /// One provider-free confirmation flight per live session. The task is runtime-only; the
     /// accepted UUID remains the sole persisted authority across restart.
-    var providerSwitchConfirmationFlights: [UUID: UUID] = [:]
+    struct ProviderSwitchConfirmationKey: Hashable {
+        let sessionID: UUID
+        let acceptedID: UUID
+    }
+    var providerSwitchConfirmationFlights: [ProviderSwitchConfirmationKey: UUID] = [:]
     /// Runtime-only failure presentation for an accepted marker whose bounded confirmation save
     /// exhausted its attempts. Hydration clears this and retries from the durable marker.
     var providerSwitchConfirmationSaveFailures: Set<UUID> = []
+    struct ProviderSwitchConfirmationRecord {
+        let acceptedID: UUID
+        let binding: AgentSessionRestorationBindingToken?
+        let runOwnership: AgentRunOwnership?
+        let runID: UUID?
+        var terminalResolved: Bool
+    }
+    var providerSwitchConfirmationRecords: [UUID: ProviderSwitchConfirmationRecord] = [:]
     /// Provider producers join separately from terminal-save effects to avoid a terminal cycle.
     var pendingManagedInputEffects: [UUID: PendingSendEffect] = [:]
     var pendingStopEffects: [UUID: PendingSendEffect] = [:]

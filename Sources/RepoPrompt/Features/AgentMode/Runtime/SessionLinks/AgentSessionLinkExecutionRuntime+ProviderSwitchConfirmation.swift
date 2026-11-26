@@ -16,16 +16,17 @@ extension AgentSessionLinkExecutionRuntime {
               session.pendingHandoff.providerSwitchDelivery == .sending,
               let sessionID = session.activeAgentSessionID
         else { return }
-        if providerSwitchConfirmationFlights[session.tabID] != nil { return }
+        let flightKey = ProviderSwitchConfirmationKey(sessionID: sessionID, acceptedID: acceptedID)
+        if providerSwitchConfirmationFlights[flightKey] != nil { return }
         let flightID = UUID()
-        providerSwitchConfirmationFlights[session.tabID] = flightID
+        providerSwitchConfirmationFlights[flightKey] = flightID
         session.providerSwitchConfirmationSaveFailed = false
         providerSwitchConfirmationSaveFailures.remove(sessionID)
         let task = Task { @MainActor [weak self, weak session, weak scope] in
             guard let self, let session, let scope else { return }
             defer {
-                if self.providerSwitchConfirmationFlights[session.tabID] == flightID {
-                    self.providerSwitchConfirmationFlights.removeValue(forKey: session.tabID)
+                if self.providerSwitchConfirmationFlights[flightKey] == flightID {
+                    self.providerSwitchConfirmationFlights.removeValue(forKey: flightKey)
                 }
                 self.pendingSendEffects.removeValue(forKey: flightID)
                 scope.noteSettlementChanged()
@@ -38,6 +39,11 @@ extension AgentSessionLinkExecutionRuntime {
                       session.pendingHandoff.providerSwitchAcceptedID == acceptedID,
                       session.pendingHandoff.providerSwitchDelivery == .sending
                 else { return }
+                if let record = self.providerSwitchConfirmationRecords[sessionID],
+                   record.acceptedID == acceptedID, !record.terminalResolved
+                {
+                    return
+                }
                 if attempt > 0 {
                     // Bounded and event-driven: the delay is only within this single flight and
                     // never parks a timer after persistent failure.
@@ -81,6 +87,7 @@ extension AgentSessionLinkExecutionRuntime {
                     }
                 )
                 if case .success = result { return }
+                if Task.isCancelled { return }
                 lastFailure = true
             }
             guard scope.sessions[session.tabID] === session,
@@ -105,10 +112,17 @@ extension AgentSessionLinkExecutionRuntime {
               scope.sessions[session.tabID] === session,
               session.providerSwitchConfirmationSaveFailed,
               let acceptedID = session.pendingHandoff.providerSwitchAcceptedID,
+              let sessionID = session.activeAgentSessionID,
+              providerSwitchConfirmationFlights[ProviderSwitchConfirmationKey(sessionID: sessionID, acceptedID: acceptedID)] == nil,
+              providerSwitchConfirmationRecords[sessionID]?.terminalResolved != false,
               let writer = providerSwitchConfirmationWriter(for: session),
               let payload = providerSwitchConfirmationPayload(for: session, acceptedID: acceptedID, includeNotice: false),
               let transcript = payload.transcript
         else { return false }
+        let discardFlightID = UUID()
+        let discardFlightKey = ProviderSwitchConfirmationKey(sessionID: sessionID, acceptedID: acceptedID)
+        providerSwitchConfirmationFlights[discardFlightKey] = discardFlightID
+        defer { providerSwitchConfirmationFlights.removeValue(forKey: discardFlightKey) }
         let result = await scope.persistence.flushProviderSwitchProjectedSave(
             payload: payload,
             writer: writer,
@@ -118,9 +132,9 @@ extension AgentSessionLinkExecutionRuntime {
                 guard let self, let session,
                       scope.sessions[session.tabID] === session,
                       session.pendingHandoff.providerSwitchAcceptedID == acceptedID,
-                      receipt.payload.transcript != nil
+                      let finalTranscript = receipt.payload.transcript
                 else { return false }
-                self.applyProviderSwitchConfirmationReceipt(receipt, to: session, transcript: transcript)
+                self.applyProviderSwitchConfirmationReceipt(receipt, to: session, transcript: finalTranscript)
                 return true
             }
         )
@@ -175,8 +189,20 @@ extension AgentSessionLinkExecutionRuntime {
                     text: noticeText
                 )
             )
-            if !items.contains(where: { $0.id == acceptedID }) {
-                items.append(notice)
+            if let existing = items.first(where: { $0.id == acceptedID }) {
+                guard existing.recoveryDiagnostic?.id == acceptedID,
+                      existing.recoveryDiagnostic?.reason == "providerSwitch",
+                      existing.recoveryDiagnostic?.outcome == "sent"
+                else { return nil }
+            } else {
+                let summaryIDs = payload.transcript?.turns.flatMap { turn in
+                    turn.summary?.recoveryDiagnostics ?? []
+                } ?? []
+                if let summary = summaryIDs.first(where: { $0.id == acceptedID }) {
+                    guard summary.reason == "providerSwitch", summary.outcome == "sent" else { return nil }
+                } else {
+                    items.append(notice)
+                }
             }
         }
         payload = payload.withItems(items)
