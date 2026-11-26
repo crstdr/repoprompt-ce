@@ -115,7 +115,7 @@ extension AgentSessionLinkExecutionRuntime {
                 && session.selfCompactState.active?.id != ignoresSelfCompactRequestID,
             stopInProgress: session.stopState.isStopping(binding: session.persistentSessionBindingIdentity),
             backgroundCompactionSettling: session.isSettlingACPBackgroundCompaction,
-            providerSwitchUnconfirmed: providerSwitchUnconfirmed(session) || session.providerSwitchConfirmationSaveFailed,
+            providerSwitchUnconfirmed: providerSwitchUnconfirmed(session),
             providerHandoverNeedsReview: !ignoresProviderSwitchStalenessAfterAcceptance && providerSwitchNeedsReview(session),
             hasWaitingPrompt: session.waitingPrompt != nil,
             hasPendingAskUser: session.pendingAskUser != nil,

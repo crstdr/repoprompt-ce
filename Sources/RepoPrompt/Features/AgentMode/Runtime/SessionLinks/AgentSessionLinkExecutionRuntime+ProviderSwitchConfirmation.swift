@@ -42,6 +42,7 @@ extension AgentSessionLinkExecutionRuntime {
                     // Bounded and event-driven: the delay is only within this single flight and
                     // never parks a timer after persistent failure.
                     try? await Task.sleep(nanoseconds: UInt64(attempt) * 100_000_000)
+                    if Task.isCancelled { return }
                 }
                 guard let writer = self.providerSwitchConfirmationWriter(for: session) else {
                     lastFailure = true
@@ -53,6 +54,7 @@ extension AgentSessionLinkExecutionRuntime {
                         lastFailure = true
                         continue
                     }
+                    if Task.isCancelled { return }
                     markerDurable = true
                 }
                 guard let payload = self.providerSwitchConfirmationPayload(
@@ -72,21 +74,12 @@ extension AgentSessionLinkExecutionRuntime {
                               session.pendingHandoff.providerSwitchAcceptedID == acceptedID,
                               let transcript = receipt.payload.transcript
                         else { return false }
-                        let sourceItems = receipt.payload.toLiveItems()
-                        session.setItemsSilently(sourceItems, reason: .persistedSessionHydration)
-                        _ = AgentSessionTranscriptRefreshRuntime.applyTranscriptPresentation(
-                            transcript, sourceItems: sourceItems, to: session
-                        )
-                        session.pendingHandoff.clearAfterSend()
-                        session.providerSwitchConfirmationSaveFailed = false
-                        session.isDirty = false
+                        self.applyProviderSwitchConfirmationReceipt(receipt, to: session, transcript: transcript)
                         self.providerSwitchConfirmationSaveFailures.remove(sessionID)
                         return true
                     }
                 )
-                if case .success = result {
-                    return
-                }
+                if case .success = result { return }
                 lastFailure = true
             }
             guard scope.sessions[session.tabID] === session,
@@ -101,6 +94,36 @@ extension AgentSessionLinkExecutionRuntime {
         pendingSendEffects[flightID] = PendingSendEffect(
             sessionIdentity: ObjectIdentifier(session), task: task
         )
+    }
+
+    /// Finalizes an accepted marker through the same projected Save B as automatic confirmation.
+    /// The safe Discard action therefore cannot expose a carrier-free live state to a concurrent
+    /// save or provider ingress before its clear is durable.
+    func providerSwitchDiscardAcceptedConfirmation(for session: TabSession) async -> Bool {
+        guard let scope,
+              scope.sessions[session.tabID] === session,
+              session.providerSwitchConfirmationSaveFailed,
+              let acceptedID = session.pendingHandoff.providerSwitchAcceptedID,
+              let writer = providerSwitchConfirmationWriter(for: session),
+              let payload = providerSwitchConfirmationPayload(for: session, acceptedID: acceptedID),
+              let transcript = payload.transcript
+        else { return false }
+        let result = await scope.persistence.flushProviderSwitchProjectedSave(
+            payload: payload,
+            writer: writer,
+            canonicalItemCount: payload.effectiveCanonicalItemCount,
+            apply: { [weak self, weak session] receipt in
+                guard let self, let session,
+                      scope.sessions[session.tabID] === session,
+                      session.pendingHandoff.providerSwitchAcceptedID == acceptedID,
+                      receipt.payload.transcript != nil
+                else { return false }
+                self.applyProviderSwitchConfirmationReceipt(receipt, to: session, transcript: transcript)
+                return true
+            }
+        )
+        if case .success = result { return true }
+        return false
     }
 
     func providerSwitchConfirmationWriter(
@@ -159,6 +182,21 @@ extension AgentSessionLinkExecutionRuntime {
         payload.pendingHandoffSourceItemID = nil
         payload.pendingHandoffDefersProviderLockUntilSend = false
         return payload
+    }
+
+    private func applyProviderSwitchConfirmationReceipt(
+        _ receipt: AgentSessionSaveRuntime.Receipt,
+        to session: TabSession,
+        transcript: AgentTranscript
+    ) {
+        let sourceItems = receipt.payload.toLiveItems()
+        session.setItemsSilently(sourceItems, reason: .persistedSessionHydration)
+        _ = AgentSessionTranscriptRefreshRuntime.applyTranscriptPresentation(
+            transcript, sourceItems: sourceItems, to: session
+        )
+        session.pendingHandoff.clearAfterSend()
+        session.providerSwitchConfirmationSaveFailed = false
+        session.isDirty = false
     }
 
     private static func providerSwitchConfirmationSnapshot(

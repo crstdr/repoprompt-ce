@@ -662,6 +662,10 @@ final class AgentSessionPersistenceRuntime {
             )
             switch outcome {
             case let .committed(receipt):
+                guard !Task.isCancelled else {
+                    session.isDirty = true
+                    return .failure(.init(operation: .save, tabID: session.tabID, message: "The provider-switch confirmation was cancelled before live application."))
+                }
                 guard writer.isCurrent, sessions[session.tabID] === session,
                       session.currentRestorationBindingToken == receipt.binding,
                       apply(receipt)

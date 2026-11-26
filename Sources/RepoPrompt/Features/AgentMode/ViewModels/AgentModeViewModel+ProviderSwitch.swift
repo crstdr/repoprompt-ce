@@ -1119,23 +1119,7 @@ extension AgentModeViewModel {
     func discardProviderSwitchHandover(tabID: UUID) async -> Bool {
         guard providerSwitchMutation == nil, let session = sessions[tabID], session.pendingHandoff.providerSwitchDelivery != nil else { return false }
         if session.pendingHandoff.providerSwitchAcceptedID != nil {
-            guard session.providerSwitchConfirmationSaveFailed,
-                  let writer = linkExecutionRuntime.providerSwitchConfirmationWriter(for: session)
-            else { return false }
-            let acceptedID = session.pendingHandoff.providerSwitchAcceptedID
-            session.pendingHandoff.clearAfterSend()
-            let text = "Pending handover discarded; chat history unchanged."
-            let notice = AgentChatItem(
-                id: acceptedID ?? UUID(), kind: .system, text: text,
-                sequenceIndex: session.nextSequenceIndex,
-                recoveryDiagnostic: .init(id: acceptedID ?? UUID(), reason: "providerSwitch", outcome: "discarded", text: text)
-            )
-            session.appendItem(notice)
-            session.providerSwitchConfirmationSaveFailed = false
-            session.isDirty = true
-            let result = await persistenceRuntime.flushSaveRequired(writer: writer)
-            if case .failure = result { persistenceRuntime.scheduleSave(for: session) }
-            return true
+            return await linkExecutionRuntime.providerSwitchDiscardAcceptedConfirmation(for: session)
         }
         // Discard needs exact local ownership, not a valid source descriptor or a rendered sheet.
         var preview = captureProviderSwitchPreview(session, agent: session.selectedAgent, model: session.selectedModelRaw, source: nil, descriptor: nil)
