@@ -1787,8 +1787,11 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
         }
 
         func testSwitchAcceptedClearIsPinnedAcrossSchedulingAndPersistence() async throws {
-            enum Fault: Error { case clear }
-            for drift in ["beforeSave", "duringSave", "retirement"] {
+            enum Fault: Error { case markerSave }
+            // beforeSave/duringSave: the writer changes before Save A is durable, so only durable
+            // evidence from the successor's own ordinary save may finish the accepted marker.
+            // afterSaveA/retirement: the origin persisted the marker, so Save B finishes it once settled.
+            for drift in ["beforeSave", "duringSave", "afterSaveA", "retirement"] {
                 try await withFixture { fixture in
                     let vm = fixture.viewModel
                     let session = fixture.sourceSession
@@ -1814,18 +1817,29 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                         XCTAssertEqual(session.currentRestorationBindingToken, binding)
                         XCTAssertFalse(writer.isCurrent)
                     }
-                    var saves = 0
+                    @MainActor func cancelDebouncedSave() {
+                        session.saveDebounceTask?.cancel()
+                        session.saveDebounceTask = nil
+                    }
+                    func persisted() throws -> AgentSession {
+                        try JSONDecoder().decode(AgentSession.self, from: Data(contentsOf: savedURL))
+                    }
+                    func sentIDs(_ items: [AgentChatItem]) -> [UUID] {
+                        items.filter { $0.recoveryDiagnostic?.outcome == "sent" }.map(\.id)
+                    }
+                    var saves: [AgentSession] = []
                     vm.test_setAgentSessionSaver { saved, _, _ in
-                        saves += 1
-                        if saves == 2, drift == "duringSave" {
+                        saves.append(saved)
+                        if drift == "duringSave", saved.providerSwitchAcceptedID != nil, writer.isCurrent {
                             reacquire()
-                            throw Fault.clear
+                            throw Fault.markerSave
                         }
                         try JSONEncoder().encode(saved).write(to: savedURL, options: .atomic)
                         return savedURL
                     }
                     let messages = await vm.linkExecutionRuntime.prepareProviderSwitchHandoverForSend(preparation, session: session, stopFence: .init(session: session))
                     XCTAssertNotNil(messages)
+                    XCTAssertEqual(saves.count, 1)
                     let runID = UUID()
                     session.installRunID(runID)
                     session.beginRunAttempt(source: "test.switch.writerClear")
@@ -1838,28 +1852,181 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                         XCTAssertTrue(writer.isCurrent)
                     }
                     vm.linkExecutionRuntime.providerSwitchRecordPhysicalAcceptance(session: session, context: context)
-                    XCTAssertNil(session.pendingHandoff.providerSwitchDelivery)
-                    XCTAssertEqual(session.items.count(where: { $0.recoveryDiagnostic?.outcome == "sent" }), 1)
-                    // No suspension between acknowledgement and this replacement: the scheduled
-                    // effect must check the originating incarnation before selecting a save target.
+                    let acceptedID = try XCTUnwrap(session.pendingHandoff.providerSwitchAcceptedID)
+                    XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .sending)
+                    XCTAssertTrue(sentIDs(session.items).isEmpty, "No notice before the durable clear")
+                    // No suspension between acceptance and this replacement: the scheduled effect must
+                    // check the originating incarnation before Save A.
                     if drift == "beforeSave" { reacquire() }
                     await vm.linkExecutionRuntime.drainPendingSendEffects(for: session)
-                    XCTAssertEqual(saves, drift == "beforeSave" ? 1 : 2)
-                    XCTAssertNil(session.pendingHandoff.providerSwitchDelivery, "Failed old effects cannot restore uncertainty onto a successor")
+                    cancelDebouncedSave()
+                    let originPersistedMarker = drift == "afterSaveA" || drift == "retirement"
+                    XCTAssertEqual(saves.count, drift == "beforeSave" ? 1 : 2, drift)
+                    XCTAssertEqual(try persisted().providerSwitchAcceptedID, originPersistedMarker ? acceptedID : nil, drift)
+                    XCTAssertEqual(try persisted().pendingHandoffProviderSwitchDelivery, .sending, drift)
+                    XCTAssertTrue(try sentIDs(persisted().toLiveItems()).isEmpty, drift)
+                    XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .sending, "Save B waits for terminal settlement")
+                    XCTAssertEqual(session.pendingHandoff.providerSwitchAcceptedID, acceptedID)
+                    if drift == "afterSaveA" { reacquire() }
+
+                    session.runState = .running
+                    await vm.runService.test_publishNaturalCompletion(session)
+                    cancelDebouncedSave()
+                    await vm.linkExecutionRuntime.drainPendingSendEffects(for: session)
+                    cancelDebouncedSave()
                     XCTAssertNil(session.pendingHandoff.providerSwitchDispatch)
-                    let persisted = try JSONDecoder().decode(AgentSession.self, from: Data(contentsOf: savedURL))
-                    XCTAssertEqual(persisted.pendingHandoffProviderSwitchDelivery, drift == "retirement" ? nil : .sending)
-                    XCTAssertEqual(persisted.toLiveItems().count(where: { $0.recoveryDiagnostic?.outcome == "sent" }), drift == "retirement" ? 1 : 0)
-                    if drift != "retirement" {
-                        XCTAssertTrue(session.isDirty, "An acknowledged in-memory effect still needs durable acknowledgement")
+                    if !originPersistedMarker {
+                        // Settlement alone cannot let a successor finish a marker it never saw durable.
+                        XCTAssertFalse(saves.contains { $0.pendingHandoffProviderSwitchDelivery == nil }, drift)
+                        XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .sending, drift)
+                        XCTAssertEqual(session.pendingHandoff.providerSwitchAcceptedID, acceptedID, drift)
+                        XCTAssertNil(try persisted().providerSwitchAcceptedID, drift)
+                        XCTAssertTrue(sentIDs(session.items).isEmpty, drift)
+                        XCTAssertTrue(session.isDirty, "The live acceptance still needs durable acknowledgement")
+                        // The successor's own durable save of the live marker is the evidence that lets it finish.
                         let successor = try XCTUnwrap(vm.runtimeCommand(sessionID: XCTUnwrap(session.activeAgentSessionID)))
                         XCTAssertNotEqual(successor.identity, writer.identity)
                         let result = await successor.writer.scope.persistence.flushSaveRequired(for: session.tabID, workspaceID: successor.identity.workspaceID)
-                        guard case .success = result else { return XCTFail("The new writer must be able to persist the retained acknowledgement") }
-                        let reopened = try JSONDecoder().decode(AgentSession.self, from: Data(contentsOf: savedURL))
-                        XCTAssertNil(reopened.pendingHandoffProviderSwitchDelivery)
-                        XCTAssertEqual(reopened.toLiveItems().count(where: { $0.recoveryDiagnostic?.outcome == "sent" }), 1)
+                        guard case .success = result else { return XCTFail("The new writer must be able to persist the retained acceptance") }
                     }
+                    try await AsyncTestWait.waitUntil("Save B clears the durable marker") {
+                        session.pendingHandoff.providerSwitchDelivery == nil
+                    }
+                    await vm.linkExecutionRuntime.drainPendingSendEffects(for: session)
+                    XCTAssertNil(session.pendingHandoff.providerSwitchAcceptedID, drift)
+                    XCTAssertNil(session.pendingHandoff.payload, drift)
+                    XCTAssertEqual(sentIDs(session.items), [acceptedID], drift)
+                    let reopened = try persisted()
+                    XCTAssertNil(reopened.pendingHandoffProviderSwitchDelivery, drift)
+                    XCTAssertNil(reopened.providerSwitchAcceptedID, drift)
+                    XCTAssertNil(reopened.pendingHandoffPayload, drift)
+                    XCTAssertEqual(sentIDs(reopened.toLiveItems()), [acceptedID], drift)
+                }
+            }
+        }
+
+        func testSuccessorWithoutDurableMarkerEvidenceNeitherRecordsNorFinishesAcceptance() async throws {
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                vm.test_setSuppressesAgentSessionPersistence(false)
+                let savedURL = fixture.rootURL.appendingPathComponent("successor-no-evidence.json")
+                defer {
+                    vm.test_setAgentSessionSaver { _, _, _ in savedURL }
+                    session.saveDebounceTask?.cancel()
+                    session.saveDebounceTask = nil
+                    vm.test_setSuppressesAgentSessionPersistence(nil)
+                }
+                try installSwitch(fixture)
+                let preparation = try await switchPreparation(fixture)
+                let writer = preparation.command.writer
+                let scope = writer.scope
+                var saves: [AgentSession] = []
+                vm.test_setAgentSessionSaver { saved, _, _ in
+                    saves.append(saved)
+                    return savedURL
+                }
+                let payload = try XCTUnwrap(session.pendingHandoff.payload)
+                _ = await vm.linkExecutionRuntime.prepareProviderSwitchHandoverForSend(preparation, session: session, stopFence: .init(session: session))
+                XCTAssertEqual(saves.count, 1)
+                let runID = UUID()
+                session.installRunID(runID)
+                session.beginRunAttempt(source: "test.switch.successorNoEvidence")
+                let dispatch = AgentSessionLinkPromptDispatchID.headlessRun(runID: runID)
+                XCTAssertTrue(vm.linkExecutionRuntime.providerSwitchAcquirePhysicalDispatch(session: session, dispatchID: dispatch))
+                vm.linkExecutionRuntime.providerSwitchRecordPhysicalAcceptance(
+                    session: session, context: AgentSessionLinkDispatchContext(session: session, dispatchID: dispatch)
+                )
+                let acceptedID = try XCTUnwrap(session.pendingHandoff.providerSwitchAcceptedID)
+                // Replace the originating writer before its Save A can run.
+                let sessions = scope.sessions
+                var withoutOrigin = sessions
+                withoutOrigin.removeValue(forKey: session.tabID)
+                scope.replaceSessions(withoutOrigin)
+                scope.replaceSessions(sessions)
+                XCTAssertFalse(writer.isCurrent)
+                await vm.linkExecutionRuntime.drainPendingSendEffects(for: session)
+                session.saveDebounceTask?.cancel()
+                session.saveDebounceTask = nil
+                // Every later trigger: terminal settlement, another writer change, an explicit wake.
+                session.runState = .running
+                await vm.runService.test_publishNaturalCompletion(session)
+                session.saveDebounceTask?.cancel()
+                session.saveDebounceTask = nil
+                scope.replaceSessions(withoutOrigin)
+                scope.replaceSessions(sessions)
+                vm.linkExecutionRuntime.providerSwitchReconcileConfirmation(for: session)
+                await vm.linkExecutionRuntime.drainPendingSendEffects(for: session)
+                session.saveDebounceTask?.cancel()
+                session.saveDebounceTask = nil
+
+                XCTAssertEqual(saves.count, 1, "The successor performs neither Save A nor Save B")
+                XCTAssertFalse(saves.contains { $0.providerSwitchAcceptedID != nil })
+                XCTAssertFalse(saves.contains { $0.pendingHandoffProviderSwitchDelivery == nil })
+                XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .sending)
+                XCTAssertEqual(session.pendingHandoff.providerSwitchAcceptedID, acceptedID)
+                XCTAssertEqual(session.pendingHandoff.payload, payload)
+                XCTAssertFalse(session.providerSwitchConfirmationSaveFailed)
+                XCTAssertFalse(session.items.contains { $0.recoveryDiagnostic?.outcome == "sent" })
+            }
+        }
+
+        func testAcceptedHandoverFinishesAfterStopFailureOrProoflessSettlement() async throws {
+            for end in ["stop", "failure", "completionWithoutProof"] {
+                try await withFixture { fixture in
+                    let vm = fixture.viewModel
+                    let session = fixture.sourceSession
+                    vm.test_setSuppressesAgentSessionPersistence(false)
+                    let savedURL = fixture.rootURL.appendingPathComponent("terminal-\(end).json")
+                    defer {
+                        vm.test_setAgentSessionSaver { _, _, _ in savedURL }
+                        session.saveDebounceTask?.cancel()
+                        session.saveDebounceTask = nil
+                        vm.test_setSuppressesAgentSessionPersistence(nil)
+                    }
+                    try installSwitch(fixture)
+                    let preparation = try await switchPreparation(fixture)
+                    vm.test_setAgentSessionSaver { saved, _, _ in
+                        try JSONEncoder().encode(saved).write(to: savedURL, options: .atomic)
+                        return savedURL
+                    }
+                    _ = await vm.linkExecutionRuntime.prepareProviderSwitchHandoverForSend(preparation, session: session, stopFence: .init(session: session))
+                    let runID = UUID()
+                    session.installRunID(runID)
+                    session.beginRunAttempt(source: "test.switch.terminal.\(end)")
+                    session.runState = .running
+                    let dispatch = AgentSessionLinkPromptDispatchID.headlessRun(runID: runID)
+                    XCTAssertTrue(vm.linkExecutionRuntime.providerSwitchAcquirePhysicalDispatch(session: session, dispatchID: dispatch))
+                    vm.linkExecutionRuntime.providerSwitchRecordPhysicalAcceptance(
+                        session: session, context: AgentSessionLinkDispatchContext(session: session, dispatchID: dispatch)
+                    )
+                    let acceptedID = try XCTUnwrap(session.pendingHandoff.providerSwitchAcceptedID)
+                    await vm.linkExecutionRuntime.drainPendingSendEffects(for: session)
+                    let saveA = try JSONDecoder().decode(AgentSession.self, from: Data(contentsOf: savedURL))
+                    XCTAssertEqual(saveA.providerSwitchAcceptedID, acceptedID, end)
+                    XCTAssertEqual(saveA.pendingHandoffProviderSwitchDelivery, .sending, end)
+                    XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .sending, "Save B waits for terminal settlement")
+                    switch end {
+                    case "stop":
+                        await vm.cancelAgentRun(tabID: session.tabID)
+                    case "failure":
+                        await vm.runService.test_publishNaturalCompletion(session, terminalState: .failed)
+                    default:
+                        // Settlement must not depend on the transient dispatch proof surviving.
+                        session.pendingHandoff.providerSwitchDispatch = nil
+                        await vm.runService.test_publishNaturalCompletion(session)
+                    }
+                    try await AsyncTestWait.waitUntil("Save B after \(end)") {
+                        session.pendingHandoff.providerSwitchDelivery == nil
+                    }
+                    await vm.linkExecutionRuntime.drainPendingSendEffects(for: session)
+                    XCTAssertNil(session.pendingHandoff.providerSwitchAcceptedID, end)
+                    XCTAssertNil(session.pendingHandoff.payload, end)
+                    XCTAssertEqual(session.items.filter { $0.recoveryDiagnostic?.outcome == "sent" }.map(\.id), [acceptedID], end)
+                    let cleared = try JSONDecoder().decode(AgentSession.self, from: Data(contentsOf: savedURL))
+                    XCTAssertNil(cleared.pendingHandoffProviderSwitchDelivery, end)
+                    XCTAssertNil(cleared.providerSwitchAcceptedID, end)
+                    XCTAssertEqual(cleared.toLiveItems().filter { $0.recoveryDiagnostic?.outcome == "sent" }.map(\.id), [acceptedID], end)
                 }
             }
         }

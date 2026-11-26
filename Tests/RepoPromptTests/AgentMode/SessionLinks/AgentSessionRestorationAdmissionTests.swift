@@ -42,6 +42,43 @@ final class AgentSessionRestorationAdmissionTests: XCTestCase {
         XCTAssertTrue(reopened.providerRequests.events.isEmpty, "Opening an empty session must not start a provider")
     }
 
+    /// A restart after Save A has no in-memory record or carrying run. Hydration alone must take
+    /// the durable accepted marker to the provider-free Save B without any provider call.
+    func testRestartWithDurableAcceptedHandoverFinishesConfirmationWithoutProvider() async throws {
+        let fixture = try await makeFixture()
+        let creationResult = await fixture.vm.createAndActivateSessionTab()
+        let createdTabID = try XCTUnwrap(creationResult)
+        let sessionID = try XCTUnwrap(fixture.vm.sessions[createdTabID]?.activeAgentSessionID)
+        let workspace = try await persistCarrier(fixture)
+        await disposeForFreshRuntimeReopen(fixture)
+        let payloadURL = sessionFile(root: fixture.root, sessionID: sessionID)
+        var saved = try JSONDecoder().decode(AgentSession.self, from: Data(contentsOf: payloadURL))
+        let acceptedID = UUID()
+        saved.pendingHandoffPayload = "Accepted handover carrier"
+        saved.pendingHandoffCreatedAt = Date()
+        saved.pendingHandoffProviderSwitchDelivery = .sending
+        saved.providerSwitchAcceptedID = acceptedID
+        _ = try await fixture.writer.saveAgentSession(saved, for: workspace)
+
+        let reopened = try await makeFixture(root: fixture.root, workspace: workspace)
+        let restored = await reopened.vm.ensureSessionReady(tabID: createdTabID)
+        XCTAssertEqual(restored.activeAgentSessionID, sessionID)
+        try await AsyncTestWait.waitUntil("hydration finishes the durable accepted marker") {
+            restored.pendingHandoff.providerSwitchAcceptedID == nil
+        }
+        await reopened.vm.linkExecutionRuntime.drainPendingSendEffects(for: restored)
+        XCTAssertNil(restored.pendingHandoff.providerSwitchDelivery)
+        XCTAssertNil(restored.pendingHandoff.payload)
+        XCTAssertFalse(restored.providerSwitchConfirmationSaveFailed)
+        XCTAssertEqual(restored.items.filter { $0.recoveryDiagnostic?.outcome == "sent" }.map(\.id), [acceptedID])
+        let cleared = try JSONDecoder().decode(AgentSession.self, from: Data(contentsOf: payloadURL))
+        XCTAssertNil(cleared.pendingHandoffProviderSwitchDelivery)
+        XCTAssertNil(cleared.providerSwitchAcceptedID)
+        XCTAssertNil(cleared.pendingHandoffPayload)
+        XCTAssertEqual(cleared.toLiveItems().filter { $0.recoveryDiagnostic?.outcome == "sent" }.map(\.id), [acceptedID])
+        XCTAssertTrue(reopened.providerRequests.events.isEmpty, "Finishing a durable acceptance must not start a provider")
+    }
+
     func testRebindPreparationRejectsReacquiredBoundAndUnboundMembers() async throws {
         for loss in ["none", "boundSuccess", "unboundTarget", "boundTarget", "source"] {
             let fixture = try await makeFixture()
