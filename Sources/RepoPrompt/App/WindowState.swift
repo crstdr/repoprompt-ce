@@ -88,7 +88,7 @@ struct CoherentWindowTitlePresentation: Equatable {
     let workspaceDisplayName: String
     let renderedTitle: String
     /// Colour of the workspace this title shows; nil for None, System, or no workspace. Resolved
-    /// with the title so the dot and sticker never describe a different workspace than the text.
+    /// with the title so the sticker never describes a different workspace than the text.
     var workspaceColor: WorkspaceColor?
 
     static let appDefault = CoherentWindowTitlePresentation(
@@ -1649,8 +1649,7 @@ class WindowState: ObservableObject {
     private func refreshAgentChatTitleCluster() {
         agentChatTitleCluster.update(
             title: displayedWindowTitle,
-            showsChatOptions: currentAgentTitlebarChatOptionsTarget() != nil,
-            workspaceColor: coherentTitlePresentation.workspaceColor
+            showsChatOptions: currentAgentTitlebarChatOptionsTarget() != nil
         )
         let stickerVisibilityChanged = workspaceSticker.update(
             workspaceID: titleColorableWorkspace()?.id,

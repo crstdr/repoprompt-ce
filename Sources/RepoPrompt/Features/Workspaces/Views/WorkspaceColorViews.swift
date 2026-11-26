@@ -1,8 +1,8 @@
 import AppKit
 import SwiftUI
 
-/// The 8 pt workspace-colour dot shown before a workspace name (toolbar title, picker rows,
-/// Manage Workspaces rows). The hairline keeps pale colours legible on light backgrounds.
+/// The 8 pt workspace-colour dot shown before a workspace name (workspace picker rows, Manage
+/// Workspaces recovery-copy rows). The hairline keeps pale colours legible on light backgrounds.
 struct WorkspaceColorDot: View {
     let color: WorkspaceColor
 

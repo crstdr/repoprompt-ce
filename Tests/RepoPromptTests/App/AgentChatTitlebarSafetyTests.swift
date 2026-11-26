@@ -1422,9 +1422,9 @@ final class WorkspaceRestorationTitleTests: XCTestCase {
         XCTAssertEqual(foreignTitle, renamed)
     }
 
-    /// A same-ID colour edit on the active workspace repaints the title dot and the sticker with no
-    /// explicit title request; System shows neither and has no sticker.
-    func testActiveWorkspaceColorChangeRepaintsTitleClusterWithoutExplicitRequest() async throws {
+    /// A same-ID colour edit on the active workspace repaints the sticker with no explicit title
+    /// request; System has no sticker.
+    func testActiveWorkspaceColorChangeRepaintsStickerWithoutExplicitRequest() async throws {
         let fixture = try await makeFixture(systemNumber: 6)
         let window = fixture.window
         let target = window.workspaceManager.createWorkspace(
@@ -1432,7 +1432,6 @@ final class WorkspaceRestorationTitleTests: XCTestCase {
         )
         _ = await window.workspaceManager.switchWorkspace(to: target, saveState: false, reason: "titleColor")
         await resolveTitle(window)
-        XCTAssertNil(window.agentChatTitleCluster.state.workspaceColor)
         XCTAssertEqual(window.workspaceSticker.state, .init(workspaceID: target.id, color: nil))
 
         let repainted = expectation(description: "title re-resolved for the colour change")
@@ -1443,22 +1442,21 @@ final class WorkspaceRestorationTitleTests: XCTestCase {
         }
         window.setTitleWorkspaceColor(.teal, expectedWorkspaceID: target.id)
         await fulfillment(of: [repainted], timeout: 5)
-        XCTAssertEqual(window.agentChatTitleCluster.state.workspaceColor, .teal)
         XCTAssertEqual(window.workspaceSticker.state, .init(workspaceID: target.id, color: .teal))
         XCTAssertEqual(window.workspaceManager.activeWorkspace?.color, "teal")
 
         let system = try XCTUnwrap(window.workspaceManager.workspaces.first(where: \.isSystemWorkspace))
         _ = await window.workspaceManager.switchWorkspace(to: system, saveState: false, reason: "titleColorSystem")
         await resolveTitle(window)
-        XCTAssertNil(window.agentChatTitleCluster.state.workspaceColor)
         XCTAssertEqual(window.workspaceSticker.state, .init(workspaceID: nil, color: nil))
         window.setTitleWorkspaceColor(.red, expectedWorkspaceID: system.id)
         XCTAssertNil(window.workspaceManager.workspace(withID: system.id)?.color)
     }
 
-    /// The colour has no window-level presentation (the former edge line reserved space at the window
-    /// root): a colour change reaches only the title dot and the sticker and publishes nothing on the
-    /// window state the root view observes, so nothing above the content can move.
+    /// The colour has no window-level or title presentation (the former edge line reserved space at
+    /// the window root, and the title no longer shows a dot): a colour change reaches only the
+    /// sticker and publishes nothing on the window state the root view observes or on the title
+    /// cluster, so neither the content nor the title can move.
     func testWorkspaceColorChangePublishesNothingOnWindowState() async throws {
         let fixture = try await makeFixture(systemNumber: 6)
         let window = fixture.window
@@ -1471,6 +1469,9 @@ final class WorkspaceRestorationTitleTests: XCTestCase {
         var windowPublishes = 0
         let subscription = window.objectWillChange.sink { windowPublishes += 1 }
         defer { subscription.cancel() }
+        var titlePublishes = 0
+        let titleSubscription = window.agentChatTitleCluster.objectWillChange.sink { titlePublishes += 1 }
+        defer { titleSubscription.cancel() }
         let repainted = expectation(description: "title re-resolved for the colour change")
         window.setWindowTitleResolutionDidCompleteHandlerForTesting {
             guard window.workspaceSticker.state.color == .violet else { return }
@@ -1479,8 +1480,9 @@ final class WorkspaceRestorationTitleTests: XCTestCase {
         }
         window.setTitleWorkspaceColor(.violet, expectedWorkspaceID: target.id)
         await fulfillment(of: [repainted], timeout: 5)
-        XCTAssertEqual(window.agentChatTitleCluster.state.workspaceColor, .violet)
+        XCTAssertEqual(window.workspaceSticker.state, .init(workspaceID: target.id, color: .violet))
         XCTAssertEqual(windowPublishes, 0)
+        XCTAssertEqual(titlePublishes, 0, "the title cluster carries no colour")
     }
 
     /// A picker opened on one workspace closes when the title switches to another, and a choice
