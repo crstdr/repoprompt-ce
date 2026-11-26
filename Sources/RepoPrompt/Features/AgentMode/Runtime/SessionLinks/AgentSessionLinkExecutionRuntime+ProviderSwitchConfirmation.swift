@@ -22,7 +22,10 @@ extension AgentSessionLinkExecutionRuntime {
             return
         }
         // A trigger that cannot make progress must not reset an exposed save-failed state.
-        guard providerSwitchConfirmationCanProgress(session, sessionID: sessionID, acceptedID: acceptedID) else { return }
+        guard providerSwitchConfirmationCanProgress(session, sessionID: sessionID, acceptedID: acceptedID) else {
+            providerSwitchConfirmationExposeIfStranded(session, sessionID: sessionID, acceptedID: acceptedID)
+            return
+        }
         let flightID = UUID()
         providerSwitchConfirmationFlights[flightKey] = flightID
         session.providerSwitchConfirmationSaveFailed = false
@@ -57,7 +60,12 @@ extension AgentSessionLinkExecutionRuntime {
                 if !record.markerDurable {
                     // Only the originating writer may record a late provider acceptance. A
                     // successor waits for durable evidence instead of inferring acceptance.
-                    guard let origin = record.originWriter, writer.identity == origin else { return }
+                    guard let origin = record.originWriter, writer.identity == origin else {
+                        if !providerSwitchConfirmationRerunRequested.contains(flightKey) {
+                            providerSwitchConfirmationExposeIfStranded(session, sessionID: sessionID, acceptedID: acceptedID)
+                        }
+                        return
+                    }
                     let save = await scope.persistence.flushSaveRequired(writer: writer)
                     guard case .success = save else {
                         lastFailure = true
@@ -134,6 +142,22 @@ extension AgentSessionLinkExecutionRuntime {
         if record.markerDurable { return record.terminalResolved }
         guard let origin = record.originWriter else { return false }
         return providerSwitchConfirmationWriter(for: session)?.identity == origin
+    }
+
+    /// After its run has ended, an accepted marker that is not durable and whose originating
+    /// writer is gone cannot be saved or finished by anyone (a successor never records Save A).
+    /// Expose the existing save-failed state so the banner offers Discard rather than an endless
+    /// progress state. Later durable evidence still wakes reconciliation and clears it.
+    private func providerSwitchConfirmationExposeIfStranded(
+        _ session: TabSession, sessionID: UUID, acceptedID: UUID
+    ) {
+        guard let record = providerSwitchConfirmationRecords[sessionID],
+              record.acceptedID == acceptedID, record.terminalResolved, !record.markerDurable,
+              !session.providerSwitchConfirmationSaveFailed
+        else { return }
+        providerSwitchConfirmationSaveFailures.insert(sessionID)
+        session.providerSwitchConfirmationSaveFailed = true
+        scope?.noteSettlementChanged()
     }
 
     private func providerSwitchNoteDurableMarker(sessionID: UUID, acceptedID: UUID) {

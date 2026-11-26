@@ -2195,8 +2195,21 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .sending)
                 XCTAssertEqual(session.pendingHandoff.providerSwitchAcceptedID, acceptedID)
                 XCTAssertEqual(session.pendingHandoff.payload, payload)
+                XCTAssertFalse(session.items.contains { $0.recoveryDiagnostic?.outcome == "sent" })
+                // The run has ended and no writer may finish this marker, so the session must not sit
+                // on progress: it exposes save failure, and the safe Discard is the way out.
+                XCTAssertTrue(session.providerSwitchConfirmationSaveFailed)
+                let discarded = await vm.linkExecutionRuntime.providerSwitchDiscardAcceptedConfirmation(for: session)
+                XCTAssertTrue(discarded)
+                XCTAssertNil(session.pendingHandoff.providerSwitchDelivery)
+                XCTAssertNil(session.pendingHandoff.providerSwitchAcceptedID)
                 XCTAssertFalse(session.providerSwitchConfirmationSaveFailed)
                 XCTAssertFalse(session.items.contains { $0.recoveryDiagnostic?.outcome == "sent" })
+                let discardWrite = try XCTUnwrap(saves.last)
+                XCTAssertEqual(saves.count, 2)
+                XCTAssertNil(discardWrite.pendingHandoffProviderSwitchDelivery)
+                XCTAssertNil(discardWrite.providerSwitchAcceptedID)
+                XCTAssertFalse(discardWrite.toLiveItems().contains { $0.recoveryDiagnostic?.outcome == "sent" })
             }
         }
 
