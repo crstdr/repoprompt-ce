@@ -497,6 +497,52 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
         }
     }
 
+    /// The sticker shows the title's workspace; its picker writes only to the workspace it opened
+    /// for, and collapsing the sidebar (which moves the sticker) closes it.
+    func testWorkspaceStickerFollowsTitleWorkspaceAndPickerWritesToIt() async throws {
+        try await withFixture { fixture in
+            let window = fixture.window
+            await awaitWindowTitleResolution(window)
+            XCTAssertEqual(window.workspaceSticker.state, .init(workspaceID: fixture.workspaceID, color: nil))
+
+            window.setTitleWorkspaceColor(.red, expectedWorkspaceID: UUID())
+            XCTAssertNil(window.workspaceManager.workspace(withID: fixture.workspaceID)?.color)
+
+            window.workspaceSticker.togglePicker(from: .sidebarToolbar)
+            window.workspaceSticker.select(.lime)
+            XCTAssertEqual(window.workspaceManager.workspace(withID: fixture.workspaceID)?.color, "lime")
+            XCTAssertEqual(
+                window.workspaceSticker.picker,
+                .init(workspaceID: fixture.workspaceID, host: .sidebarToolbar),
+                "choosing leaves the picker open"
+            )
+
+            window.setAgentSidebarCollapsed(true)
+            XCTAssertNil(window.workspaceSticker.picker)
+        }
+    }
+
+    /// Collapsing the sidebar moves compose and the sticker beside the traffic lights, after the
+    /// toggle; System shows no sticker there either.
+    func testCollapsedTitlebarAccessoryIncludesWorkspaceSticker() {
+        XCTAssertEqual(
+            AgentModeTitlebarLeadingItem.items(isSidebarCollapsed: true, showsWorkspaceSticker: true),
+            [.sidebarToggle, .newSession, .workspaceSticker]
+        )
+        XCTAssertEqual(
+            AgentModeTitlebarLeadingItem.items(isSidebarCollapsed: true, showsWorkspaceSticker: false),
+            [.sidebarToggle, .newSession]
+        )
+        XCTAssertEqual(
+            AgentModeTitlebarLeadingItem.items(isSidebarCollapsed: false, showsWorkspaceSticker: true),
+            [.sidebarToggle]
+        )
+        XCTAssertEqual(
+            AgentModeTitlebarLeadingItem.items(isSidebarCollapsed: false, showsWorkspaceSticker: false),
+            [.sidebarToggle]
+        )
+    }
+
     func testSnapshotAndTargetValidationFailClosedAcrossLifecycleChanges() async throws {
         try await withFixture { fixture in
             let snapshot = try XCTUnwrap(fixture.window.agentChatTitleClusterMenuSnapshot())

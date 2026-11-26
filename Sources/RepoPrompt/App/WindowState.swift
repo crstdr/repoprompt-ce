@@ -350,6 +350,9 @@ class WindowState: ObservableObject {
     private var isAgentSidebarCollapsed = false
     /// Narrow titlebar state observed only by the principal toolbar title cluster.
     let agentChatTitleCluster = AgentChatTitleClusterModel(title: WindowTitleFormatter.defaultTitle)
+    /// The workspace colour sticker and its picker, fed from the resolved title; observed only by
+    /// the sticker buttons in the sidebar's titlebar cluster and the leading titlebar accessory.
+    let workspaceSticker = WorkspaceStickerModel()
 
     /// The sticky instance number assigned for this window's workspace, qualified by that workspace.
     /// Installed only by `setWorkspaceInstanceAssignment(_:)`; never allocated here.
@@ -903,6 +906,9 @@ class WindowState: ObservableObject {
         // ordinary run, save, endpoint and MCP owners above are retained without UI startup work.
         if isPreparedSessionOwner { return }
 
+        workspaceSticker.onSelectColor = { [weak self] workspaceID, color in
+            self?.setTitleWorkspaceColor(color, expectedWorkspaceID: workspaceID)
+        }
         workspaceManager.isUnusedAutomaticChat = { [weak oracleViewModel] id in
             oracleViewModel?.isUnusedImplicitDefaultChat(id) == true
         }
@@ -1661,6 +1667,14 @@ class WindowState: ObservableObject {
             allowsWorkspaceColorMenu: colorableWorkspaceID != nil,
             workspaceID: colorableWorkspaceID
         )
+        let stickerVisibilityChanged = workspaceSticker.update(
+            workspaceID: colorableWorkspaceID,
+            color: coherentTitlePresentation.workspaceColor
+        )
+        // The collapsed accessory's width depends on whether it shows the sticker.
+        if stickerVisibilityChanged, isAgentSidebarCollapsed {
+            applyAgentTitlebarAccessoryIfPossible()
+        }
     }
 
     /// The workspace the installed title shows, when it can be coloured (not System).
@@ -1858,6 +1872,8 @@ class WindowState: ObservableObject {
     func setAgentSidebarCollapsed(_ collapsed: Bool) {
         guard isAgentSidebarCollapsed != collapsed else { return }
         isAgentSidebarCollapsed = collapsed
+        // The sticker moves to the other host, so an open picker would lose its anchor.
+        workspaceSticker.dismissPicker()
         applyAgentTitlebarAccessoryIfPossible()
     }
 
@@ -1882,6 +1898,7 @@ class WindowState: ObservableObject {
         if let existing = agentTitlebarAccessory {
             existing.update(
                 isSidebarCollapsed: isAgentSidebarCollapsed,
+                workspaceSticker: workspaceSticker,
                 onToggleSidebar: toggleSidebar,
                 onNewSession: action
             )
@@ -1891,6 +1908,7 @@ class WindowState: ObservableObject {
         } else {
             let accessory = AgentModeTitlebarAccessoryViewController(
                 isSidebarCollapsed: isAgentSidebarCollapsed,
+                workspaceSticker: workspaceSticker,
                 onToggleSidebar: toggleSidebar,
                 onNewSession: action
             )
