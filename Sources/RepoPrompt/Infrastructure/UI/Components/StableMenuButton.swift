@@ -87,6 +87,9 @@ struct StableMenuItem {
     let isEnabled: Bool
     let isSelected: Bool
     let imageSystemName: String?
+    /// A prebuilt image used instead of `imageSystemName`, keeping its own template flag (for
+    /// example a non-template colour swatch).
+    let image: NSImage?
     let style: StableMenuItemStyle
     /// Optional VoiceOver overrides forwarded to the produced `NSMenuItem`: the label
     /// replaces the spoken title, the value carries counts/state, and the hint is help.
@@ -100,6 +103,7 @@ struct StableMenuItem {
         isEnabled: Bool = true,
         isSelected: Bool = false,
         imageSystemName: String? = nil,
+        image: NSImage? = nil,
         style: StableMenuItemStyle = .normal,
         accessibilityLabel: String? = nil,
         accessibilityValue: String? = nil,
@@ -110,6 +114,7 @@ struct StableMenuItem {
         self.isEnabled = isEnabled
         self.isSelected = isSelected
         self.imageSystemName = imageSystemName
+        self.image = image
         self.style = style
         self.accessibilityLabel = accessibilityLabel
         self.accessibilityValue = accessibilityValue
@@ -121,6 +126,7 @@ struct StableMenuItem {
         isEnabled: Bool = true,
         isSelected: Bool = false,
         imageSystemName: String? = nil,
+        image: NSImage? = nil,
         style: StableMenuItemStyle = .normal,
         accessibilityLabel: String? = nil,
         accessibilityValue: String? = nil,
@@ -133,6 +139,7 @@ struct StableMenuItem {
             isEnabled: isEnabled,
             isSelected: isSelected,
             imageSystemName: imageSystemName,
+            image: image,
             style: style,
             accessibilityLabel: accessibilityLabel,
             accessibilityValue: accessibilityValue,
@@ -242,6 +249,10 @@ struct StableMenuItem {
     }
 
     private func configureImage(on item: NSMenuItem) {
+        if let image {
+            item.image = image
+            return
+        }
         guard let imageSystemName,
               let image = NSImage(systemSymbolName: imageSystemName, accessibilityDescription: title)
         else {
