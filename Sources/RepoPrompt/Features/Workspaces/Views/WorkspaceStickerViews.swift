@@ -84,6 +84,15 @@ final class WorkspaceStickerModel: ObservableObject {
         let host: WorkspaceStickerHost
     }
 
+    /// The swatch and close actions of one opening, captured by the view that shows it. Both act
+    /// only while that opening is still the open picker, so actions a view kept after the picker
+    /// closed or reopened do nothing.
+    struct PickerActions {
+        let presentation: PickerPresentation
+        let select: @MainActor (WorkspaceColor?) -> Void
+        let dismiss: @MainActor () -> Void
+    }
+
     @Published private(set) var state = State()
     /// nil while the picker is closed.
     @Published private(set) var picker: PickerPresentation?
@@ -131,6 +140,19 @@ final class WorkspaceStickerModel: ObservableObject {
     func select(_ color: WorkspaceColor?, in presentation: PickerPresentation) {
         guard picker == presentation else { return }
         onSelectColor(presentation.workspaceID, color)
+    }
+
+    func actions(for presentation: PickerPresentation) -> PickerActions {
+        PickerActions(
+            presentation: presentation,
+            select: { [weak self] color in self?.select(color, in: presentation) },
+            dismiss: { [weak self] in self?.dismissPicker(presentation) }
+        )
+    }
+
+    /// The actions of the opening `host` presents, or nil while it presents none.
+    func actions(in host: WorkspaceStickerHost) -> PickerActions? {
+        presentation(in: host).map(actions(for:))
     }
 
     /// The open picker if `host` presents it.

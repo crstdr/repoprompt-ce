@@ -1693,6 +1693,41 @@ final class WorkspaceRestorationTitleTests: XCTestCase {
         try assertOnlyCurrentForwards(retired: reopenedOnce, "close and reopen on the same workspace and host")
     }
 
+    /// The actions a sticker view captures for one opening (swatches and popover dismissal) do
+    /// nothing once that opening is retired, so a stale popover can neither recolour nor close a
+    /// newer picker.
+    func testRetiredOpeningActionsCannotSelectOrDismissNewerPicker() throws {
+        let model = WorkspaceStickerModel()
+        var chosen: [(UUID, WorkspaceColor?)] = []
+        model.onSelectColor = { chosen.append(($0, $1)) }
+        let workspaceID = UUID()
+        model.update(workspaceID: workspaceID, color: nil)
+
+        XCTAssertNil(model.actions(in: .sidebarToolbar), "no actions while the host shows no picker")
+        model.togglePicker(from: .sidebarToolbar)
+        let retired = try XCTUnwrap(model.actions(in: .sidebarToolbar))
+        XCTAssertNil(model.actions(in: .titlebarAccessory))
+
+        // Retire the opening, then reopen on the same workspace and host.
+        model.togglePicker(from: .sidebarToolbar)
+        model.togglePicker(from: .sidebarToolbar)
+        let current = try XCTUnwrap(model.actions(in: .sidebarToolbar))
+        XCTAssertNotEqual(current.presentation.id, retired.presentation.id)
+
+        retired.select(.red)
+        retired.dismiss()
+        XCTAssertTrue(chosen.isEmpty, "a retired swatch must not forward")
+        XCTAssertEqual(model.picker, current.presentation, "a retired dismissal must not close the newer picker")
+
+        current.select(.teal)
+        XCTAssertEqual(chosen.map(\.0), [workspaceID])
+        XCTAssertEqual(chosen.map(\.1), [.teal])
+        current.dismiss()
+        XCTAssertNil(model.picker)
+        current.select(.red)
+        XCTAssertEqual(chosen.count, 1, "actions of a closed opening do nothing")
+    }
+
     /// Registration during a held switch assigns the target through the manager's established
     /// allocation point; the outgoing selection still keeps the title from mixing identities.
     func testRegistrationDuringHeldSwitchNeverMixesTitle() async throws {
