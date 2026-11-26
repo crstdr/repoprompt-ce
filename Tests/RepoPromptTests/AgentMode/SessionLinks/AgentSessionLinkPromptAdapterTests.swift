@@ -1382,7 +1382,11 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
             let source = try AgentProviderHandover.Source(provider: "source", model: "source-model")
             let payload = AgentProviderHandover.render(AgentProviderHandover.history(projection, source: source, historyReference: nil))
             session.pendingHandoff = .init(payload: payload, createdAt: Date(), providerSwitchDelivery: .ready)
-            vm.test_setAgentSessionSaver { _, _, _ in FileManager.default.temporaryDirectory.appendingPathComponent("switch-read-proof-\(UUID()).json") }
+            var saves: [(delivery: AgentProviderSwitchDelivery?, acceptedID: UUID?)] = []
+            vm.test_setAgentSessionSaver { saved, _, _ in
+                saves.append((saved.pendingHandoffProviderSwitchDelivery, saved.providerSwitchAcceptedID))
+                return FileManager.default.temporaryDirectory.appendingPathComponent("switch-read-proof-\(UUID()).json")
+            }
             guard case let .success(.some(preparation)) = await vm.linkExecutionRuntime.providerSwitchSendAdmission(session: session, input: "ordinary switched input") else {
                 return XCTFail("Fitting carrier must admit before native acquisition")
             }
@@ -1433,8 +1437,28 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
                 XCTAssertEqual(outcome, .sent)
                 XCTAssertEqual(fixture.startedTurns.count, 1)
                 XCTAssertTrue(try XCTUnwrap(fixture.startedTurns.first).contains("SWITCH-READ-PROOF-CORRECTION"))
+                // Save A: acceptance persists only the marker while the carrying run is live.
+                let acceptedID = try XCTUnwrap(session.pendingHandoff.providerSwitchAcceptedID)
+                try await AsyncTestWait.waitUntil("read-proof switch acceptance Save A") {
+                    saves.contains { $0.acceptedID == acceptedID }
+                }
+                await vm.linkExecutionRuntime.drainPendingSendEffects(for: session)
+                XCTAssertTrue(saves.filter { $0.acceptedID == acceptedID }.allSatisfy { $0.delivery == .sending })
+                XCTAssertFalse(saves.contains { $0.delivery == nil }, "Save B waits for the carrying run to end")
+                XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .sending)
+                XCTAssertEqual(session.pendingHandoff.payload, payload)
+                XCTAssertFalse(session.items.contains { $0.recoveryDiagnostic?.outcome == "sent" })
+                // End the carrying run through the real terminal commit barrier.
+                XCTAssertNotNil(session.activeRunOwnership)
+                session.runState = .running
+                await vm.runService.test_publishNaturalCompletion(session)
+                try await AsyncTestWait.waitUntil("read-proof switch clear Save B") {
+                    saves.contains { $0.delivery == nil && $0.acceptedID == nil } && session.pendingHandoff.providerSwitchDelivery == nil
+                }
                 XCTAssertEqual(session.pendingHandoff, .init())
+                XCTAssertNil(session.pendingHandoff.providerSwitchAcceptedID)
                 XCTAssertEqual(session.items.count(where: { $0.recoveryDiagnostic?.reason == "providerSwitch" && $0.recoveryDiagnostic?.outcome == "sent" }), 1)
+                XCTAssertEqual(fixture.startedTurns.count, 1, "Ending the run must not dispatch again")
                 try input.assertConsumed()
             }
             vm.test_agentSessionLinkLocalInputReadProof = nil
@@ -1981,9 +2005,11 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         let payload = AgentProviderHandover.render(AgentProviderHandover.history(projection, source: source, historyReference: nil))
         session.pendingHandoff = .init(payload: payload, createdAt: Date(), providerSwitchDelivery: .ready)
         var savedDeliveries: [AgentProviderSwitchDelivery?] = []
+        var savedAcceptedIDs: [UUID?] = []
         let saveURL = FileManager.default.temporaryDirectory.appendingPathComponent("provider-switch-auth-\(UUID().uuidString).json")
         fixture.viewModel.test_setAgentSessionSaver { saved, _, _ in
             savedDeliveries.append(saved.pendingHandoffProviderSwitchDelivery)
+            savedAcceptedIDs.append(saved.providerSwitchAcceptedID)
             return saveURL
         }
         guard case let .success(.some(preparation)) = await fixture.viewModel.linkExecutionRuntime.providerSwitchSendAdmission(session: session, input: "ordinary destination input") else {
@@ -2013,10 +2039,30 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
         XCTAssertEqual(Array(replay.utf8), Array(text.utf8))
         MonitorSupplementAssertions.assertCarriesNoSupplement(replay)
         XCTAssertTrue(replay.contains(payload))
-        try await AsyncTestWait.waitUntil("provider switch managed-auth replay clear save") {
-            savedDeliveries.contains { $0 == nil }
+        // Save A: only the positive replay records acceptance; the carrier stays `.sending`
+        // with no notice until the carrying run ends.
+        let acceptedID = try XCTUnwrap(session.pendingHandoff.providerSwitchAcceptedID)
+        try await AsyncTestWait.waitUntil("provider switch managed-auth replay Save A") {
+            savedAcceptedIDs.contains(acceptedID)
         }
+        await fixture.viewModel.linkExecutionRuntime.drainPendingSendEffects(for: session)
+        XCTAssertEqual(Set(savedAcceptedIDs.compactMap(\.self)), [acceptedID], "The rejected start must not record its own acceptance")
+        XCTAssertTrue(zip(savedDeliveries, savedAcceptedIDs).filter { $0.1 == acceptedID }.allSatisfy { $0.0 == .sending })
+        XCTAssertFalse(savedDeliveries.contains { $0 == nil }, "Save B waits for the carrying run to end")
+        XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .sending)
+        XCTAssertEqual(session.pendingHandoff.payload, payload)
+        XCTAssertFalse(session.items.contains { $0.recoveryDiagnostic?.outcome == "sent" })
+        // End the carrying (replayed) run through the real terminal commit barrier.
+        XCTAssertNotNil(session.activeRunOwnership)
+        session.runState = .running
+        await fixture.viewModel.runService.test_publishNaturalCompletion(session)
+        try await AsyncTestWait.waitUntil("provider switch managed-auth replay clear save") {
+            savedDeliveries.contains { $0 == nil } && session.pendingHandoff.providerSwitchDelivery == nil
+        }
+        XCTAssertTrue(zip(savedDeliveries, savedAcceptedIDs).contains { $0.0 == nil && $0.1 == nil }, "Save B persists the projected clear")
         XCTAssertEqual(session.pendingHandoff, .init())
+        XCTAssertNil(session.pendingHandoff.providerSwitchAcceptedID)
+        XCTAssertEqual(fixture.startedTurns.count, 2, "Settlement must not dispatch the handover again")
         let expectedConfirmation = "Handover sent to \(session.selectedAgent.displayName) / \(fixture.viewModel.inputBarModelDisplayName(rawModel: session.selectedModelRaw, agentKind: session.selectedAgent))."
         let confirmations = session.items.filter { $0.recoveryDiagnostic?.reason == "providerSwitch" && $0.recoveryDiagnostic?.outcome == "sent" }
         XCTAssertEqual(confirmations.map(\.text), [expectedConfirmation], "Only the positive replay may confirm and clear the carrier")
