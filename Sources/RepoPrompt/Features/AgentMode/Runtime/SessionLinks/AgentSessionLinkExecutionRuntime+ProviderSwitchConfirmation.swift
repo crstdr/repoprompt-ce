@@ -67,6 +67,7 @@ extension AgentSessionLinkExecutionRuntime {
                     payload: payload,
                     writer: writer,
                     canonicalItemCount: payload.effectiveCanonicalItemCount,
+                    rebuildPayload: { self.providerSwitchConfirmationPayload(for: session, acceptedID: acceptedID) },
                     apply: { [weak self, weak session] receipt in
                         guard let self, let session,
                               scope.sessions[session.tabID] === session,
@@ -105,13 +106,14 @@ extension AgentSessionLinkExecutionRuntime {
               session.providerSwitchConfirmationSaveFailed,
               let acceptedID = session.pendingHandoff.providerSwitchAcceptedID,
               let writer = providerSwitchConfirmationWriter(for: session),
-              let payload = providerSwitchConfirmationPayload(for: session, acceptedID: acceptedID),
+              let payload = providerSwitchConfirmationPayload(for: session, acceptedID: acceptedID, includeNotice: false),
               let transcript = payload.transcript
         else { return false }
         let result = await scope.persistence.flushProviderSwitchProjectedSave(
             payload: payload,
             writer: writer,
             canonicalItemCount: payload.effectiveCanonicalItemCount,
+            rebuildPayload: { self.providerSwitchConfirmationPayload(for: session, acceptedID: acceptedID, includeNotice: false) },
             apply: { [weak self, weak session] receipt in
                 guard let self, let session,
                       scope.sessions[session.tabID] === session,
@@ -141,7 +143,8 @@ extension AgentSessionLinkExecutionRuntime {
     /// Builds the final value projection without touching the live carrier or transcript.
     func providerSwitchConfirmationPayload(
         for session: TabSession,
-        acceptedID: UUID
+        acceptedID: UUID,
+        includeNotice: Bool = true
     ) -> AgentSession? {
         guard let scope,
               let workspaceID = session.persistentSessionBindingIdentity?.workspaceID
@@ -156,23 +159,25 @@ extension AgentSessionLinkExecutionRuntime {
             snapshot: snapshot
         )
         let existingItems = payload.toLiveItems()
-        let noticeText = "Handover sent to \(session.selectedAgent.displayName) / \(commands.modelDisplayName(session))."
-        let notice = AgentChatItem(
-            id: acceptedID,
-            timestamp: Date(),
-            kind: .system,
-            text: noticeText,
-            sequenceIndex: max((existingItems.map(\.sequenceIndex).max() ?? -1) + 1, session.nextSequenceIndex),
-            recoveryDiagnostic: AgentTranscriptRecoveryDiagnostic(
-                id: acceptedID,
-                reason: "providerSwitch",
-                outcome: "sent",
-                text: noticeText
-            )
-        )
         var items = existingItems
-        if !items.contains(where: { $0.id == acceptedID }) {
-            items.append(notice)
+        if includeNotice {
+            let noticeText = "Handover sent to \(session.selectedAgent.displayName) / \(commands.modelDisplayName(session))."
+            let notice = AgentChatItem(
+                id: acceptedID,
+                timestamp: Date(),
+                kind: .system,
+                text: noticeText,
+                sequenceIndex: max((existingItems.map(\.sequenceIndex).max() ?? -1) + 1, session.nextSequenceIndex),
+                recoveryDiagnostic: AgentTranscriptRecoveryDiagnostic(
+                    id: acceptedID,
+                    reason: "providerSwitch",
+                    outcome: "sent",
+                    text: noticeText
+                )
+            )
+            if !items.contains(where: { $0.id == acceptedID }) {
+                items.append(notice)
+            }
         }
         payload = payload.withItems(items)
         payload.pendingHandoffProviderSwitchDelivery = nil

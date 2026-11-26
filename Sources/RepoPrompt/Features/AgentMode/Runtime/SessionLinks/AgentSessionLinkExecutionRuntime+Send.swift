@@ -290,7 +290,9 @@ extension AgentSessionLinkExecutionRuntime {
     }
 
     func providerSwitchAcquirePhysicalDispatch(session: TabSession, dispatchID: AgentSessionLinkPromptDispatchID) -> Bool {
-        guard session.pendingHandoff.providerSwitchAcceptedID == nil else { return false }
+        // An accepted marker fences the retained carrier, but ordinary provider input is
+        // carrier-free and must not be mistaken for a second physical handover.
+        if session.pendingHandoff.providerSwitchAcceptedID != nil { return true }
         guard session.pendingHandoff.providerSwitchDelivery != nil else { return true }
         guard session.pendingHandoff.providerSwitchDelivery == .sending,
               session.pendingHandoff.isStagedForSend else { return false }
@@ -683,7 +685,8 @@ extension AgentSessionLinkExecutionRuntime {
               composerSubmitClaimIsCurrent(claim),
               liveSession.permitsBoundOperationAndSave,
               providerSwitchPreparation.map({ providerSwitchPreparationIsCurrent($0, session: liveSession) })
-              ?? (liveSession.pendingHandoff.providerSwitchDelivery == nil),
+              ?? (liveSession.pendingHandoff.providerSwitchDelivery == nil
+                  || liveSession.pendingHandoff.providerSwitchAcceptedID != nil),
               dispatchIsCurrent()
         else {
             releaseComposerSubmitClaim(claim)

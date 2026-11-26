@@ -552,7 +552,7 @@ struct AgentSession: Codable, Identifiable {
         organizationalParentID = try container.decodeIfPresent(UUID.self, forKey: .organizationalParentID)
         delegationScopeID = try container.decodeIfPresent(UUID.self, forKey: .delegationScopeID)
         pendingHandoffProviderSwitchDelivery = try container.decodeIfPresent(AgentProviderSwitchDelivery.self, forKey: .pendingHandoffProviderSwitchDelivery)
-        providerSwitchAcceptedID = try container.decodeIfPresent(UUID.self, forKey: .providerSwitchAcceptedID)
+        providerSwitchAcceptedID = try? container.decode(UUID.self, forKey: .providerSwitchAcceptedID)
         pendingHandoffPayload = try container.decodeIfPresent(String.self, forKey: .pendingHandoffPayload)
         pendingHandoffAwaitsLocalClaudeOverflowInput = try container.decodeIfPresent(Bool.self, forKey: .pendingHandoffAwaitsLocalClaudeOverflowInput)
         pendingHandoffCreatedAt = try container.decodeIfPresent(Date.self, forKey: .pendingHandoffCreatedAt)

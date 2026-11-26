@@ -582,6 +582,7 @@ final class AgentSessionPersistenceRuntime {
         payload: AgentSession,
         writer: AgentSessionRuntimeStore.Writer,
         canonicalItemCount: Int,
+        rebuildPayload: (@MainActor () -> AgentSession?)? = nil,
         observingSavePhase: ((RequiredSavePhase) -> Void)? = nil,
         apply: @MainActor (AgentSessionSaveRuntime.Receipt) -> Bool
     ) async -> Result<Void, AgentSessionPersistenceFailure> {
@@ -607,6 +608,8 @@ final class AgentSessionPersistenceRuntime {
             }
         }
         let session = writer.session
+        let projectedPayload = rebuildPayload?() ?? payload
+        let projectedItemCount = rebuildPayload == nil ? canonicalItemCount : projectedPayload.effectiveCanonicalItemCount
         session.saveDebounceTask?.cancel()
         session.saveDebounceTask = nil
         session.saveDebounceRequestID = nil
@@ -632,7 +635,7 @@ final class AgentSessionPersistenceRuntime {
         }
         let prepared: AgentSessionSaveRuntime.PreparedWrite
         do {
-            prepared = try AgentSessionSaveRuntime.prepare(payload: payload, session: session, creation: nil)
+            prepared = try AgentSessionSaveRuntime.prepare(payload: projectedPayload, session: session, creation: nil)
         } catch {
             return .failure(.init(operation: .save, tabID: session.tabID, message: error.localizedDescription))
         }
@@ -640,7 +643,7 @@ final class AgentSessionPersistenceRuntime {
             let outcome = try await AgentSessionSaveRuntime.commit(
                 prepared,
                 workspace: workspace,
-                canonicalItemCount: canonicalItemCount,
+                canonicalItemCount: projectedItemCount,
                 writer: writer,
                 token: token,
                 storageIsCurrent: { [self] in
@@ -670,6 +673,7 @@ final class AgentSessionPersistenceRuntime {
                       session.currentRestorationBindingToken == receipt.binding,
                       apply(receipt)
                 else {
+                    session.isDirty = true
                     return .failure(.init(operation: .save, tabID: session.tabID, message: "The provider-switch confirmation could not be applied to its live owner."))
                 }
                 observingSavePhase?(.durablySaved(receipt.binding))

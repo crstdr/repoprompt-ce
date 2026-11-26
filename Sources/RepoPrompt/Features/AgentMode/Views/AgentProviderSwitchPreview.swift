@@ -216,7 +216,6 @@ struct AgentProviderSwitchPreview: View {
                     .font(.headline)
                 if preview.session.pendingHandoff.providerSwitchAcceptedID != nil {
                     if preview.session.providerSwitchConfirmationSaveFailed {
-                        Text(Self.confirmationSaveFailedText)
                         Button("Discard handover") { Task { _ = await viewModel.discardProviderSwitchHandover(tabID: preview.session.tabID) } }
                             .disabled(viewModel.providerSwitchMutation != nil)
                     } else {
