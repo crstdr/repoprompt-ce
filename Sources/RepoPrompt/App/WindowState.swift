@@ -88,7 +88,7 @@ struct CoherentWindowTitlePresentation: Equatable {
     let workspaceDisplayName: String
     let renderedTitle: String
     /// Colour of the workspace this title shows; nil for None, System, or no workspace. Resolved
-    /// with the title so the dot and edge line never describe a different workspace than the text.
+    /// with the title so the dot and sticker never describe a different workspace than the text.
     var workspaceColor: WorkspaceColor?
 
     static let appDefault = CoherentWindowTitlePresentation(
@@ -350,6 +350,9 @@ class WindowState: ObservableObject {
     private var isAgentSidebarCollapsed = false
     /// Narrow titlebar state observed only by the principal toolbar title cluster.
     let agentChatTitleCluster = AgentChatTitleClusterModel(title: WindowTitleFormatter.defaultTitle)
+    /// The workspace colour sticker and its picker, fed from the resolved title; observed only by
+    /// the sticker buttons in the sidebar's titlebar cluster and the leading titlebar accessory.
+    let workspaceSticker = WorkspaceStickerModel()
 
     /// The sticky instance number assigned for this window's workspace, qualified by that workspace.
     /// Installed only by `setWorkspaceInstanceAssignment(_:)`; never allocated here.
@@ -400,9 +403,6 @@ class WindowState: ObservableObject {
     /// Published so the scene keeps re-applying it; otherwise SwiftUI falls back to the
     /// app display name whenever it refreshes the window chrome.
     @Published private(set) var displayedWindowTitle: String = WindowTitleFormatter.defaultTitle
-
-    /// Colour of the workspace the installed title shows (drives the window edge line).
-    @Published private(set) var workspaceColor: WorkspaceColor?
 
     /// The last complete title resolution. Retained, never partially updated, while the active
     /// workspace model is unresolved or a real switch has not yet assigned the target's number.
@@ -903,6 +903,9 @@ class WindowState: ObservableObject {
         // ordinary run, save, endpoint and MCP owners above are retained without UI startup work.
         if isPreparedSessionOwner { return }
 
+        workspaceSticker.onSelectColor = { [weak self] workspaceID, color in
+            self?.setTitleWorkspaceColor(color, expectedWorkspaceID: workspaceID)
+        }
         workspaceManager.isUnusedAutomaticChat = { [weak oracleViewModel] id in
             oracleViewModel?.isUnusedImplicitDefaultChat(id) == true
         }
@@ -1354,9 +1357,6 @@ class WindowState: ObservableObject {
         if displayedWindowTitle != title {
             displayedWindowTitle = title
         }
-        if workspaceColor != coherentTitlePresentation.workspaceColor {
-            workspaceColor = coherentTitlePresentation.workspaceColor
-        }
         refreshAgentChatTitleCluster()
         guard let window = nsWindow else { return }
         if window.title == title, lastAppliedWindowTitle == title {
@@ -1566,10 +1566,7 @@ class WindowState: ObservableObject {
                 tabID: target.tabID,
                 sessionID: target.agentSessionID,
                 tabName: tab.name
-            ),
-            workspaceColor: titleColorableWorkspace().map { workspace in
-                AgentChatWorkspaceColorMenuState(workspaceID: workspace.id, selection: workspace.workspaceColor)
-            }
+            )
         )
     }
 
@@ -1617,9 +1614,6 @@ class WindowState: ObservableObject {
             },
             delete: { [weak self] target in
                 self?.confirmDeleteAgentChatFromTitlebar(target: target)
-            },
-            setWorkspaceColor: { [weak self] workspaceID, color in
-                self?.setTitleWorkspaceColor(color, expectedWorkspaceID: workspaceID)
             }
         )
     }
@@ -1653,14 +1647,19 @@ class WindowState: ObservableObject {
     }
 
     private func refreshAgentChatTitleCluster() {
-        let colorableWorkspaceID = titleColorableWorkspace()?.id
         agentChatTitleCluster.update(
             title: displayedWindowTitle,
             showsChatOptions: currentAgentTitlebarChatOptionsTarget() != nil,
-            workspaceColor: coherentTitlePresentation.workspaceColor,
-            allowsWorkspaceColorMenu: colorableWorkspaceID != nil,
-            workspaceID: colorableWorkspaceID
+            workspaceColor: coherentTitlePresentation.workspaceColor
         )
+        let stickerVisibilityChanged = workspaceSticker.update(
+            workspaceID: titleColorableWorkspace()?.id,
+            color: coherentTitlePresentation.workspaceColor
+        )
+        // The collapsed accessory's width depends on whether it shows the sticker.
+        if stickerVisibilityChanged, isAgentSidebarCollapsed {
+            applyAgentTitlebarAccessoryIfPossible()
+        }
     }
 
     /// The workspace the installed title shows, when it can be coloured (not System).
@@ -1672,8 +1671,10 @@ class WindowState: ObservableObject {
         return workspace
     }
 
-    /// Title Workspace Color action: colours the workspace whose name the title shows, only while
-    /// it is still the workspace the menu was built for. A switch while the menu is open writes nothing.
+    /// Sticker picker action: colours the workspace whose name the title shows, only while it is
+    /// still the workspace the picker was opened for. Once the title shows another workspace the
+    /// click writes nothing; while a switch is still pending the title still shows the original
+    /// workspace, so the click colours that one.
     func setTitleWorkspaceColor(_ color: WorkspaceColor?, expectedWorkspaceID: UUID) {
         guard !isClosing,
               let workspace = titleColorableWorkspace(),
@@ -1849,6 +1850,8 @@ class WindowState: ObservableObject {
         } else {
             wantsAgentTitlebarAccessory = false
             agentNewSessionAction = nil
+            // Leaving Agent mode hides both sticker hosts; an open picker must not survive the return.
+            workspaceSticker.dismissPicker()
             removeAgentTitlebarAccessory()
             refreshAgentChatTitleCluster()
         }
@@ -1858,6 +1861,8 @@ class WindowState: ObservableObject {
     func setAgentSidebarCollapsed(_ collapsed: Bool) {
         guard isAgentSidebarCollapsed != collapsed else { return }
         isAgentSidebarCollapsed = collapsed
+        // The sticker moves to the other host, so an open picker would lose its anchor.
+        workspaceSticker.dismissPicker()
         applyAgentTitlebarAccessoryIfPossible()
     }
 
@@ -1882,6 +1887,7 @@ class WindowState: ObservableObject {
         if let existing = agentTitlebarAccessory {
             existing.update(
                 isSidebarCollapsed: isAgentSidebarCollapsed,
+                workspaceSticker: workspaceSticker,
                 onToggleSidebar: toggleSidebar,
                 onNewSession: action
             )
@@ -1891,6 +1897,7 @@ class WindowState: ObservableObject {
         } else {
             let accessory = AgentModeTitlebarAccessoryViewController(
                 isSidebarCollapsed: isAgentSidebarCollapsed,
+                workspaceSticker: workspaceSticker,
                 onToggleSidebar: toggleSidebar,
                 onNewSession: action
             )

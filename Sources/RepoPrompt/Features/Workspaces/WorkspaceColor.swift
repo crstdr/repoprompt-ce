@@ -147,3 +147,25 @@ enum WorkspaceColor: String, CaseIterable, Identifiable {
         )
     }
 }
+
+/// One swatch in the workspace colour picker: None (`color == nil`) or a palette colour.
+struct WorkspaceColorPickerOption: Equatable, Identifiable {
+    let color: WorkspaceColor?
+    let isSelected: Bool
+
+    var id: String {
+        color?.rawValue ?? ""
+    }
+
+    /// Tooltip and VoiceOver label for the swatch.
+    var label: String {
+        color?.displayName ?? "None"
+    }
+
+    /// None first, then the palette in declaration order; exactly one option matches `selection`.
+    static func options(selection: WorkspaceColor?) -> [WorkspaceColorPickerOption] {
+        ([nil] + WorkspaceColor.allCases.map(Optional.some)).map { color in
+            WorkspaceColorPickerOption(color: color, isSelected: color == selection)
+        }
+    }
+}

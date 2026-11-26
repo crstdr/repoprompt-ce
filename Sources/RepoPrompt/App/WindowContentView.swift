@@ -29,9 +29,8 @@ struct WindowContentView: View {
         ContentView(windowState: windowState)
             .safeAreaInset(edge: .top) { GlobalSettingsPersistenceBlockBanner(allowsSessionDismissal: true) }
             .safeAreaInset(edge: .top) { WorkspaceRecoveryBackupBlockBanner(workspaceManager: windowState.workspaceManager) }
-            // Both rules reserve their height as top insets. The later modifier is outermost, so the
-            // order top to bottom is: DEBUG rule, workspace-colour rule, banners, content.
-            .workspaceColorWindowEdge(windowState.workspaceColor)
+            // The DEBUG rule reserves its height as a top inset. The later modifier is outermost, so
+            // the order top to bottom is: DEBUG rule, banners, content.
             .debugBuildWindowEdge()
             .environmentObject(windowState) // If your subviews need it
             .environment(\.windowIsPresentationVisible, windowState.isPresentationVisible)

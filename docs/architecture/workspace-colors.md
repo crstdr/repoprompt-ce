@@ -37,11 +37,11 @@ The id `grey` keeps its British spelling for compatibility with existing readers
 
 ## Where it shows
 
-- An 8 pt dot before the toolbar title, before workspace names in the workspace picker, and in Manage Workspaces rows.
-- A 2 pt line along the top content edge, directly below the toolbar. It reserves its own 2 pt, so content starts below it and is never covered. It takes space only while a colour is set. In debug builds it sits below the debug build's own 2 pt rule.
-- With None, nothing is drawn.
+- The workspace sticker, a 20 pt rounded square filled with the color. It is the last of the buttons above the Agent sidebar, after New Session. While the sidebar is hidden, it moves to the titlebar beside the window's close, minimize and zoom buttons, after the sidebar toggle and New Session. With None it shows a dashed outline. The System workspace has no sticker.
+- An 8 pt dot before the toolbar title and before workspace names in the workspace picker. With None, there is no dot.
+- A 16 pt sticker at the start of each Manage Workspaces row. Consolidated recovery copies show the dot instead, and only when a color is set.
 
-To set a color, right-click the toolbar title or a row in Manage Workspaces and choose from the `Workspace Color` section. The System workspace and consolidated recovery copies have no color menu.
+To set a color, click the sticker and choose a swatch. The color applies at once and the picker stays open. In Manage Workspaces, click a row's sticker, or right-click the row and choose from the `Workspace Color` section. The System workspace and consolidated recovery copies cannot be colored.
 
 ## Not exposed over MCP
 

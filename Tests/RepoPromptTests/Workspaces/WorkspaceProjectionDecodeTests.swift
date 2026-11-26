@@ -1326,32 +1326,17 @@ final class WorkspaceColorPaletteTests: XCTestCase {
         XCTAssertNil(WorkspaceColor.resolve(nil))
     }
 
-    /// The AppKit Workspace Color items: None then the palette in menu order, one checkmark, the
-    /// chosen colour (or nil) passed through, and colour-keeping swatches.
-    @MainActor
-    func testStableMenuItemsListNoneThenPaletteWithOneCheckmarkAndSwatches() throws {
-        var chosen: [WorkspaceColor?] = []
+    /// The sticker picker: None then the palette in declaration order, exactly one selected option
+    /// for every selection, and unique ids.
+    func testPickerOptionsListNoneThenPaletteWithExactlyOneSelected() {
         for selection in [nil] + WorkspaceColor.allCases.map(Optional.some) {
-            let menu = NSMenu.stableMenu(from: WorkspaceColor.stableMenuItems(selection: selection) { chosen.append($0) })
-            XCTAssertEqual(menu.items.map(\.title), ["None"] + contract.map(\.name))
-            XCTAssertEqual(
-                menu.items.filter { $0.state == .on }.map(\.title),
-                [selection?.displayName ?? "None"]
-            )
+            let options = WorkspaceColorPickerOption.options(selection: selection)
+            XCTAssertEqual(options.count, 15)
+            XCTAssertEqual(options.map(\.color), [nil] + WorkspaceColor.allCases.map(Optional.some))
+            XCTAssertEqual(options.map(\.label), ["None"] + contract.map(\.name))
+            XCTAssertEqual(options.filter(\.isSelected).map(\.color), [selection])
+            XCTAssertEqual(Set(options.map(\.id)).count, options.count)
         }
-
-        let menu = NSMenu.stableMenu(from: WorkspaceColor.stableMenuItems(selection: nil) { chosen.append($0) })
-        XCTAssertNil(menu.items[0].image)
-        for (index, color) in WorkspaceColor.allCases.enumerated() {
-            let image = try XCTUnwrap(menu.items[index + 1].image, color.rawValue)
-            XCTAssertFalse(image.isTemplate, color.rawValue)
-        }
-
-        chosen.removeAll()
-        for item in menu.items {
-            XCTAssertTrue(try NSApplication.shared.sendAction(XCTUnwrap(item.action), to: item.target, from: item))
-        }
-        XCTAssertEqual(chosen, [nil] + WorkspaceColor.allCases.map(Optional.some))
     }
 
     private func rendered(_ color: NSColor, in appearance: NSAppearance) -> UInt32? {

@@ -115,7 +115,9 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
         XCTAssertEqual(invocations.map(\.1), Array(repeating: target, count: 5))
     }
 
-    func testWorkspaceColorSubmenuSitsBeforeDeleteAndBindsCapturedWorkspace() throws {
+    /// Workspace colour moved to the sticker: Chat Options offers only session actions, with or
+    /// without Copy Session ID, and no submenu.
+    func testChatOptionsMenuOffersNoWorkspaceColor() {
         let target = AgentChatOptionsMenuTarget(
             windowID: 7,
             workspaceID: UUID(),
@@ -123,47 +125,25 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
             agentSessionID: UUID(),
             tabName: "Captured"
         )
-        let colorWorkspaceID = UUID()
-        var chosen: [(UUID, WorkspaceColor?)] = []
-        var actions = Self.noopActions()
-        actions.setWorkspaceColor = { chosen.append(($0, $1)) }
-        let menu = AgentChatOptionsMenuPresenter.makeMenu(
-            snapshot: AgentChatOptionsMenuSnapshot(
-                target: target,
-                isPinned: false,
-                workspaceColor: AgentChatWorkspaceColorMenuState(workspaceID: colorWorkspaceID, selection: .teal)
-            ),
-            actions: actions
+        let capture = AgentSessionCopyIDTarget(
+            windowID: target.windowID,
+            workspaceID: target.workspaceID,
+            tabID: target.tabID,
+            sessionID: target.agentSessionID,
+            persistentBindingGeneration: UUID(),
+            bindingTransitionGeneration: 1
         )
-        XCTAssertEqual(menu.items.map(\.title), [
-            "Pin",
-            "Rename",
-            "Stash",
-            "Handoff",
-            "Workspace Color",
-            "",
-            "Delete"
-        ])
-
-        let parent = menu.items[4]
-        XCTAssertNotNil(parent.image)
-        let submenu = try XCTUnwrap(parent.submenu)
-        XCTAssertEqual(submenu.items.map(\.title), ["None"] + WorkspaceColor.allCases.map(\.displayName))
-        XCTAssertEqual(submenu.items.filter { $0.state == .on }.map(\.title), ["Teal"])
-
-        for title in ["Blue", "None"] {
-            let item = try XCTUnwrap(submenu.items.first { $0.title == title })
-            XCTAssertTrue(try NSApplication.shared.sendAction(XCTUnwrap(item.action), to: item.target, from: item))
+        for (copyTarget, expected) in [
+            (nil, ["Pin", "Rename", "Stash", "Handoff", "", "Delete"]),
+            (capture, ["Pin", "Rename", "Stash", "Handoff", "Copy Session ID", "", "Delete"])
+        ] as [(AgentSessionCopyIDTarget?, [String])] {
+            let menu = AgentChatOptionsMenuPresenter.makeMenu(
+                snapshot: AgentChatOptionsMenuSnapshot(target: target, isPinned: false, copySessionIDTarget: copyTarget),
+                actions: Self.noopActions()
+            )
+            XCTAssertEqual(menu.items.map(\.title), expected)
+            XCTAssertFalse(menu.items.contains { $0.title == "Workspace Color" || $0.hasSubmenu })
         }
-        XCTAssertEqual(chosen.map(\.0), [colorWorkspaceID, colorWorkspaceID])
-        XCTAssertEqual(chosen.map(\.1), [.blue, nil])
-
-        // No colourable workspace (System): the menu is unchanged.
-        let withoutColor = AgentChatOptionsMenuPresenter.makeMenu(
-            snapshot: AgentChatOptionsMenuSnapshot(target: target, isPinned: false),
-            actions: actions
-        )
-        XCTAssertEqual(withoutColor.items.map(\.title), ["Pin", "Rename", "Stash", "Handoff", "", "Delete"])
     }
 
     func testCopySessionIDItemAppearsOnlyWithAGenerationBearingCaptureAndPassesItThrough() throws {
@@ -476,25 +456,68 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
         }
     }
 
-    /// The Chat Options snapshot captures the title's colourable workspace and its colour; the wired
-    /// action applies only to that workspace.
-    func testMenuSnapshotCapturesTitleWorkspaceColorAndActionHonorsCapturedID() async throws {
+    /// The sticker shows the title's workspace; its picker writes only to the workspace it opened
+    /// for, and collapsing the sidebar (which moves the sticker) closes it.
+    func testWorkspaceStickerFollowsTitleWorkspaceAndPickerWritesToIt() async throws {
         try await withFixture { fixture in
-            await awaitWindowTitleResolution(fixture.window)
-            let snapshot = try XCTUnwrap(fixture.window.agentChatTitleClusterMenuSnapshot())
+            let window = fixture.window
+            await awaitWindowTitleResolution(window)
+            XCTAssertEqual(window.workspaceSticker.state, .init(workspaceID: fixture.workspaceID, color: nil))
+
+            window.setTitleWorkspaceColor(.red, expectedWorkspaceID: UUID())
+            XCTAssertNil(window.workspaceManager.workspace(withID: fixture.workspaceID)?.color)
+
+            window.workspaceSticker.togglePicker(from: .sidebarToolbar)
+            window.workspaceSticker.select(.lime)
+            XCTAssertEqual(window.workspaceManager.workspace(withID: fixture.workspaceID)?.color, "lime")
             XCTAssertEqual(
-                snapshot.workspaceColor,
-                AgentChatWorkspaceColorMenuState(workspaceID: fixture.workspaceID, selection: nil)
+                window.workspaceSticker.picker,
+                .init(workspaceID: fixture.workspaceID, host: .sidebarToolbar),
+                "choosing leaves the picker open"
             )
 
-            let actions = fixture.window.agentChatTitleClusterMenuActions()
-            actions.setWorkspaceColor(UUID(), .red)
-            XCTAssertNil(fixture.window.workspaceManager.workspace(withID: fixture.workspaceID)?.color)
-
-            actions.setWorkspaceColor(fixture.workspaceID, .lime)
-            XCTAssertEqual(fixture.window.workspaceManager.workspace(withID: fixture.workspaceID)?.color, "lime")
-            XCTAssertEqual(fixture.window.agentChatTitleClusterMenuSnapshot()?.workspaceColor?.selection, .lime)
+            window.setAgentSidebarCollapsed(true)
+            XCTAssertNil(window.workspaceSticker.picker)
         }
+    }
+
+    /// Leaving Agent mode (or entering System) hides the titlebar accessory and closes an open
+    /// sticker picker, so returning to the same workspace does not reopen it.
+    func testLeavingAgentModeClosesWorkspaceStickerPicker() async throws {
+        try await withFixture { fixture in
+            let window = fixture.window
+            await awaitWindowTitleResolution(window)
+            window.workspaceSticker.togglePicker(from: .sidebarToolbar)
+            XCTAssertEqual(
+                window.workspaceSticker.picker,
+                .init(workspaceID: fixture.workspaceID, host: .sidebarToolbar)
+            )
+
+            window.setAgentTitlebarAccessoryVisible(false)
+            XCTAssertNil(window.workspaceSticker.picker)
+            XCTAssertFalse(window.workspaceSticker.isPickerPresented(in: .sidebarToolbar))
+        }
+    }
+
+    /// Collapsing the sidebar moves compose and the sticker beside the traffic lights, after the
+    /// toggle; System shows no sticker there either.
+    func testCollapsedTitlebarAccessoryIncludesWorkspaceSticker() {
+        XCTAssertEqual(
+            AgentModeTitlebarLeadingItem.items(isSidebarCollapsed: true, showsWorkspaceSticker: true),
+            [.sidebarToggle, .newSession, .workspaceSticker]
+        )
+        XCTAssertEqual(
+            AgentModeTitlebarLeadingItem.items(isSidebarCollapsed: true, showsWorkspaceSticker: false),
+            [.sidebarToggle, .newSession]
+        )
+        XCTAssertEqual(
+            AgentModeTitlebarLeadingItem.items(isSidebarCollapsed: false, showsWorkspaceSticker: true),
+            [.sidebarToggle]
+        )
+        XCTAssertEqual(
+            AgentModeTitlebarLeadingItem.items(isSidebarCollapsed: false, showsWorkspaceSticker: false),
+            [.sidebarToggle]
+        )
     }
 
     func testSnapshotAndTargetValidationFailClosedAcrossLifecycleChanges() async throws {
@@ -1399,8 +1422,8 @@ final class WorkspaceRestorationTitleTests: XCTestCase {
         XCTAssertEqual(foreignTitle, renamed)
     }
 
-    /// A same-ID colour edit on the active workspace repaints the title dot and edge colour with no
-    /// explicit title request; System never shows a colour or offers the menu.
+    /// A same-ID colour edit on the active workspace repaints the title dot and the sticker with no
+    /// explicit title request; System shows neither and has no sticker.
     func testActiveWorkspaceColorChangeRepaintsTitleClusterWithoutExplicitRequest() async throws {
         let fixture = try await makeFixture(systemNumber: 6)
         let window = fixture.window
@@ -1409,35 +1432,59 @@ final class WorkspaceRestorationTitleTests: XCTestCase {
         )
         _ = await window.workspaceManager.switchWorkspace(to: target, saveState: false, reason: "titleColor")
         await resolveTitle(window)
-        XCTAssertNil(window.workspaceColor)
         XCTAssertNil(window.agentChatTitleCluster.state.workspaceColor)
-        XCTAssertTrue(window.agentChatTitleCluster.state.allowsWorkspaceColorMenu)
-        XCTAssertEqual(window.agentChatTitleCluster.state.workspaceID, target.id)
+        XCTAssertEqual(window.workspaceSticker.state, .init(workspaceID: target.id, color: nil))
 
         let repainted = expectation(description: "title re-resolved for the colour change")
         window.setWindowTitleResolutionDidCompleteHandlerForTesting {
-            guard window.workspaceColor == .teal else { return }
+            guard window.workspaceSticker.state.color == .teal else { return }
             window.setWindowTitleResolutionDidCompleteHandlerForTesting(nil)
             repainted.fulfill()
         }
         window.setTitleWorkspaceColor(.teal, expectedWorkspaceID: target.id)
         await fulfillment(of: [repainted], timeout: 5)
         XCTAssertEqual(window.agentChatTitleCluster.state.workspaceColor, .teal)
+        XCTAssertEqual(window.workspaceSticker.state, .init(workspaceID: target.id, color: .teal))
         XCTAssertEqual(window.workspaceManager.activeWorkspace?.color, "teal")
 
         let system = try XCTUnwrap(window.workspaceManager.workspaces.first(where: \.isSystemWorkspace))
         _ = await window.workspaceManager.switchWorkspace(to: system, saveState: false, reason: "titleColorSystem")
         await resolveTitle(window)
-        XCTAssertNil(window.workspaceColor)
         XCTAssertNil(window.agentChatTitleCluster.state.workspaceColor)
-        XCTAssertFalse(window.agentChatTitleCluster.state.allowsWorkspaceColorMenu)
-        XCTAssertNil(window.agentChatTitleCluster.state.workspaceID)
+        XCTAssertEqual(window.workspaceSticker.state, .init(workspaceID: nil, color: nil))
         window.setTitleWorkspaceColor(.red, expectedWorkspaceID: system.id)
         XCTAssertNil(window.workspaceManager.workspace(withID: system.id)?.color)
     }
 
-    /// A Workspace Color menu binds the workspace shown when it was built; choosing after a switch
-    /// writes nothing to either workspace, and the current workspace's ID still applies.
+    /// The colour has no window-level presentation (the former edge line reserved space at the window
+    /// root): a colour change reaches only the title dot and the sticker and publishes nothing on the
+    /// window state the root view observes, so nothing above the content can move.
+    func testWorkspaceColorChangePublishesNothingOnWindowState() async throws {
+        let fixture = try await makeFixture(systemNumber: 6)
+        let window = fixture.window
+        let target = window.workspaceManager.createWorkspace(
+            name: "Edge \(UUID().uuidString.prefix(6))", repoPaths: [fixture.rootURL.path], ephemeral: true
+        )
+        _ = await window.workspaceManager.switchWorkspace(to: target, saveState: false, reason: "titleColorEdge")
+        await resolveTitle(window)
+
+        var windowPublishes = 0
+        let subscription = window.objectWillChange.sink { windowPublishes += 1 }
+        defer { subscription.cancel() }
+        let repainted = expectation(description: "title re-resolved for the colour change")
+        window.setWindowTitleResolutionDidCompleteHandlerForTesting {
+            guard window.workspaceSticker.state.color == .violet else { return }
+            window.setWindowTitleResolutionDidCompleteHandlerForTesting(nil)
+            repainted.fulfill()
+        }
+        window.setTitleWorkspaceColor(.violet, expectedWorkspaceID: target.id)
+        await fulfillment(of: [repainted], timeout: 5)
+        XCTAssertEqual(window.agentChatTitleCluster.state.workspaceColor, .violet)
+        XCTAssertEqual(windowPublishes, 0)
+    }
+
+    /// A picker opened on one workspace closes when the title switches to another, and a choice
+    /// bound to the first workspace writes nothing to either; the current workspace's ID still applies.
     func testTitleWorkspaceColorWithStaleExpectedWorkspaceWritesNothing() async throws {
         let fixture = try await makeFixture(systemNumber: 6)
         let window = fixture.window
@@ -1449,26 +1496,16 @@ final class WorkspaceRestorationTitleTests: XCTestCase {
         )
         _ = await window.workspaceManager.switchWorkspace(to: first, saveState: false, reason: "titleColorStaleFirst")
         await resolveTitle(window)
-        let capturedID = try XCTUnwrap(window.agentChatTitleCluster.state.workspaceID)
-        XCTAssertEqual(capturedID, first.id)
-        var chosen: [(UUID, WorkspaceColor?)] = []
-        let items = AgentChatTitleClusterView.workspaceColorContextMenuItems(
-            state: window.agentChatTitleCluster.state,
-            onSetWorkspaceColor: { chosen.append(($0, $1)) }
-        )
+        window.workspaceSticker.togglePicker(from: .sidebarToolbar)
+        XCTAssertEqual(window.workspaceSticker.picker, .init(workspaceID: first.id, host: .sidebarToolbar))
 
         _ = await window.workspaceManager.switchWorkspace(to: second, saveState: false, reason: "titleColorStaleSecond")
         await resolveTitle(window)
-        XCTAssertEqual(window.agentChatTitleCluster.state.workspaceID, second.id)
+        XCTAssertNil(window.workspaceSticker.picker, "the switch closes the picker")
+        XCTAssertEqual(window.workspaceSticker.state.workspaceID, second.id)
+        window.workspaceSticker.select(.red)
 
-        // The menu built for the first workspace still carries its ID after the switch.
-        let menu = NSMenu.stableMenu(from: items)
-        let red = try XCTUnwrap(menu.items.first { $0.title == "Red" })
-        XCTAssertTrue(try NSApplication.shared.sendAction(XCTUnwrap(red.action), to: red.target, from: red))
-        XCTAssertEqual(chosen.map(\.0), [first.id])
-        XCTAssertEqual(chosen.map(\.1), [.red])
-
-        window.setTitleWorkspaceColor(.red, expectedWorkspaceID: capturedID)
+        window.setTitleWorkspaceColor(.red, expectedWorkspaceID: first.id)
         XCTAssertNil(window.workspaceManager.workspace(withID: first.id)?.color)
         XCTAssertNil(window.workspaceManager.workspace(withID: second.id)?.color)
 
@@ -1477,38 +1514,65 @@ final class WorkspaceRestorationTitleTests: XCTestCase {
         XCTAssertNil(window.workspaceManager.workspace(withID: first.id)?.color)
     }
 
-    /// The title's right-click menu offers nothing for System (so the click passes through) and the
-    /// header plus None and the palette otherwise, each choice carrying the captured workspace ID.
-    func testTitleWorkspaceColorContextMenuItemsFollowStateAndBindWorkspaceID() throws {
-        let workspaceID = UUID()
+    /// The sticker picker binds the workspace it opened for: same-ID updates keep it open, a switch
+    /// closes it and later choices go nowhere. Each host presents only its own picker, and only a
+    /// visibility flip asks the host to re-measure.
+    func testWorkspaceStickerModelBindsPickerToOpenedWorkspaceAndHost() {
+        let model = WorkspaceStickerModel()
         var chosen: [(UUID, WorkspaceColor?)] = []
-        let record: (UUID, WorkspaceColor?) -> Void = { chosen.append(($0, $1)) }
-        var state = AgentChatTitleClusterModel.State(title: "System", showsChatOptions: false)
-        XCTAssertTrue(AgentChatTitleClusterView.workspaceColorContextMenuItems(state: state, onSetWorkspaceColor: record).isEmpty)
-        state.workspaceID = workspaceID
-        XCTAssertTrue(
-            AgentChatTitleClusterView.workspaceColorContextMenuItems(state: state, onSetWorkspaceColor: record).isEmpty,
-            "a disallowed title offers no menu even with a stale ID"
-        )
+        model.onSelectColor = { chosen.append(($0, $1)) }
+        let first = UUID()
+        let second = UUID()
 
-        state.allowsWorkspaceColorMenu = true
-        state.workspaceColor = .violet
-        let menu = NSMenu.stableMenu(
-            from: AgentChatTitleClusterView.workspaceColorContextMenuItems(state: state, onSetWorkspaceColor: record)
-        )
-        XCTAssertEqual(
-            menu.items.map(\.title),
-            ["Workspace Color", "None"] + WorkspaceColor.allCases.map(\.displayName)
-        )
-        XCTAssertFalse(menu.items[0].isEnabled)
-        XCTAssertEqual(menu.items.filter { $0.state == .on }.map(\.title), ["Violet"])
+        // System or no workspace: no sticker, so nothing opens and nothing is forwarded.
+        model.togglePicker(from: .sidebarToolbar)
+        XCTAssertNil(model.picker)
+        model.select(.red)
+        XCTAssertTrue(chosen.isEmpty)
+        XCTAssertFalse(model.update(workspaceID: nil, color: .red), "no flip while still hidden")
+        XCTAssertEqual(model.state, .init(workspaceID: nil, color: nil), "no colour without a workspace")
 
-        for index in [1, 2] {
-            let item = menu.items[index]
-            XCTAssertTrue(try NSApplication.shared.sendAction(XCTUnwrap(item.action), to: item.target, from: item))
-        }
-        XCTAssertEqual(chosen.map(\.0), [workspaceID, workspaceID])
-        XCTAssertEqual(chosen.map(\.1), [nil, .red])
+        XCTAssertTrue(model.update(workspaceID: first, color: nil), "hidden to shown flips")
+        XCTAssertFalse(model.update(workspaceID: first, color: nil), "duplicate update")
+        XCTAssertFalse(model.update(workspaceID: first, color: .teal), "colour change is not a flip")
+        XCTAssertFalse(model.update(workspaceID: second, color: .teal), "workspace change is not a flip")
+        XCTAssertFalse(model.update(workspaceID: first, color: .teal))
+
+        model.togglePicker(from: .sidebarToolbar)
+        XCTAssertEqual(model.picker, .init(workspaceID: first, host: .sidebarToolbar))
+        XCTAssertTrue(model.isPickerPresented(in: .sidebarToolbar))
+        XCTAssertFalse(model.isPickerPresented(in: .titlebarAccessory))
+
+        model.select(.lime)
+        model.select(nil)
+        XCTAssertEqual(chosen.map(\.0), [first, first])
+        XCTAssertEqual(chosen.map(\.1), [.lime, nil])
+        XCTAssertNotNil(model.picker, "choosing leaves the picker open")
+
+        model.update(workspaceID: first, color: .lime)
+        XCTAssertEqual(model.picker, .init(workspaceID: first, host: .sidebarToolbar), "same-ID update keeps it open")
+
+        // The other host takes over rather than both presenting; toggling the same host closes.
+        model.togglePicker(from: .titlebarAccessory)
+        XCTAssertEqual(model.picker, .init(workspaceID: first, host: .titlebarAccessory))
+        XCTAssertFalse(model.isPickerPresented(in: .sidebarToolbar))
+        model.togglePicker(from: .titlebarAccessory)
+        XCTAssertNil(model.picker)
+
+        model.togglePicker(from: .sidebarToolbar)
+        model.update(workspaceID: second, color: nil)
+        XCTAssertNil(model.picker, "a switch closes the picker")
+        chosen.removeAll()
+        model.select(.red)
+        XCTAssertTrue(chosen.isEmpty, "a choice after the switch goes nowhere")
+
+        model.togglePicker(from: .sidebarToolbar)
+        model.dismissPicker()
+        XCTAssertNil(model.picker)
+
+        model.togglePicker(from: .sidebarToolbar)
+        XCTAssertTrue(model.update(workspaceID: nil, color: nil), "shown to hidden flips")
+        XCTAssertNil(model.picker)
     }
 
     /// Registration during a held switch assigns the target through the manager's established

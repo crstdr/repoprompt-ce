@@ -54,13 +54,6 @@ enum AgentSessionHandoffPrompt {
     }
 }
 
-/// The Chat Options `Workspace Color` submenu's capture: the colourable workspace the title showed
-/// when the menu was built and its colour then.
-struct AgentChatWorkspaceColorMenuState: Equatable {
-    let workspaceID: UUID
-    let selection: WorkspaceColor?
-}
-
 struct AgentChatOptionsMenuSnapshot: Equatable {
     let target: AgentChatOptionsMenuTarget
     let isPinned: Bool
@@ -71,19 +64,15 @@ struct AgentChatOptionsMenuSnapshot: Equatable {
     /// still validate. Carrying the exact incarnation here closes that gap. `nil` means the current
     /// session is not an eligible oversight endpoint and the item is not offered.
     let copySessionIDTarget: AgentSessionCopyIDTarget?
-    /// `nil` when the title cannot be coloured (System or no workspace): no submenu is offered.
-    let workspaceColor: AgentChatWorkspaceColorMenuState?
 
     init(
         target: AgentChatOptionsMenuTarget,
         isPinned: Bool,
-        copySessionIDTarget: AgentSessionCopyIDTarget? = nil,
-        workspaceColor: AgentChatWorkspaceColorMenuState? = nil
+        copySessionIDTarget: AgentSessionCopyIDTarget? = nil
     ) {
         self.target = target
         self.isPinned = isPinned
         self.copySessionIDTarget = copySessionIDTarget
-        self.workspaceColor = workspaceColor
     }
 }
 
@@ -121,8 +110,6 @@ struct AgentChatOptionsMenuActions {
     let copyHandoffPrompt: (AgentChatOptionsMenuTarget) -> Void
     let copySessionID: (AgentSessionCopyIDTarget) -> Void
     let delete: (AgentChatOptionsMenuTarget) -> Void
-    /// Colours the captured workspace if the title still shows it.
-    var setWorkspaceColor: (UUID, WorkspaceColor?) -> Void = { _, _ in }
 }
 
 private final class AgentChatOptionsMenuItem: NSMenuItem {
@@ -194,9 +181,6 @@ enum AgentChatOptionsMenuPresenter {
                 handler: { actions.copySessionID(copySessionIDTarget) }
             ))
         }
-        if let workspaceColor = snapshot.workspaceColor {
-            menu.addItem(makeWorkspaceColorItem(workspaceColor, actions: actions))
-        }
         menu.addItem(.separator())
         menu.addItem(AgentChatOptionsMenuItem(
             title: "Delete",
@@ -205,24 +189,6 @@ enum AgentChatOptionsMenuPresenter {
             handler: { actions.delete(target) }
         ))
         return menu
-    }
-
-    /// Same items, checkmark and swatches as the title's right-click menu; the parent item supplies
-    /// the section title.
-    private static func makeWorkspaceColorItem(
-        _ state: AgentChatWorkspaceColorMenuState,
-        actions: AgentChatOptionsMenuActions
-    ) -> NSMenuItem {
-        let title = "Workspace Color"
-        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-        item.image = NSImage(systemSymbolName: "paintpalette", accessibilityDescription: title)
-        let workspaceID = state.workspaceID
-        item.submenu = NSMenu.stableMenu(
-            from: WorkspaceColor.stableMenuItems(selection: state.selection) { color in
-                actions.setWorkspaceColor(workspaceID, color)
-            }
-        )
-        return item
     }
 
     static func popUp(
