@@ -684,13 +684,14 @@ enum AgentSessionTranscriptRefreshRuntime {
         workingItems: [AgentChatItem],
         existingTranscript: AgentTranscript,
         importPolicy: AgentTranscriptImportPolicy,
-        projectionProtection: AgentTranscriptProjectionProtection
+        projectionProtection: AgentTranscriptProjectionProtection,
+        nextSequenceIndex: Int? = nil
     ) -> AgentPersistableTranscriptSnapshot {
         let transcriptSnapshot = AgentTranscriptIO.rebuiltTranscriptPreservingCompactedPrefix(
             existingTranscript: existingTranscript,
             workingItems: workingItems,
             terminalState: session.runState,
-            nextSequenceIndex: session.nextSequenceIndex,
+            nextSequenceIndex: nextSequenceIndex ?? session.nextSequenceIndex,
             policy: importPolicy,
             protection: projectionProtection
         )
