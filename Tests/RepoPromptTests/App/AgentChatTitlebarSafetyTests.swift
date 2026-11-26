@@ -115,6 +115,57 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
         XCTAssertEqual(invocations.map(\.1), Array(repeating: target, count: 5))
     }
 
+    func testWorkspaceColorSubmenuSitsBeforeDeleteAndBindsCapturedWorkspace() throws {
+        let target = AgentChatOptionsMenuTarget(
+            windowID: 7,
+            workspaceID: UUID(),
+            tabID: UUID(),
+            agentSessionID: UUID(),
+            tabName: "Captured"
+        )
+        let colorWorkspaceID = UUID()
+        var chosen: [(UUID, WorkspaceColor?)] = []
+        var actions = Self.noopActions()
+        actions.setWorkspaceColor = { chosen.append(($0, $1)) }
+        let menu = AgentChatOptionsMenuPresenter.makeMenu(
+            snapshot: AgentChatOptionsMenuSnapshot(
+                target: target,
+                isPinned: false,
+                workspaceColor: AgentChatWorkspaceColorMenuState(workspaceID: colorWorkspaceID, selection: .teal)
+            ),
+            actions: actions
+        )
+        XCTAssertEqual(menu.items.map(\.title), [
+            "Pin",
+            "Rename",
+            "Stash",
+            "Handoff",
+            "Workspace Color",
+            "",
+            "Delete"
+        ])
+
+        let parent = menu.items[4]
+        XCTAssertNotNil(parent.image)
+        let submenu = try XCTUnwrap(parent.submenu)
+        XCTAssertEqual(submenu.items.map(\.title), ["None"] + WorkspaceColor.allCases.map(\.displayName))
+        XCTAssertEqual(submenu.items.filter { $0.state == .on }.map(\.title), ["Teal"])
+
+        for title in ["Blue", "None"] {
+            let item = try XCTUnwrap(submenu.items.first { $0.title == title })
+            XCTAssertTrue(try NSApplication.shared.sendAction(XCTUnwrap(item.action), to: item.target, from: item))
+        }
+        XCTAssertEqual(chosen.map(\.0), [colorWorkspaceID, colorWorkspaceID])
+        XCTAssertEqual(chosen.map(\.1), [.blue, nil])
+
+        // No colourable workspace (System): the menu is unchanged.
+        let withoutColor = AgentChatOptionsMenuPresenter.makeMenu(
+            snapshot: AgentChatOptionsMenuSnapshot(target: target, isPinned: false),
+            actions: actions
+        )
+        XCTAssertEqual(withoutColor.items.map(\.title), ["Pin", "Rename", "Stash", "Handoff", "", "Delete"])
+    }
+
     func testCopySessionIDItemAppearsOnlyWithAGenerationBearingCaptureAndPassesItThrough() throws {
         let target = AgentChatOptionsMenuTarget(
             windowID: 7,
@@ -422,6 +473,27 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
             XCTAssertNotNil(background)
             XCTAssertEqual(promptManager.activeComposeTabID, fixture.tabAID, "Background creation must not change the active tab")
             XCTAssertEqual(requestedTabIDs, [], "Background creation must not request composer focus")
+        }
+    }
+
+    /// The Chat Options snapshot captures the title's colourable workspace and its colour; the wired
+    /// action applies only to that workspace.
+    func testMenuSnapshotCapturesTitleWorkspaceColorAndActionHonorsCapturedID() async throws {
+        try await withFixture { fixture in
+            await awaitWindowTitleResolution(fixture.window)
+            let snapshot = try XCTUnwrap(fixture.window.agentChatTitleClusterMenuSnapshot())
+            XCTAssertEqual(
+                snapshot.workspaceColor,
+                AgentChatWorkspaceColorMenuState(workspaceID: fixture.workspaceID, selection: nil)
+            )
+
+            let actions = fixture.window.agentChatTitleClusterMenuActions()
+            actions.setWorkspaceColor(UUID(), .red)
+            XCTAssertNil(fixture.window.workspaceManager.workspace(withID: fixture.workspaceID)?.color)
+
+            actions.setWorkspaceColor(fixture.workspaceID, .lime)
+            XCTAssertEqual(fixture.window.workspaceManager.workspace(withID: fixture.workspaceID)?.color, "lime")
+            XCTAssertEqual(fixture.window.agentChatTitleClusterMenuSnapshot()?.workspaceColor?.selection, .lime)
         }
     }
 

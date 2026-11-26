@@ -1566,7 +1566,10 @@ class WindowState: ObservableObject {
                 tabID: target.tabID,
                 sessionID: target.agentSessionID,
                 tabName: tab.name
-            )
+            ),
+            workspaceColor: titleColorableWorkspace().map { workspace in
+                AgentChatWorkspaceColorMenuState(workspaceID: workspace.id, selection: workspace.workspaceColor)
+            }
         )
     }
 
@@ -1614,6 +1617,9 @@ class WindowState: ObservableObject {
             },
             delete: { [weak self] target in
                 self?.confirmDeleteAgentChatFromTitlebar(target: target)
+            },
+            setWorkspaceColor: { [weak self] workspaceID, color in
+                self?.setTitleWorkspaceColor(color, expectedWorkspaceID: workspaceID)
             }
         )
     }
