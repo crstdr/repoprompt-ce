@@ -1,12 +1,13 @@
 # Workspace Colors
 
-A workspace can carry one color from a fixed palette, so windows are easy to tell apart at a glance. The color belongs to the workspace, not to a window: it is saved with the workspace, and every window reads the same value. To mark a window, the color appears only on the workspace sticker in Agent mode: in the strip above the sidebar or, while the sidebar is hidden, in the titlebar. Other modes and the window title do not show it. Manage Workspaces and the dots in the workspace picker also show the color, including for workspaces that no window has open. See [Where it shows](#where-it-shows).
+A workspace can carry one color from a fixed palette, so windows are easy to tell apart at a glance. The color belongs to the workspace, not to a window: a saved workspace stores it in its `workspace.json`, and every window reads the same value. An ephemeral workspace keeps its color in memory until it is saved. To mark a window, the color appears only on the workspace sticker in Agent mode: in the strip above the sidebar or, while the sidebar is hidden, in the titlebar. Other modes and the window title do not show it. Manage Workspaces and the dots in the workspace picker also show the color, including for workspaces that no window has open. See [Where it shows](#where-it-shows).
 
 ## Saved contract
 
 - File: the workspace's `workspace.json` (owner: `WorkspaceModel`, `Sources/RepoPrompt/Features/Workspaces/WorkspaceModel.swift`).
 - Key: top-level `color`. The value is one of the ids in the table below.
 - None: the key is absent. The app never writes an empty string or `null`.
+- Ephemeral workspaces: the color is not written while the workspace is ephemeral, so other windows and external readers do not see it.
 - Readers must treat an unknown id as None. The app itself keeps an unknown id on re-save, so a value written by a newer build survives.
 - The app trims and lowercases the value when it reads the file.
 - Builds from before this feature ignore the key and drop it the next time they save that workspace.
