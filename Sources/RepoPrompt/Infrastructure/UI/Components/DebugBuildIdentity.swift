@@ -32,7 +32,7 @@ enum DebugBuildIdentity {
     static let badgeTitle = "DEBUG"
     static let accessibilityDescription = "RepoPrompt CE debug build"
 
-    /// Height of the accent rule drawn along the top content edge, directly below the titlebar.
+    /// Height of the accent rule reserved along the top content edge, directly below the titlebar.
     static let windowEdgeRuleHeight: CGFloat = 2
 
     /// Opacity of the composer ring. Kept low enough to read as chrome rather than an alert, and
@@ -58,12 +58,13 @@ struct DebugBuildToolbarBadge: View {
 }
 
 extension View {
-    /// DEBUG builds draw a thin accent rule along the top content edge (just below the titlebar).
+    /// DEBUG builds draw a thin accent rule along the top content edge (just below the titlebar),
+    /// as a top safe-area inset with no spacing so content starts below it instead of under it.
     /// Release builds return `self` unchanged.
     @ViewBuilder
     func debugBuildWindowEdge() -> some View {
         #if DEBUG
-            overlay(alignment: .top) {
+            safeAreaInset(edge: .top, spacing: 0) {
                 DebugBuildIdentity.accentColor
                     .frame(height: DebugBuildIdentity.windowEdgeRuleHeight)
                     .allowsHitTesting(false)

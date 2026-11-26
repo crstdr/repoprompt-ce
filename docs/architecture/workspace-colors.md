@@ -38,7 +38,7 @@ The id `grey` keeps its British spelling for compatibility with existing readers
 ## Where it shows
 
 - An 8 pt dot before the toolbar title, before workspace names in the workspace picker, and in Manage Workspaces rows.
-- A 2 pt line along the top content edge, directly below the toolbar. It is an overlay, so it never moves content. In debug builds it sits below the debug build's own 2 pt rule.
+- A 2 pt line along the top content edge, directly below the toolbar. It reserves its own 2 pt, so content starts below it and is never covered. It takes space only while a colour is set. In debug builds it sits below the debug build's own 2 pt rule.
 - With None, nothing is drawn.
 
 To set a color, right-click the toolbar title or a row in Manage Workspaces and choose from the `Workspace Color` section. The System workspace and consolidated recovery copies have no color menu.
