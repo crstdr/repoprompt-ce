@@ -1326,6 +1326,19 @@ final class WorkspaceColorPaletteTests: XCTestCase {
         XCTAssertNil(WorkspaceColor.resolve(nil))
     }
 
+    /// The sticker picker: None then the palette in declaration order, exactly one selected option
+    /// for every selection, and unique ids.
+    func testPickerOptionsListNoneThenPaletteWithExactlyOneSelected() {
+        for selection in [nil] + WorkspaceColor.allCases.map(Optional.some) {
+            let options = WorkspaceColorPickerOption.options(selection: selection)
+            XCTAssertEqual(options.count, 15)
+            XCTAssertEqual(options.map(\.color), [nil] + WorkspaceColor.allCases.map(Optional.some))
+            XCTAssertEqual(options.map(\.label), ["None"] + contract.map(\.name))
+            XCTAssertEqual(options.filter(\.isSelected).map(\.color), [selection])
+            XCTAssertEqual(Set(options.map(\.id)).count, options.count)
+        }
+    }
+
     /// The AppKit Workspace Color items: None then the palette in menu order, one checkmark, the
     /// chosen colour (or nil) passed through, and colour-keeping swatches.
     @MainActor

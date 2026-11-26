@@ -1477,6 +1477,67 @@ final class WorkspaceRestorationTitleTests: XCTestCase {
         XCTAssertNil(window.workspaceManager.workspace(withID: first.id)?.color)
     }
 
+    /// The sticker picker binds the workspace it opened for: same-ID updates keep it open, a switch
+    /// closes it and later choices go nowhere. Each host presents only its own picker, and only a
+    /// visibility flip asks the host to re-measure.
+    func testWorkspaceStickerModelBindsPickerToOpenedWorkspaceAndHost() {
+        let model = WorkspaceStickerModel()
+        var chosen: [(UUID, WorkspaceColor?)] = []
+        model.onSelectColor = { chosen.append(($0, $1)) }
+        let first = UUID()
+        let second = UUID()
+
+        // System or no workspace: no sticker, so nothing opens and nothing is forwarded.
+        model.togglePicker(from: .sidebarToolbar)
+        XCTAssertNil(model.picker)
+        model.select(.red)
+        XCTAssertTrue(chosen.isEmpty)
+        XCTAssertFalse(model.update(workspaceID: nil, color: .red), "no flip while still hidden")
+        XCTAssertEqual(model.state, .init(workspaceID: nil, color: nil), "no colour without a workspace")
+
+        XCTAssertTrue(model.update(workspaceID: first, color: nil), "hidden to shown flips")
+        XCTAssertFalse(model.update(workspaceID: first, color: nil), "duplicate update")
+        XCTAssertFalse(model.update(workspaceID: first, color: .teal), "colour change is not a flip")
+        XCTAssertFalse(model.update(workspaceID: second, color: .teal), "workspace change is not a flip")
+        XCTAssertFalse(model.update(workspaceID: first, color: .teal))
+
+        model.togglePicker(from: .sidebarToolbar)
+        XCTAssertEqual(model.picker, .init(workspaceID: first, host: .sidebarToolbar))
+        XCTAssertTrue(model.isPickerPresented(in: .sidebarToolbar))
+        XCTAssertFalse(model.isPickerPresented(in: .titlebarAccessory))
+
+        model.select(.lime)
+        model.select(nil)
+        XCTAssertEqual(chosen.map(\.0), [first, first])
+        XCTAssertEqual(chosen.map(\.1), [.lime, nil])
+        XCTAssertNotNil(model.picker, "choosing leaves the picker open")
+
+        model.update(workspaceID: first, color: .lime)
+        XCTAssertEqual(model.picker, .init(workspaceID: first, host: .sidebarToolbar), "same-ID update keeps it open")
+
+        // The other host takes over rather than both presenting; toggling the same host closes.
+        model.togglePicker(from: .titlebarAccessory)
+        XCTAssertEqual(model.picker, .init(workspaceID: first, host: .titlebarAccessory))
+        XCTAssertFalse(model.isPickerPresented(in: .sidebarToolbar))
+        model.togglePicker(from: .titlebarAccessory)
+        XCTAssertNil(model.picker)
+
+        model.togglePicker(from: .sidebarToolbar)
+        model.update(workspaceID: second, color: nil)
+        XCTAssertNil(model.picker, "a switch closes the picker")
+        chosen.removeAll()
+        model.select(.red)
+        XCTAssertTrue(chosen.isEmpty, "a choice after the switch goes nowhere")
+
+        model.togglePicker(from: .sidebarToolbar)
+        model.dismissPicker()
+        XCTAssertNil(model.picker)
+
+        model.togglePicker(from: .sidebarToolbar)
+        XCTAssertTrue(model.update(workspaceID: nil, color: nil), "shown to hidden flips")
+        XCTAssertNil(model.picker)
+    }
+
     /// The title's right-click menu offers nothing for System (so the click passes through) and the
     /// header plus None and the palette otherwise, each choice carrying the captured workspace ID.
     func testTitleWorkspaceColorContextMenuItemsFollowStateAndBindWorkspaceID() throws {
