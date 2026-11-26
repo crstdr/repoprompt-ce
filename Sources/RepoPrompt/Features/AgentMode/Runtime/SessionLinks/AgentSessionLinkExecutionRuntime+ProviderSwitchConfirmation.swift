@@ -4,12 +4,11 @@ import RepoPromptInstrumentation
 
 @MainActor
 extension AgentSessionLinkExecutionRuntime {
-    /// Starts or coalesces the provider-free confirmation protocol. A hydrated marker is already
-    /// durable; an acceptance callback must first persist Save A before projecting the clear.
-    func providerSwitchReconcileConfirmation(
-        for session: TabSession,
-        markerAlreadyDurable: Bool
-    ) {
+    /// Starts or coalesces the provider-free confirmation protocol. Triggers carry no evidence;
+    /// the runtime record decides. Save A may run only for the originating writer, and Save B
+    /// only for a durable marker whose carrying run is terminally resolved. Anything else leaves
+    /// the live `.sending` marker untouched for a later event or the manual-review path.
+    func providerSwitchReconcileConfirmation(for session: TabSession) {
         guard let scope,
               scope.sessions[session.tabID] === session,
               let acceptedID = session.pendingHandoff.providerSwitchAcceptedID,
@@ -18,6 +17,8 @@ extension AgentSessionLinkExecutionRuntime {
         else { return }
         let flightKey = ProviderSwitchConfirmationKey(sessionID: sessionID, acceptedID: acceptedID)
         if providerSwitchConfirmationFlights[flightKey] != nil { return }
+        // A trigger that cannot make progress must not reset an exposed save-failed state.
+        guard providerSwitchConfirmationCanProgress(session, sessionID: sessionID, acceptedID: acceptedID) else { return }
         let flightID = UUID()
         providerSwitchConfirmationFlights[flightKey] = flightID
         session.providerSwitchConfirmationSaveFailed = false
@@ -31,7 +32,6 @@ extension AgentSessionLinkExecutionRuntime {
                 self.pendingSendEffects.removeValue(forKey: flightID)
                 scope.noteSettlementChanged()
             }
-            var markerDurable = markerAlreadyDurable
             var lastFailure = false
             for attempt in 0 ..< 3 {
                 guard scope.sessions[session.tabID] === session,
@@ -49,20 +49,24 @@ extension AgentSessionLinkExecutionRuntime {
                     lastFailure = true
                     continue
                 }
-                if !markerDurable {
+                guard let record = providerSwitchConfirmationRecords[sessionID],
+                      record.acceptedID == acceptedID
+                else { return }
+                if !record.markerDurable {
+                    // Only the originating writer may record a late provider acceptance. A
+                    // successor waits for durable evidence instead of inferring acceptance.
+                    guard let origin = record.originWriter, writer.identity == origin else { return }
                     let save = await scope.persistence.flushSaveRequired(writer: writer)
                     guard case .success = save else {
                         lastFailure = true
                         continue
                     }
                     if Task.isCancelled { return }
-                    markerDurable = true
+                    providerSwitchNoteDurableMarker(sessionID: sessionID, acceptedID: acceptedID)
                 }
-                if let record = providerSwitchConfirmationRecords[sessionID],
-                   record.acceptedID == acceptedID, !record.terminalResolved
-                {
-                    return
-                }
+                guard let settled = providerSwitchConfirmationRecords[sessionID],
+                      settled.acceptedID == acceptedID, settled.markerDurable, settled.terminalResolved
+                else { return }
                 guard let payload = providerSwitchConfirmationPayload(
                     for: session, acceptedID: acceptedID
                 ) else {
@@ -102,6 +106,67 @@ extension AgentSessionLinkExecutionRuntime {
         pendingSendEffects[flightID] = PendingSendEffect(
             sessionIdentity: ObjectIdentifier(session), task: task
         )
+    }
+
+    /// Whether a new flight could perform Save A or Save B from the current record evidence.
+    private func providerSwitchConfirmationCanProgress(
+        _ session: TabSession, sessionID: UUID, acceptedID: UUID
+    ) -> Bool {
+        guard let record = providerSwitchConfirmationRecords[sessionID],
+              record.acceptedID == acceptedID
+        else { return false }
+        if record.markerDurable { return record.terminalResolved }
+        guard let origin = record.originWriter else { return false }
+        return providerSwitchConfirmationWriter(for: session)?.identity == origin
+    }
+
+    private func providerSwitchNoteDurableMarker(sessionID: UUID, acceptedID: UUID) {
+        guard var record = providerSwitchConfirmationRecords[sessionID],
+              record.acceptedID == acceptedID, !record.markerDurable
+        else { return }
+        record.markerDurable = true
+        providerSwitchConfirmationRecords[sessionID] = record
+    }
+
+    /// Ordinary save settlement. A committed receipt whose payload carries the live accepted ID
+    /// is durable-marker evidence for any same-session writer; it then wakes reconciliation, as
+    /// does any settlement while the confirmation is exposed as save-failed.
+    func providerSwitchConfirmationSaveSettled(
+        _ session: TabSession, sessionID: UUID, committedAcceptedID: UUID?
+    ) {
+        guard let scope, scope.sessions[session.tabID] === session,
+              session.activeAgentSessionID == sessionID,
+              let acceptedID = session.pendingHandoff.providerSwitchAcceptedID,
+              session.pendingHandoff.providerSwitchDelivery == .sending
+        else { return }
+        let wasDurable = providerSwitchConfirmationRecords[sessionID]?.markerDurable == true
+        if committedAcceptedID == acceptedID {
+            providerSwitchNoteDurableMarker(sessionID: sessionID, acceptedID: acceptedID)
+        }
+        let becameDurable = !wasDurable && providerSwitchConfirmationRecords[sessionID]?.markerDurable == true
+        if becameDurable || session.providerSwitchConfirmationSaveFailed {
+            providerSwitchReconcileConfirmation(for: session)
+        }
+    }
+
+    /// A hydrated payload carrying the accepted ID is durable evidence, and no run from before
+    /// the restart can still carry the handover, so hydration reconciles straight to Save B.
+    func providerSwitchConfirmationHydrated(_ session: TabSession, acceptedID: UUID) {
+        guard let scope, scope.sessions[session.tabID] === session,
+              let sessionID = session.activeAgentSessionID,
+              session.pendingHandoff.providerSwitchAcceptedID == acceptedID,
+              session.pendingHandoff.providerSwitchDelivery == .sending
+        else { return }
+        providerSwitchConfirmationRecords[sessionID] = .init(
+            acceptedID: acceptedID,
+            binding: session.currentRestorationBindingToken,
+            runOwnership: nil,
+            runID: nil,
+            originWriter: nil,
+            terminalResolved: true,
+            markerDurable: true
+        )
+        providerSwitchReconcileConfirmation(for: session)
     }
 
     /// Finalizes an accepted marker through the same projected Save B as automatic confirmation.

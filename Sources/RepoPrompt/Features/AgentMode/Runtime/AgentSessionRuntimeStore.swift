@@ -645,9 +645,7 @@ final class AgentSessionRuntimeStore {
                 noteSettlementChanged()
                 if let current { liveTabIDsBySessionID[current, default: []].insert(tabID) }
                 if session.pendingHandoff.providerSwitchAcceptedID != nil {
-                    linkExecution?.providerSwitchReconcileConfirmation(
-                        for: session, markerAlreadyDurable: session.isDirty == false
-                    )
+                    linkExecution?.providerSwitchReconcileConfirmation(for: session)
                 }
             }
         }

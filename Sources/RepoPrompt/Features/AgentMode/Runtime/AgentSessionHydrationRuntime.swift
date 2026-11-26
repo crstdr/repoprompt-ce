@@ -198,9 +198,9 @@ enum AgentSessionHydrationRuntime {
         if payload.needsReloadMigrationSave { scope.persistence.scheduleSave(for: session) }
         guard applied.commitReadiness() else { return false }
         if let linkExecution = scope.linkExecution,
-           session.pendingHandoff.providerSwitchAcceptedID != nil
+           let acceptedID = payload.persistedSession.providerSwitchAcceptedID
         {
-            linkExecution.providerSwitchReconcileConfirmation(for: session, markerAlreadyDurable: true)
+            linkExecution.providerSwitchConfirmationHydrated(session, acceptedID: acceptedID)
         }
         if attempt.ownsBinding, session.selectedAgent.usesClaudeTooling {
             _ = claude.currentClaudeEffortLevel(for: session)

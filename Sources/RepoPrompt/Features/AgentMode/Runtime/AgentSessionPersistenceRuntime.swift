@@ -380,6 +380,8 @@ final class AgentSessionPersistenceRuntime {
         guard saveQueue.begin(sessionID: sessionID) else {
             return .deferred("A save for this session is already in flight.")
         }
+        // Accepted provider-switch ID carried by a committed receipt's payload, if any.
+        var committedAcceptedID: UUID?
         defer {
             defer { scope?.noteSettlementChanged() }
             if saveQueue.finish(sessionID: sessionID) {
@@ -391,10 +393,10 @@ final class AgentSessionPersistenceRuntime {
                     scheduleSave(for: tabID)
                 }
             }
-            if sessions[tabID] === session, session.providerSwitchConfirmationSaveFailed,
-               session.pendingHandoff.providerSwitchAcceptedID != nil
-            {
-                scope?.linkExecution?.providerSwitchReconcileConfirmation(for: session, markerAlreadyDurable: true)
+            if sessions[tabID] === session, session.pendingHandoff.providerSwitchAcceptedID != nil {
+                scope?.linkExecution?.providerSwitchConfirmationSaveSettled(
+                    session, sessionID: sessionID, committedAcceptedID: committedAcceptedID
+                )
             }
         }
         // Queue admission and its completion owner precede the first suspension, including
@@ -512,6 +514,7 @@ final class AgentSessionPersistenceRuntime {
                 return .deferred(message)
             case let .committed(committed):
                 receipt = committed
+                committedAcceptedID = committed.payload.providerSwitchAcceptedID
             }
             guard permits(expectation, tabID: tabID) else {
                 return .deferred("The originating writer changed after persistence committed.")
@@ -613,7 +616,8 @@ final class AgentSessionPersistenceRuntime {
                    .init(sessionID: sessionID, acceptedID: acceptedID)
                ] == nil
             {
-                scope?.linkExecution?.providerSwitchReconcileConfirmation(for: session, markerAlreadyDurable: true)
+                // A projected clear never carries the marker, so this is a wake-up, not evidence.
+                scope?.linkExecution?.providerSwitchReconcileConfirmation(for: session)
             }
         }
         let projectedPayload: AgentSession

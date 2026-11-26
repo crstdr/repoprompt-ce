@@ -320,22 +320,28 @@ extension AgentSessionLinkExecutionRuntime {
         return true
     }
 
+    /// Every terminal state (completed, user Stop, failure) commits through the terminal barrier
+    /// and reaches this callback once publication resolves.
     func providerSwitchRunSettled(_ session: TabSession, revision: AgentRunTerminalCommitRevision, publication: AgentRunTerminalPublicationResult) {
-        guard publication.isResolved, sessions[session.tabID] === session,
-              let proof = session.pendingHandoff.providerSwitchDispatch,
-              proof.binding == session.currentRestorationBindingToken,
-              proof.runOwnership == revision.ownership,
-              proof.runID == nil || proof.runID == revision.expectedRunID
-        else { return }
-        session.pendingHandoff.providerSwitchDispatch = nil
-        if var record = providerSwitchConfirmationRecords[session.activeAgentSessionID ?? session.tabID],
-           record.runID == revision.expectedRunID || record.runOwnership == revision.ownership
+        guard publication.isResolved, sessions[session.tabID] === session else { return }
+        if let proof = session.pendingHandoff.providerSwitchDispatch,
+           proof.binding == session.currentRestorationBindingToken,
+           proof.runOwnership == revision.ownership,
+           proof.runID == nil || proof.runID == revision.expectedRunID
         {
-            record.terminalResolved = true
-            providerSwitchConfirmationRecords[session.activeAgentSessionID ?? session.tabID] = record
-            if session.pendingHandoff.providerSwitchAcceptedID != nil {
-                providerSwitchReconcileConfirmation(for: session, markerAlreadyDurable: session.isDirty == false)
-            }
+            session.pendingHandoff.providerSwitchDispatch = nil
+        }
+        // The accepted-run record outlives the transient proof, so settlement never depends on
+        // the proof still being present.
+        let recordKey = session.activeAgentSessionID ?? session.tabID
+        guard var record = providerSwitchConfirmationRecords[recordKey], !record.terminalResolved,
+              record.runOwnership == revision.ownership,
+              record.runID == nil || record.runID == revision.expectedRunID
+        else { return }
+        record.terminalResolved = true
+        providerSwitchConfirmationRecords[recordKey] = record
+        if session.pendingHandoff.providerSwitchAcceptedID == record.acceptedID {
+            providerSwitchReconcileConfirmation(for: session)
         }
     }
 
@@ -346,12 +352,11 @@ extension AgentSessionLinkExecutionRuntime {
               let staged = session.pendingHandoff.providerSwitchDispatch,
               staged.dispatchID == context.dispatchID, staged.binding == session.currentRestorationBindingToken
         else { return }
-        let acceptanceWriter = providerSwitchWriter(for: session, proof: staged)
-        guard acceptanceWriter != nil else { return }
+        guard let acceptanceWriter = providerSwitchWriter(for: session, proof: staged) else { return }
         // Acceptance is monotonic. Keep the carrier and `.sending` in live memory until the
         // provider-free projected clear has a durable receipt; duplicate callbacks are no-ops.
         guard session.pendingHandoff.providerSwitchAcceptedID == nil else {
-            providerSwitchReconcileConfirmation(for: session, markerAlreadyDurable: false)
+            providerSwitchReconcileConfirmation(for: session)
             return
         }
         let acceptedID = UUID()
@@ -361,12 +366,14 @@ extension AgentSessionLinkExecutionRuntime {
             binding: staged.binding,
             runOwnership: staged.runOwnership,
             runID: staged.runID,
-            terminalResolved: staged.runOwnership == nil && staged.runID == nil
+            originWriter: acceptanceWriter.identity,
+            terminalResolved: staged.runOwnership == nil && staged.runID == nil,
+            markerDurable: false
         )
         session.pendingHandoff.isStagedForSend = false
         session.providerSwitchConfirmationSaveFailed = false
         session.isDirty = true
-        providerSwitchReconcileConfirmation(for: session, markerAlreadyDurable: false)
+        providerSwitchReconcileConfirmation(for: session)
     }
 
     func providerSwitchHistoryToolAllowed(_ session: TabSession, destination: AgentProviderKind? = nil) -> Bool {
