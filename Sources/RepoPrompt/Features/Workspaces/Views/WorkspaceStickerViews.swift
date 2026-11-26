@@ -48,7 +48,7 @@ struct WorkspaceColorSwatchPicker: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .help(option.label)
+                .hoverTooltip(option.label)
                 .accessibilityLabel(option.label)
                 .accessibilityAddTraits(option.isSelected ? .isSelected : [])
             }
