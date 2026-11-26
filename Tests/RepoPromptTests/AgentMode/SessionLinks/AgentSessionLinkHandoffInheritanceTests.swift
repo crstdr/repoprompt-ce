@@ -1652,8 +1652,13 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     XCTAssertEqual(session.pendingHandoff.providerSwitchAcceptedID, acceptedID)
                     session.runState = .running
                     await fixture.viewModel.runService.test_publishNaturalCompletion(session)
+                    func isSaveB(_ saved: AgentSession) -> Bool {
+                        saved.pendingHandoffProviderSwitchDelivery == nil && saved.providerSwitchAcceptedID == nil
+                    }
                     try await AsyncTestWait.waitUntil("clear save settles") {
-                        clearFails ? session.providerSwitchConfirmationSaveFailed : session.pendingHandoff.providerSwitchDelivery == nil
+                        clearFails
+                            ? session.providerSwitchConfirmationSaveFailed
+                            : saves.contains(where: isSaveB) && session.pendingHandoff.providerSwitchDelivery == nil
                     }
                     await fixture.viewModel.linkExecutionRuntime.drainPendingSendEffects(for: session)
                     session.saveDebounceTask?.cancel()
@@ -1670,6 +1675,14 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                         XCTAssertFalse(session.providerSwitchConfirmationSaveFailed)
                         XCTAssertNil(session.pendingHandoff.providerSwitchAcceptedID)
                         XCTAssertEqual(sentRows.map(\.id), [acceptedID])
+                        // The persisted Save B payload, not only the live state, carries the clear.
+                        let saveB = try XCTUnwrap(saves.last(where: isSaveB))
+                        XCTAssertNil(saveB.providerSwitchAcceptedID)
+                        XCTAssertNil(saveB.pendingHandoffProviderSwitchDelivery)
+                        XCTAssertNil(saveB.pendingHandoffPayload)
+                        let persistedSent = saveB.toLiveItems().filter { $0.recoveryDiagnostic?.outcome == "sent" }
+                        XCTAssertEqual(persistedSent.map(\.id), [acceptedID])
+                        XCTAssertEqual(persistedSent.map { $0.recoveryDiagnostic?.id }, [acceptedID])
                         XCTAssertEqual(sentRows.map(\.text), ["Handover sent to \(session.selectedAgent.displayName) / \(fixture.viewModel.inputBarModelDisplayName(rawModel: session.selectedModelRaw, agentKind: session.selectedAgent))."])
                         XCTAssertFalse(session.pendingHandoff.isStagedForSend)
                     }
