@@ -16,7 +16,11 @@ extension AgentSessionLinkExecutionRuntime {
               let sessionID = session.activeAgentSessionID
         else { return }
         let flightKey = ProviderSwitchConfirmationKey(sessionID: sessionID, acceptedID: acceptedID)
-        if providerSwitchConfirmationFlights[flightKey] != nil { return }
+        if providerSwitchConfirmationFlights[flightKey] != nil {
+            // Coalesce: the active flight reconciles once more when it ends.
+            providerSwitchConfirmationRerunRequested.insert(flightKey)
+            return
+        }
         // A trigger that cannot make progress must not reset an exposed save-failed state.
         guard providerSwitchConfirmationCanProgress(session, sessionID: sessionID, acceptedID: acceptedID) else { return }
         let flightID = UUID()
@@ -26,10 +30,8 @@ extension AgentSessionLinkExecutionRuntime {
         let task = Task { @MainActor [weak self, weak session, weak scope] in
             guard let self, let session, let scope else { return }
             defer {
-                if self.providerSwitchConfirmationFlights[flightKey] == flightID {
-                    self.providerSwitchConfirmationFlights.removeValue(forKey: flightKey)
-                }
                 self.pendingSendEffects.removeValue(forKey: flightID)
+                self.providerSwitchConfirmationFlightEnded(flightKey, flightID: flightID, session: session)
                 scope.noteSettlementChanged()
             }
             var lastFailure = false
@@ -94,10 +96,13 @@ extension AgentSessionLinkExecutionRuntime {
                 if Task.isCancelled { return }
                 lastFailure = true
             }
+            // A coalesced trigger gets its rerun first; only a flight with nothing pending may
+            // expose save failure.
             guard scope.sessions[session.tabID] === session,
                   session.activeAgentSessionID == sessionID,
                   session.pendingHandoff.providerSwitchAcceptedID == acceptedID,
-                  lastFailure
+                  lastFailure,
+                  !providerSwitchConfirmationRerunRequested.contains(flightKey)
             else { return }
             providerSwitchConfirmationSaveFailures.insert(sessionID)
             session.providerSwitchConfirmationSaveFailed = true
@@ -106,6 +111,17 @@ extension AgentSessionLinkExecutionRuntime {
         pendingSendEffects[flightID] = PendingSendEffect(
             sessionIdentity: ObjectIdentifier(session), task: task
         )
+    }
+
+    /// Releases a flight key and runs at most one reconciliation for triggers coalesced into it.
+    /// The rerun passes the normal fences and single-flight admission.
+    private func providerSwitchConfirmationFlightEnded(
+        _ flightKey: ProviderSwitchConfirmationKey, flightID: UUID, session: TabSession
+    ) {
+        guard providerSwitchConfirmationFlights[flightKey] == flightID else { return }
+        providerSwitchConfirmationFlights.removeValue(forKey: flightKey)
+        guard providerSwitchConfirmationRerunRequested.remove(flightKey) != nil else { return }
+        providerSwitchReconcileConfirmation(for: session)
     }
 
     /// Whether a new flight could perform Save A or Save B from the current record evidence.
@@ -187,7 +203,7 @@ extension AgentSessionLinkExecutionRuntime {
         let discardFlightID = UUID()
         let discardFlightKey = ProviderSwitchConfirmationKey(sessionID: sessionID, acceptedID: acceptedID)
         providerSwitchConfirmationFlights[discardFlightKey] = discardFlightID
-        defer { providerSwitchConfirmationFlights.removeValue(forKey: discardFlightKey) }
+        defer { providerSwitchConfirmationFlightEnded(discardFlightKey, flightID: discardFlightID, session: session) }
         let result = await scope.persistence.flushProviderSwitchProjectedSave(
             payload: payload,
             writer: writer,

@@ -61,6 +61,9 @@ final class AgentSessionLinkExecutionRuntime {
     }
 
     var providerSwitchConfirmationFlights: [ProviderSwitchConfirmationKey: UUID] = [:]
+    /// Triggers that arrived while a flight held the key. Each ending flight consumes its entry
+    /// and reconciles exactly once more; no timer or self-perpetuating retry is involved.
+    var providerSwitchConfirmationRerunRequested: Set<ProviderSwitchConfirmationKey> = []
     /// Runtime-only failure presentation for an accepted marker whose bounded confirmation save
     /// exhausted its attempts. Hydration clears this and retries from the durable marker.
     var providerSwitchConfirmationSaveFailures: Set<UUID> = []

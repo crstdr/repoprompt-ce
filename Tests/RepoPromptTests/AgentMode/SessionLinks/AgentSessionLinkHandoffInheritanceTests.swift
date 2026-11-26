@@ -1964,6 +1964,87 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             }
         }
 
+        func testTriggerDuringSuspendedSaveBReconcilesOnceTheFlightEnds() async throws {
+            enum Fault: Error { case beforeWrite }
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                vm.test_setSuppressesAgentSessionPersistence(false)
+                let savedURL = fixture.rootURL.appendingPathComponent("coalesced-rerun.json")
+                try installSwitch(fixture)
+                let preparation = try await switchPreparation(fixture)
+                let writer = preparation.command.writer
+                let scope = writer.scope
+                // Keep debounced ordinary saves out of the window so only the coalesced rerun can
+                // restart reconciliation after the flight ends.
+                let originalDebounce = scope.persistence.debounce
+                scope.persistence.debounce = { try await Task.sleep(nanoseconds: 60_000_000_000) }
+                let gate = AgentSessionLinkStopSignal<Void>()
+                defer {
+                    gate.finish(())
+                    scope.persistence.debounce = originalDebounce
+                    vm.test_setAgentSessionSaver { _, _, _ in savedURL }
+                    session.saveDebounceTask?.cancel()
+                    session.saveDebounceTask = nil
+                    vm.test_setSuppressesAgentSessionPersistence(nil)
+                }
+                var clearAttempts = 0
+                var gateEntered = false
+                vm.test_setAgentSessionSaver { saved, _, _ in
+                    if saved.pendingHandoffProviderSwitchDelivery == nil, saved.providerSwitchAcceptedID == nil {
+                        clearAttempts += 1
+                        // The origin's first two Save B attempts fail; its last one suspends.
+                        if clearAttempts < 3 { throw Fault.beforeWrite }
+                        if clearAttempts == 3 {
+                            gateEntered = true
+                            await gate.value()
+                        }
+                    }
+                    try JSONEncoder().encode(saved).write(to: savedURL, options: .atomic)
+                    return savedURL
+                }
+                _ = await vm.linkExecutionRuntime.prepareProviderSwitchHandoverForSend(preparation, session: session, stopFence: .init(session: session))
+                let runID = UUID()
+                session.installRunID(runID)
+                session.beginRunAttempt(source: "test.switch.coalescedRerun")
+                session.runState = .running
+                let dispatch = AgentSessionLinkPromptDispatchID.headlessRun(runID: runID)
+                XCTAssertTrue(vm.linkExecutionRuntime.providerSwitchAcquirePhysicalDispatch(session: session, dispatchID: dispatch))
+                vm.linkExecutionRuntime.providerSwitchRecordPhysicalAcceptance(
+                    session: session, context: AgentSessionLinkDispatchContext(session: session, dispatchID: dispatch)
+                )
+                let acceptedID = try XCTUnwrap(session.pendingHandoff.providerSwitchAcceptedID)
+                await vm.linkExecutionRuntime.drainPendingSendEffects(for: session)
+                XCTAssertEqual(try JSONDecoder().decode(AgentSession.self, from: Data(contentsOf: savedURL)).providerSwitchAcceptedID, acceptedID)
+
+                await vm.runService.test_publishNaturalCompletion(session)
+                try await AsyncTestWait.waitUntil("the origin's last Save B attempt suspends") { gateEntered }
+                // The writer changes while Save B is suspended; its trigger finds the active flight.
+                let sessions = scope.sessions
+                var withoutOrigin = sessions
+                withoutOrigin.removeValue(forKey: session.tabID)
+                scope.replaceSessions(withoutOrigin)
+                scope.replaceSessions(sessions)
+                XCTAssertFalse(writer.isCurrent)
+                XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .sending)
+                gate.finish(())
+
+                try await AsyncTestWait.waitUntil("the coalesced rerun lets the successor finish Save B") {
+                    session.pendingHandoff.providerSwitchDelivery == nil
+                }
+                await vm.linkExecutionRuntime.drainPendingSendEffects(for: session)
+                XCTAssertEqual(clearAttempts, 4, "One stale origin attempt, then exactly one successor Save B")
+                XCTAssertFalse(session.providerSwitchConfirmationSaveFailed)
+                XCTAssertNil(session.pendingHandoff.providerSwitchAcceptedID)
+                XCTAssertTrue(vm.linkExecutionRuntime.providerSwitchConfirmationRerunRequested.isEmpty)
+                XCTAssertEqual(session.items.filter { $0.recoveryDiagnostic?.outcome == "sent" }.map(\.id), [acceptedID])
+                let cleared = try JSONDecoder().decode(AgentSession.self, from: Data(contentsOf: savedURL))
+                XCTAssertNil(cleared.providerSwitchAcceptedID)
+                XCTAssertNil(cleared.pendingHandoffProviderSwitchDelivery)
+                XCTAssertEqual(cleared.toLiveItems().filter { $0.recoveryDiagnostic?.outcome == "sent" }.map(\.id), [acceptedID])
+            }
+        }
+
         func testSuccessorWithoutDurableMarkerEvidenceNeitherRecordsNorFinishesAcceptance() async throws {
             try await withFixture { fixture in
                 let vm = fixture.viewModel
