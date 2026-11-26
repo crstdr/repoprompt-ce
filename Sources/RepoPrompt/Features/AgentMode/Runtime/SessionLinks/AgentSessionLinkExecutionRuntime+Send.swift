@@ -320,11 +320,13 @@ extension AgentSessionLinkExecutionRuntime {
         return true
     }
 
-    /// Every terminal state (completed, user Stop, failure) commits through the terminal barrier
-    /// and reaches this callback once publication resolves.
+    /// Every terminal state (completed, user Stop, failure) commits through the terminal barrier,
+    /// which ends the run attempt before publishing and then calls this for every publication
+    /// result, including a rejected one.
     func providerSwitchRunSettled(_ session: TabSession, revision: AgentRunTerminalCommitRevision, publication: AgentRunTerminalPublicationResult) {
-        guard publication.isResolved, sessions[session.tabID] === session else { return }
-        if let proof = session.pendingHandoff.providerSwitchDispatch,
+        guard sessions[session.tabID] === session else { return }
+        if publication.isResolved,
+           let proof = session.pendingHandoff.providerSwitchDispatch,
            proof.binding == session.currentRestorationBindingToken,
            proof.runOwnership == revision.ownership,
            proof.runID == nil || proof.runID == revision.expectedRunID
@@ -332,11 +334,14 @@ extension AgentSessionLinkExecutionRuntime {
             session.pendingHandoff.providerSwitchDispatch = nil
         }
         // The accepted-run record outlives the transient proof, so settlement never depends on
-        // the proof still being present.
+        // the proof still being present. It waits only for the carrying run to stop, not for MCP
+        // publication: Save B and safe Discard are provider-free. The barrier's finishActiveState
+        // has already ended this attempt, so an unresolved publication cannot mean a live run.
         let recordKey = session.activeAgentSessionID ?? session.tabID
         guard var record = providerSwitchConfirmationRecords[recordKey], !record.terminalResolved,
               record.runOwnership == revision.ownership,
-              record.runID == nil || record.runID == revision.expectedRunID
+              record.runID == nil || record.runID == revision.expectedRunID,
+              !session.isCurrentRunAttempt(revision.ownership)
         else { return }
         record.terminalResolved = true
         providerSwitchConfirmationRecords[recordKey] = record
