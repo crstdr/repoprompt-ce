@@ -78,21 +78,4 @@ extension View {
             self
         }
     }
-
-    /// A 2 pt workspace-colour rule along the top content edge, directly below the toolbar. It is
-    /// a top safe-area inset with no spacing, so content starts below the rule instead of being
-    /// drawn over (an overlay clipped the top of the sidebar selector). Space is reserved only
-    /// while a colour is set: None reserves nothing, and setting or clearing a colour moves
-    /// content by the rule's 2 pt. Apply it before `debugBuildWindowEdge()` so the DEBUG rule
-    /// stays outermost and this rule sits directly below it.
-    func workspaceColorWindowEdge(_ color: WorkspaceColor?) -> some View {
-        safeAreaInset(edge: .top, spacing: 0) {
-            if let color {
-                color.color
-                    .frame(height: 2)
-                    .allowsHitTesting(false)
-                    .accessibilityHidden(true)
-            }
-        }
-    }
 }

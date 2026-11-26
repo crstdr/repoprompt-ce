@@ -1438,6 +1438,33 @@ final class WorkspaceRestorationTitleTests: XCTestCase {
         XCTAssertNil(window.workspaceManager.workspace(withID: system.id)?.color)
     }
 
+    /// The colour has no window-level presentation (the former edge line reserved space at the window
+    /// root): a colour change reaches only the title dot and the sticker and publishes nothing on the
+    /// window state the root view observes, so nothing above the content can move.
+    func testWorkspaceColorChangePublishesNothingOnWindowState() async throws {
+        let fixture = try await makeFixture(systemNumber: 6)
+        let window = fixture.window
+        let target = window.workspaceManager.createWorkspace(
+            name: "Edge \(UUID().uuidString.prefix(6))", repoPaths: [fixture.rootURL.path], ephemeral: true
+        )
+        _ = await window.workspaceManager.switchWorkspace(to: target, saveState: false, reason: "titleColorEdge")
+        await resolveTitle(window)
+
+        var windowPublishes = 0
+        let subscription = window.objectWillChange.sink { windowPublishes += 1 }
+        defer { subscription.cancel() }
+        let repainted = expectation(description: "title re-resolved for the colour change")
+        window.setWindowTitleResolutionDidCompleteHandlerForTesting {
+            guard window.workspaceSticker.state.color == .violet else { return }
+            window.setWindowTitleResolutionDidCompleteHandlerForTesting(nil)
+            repainted.fulfill()
+        }
+        window.setTitleWorkspaceColor(.violet, expectedWorkspaceID: target.id)
+        await fulfillment(of: [repainted], timeout: 5)
+        XCTAssertEqual(window.agentChatTitleCluster.state.workspaceColor, .violet)
+        XCTAssertEqual(windowPublishes, 0)
+    }
+
     /// A picker opened on one workspace closes when the title switches to another, and a choice
     /// bound to the first workspace writes nothing to either; the current workspace's ID still applies.
     func testTitleWorkspaceColorWithStaleExpectedWorkspaceWritesNothing() async throws {

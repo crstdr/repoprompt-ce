@@ -88,7 +88,7 @@ struct CoherentWindowTitlePresentation: Equatable {
     let workspaceDisplayName: String
     let renderedTitle: String
     /// Colour of the workspace this title shows; nil for None, System, or no workspace. Resolved
-    /// with the title so the dot and edge line never describe a different workspace than the text.
+    /// with the title so the dot and sticker never describe a different workspace than the text.
     var workspaceColor: WorkspaceColor?
 
     static let appDefault = CoherentWindowTitlePresentation(
@@ -403,9 +403,6 @@ class WindowState: ObservableObject {
     /// Published so the scene keeps re-applying it; otherwise SwiftUI falls back to the
     /// app display name whenever it refreshes the window chrome.
     @Published private(set) var displayedWindowTitle: String = WindowTitleFormatter.defaultTitle
-
-    /// Colour of the workspace the installed title shows (drives the window edge line).
-    @Published private(set) var workspaceColor: WorkspaceColor?
 
     /// The last complete title resolution. Retained, never partially updated, while the active
     /// workspace model is unresolved or a real switch has not yet assigned the target's number.
@@ -1359,9 +1356,6 @@ class WindowState: ObservableObject {
         let title = coherentTitlePresentation.renderedTitle
         if displayedWindowTitle != title {
             displayedWindowTitle = title
-        }
-        if workspaceColor != coherentTitlePresentation.workspaceColor {
-            workspaceColor = coherentTitlePresentation.workspaceColor
         }
         refreshAgentChatTitleCluster()
         guard let window = nsWindow else { return }
