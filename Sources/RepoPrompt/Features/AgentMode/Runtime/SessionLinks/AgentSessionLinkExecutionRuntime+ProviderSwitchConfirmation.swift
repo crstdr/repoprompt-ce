@@ -117,7 +117,7 @@ extension AgentSessionLinkExecutionRuntime {
               providerSwitchConfirmationRecords[sessionID]?.terminalResolved != false,
               let writer = providerSwitchConfirmationWriter(for: session),
               let payload = providerSwitchConfirmationPayload(for: session, acceptedID: acceptedID, includeNotice: false),
-              let transcript = payload.transcript
+              payload.transcript != nil
         else { return false }
         let discardFlightID = UUID()
         let discardFlightKey = ProviderSwitchConfirmationKey(sessionID: sessionID, acceptedID: acceptedID)
