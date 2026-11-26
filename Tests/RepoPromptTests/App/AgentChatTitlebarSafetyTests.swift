@@ -1451,16 +1451,16 @@ final class WorkspaceRestorationTitleTests: XCTestCase {
     }
 
     /// The colour has no window-level or title presentation (the former edge line reserved space at
-    /// the window root, and the title no longer shows a dot): a colour change reaches only the
-    /// sticker and publishes nothing on the window state the root view observes or on the title
-    /// cluster, so neither the content nor the title can move.
+    /// the window root, and the title no longer shows a dot): a colour change repaints the sticker
+    /// and publishes nothing on the window state the root view observes or on the title cluster.
+    /// Other observers of the workspace list may still re-render; this test does not cover them.
     func testWorkspaceColorChangePublishesNothingOnWindowState() async throws {
         let fixture = try await makeFixture(systemNumber: 6)
         let window = fixture.window
         let target = window.workspaceManager.createWorkspace(
-            name: "Edge \(UUID().uuidString.prefix(6))", repoPaths: [fixture.rootURL.path], ephemeral: true
+            name: "Sticker \(UUID().uuidString.prefix(6))", repoPaths: [fixture.rootURL.path], ephemeral: true
         )
-        _ = await window.workspaceManager.switchWorkspace(to: target, saveState: false, reason: "titleColorEdge")
+        _ = await window.workspaceManager.switchWorkspace(to: target, saveState: false, reason: "titleColorSticker")
         await resolveTitle(window)
 
         var windowPublishes = 0

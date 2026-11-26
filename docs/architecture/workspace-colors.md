@@ -1,6 +1,6 @@
 # Workspace Colors
 
-A workspace can carry one color from a fixed palette, so windows are easy to tell apart at a glance. The color belongs to the workspace, not to a window: every window that shows the workspace shows the same color, and the color stays visible in the workspace lists while no window is open.
+A workspace can carry one color from a fixed palette, so windows are easy to tell apart at a glance. The color belongs to the workspace, not to a window: it is saved with the workspace, and every window reads the same value. To mark a window, the color appears only on the workspace sticker in Agent mode: in the strip above the sidebar or, while the sidebar is hidden, in the titlebar. Other modes and the window title do not show it. Manage Workspaces and the dots in the workspace picker also show the color, including for workspaces that no window has open. See [Where it shows](#where-it-shows).
 
 ## Saved contract
 

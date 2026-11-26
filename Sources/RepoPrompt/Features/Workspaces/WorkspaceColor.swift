@@ -47,7 +47,8 @@ enum WorkspaceColor: String, CaseIterable, Identifiable {
         }
     }
 
-    /// VoiceOver label shared by every dot that shows this colour.
+    /// VoiceOver label shared by every dot that shows this colour; the workspace stickers also use
+    /// it as their accessibility value.
     var accessibilityLabel: String {
         "Workspace color: \(displayName)"
     }
