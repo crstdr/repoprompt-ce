@@ -1672,7 +1672,9 @@ class WindowState: ObservableObject {
     }
 
     /// Sticker picker action: colours the workspace whose name the title shows, only while it is
-    /// still the workspace the picker was opened for. A switch while the picker is open writes nothing.
+    /// still the workspace the picker was opened for. Once the title shows another workspace the
+    /// click writes nothing; while a switch is still pending the title still shows the original
+    /// workspace, so the click colours that one.
     func setTitleWorkspaceColor(_ color: WorkspaceColor?, expectedWorkspaceID: UUID) {
         guard !isClosing,
               let workspace = titleColorableWorkspace(),
@@ -1848,6 +1850,8 @@ class WindowState: ObservableObject {
         } else {
             wantsAgentTitlebarAccessory = false
             agentNewSessionAction = nil
+            // Leaving Agent mode hides both sticker hosts; an open picker must not survive the return.
+            workspaceSticker.dismissPicker()
             removeAgentTitlebarAccessory()
             refreshAgentChatTitleCluster()
         }

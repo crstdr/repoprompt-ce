@@ -481,6 +481,24 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
         }
     }
 
+    /// Leaving Agent mode (or entering System) hides the titlebar accessory and closes an open
+    /// sticker picker, so returning to the same workspace does not reopen it.
+    func testLeavingAgentModeClosesWorkspaceStickerPicker() async throws {
+        try await withFixture { fixture in
+            let window = fixture.window
+            await awaitWindowTitleResolution(window)
+            window.workspaceSticker.togglePicker(from: .sidebarToolbar)
+            XCTAssertEqual(
+                window.workspaceSticker.picker,
+                .init(workspaceID: fixture.workspaceID, host: .sidebarToolbar)
+            )
+
+            window.setAgentTitlebarAccessoryVisible(false)
+            XCTAssertNil(window.workspaceSticker.picker)
+            XCTAssertFalse(window.workspaceSticker.isPickerPresented(in: .sidebarToolbar))
+        }
+    }
+
     /// Collapsing the sidebar moves compose and the sticker beside the traffic lights, after the
     /// toggle; System shows no sticker there either.
     func testCollapsedTitlebarAccessoryIncludesWorkspaceSticker() {
