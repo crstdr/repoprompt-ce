@@ -313,6 +313,8 @@ struct AgentModeChatDetailView: View {
         nonmutating set { scrollEngine.bottomScrollOutcome = newValue }
     }
 
+    @State private var pendingBottomReveal: PendingBottomReveal?
+
     private var programmaticScrollGate: ProgrammaticScrollGate {
         get { scrollEngine.programmaticScrollGate }
         nonmutating set { scrollEngine.programmaticScrollGate = newValue }
@@ -1824,6 +1826,45 @@ struct AgentModeChatDetailView: View {
             ScrollViewReader { proxy in
                 ZStack(alignment: .bottomTrailing) {
                     versionedScrollableContent(proxy: proxy, viewportHeight: geometry.size.height)
+                        .onPreferenceChange(TranscriptBottomRevealFrameKey.self) { witness in
+                            if let witness, witness.isVisible(in: geometry.size) {
+                                completeBottomReveal(witness)
+                            }
+                        }
+                        .onPreferenceChange(BottomRevealTailStartKey.self) { witness in
+                            if let witness, witness.frame.minY <= 0 {
+                                completeBottomReveal(witness)
+                            }
+                        }
+                        .onChange(of: bottomRevealScope) { _, scope in
+                            if let pendingBottomReveal, pendingBottomReveal.scope != scope {
+                                cancelBottomRevealIfNeeded()
+                            }
+                        }
+                        .onChange(of: transcriptSnapshot.renderEntries?.entries.last?.id) { _, _ in
+                            retargetBottomRevealIfNeeded()
+                        }
+                        .task(id: pendingBottomReveal?.witnessID) { [witnessID = pendingBottomReveal?.witnessID] in
+                            guard let witnessID else { return }
+                            // Give an already mounted row a layout pass without moving the viewport.
+                            do { try await Task.sleep(for: .milliseconds(24)) } catch { return }
+                            guard let reveal = pendingBottomReveal, reveal.witnessID == witnessID,
+                                  reveal.scope == bottomRevealScope, currentTabID == agentModeVM.currentTabID,
+                                  !isUserInteractingWithScroll, programmaticScrollGate.isInFlight,
+                                  let entry = transcriptSnapshot.renderEntries?.entries.last, entry.id == reveal.entryID
+                            else { return }
+                            guard reveal.revisionFence.permits(currentTranscriptPresentationRevision) else {
+                                cancelBottomRevealIfNeeded()
+                                return
+                            }
+                            reveal.move(bottomRevealScrollID(for: entry))
+                        }
+                        .task(id: pendingBottomReveal?.id) { [id = pendingBottomReveal?.id] in
+                            guard let id else { return }
+                            do { try await Task.sleep(for: .milliseconds(300)) } catch { return }
+                            guard pendingBottomReveal?.id == id else { return }
+                            cancelBottomRevealIfNeeded()
+                        }
 
                     #if DEBUG
                         if let stressHarness {
@@ -2210,6 +2251,88 @@ struct AgentModeChatDetailView: View {
         let hasTranscript: Bool
     }
 
+    private struct BottomRevealScope: Equatable {
+        let mount: TranscriptScrollMountID
+        let target: AgentTranscriptPaneTarget
+    }
+
+    private struct PendingBottomReveal {
+        let id: UUID
+        var witnessID = UUID()
+        let scope: BottomRevealScope
+        var entryID: AgentTranscriptRenderEntries.Entry.ID
+        let revisionFence: TranscriptBottomRevealRevisionFence
+        let restoreToken: UInt64?
+        let move: (AnyHashable) -> Void
+        let complete: () -> Void
+    }
+
+    private var bottomRevealScope: BottomRevealScope {
+        .init(
+            mount: .init(revision: transcriptScrollResetRevision, hasTranscript: transcriptSnapshot.panePresentation == .transcript),
+            target: transcriptUI.snapshot.paneTarget
+        )
+    }
+
+    private func bottomRevealScrollID(for entry: AgentTranscriptRenderEntries.Entry) -> AnyHashable {
+        entry.isFirstInBlock ? AnyHashable(entry.block.id) : AnyHashable(entry.id)
+    }
+
+    private enum BottomRevealTailStartKey: PreferenceKey {
+        static var defaultValue: TranscriptBottomRevealFrame? {
+            nil
+        }
+
+        static func reduce(value: inout TranscriptBottomRevealFrame?, nextValue: () -> TranscriptBottomRevealFrame?) {
+            value = nextValue() ?? value
+        }
+    }
+
+    private func completeBottomReveal(_ witness: TranscriptBottomRevealFrame) {
+        guard let reveal = pendingBottomReveal, witness.requestID == reveal.witnessID,
+              witness.presentationRevision == currentTranscriptPresentationRevision,
+              reveal.entryID == transcriptSnapshot.renderEntries?.entries.last?.id
+        else { return }
+        guard reveal.scope == bottomRevealScope, currentTabID == agentModeVM.currentTabID,
+              !isUserInteractingWithScroll,
+              reveal.revisionFence.permits(currentTranscriptPresentationRevision),
+              programmaticScrollGate.isInFlight
+        else {
+            cancelBottomRevealIfNeeded()
+            return
+        }
+        pendingBottomReveal = nil
+        reveal.complete()
+    }
+
+    private func retargetBottomRevealIfNeeded() {
+        guard var reveal = pendingBottomReveal else { return }
+        guard reveal.scope == bottomRevealScope, reveal.revisionFence.allowsRevisionMismatch,
+              let entry = transcriptSnapshot.renderEntries?.entries.last
+        else {
+            cancelBottomRevealIfNeeded()
+            return
+        }
+        if reveal.entryID != entry.id {
+            reveal.entryID = entry.id
+            reveal.witnessID = UUID()
+            pendingBottomReveal = reveal
+        }
+    }
+
+    private func cancelBottomRevealIfNeeded() {
+        guard let reveal = pendingBottomReveal else { return }
+        cancelPendingScrollWork()
+        cancelPendingBottomScrollOutcomeIfUnexecuted(reason: "bottomRevealCancelled")
+        cancelBottomRevealRestore(token: reveal.restoreToken, tabID: reveal.scope.target.tabID)
+    }
+
+    private func cancelBottomRevealRestore(token: UInt64?, tabID: UUID?) {
+        guard token == rehydrateLayoutPassToken, rehydrateRestorePhase.isActive,
+              rehydrateRestorePhase.tabID == tabID else { return }
+        cancelRehydrateRestore()
+    }
+
     @available(macOS 15.0, *)
     private func modernScrollableContent(proxy: ScrollViewProxy, viewportHeight: CGFloat) -> some View {
         // Keep the ScrollView identity stable across pinned/detached transitions.
@@ -2221,6 +2344,7 @@ struct AgentModeChatDetailView: View {
             revision: transcriptScrollResetRevision,
             hasTranscript: transcriptSnapshot.panePresentation == .transcript
         ))
+        .coordinateSpace(name: TranscriptBottomRevealFrameKey.coordinateSpace)
         .accessibilityIdentifier("agentTranscript.scrollView")
         .transaction { txn in
             if didChatChange { txn.disablesAnimations = true }
@@ -2293,6 +2417,7 @@ struct AgentModeChatDetailView: View {
         currentUserScrollPhase = phase
         switch phase {
         case .tracking, .interacting, .decelerating:
+            cancelBottomRevealIfNeeded()
             _ = applyScrollMetrics(metrics)
             beginUserScrollInteractionIfNeeded(
                 proxy: proxy,
@@ -2314,6 +2439,7 @@ struct AgentModeChatDetailView: View {
             messageListContent(viewportHeight: viewportHeight, proxy: proxy)
         }
         .id(transcriptScrollResetRevision)
+        .coordinateSpace(name: TranscriptBottomRevealFrameKey.coordinateSpace)
         .accessibilityIdentifier("agentTranscript.scrollView")
         .transaction { txn in
             if didChatChange { txn.disablesAnimations = true }
@@ -2403,7 +2529,19 @@ struct AgentModeChatDetailView: View {
     /// Keep the active interaction state and the live-bottom scroll target mounted while history is lazy.
     @ViewBuilder
     private var liveTranscriptTail: some View {
-        runningIndicatorSlot
+        runningIndicatorSlot.background {
+            if let witnessID = pendingBottomReveal?.witnessID {
+                GeometryReader { geometry in
+                    Color.clear.preference(
+                        key: BottomRevealTailStartKey.self,
+                        value: .init(
+                            requestID: witnessID, presentationRevision: currentTranscriptPresentationRevision,
+                            frame: geometry.frame(in: .named(TranscriptBottomRevealFrameKey.coordinateSpace))
+                        )
+                    )
+                }
+            }
+        }
         DelegationApprovalSlot(
             windowID: windowID,
             tabID: currentTabID,
@@ -2645,7 +2783,11 @@ struct AgentModeChatDetailView: View {
                 }
             }
             .padding(.top, entry.isFirstInBlock ? 0 : -4)
-            .id(entry.isFirstInBlock ? AnyHashable(entry.block.id) : AnyHashable(entry.id))
+            .modifier(TranscriptBottomRevealWitness(
+                requestID: pendingBottomReveal.flatMap { $0.entryID == entry.id ? $0.witnessID : nil },
+                presentationRevision: pendingBottomReveal?.entryID == entry.id ? currentTranscriptPresentationRevision : 0
+            ))
+            .id(bottomRevealScrollID(for: entry))
             #if DEBUG
                 .modifier(AgentChatStressReadingProbeModifier(
                     isEnabled: entry.isFirstInBlock && stressHarness?.readingProbe != nil,
@@ -3454,6 +3596,8 @@ struct AgentModeChatDetailView: View {
         cancelPendingScrollWork()
         let capturedTabID = currentTabID
         let capturedPresentationRevision = currentTranscriptPresentationRevision
+        let capturedScope = bottomRevealScope
+        let restoreToken = intent.reason == .sessionSwitchRestore ? rehydrateLayoutPassToken : nil
         let delay = immediate ? 0 : intent.scheduleDelay
         clearPendingDetachedSettleCaptureState()
         if smoothPinnedSendState != nil,
@@ -3469,6 +3613,10 @@ struct AgentModeChatDetailView: View {
 
         debugLog("requestScroll scheduled", details: "intent=\(debugDescription(for: intent)) immediate=\(immediate) delay=\(delay)")
         programmaticScrollGate.schedule(after: delay, settleAfter: intent.settleDelay, onSettled: {
+            guard capturedTabID == agentModeVM.currentTabID, capturedScope == bottomRevealScope else {
+                cancelBottomRevealRestore(token: restoreToken, tabID: capturedTabID)
+                return
+            }
             debugLog("requestScroll settled", details: "intent=\(debugDescription(for: intent))")
             if case let .bottom(_, settleReason) = intent {
                 let bottomSettleAt = Date()
@@ -3533,9 +3681,11 @@ struct AgentModeChatDetailView: View {
                 return
             }
             finishRehydrateRestoreIfSettled()
-        }, action: {
+        }, deferredAction: { finish in
             debugLog("requestScroll executing", details: "intent=\(debugDescription(for: intent)) capturedTab=\(debugShortID(capturedTabID)) capturedRev=\(capturedPresentationRevision)")
-            guard capturedTabID == currentTabID else {
+            guard capturedTabID == agentModeVM.currentTabID, capturedScope == bottomRevealScope else {
+                programmaticScrollGate.cancel()
+                cancelBottomRevealRestore(token: restoreToken, tabID: capturedTabID)
                 cancelPendingBottomScrollOutcomeIfUnexecuted(reason: "tabMismatch")
                 debugLog("requestScroll aborted tab mismatch", details: "intent=\(debugDescription(for: intent)) capturedTab=\(debugShortID(capturedTabID)) currentTab=\(debugCurrentTabLabel)")
                 return
@@ -3543,6 +3693,7 @@ struct AgentModeChatDetailView: View {
             guard capturedPresentationRevision == currentTranscriptPresentationRevision
                 || intent.allowsRevisionMismatch
             else {
+                finish()
                 cancelPendingBottomScrollOutcomeIfUnexecuted(reason: "revisionGate")
                 debugLog("requestScroll aborted revision gate", details: "intent=\(debugDescription(for: intent)) capturedRev=\(capturedPresentationRevision) currentRev=\(currentTranscriptPresentationRevision)")
                 return
@@ -3550,28 +3701,47 @@ struct AgentModeChatDetailView: View {
             if let pinnedMaintenanceGeneration,
                pinnedMaintenanceGeneration != self.pinnedMaintenanceGeneration
             {
+                finish()
                 cancelPendingBottomScrollOutcomeIfUnexecuted(reason: "pinnedMaintenanceGeneration")
                 debugLog("requestScroll aborted pinned maintenance generation", details: "intent=\(debugDescription(for: intent)) requested=\(pinnedMaintenanceGeneration) current=\(self.pinnedMaintenanceGeneration)")
                 return
             }
             if shouldAbortPinnedMaintenanceScrollExecution(intent) {
+                finish()
                 cancelPendingBottomScrollOutcomeIfUnexecuted(reason: "stalePinnedMaintenance")
                 debugLog("requestScroll aborted stale pinned maintenance", details: "intent=\(debugDescription(for: intent)) distance=\(Int(scrollMetrics.distanceToBottom)) interacting=\(isUserInteractingWithScroll) detached=\(userDetachedAutoFollow) suppression=\(isPinnedTranscriptChangeSuppressionActive())")
                 return
             }
             if shouldAbortCompetingPinnedMaintenanceDuringExplicitBottomOutcome(intent.reason) {
+                finish()
                 debugLog(
                     "requestScroll aborted competing pinned maintenance during explicit bottom outcome",
                     details: "intent=\(debugDescription(for: intent)) distance=\(Int(scrollMetrics.distanceToBottom))"
                 )
                 return
             }
-            _ = markPendingBottomScrollOutcomeExecutedIfNeeded(for: intent.reason)
-            #if DEBUG
-                recordStressSnapBackIfNeeded(intent)
-            #endif
-
-            perform(intent, with: SwiftUITranscriptScrollDriver(proxy: proxy))
+            let driver = SwiftUITranscriptScrollDriver(proxy: proxy)
+            let complete = {
+                _ = markPendingBottomScrollOutcomeExecutedIfNeeded(for: intent.reason)
+                #if DEBUG
+                    recordStressSnapBackIfNeeded(intent)
+                #endif
+                perform(intent, with: driver)
+                finish()
+            }
+            // The older container cannot cancel a pending reveal on scroll-phase changes.
+            if #available(macOS 15.0, *), transcriptSnapshot.panePresentation == .transcript,
+               let entry = transcriptSnapshot.renderEntries?.entries.last
+            {
+                pendingBottomReveal = PendingBottomReveal(
+                    id: UUID(), scope: capturedScope, entryID: entry.id,
+                    revisionFence: .init(revision: capturedPresentationRevision, allowsRevisionMismatch: intent.allowsRevisionMismatch),
+                    restoreToken: restoreToken,
+                    move: { driver.revealBottomEntry(id: $0, animated: intent.isAnimated) }, complete: complete
+                )
+            } else {
+                complete()
+            }
         })
     }
 
@@ -3585,11 +3755,13 @@ struct AgentModeChatDetailView: View {
     }
 
     private func cancelPendingScrollWork() {
+        pendingBottomReveal = nil
         debugLog("cancelPendingScrollWork")
         programmaticScrollGate.cancel()
     }
 
     private func cancelAllScheduledScrollWork() {
+        pendingBottomReveal = nil
         debugLog("cancelAllScheduledScrollWork")
         scrollEngine.cancelScheduledWork()
         #if DEBUG
@@ -4596,7 +4768,9 @@ struct AgentModeChatDetailView: View {
                     markColdRestoreBottomRequest(corrective: false)
                 }
                 if let restoreIntent = rehydrateRestoreIntent(for: target, tabID: currentTabID) {
-                    requestScroll(proxy, intent: restoreIntent, immediate: true)
+                    if pendingBottomReveal?.restoreToken != rehydrateLayoutPassToken {
+                        requestScroll(proxy, intent: restoreIntent, immediate: true)
+                    }
                 } else {
                     finishRehydrateRestoreIfSettled()
                 }
@@ -4703,6 +4877,7 @@ struct AgentModeChatDetailView: View {
                 agentModeVM.setTranscriptDetachedFromLiveBottom(tabID: currentTabID, isDetached: false)
             }
         case let .detached(userInitiated):
+            cancelBottomRevealIfNeeded()
             clearPinnedTranscriptChangeSuppression()
             clearPinnedIdleTransitionManualDetach()
             if userInitiated {

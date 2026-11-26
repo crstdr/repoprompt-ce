@@ -53,6 +53,7 @@ final class ProgrammaticScrollGate {
     private let workGate = WorkItemGate()
     private var scheduledScrollWorkItem: DispatchWorkItem?
     private var settleWorkItem: DispatchWorkItem?
+    private var generation: UInt64 = 0
     private(set) var isInFlight = false
 
     func schedule(
@@ -61,16 +62,30 @@ final class ProgrammaticScrollGate {
         onSettled: (() -> Void)?,
         action: @escaping () -> Void
     ) {
+        schedule(after: delay, settleAfter: settleDelay, onSettled: onSettled, deferredAction: { finish in
+            action()
+            finish()
+        })
+    }
+
+    func schedule(
+        after delay: TimeInterval,
+        settleAfter settleDelay: TimeInterval,
+        onSettled: (() -> Void)?,
+        deferredAction: @escaping (@escaping () -> Void) -> Void
+    ) {
         cancelPendingWork(resetInFlight: false)
+        let generation = generation
         isInFlight = true
         scheduledScrollWorkItem = workGate.schedule(after: delay) { [weak self] in
-            guard let self else { return }
-            action()
-            settleWorkItem?.cancel()
-            settleWorkItem = workGate.schedule(after: max(0, settleDelay)) { [weak self] in
-                guard let self else { return }
-                isInFlight = false
-                onSettled?()
+            guard let self, self.generation == generation else { return }
+            deferredAction { [weak self] in
+                guard let self, self.generation == generation, settleWorkItem == nil else { return }
+                settleWorkItem = workGate.schedule(after: max(0, settleDelay)) { [weak self] in
+                    guard let self, self.generation == generation else { return }
+                    isInFlight = false
+                    onSettled?()
+                }
             }
         }
     }
@@ -88,6 +103,7 @@ final class ProgrammaticScrollGate {
     }
 
     private func cancelPendingWork(resetInFlight: Bool) {
+        generation &+= 1
         scheduledScrollWorkItem?.cancel()
         settleWorkItem?.cancel()
         workGate.cancel()

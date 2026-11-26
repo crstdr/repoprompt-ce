@@ -42,6 +42,58 @@ enum TranscriptScrollDriverEvent: Equatable {
     case phaseChanged(AgentTranscriptUserScrollPhase, metrics: AgentTranscriptScrollMetrics)
 }
 
+struct TranscriptBottomRevealRevisionFence {
+    let revision: Int
+    let allowsRevisionMismatch: Bool
+
+    func permits(_ currentRevision: Int) -> Bool {
+        allowsRevisionMismatch || revision == currentRevision
+    }
+}
+
+struct TranscriptBottomRevealFrame: Equatable {
+    let requestID: UUID
+    let presentationRevision: Int
+    let frame: CGRect
+
+    func isVisible(in viewport: CGSize) -> Bool {
+        frame.height > 0 && !frame.intersection(CGRect(origin: .zero, size: viewport)).isEmpty
+    }
+}
+
+enum TranscriptBottomRevealFrameKey: PreferenceKey {
+    static let coordinateSpace = "agentTranscript.bottomRevealViewport"
+    static var defaultValue: TranscriptBottomRevealFrame? {
+        nil
+    }
+
+    static func reduce(value: inout TranscriptBottomRevealFrame?, nextValue: () -> TranscriptBottomRevealFrame?) {
+        value = nextValue() ?? value
+    }
+}
+
+struct TranscriptBottomRevealWitness: ViewModifier {
+    let requestID: UUID?
+    var presentationRevision = 0
+
+    func body(content: Content) -> some View {
+        content.background {
+            if let requestID {
+                GeometryReader { geometry in
+                    Color.clear.preference(
+                        key: TranscriptBottomRevealFrameKey.self,
+                        value: .init(
+                            requestID: requestID,
+                            presentationRevision: presentationRevision,
+                            frame: geometry.frame(in: .named(TranscriptBottomRevealFrameKey.coordinateSpace))
+                        )
+                    )
+                }
+            }
+        }
+    }
+}
+
 // MARK: - SwiftUI ScrollViewProxy Driver
 
 /// `TranscriptScrollDriver` backed by a SwiftUI `ScrollViewProxy`. Scroll targets are
@@ -55,6 +107,12 @@ struct SwiftUITranscriptScrollDriver: TranscriptScrollDriver {
     func scrollToBottom(animated: Bool) {
         perform(animated: animated) {
             proxy.scrollTo(Self.bottomTargetID, anchor: .bottom)
+        }
+    }
+
+    func revealBottomEntry(id: AnyHashable, animated: Bool = false) {
+        perform(animated: animated) {
+            proxy.scrollTo(id, anchor: .bottom)
         }
     }
 
