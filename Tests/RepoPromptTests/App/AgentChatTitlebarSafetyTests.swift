@@ -1515,6 +1515,50 @@ final class WorkspaceRestorationTitleTests: XCTestCase {
         XCTAssertNil(window.workspaceManager.workspace(withID: first.id)?.color)
     }
 
+    /// Detaching the live window or replacing it removes the sticker's anchors, so an open picker
+    /// closes; attaching the same window again keeps it, and a true close publishes nothing.
+    func testLiveWindowDetachOrReplacementClosesStickerPicker() async throws {
+        let fixture = try await makeFixture(systemNumber: 6)
+        let window = fixture.window
+        let target = window.workspaceManager.createWorkspace(
+            name: "Anchored \(UUID().uuidString.prefix(6))", repoPaths: [fixture.rootURL.path], ephemeral: true
+        )
+        _ = await window.workspaceManager.switchWorkspace(to: target, saveState: false, reason: "stickerAnchor")
+        await resolveTitle(window)
+        let sticker = window.workspaceSticker
+
+        sticker.togglePicker(from: .titlebarAccessory)
+        let opened = try XCTUnwrap(sticker.picker)
+        window.attachWindow(fixture.nsWindow)
+        XCTAssertEqual(sticker.picker, opened, "attaching the same window keeps the picker")
+
+        let replacement = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 480, height: 320),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: true
+        )
+        replacement.isReleasedWhenClosed = false
+        window.attachWindow(replacement)
+        XCTAssertNil(sticker.picker, "a replacement window does not inherit the picker")
+
+        sticker.togglePicker(from: .titlebarAccessory)
+        XCTAssertNotNil(sticker.picker)
+        window.attachWindow(nil)
+        XCTAssertNil(sticker.picker, "a live detach closes the picker")
+
+        window.attachWindow(fixture.nsWindow)
+        sticker.togglePicker(from: .sidebarToolbar)
+        let beforeClose = try XCTUnwrap(sticker.picker)
+        var publishes = 0
+        let subscription = sticker.objectWillChange.sink { publishes += 1 }
+        defer { subscription.cancel() }
+        window.beginClose()
+        window.attachWindow(nil)
+        XCTAssertEqual(publishes, 0, "a true close publishes nothing on the sticker")
+        XCTAssertEqual(sticker.picker, beforeClose)
+    }
+
     /// The sticker picker binds the workspace it opened for: same-ID updates keep it open, a switch
     /// closes it and later choices go nowhere. Each host presents only its own picker, and only a
     /// visibility flip asks the host to re-measure.

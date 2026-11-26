@@ -1128,6 +1128,7 @@ class WindowState: ObservableObject {
         // Detach path (always do the cleanup even if both are nil)
         if window == nil {
             let oldWindow = nsWindow
+            dismissStickerPickerBeforeLosingAnchor()
             detachTitlebarAccessoryControllers(from: oldWindow)
             nsWindow = nil
             removeFocusObservers()
@@ -1153,6 +1154,7 @@ class WindowState: ObservableObject {
         }
 
         if let oldWindow = nsWindow, oldWindow !== window {
+            dismissStickerPickerBeforeLosingAnchor()
             detachTitlebarAccessoryControllers(from: oldWindow)
         }
         nsWindow = window
@@ -1173,6 +1175,13 @@ class WindowState: ObservableObject {
         // Install Agent mode titlebar accessory if requested before window was attached
         applyAgentTitlebarAccessoryIfPossible()
         StartupPhaseLog.mark(.windowAttached, window: windowID)
+    }
+
+    /// A live detach or window replacement removes the sticker's anchors, and the next window's
+    /// hosts must not inherit an open picker. A true close publishes nothing.
+    private func dismissStickerPickerBeforeLosingAnchor() {
+        guard !shouldSuppressObservationSideEffects else { return }
+        workspaceSticker.dismissPicker()
     }
 
     private func configureWindowChrome(for window: NSWindow) {
