@@ -52,6 +52,9 @@ struct AgentModeSessionsSidebarView: View {
     let currentTabID: UUID?
     let onManageWorkspaces: () -> Void
     let onNewSession: () -> Void
+    /// Not observed here: the sticker button observes it, so colour changes and picker toggles
+    /// do not invalidate the sessions sidebar.
+    let workspaceSticker: WorkspaceStickerModel
 
     /// Remembered per window; mirrored into the sidebar store, which owns filtering.
     @SceneStorage("agentModeSidebarTab") private var storedSidebarTab = AgentSidebarTab.all.rawValue
@@ -151,7 +154,7 @@ struct AgentModeSessionsSidebarView: View {
         }
     }
 
-    /// The sidebar column's trailing titlebar cluster: list actions, then compose.
+    /// The sidebar column's trailing titlebar cluster: list actions, compose, then the workspace sticker.
     @ToolbarContentBuilder
     private var titlebarActions: some ToolbarContent {
         if #available(macOS 26.0, *) {
@@ -178,6 +181,7 @@ struct AgentModeSessionsSidebarView: View {
                 action: toggleAllThreads
             )
             AgentModeTitlebarNewSessionButton(action: onNewSession)
+            AgentModeTitlebarWorkspaceStickerButton(model: workspaceSticker, host: .sidebarToolbar)
         }
     }
 
