@@ -569,6 +569,61 @@ import XCTest
             XCTAssertNil(object["color"], "None removes the key instead of writing an empty value")
         }
 
+        /// A row action retained from before its workspace became a consolidated recovery copy is
+        /// judged against the current record: it changes nothing and queues no save.
+        func testRetainedColorActionRejectsWorkspaceThatBecameRecoveryCopy() async throws {
+            let workspace = WorkspaceModel(name: "Recovered project", repoPaths: [])
+            try writeWorkspace(workspace)
+            try writeLegacyIndex([workspace])
+            let manager = makeManager(windowID: -803)
+            await manager.awaitInitialized()
+            let retained = try XCTUnwrap(manager.workspace(withID: workspace.id))
+            XCTAssertNil(retained.consolidatedIntoWorkspaceID)
+            let index = try XCTUnwrap(manager.workspaces.firstIndex(where: { $0.id == workspace.id }))
+            manager.workspaces[index].consolidatedIntoWorkspaceID = UUID()
+            let reclassified = try XCTUnwrap(manager.workspace(withID: workspace.id))
+
+            manager.setWorkspaceColor(retained, color: .teal)
+            manager.setWorkspaceColor(retained, color: nil)
+
+            XCTAssertEqual(manager.workspace(withID: workspace.id), reclassified, "no in-memory mutation")
+            XCTAssertFalse(manager.hasPendingWorkspaceColorIntentForTesting(workspaceID: workspace.id), "no save queued")
+            let url = manager.workspaceFileURL(for: workspace)
+            await WorkspaceDiskWriterComposition.processWriter.flush(url: url)
+            XCTAssertNil(try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: url)).color)
+        }
+
+        /// Reclassification after admission but before the queued save runs: the save task sees a
+        /// recovery copy, writes nothing, and still retires its intent.
+        func testColorSaveQueuedBeforeReclassificationIsNotSaved() async throws {
+            let workspace = WorkspaceModel(name: "Reclassified project", repoPaths: [])
+            try writeWorkspace(workspace)
+            try writeLegacyIndex([workspace])
+            let manager = makeManager(windowID: -804)
+            await manager.awaitInitialized()
+            let url = manager.workspaceFileURL(for: workspace)
+
+            // Both steps run without suspending, so the queued main-actor save cannot start between them.
+            try manager.setWorkspaceColor(XCTUnwrap(manager.workspace(withID: workspace.id)), color: .teal)
+            XCTAssertTrue(manager.hasPendingWorkspaceColorIntentForTesting(workspaceID: workspace.id), "admitted")
+            let index = try XCTUnwrap(manager.workspaces.firstIndex(where: { $0.id == workspace.id }))
+            manager.workspaces[index].consolidatedIntoWorkspaceID = UUID()
+
+            let deadline = Date().addingTimeInterval(5)
+            while manager.hasPendingWorkspaceColorIntentForTesting(workspaceID: workspace.id), Date() < deadline {
+                await Task.yield()
+            }
+            XCTAssertFalse(
+                manager.hasPendingWorkspaceColorIntentForTesting(workspaceID: workspace.id),
+                "the rejected save still retires its intent"
+            )
+            await WorkspaceDiskWriterComposition.processWriter.flush(url: url)
+            XCTAssertNil(
+                try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: url)).color,
+                "a recovery copy's colour is never saved"
+            )
+        }
+
         func testExplicitLibraryChoicePersistsAcrossReload() async throws {
             let workspace = WorkspaceModel(name: "Automation project", repoPaths: [], isSavedWorkspace: false)
             try writeWorkspace(workspace)
