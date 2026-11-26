@@ -1566,7 +1566,10 @@ class WindowState: ObservableObject {
                 tabID: target.tabID,
                 sessionID: target.agentSessionID,
                 tabName: tab.name
-            )
+            ),
+            workspaceColor: titleColorableWorkspace().map { workspace in
+                AgentChatWorkspaceColorMenuState(workspaceID: workspace.id, selection: workspace.workspaceColor)
+            }
         )
     }
 
@@ -1614,6 +1617,9 @@ class WindowState: ObservableObject {
             },
             delete: { [weak self] target in
                 self?.confirmDeleteAgentChatFromTitlebar(target: target)
+            },
+            setWorkspaceColor: { [weak self] workspaceID, color in
+                self?.setTitleWorkspaceColor(color, expectedWorkspaceID: workspaceID)
             }
         )
     }
@@ -1647,11 +1653,13 @@ class WindowState: ObservableObject {
     }
 
     private func refreshAgentChatTitleCluster() {
+        let colorableWorkspaceID = titleColorableWorkspace()?.id
         agentChatTitleCluster.update(
             title: displayedWindowTitle,
             showsChatOptions: currentAgentTitlebarChatOptionsTarget() != nil,
             workspaceColor: coherentTitlePresentation.workspaceColor,
-            allowsWorkspaceColorMenu: titleColorableWorkspace() != nil
+            allowsWorkspaceColorMenu: colorableWorkspaceID != nil,
+            workspaceID: colorableWorkspaceID
         )
     }
 
@@ -1664,9 +1672,13 @@ class WindowState: ObservableObject {
         return workspace
     }
 
-    /// Title right-click action: colours the workspace whose name the title shows.
-    func setTitleWorkspaceColor(_ color: WorkspaceColor?) {
-        guard !isClosing, let workspace = titleColorableWorkspace() else { return }
+    /// Title Workspace Color action: colours the workspace whose name the title shows, only while
+    /// it is still the workspace the menu was built for. A switch while the menu is open writes nothing.
+    func setTitleWorkspaceColor(_ color: WorkspaceColor?, expectedWorkspaceID: UUID) {
+        guard !isClosing,
+              let workspace = titleColorableWorkspace(),
+              workspace.id == expectedWorkspaceID
+        else { return }
         workspaceManager.setWorkspaceColor(workspace, color: color)
     }
 

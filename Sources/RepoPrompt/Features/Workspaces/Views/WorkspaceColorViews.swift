@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// The 8 pt workspace-colour dot shown before a workspace name (toolbar title, picker rows,
@@ -44,6 +45,23 @@ struct WorkspaceColorMenuSection: View {
     }
 }
 
+extension WorkspaceColor {
+    /// The AppKit counterpart of `WorkspaceColorMenuSection` for `StableMenuItem` menus (toolbar
+    /// title right-click, Chat Options submenu): None, then the palette in menu order, with a
+    /// checkmark on `selection`. No header: callers add their own section title or parent item.
+    static func stableMenuItems(
+        selection: WorkspaceColor?,
+        onSelect: @escaping (WorkspaceColor?) -> Void
+    ) -> [StableMenuItem] {
+        [.action("None", isSelected: selection == nil) { onSelect(nil) }]
+            + allCases.map { color in
+                .action(color.displayName, isSelected: selection == color, image: color.menuSwatchImage) {
+                    onSelect(color)
+                }
+            }
+    }
+}
+
 extension View {
     /// Attaches the `Workspace Color` context menu only when `onSelect` is provided, so surfaces
     /// that cannot be coloured (System, recovery copies) keep their default right-click.
@@ -61,15 +79,17 @@ extension View {
         }
     }
 
-    /// A 2 pt workspace-colour rule along the top content edge, directly below the toolbar (and
-    /// below the DEBUG rule in debug builds). Drawn as an overlay, so it reserves no height, never
-    /// shifts content, and sits above inset banners. Draws nothing for None.
+    /// A 2 pt workspace-colour rule along the top content edge, directly below the toolbar. It is
+    /// a top safe-area inset with no spacing, so content starts below the rule instead of being
+    /// drawn over (an overlay clipped the top of the sidebar selector). Space is reserved only
+    /// while a colour is set: None reserves nothing, and setting or clearing a colour moves
+    /// content by the rule's 2 pt. Apply it before `debugBuildWindowEdge()` so the DEBUG rule
+    /// stays outermost and this rule sits directly below it.
     func workspaceColorWindowEdge(_ color: WorkspaceColor?) -> some View {
-        overlay(alignment: .top) {
+        safeAreaInset(edge: .top, spacing: 0) {
             if let color {
                 color.color
                     .frame(height: 2)
-                    .padding(.top, DebugBuildIdentity.isEnabled ? DebugBuildIdentity.windowEdgeRuleHeight : 0)
                     .allowsHitTesting(false)
                     .accessibilityHidden(true)
             }

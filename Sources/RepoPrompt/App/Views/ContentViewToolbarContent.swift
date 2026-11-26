@@ -64,8 +64,8 @@ struct ContentViewToolbarContent: ToolbarContent {
                     windowState?.agentChatTitleClusterMenuSnapshot()
                 },
                 menuActions: windowState.agentChatTitleClusterMenuActions(),
-                onSetWorkspaceColor: { [weak windowState] color in
-                    windowState?.setTitleWorkspaceColor(color)
+                onSetWorkspaceColor: { [weak windowState] workspaceID, color in
+                    windowState?.setTitleWorkspaceColor(color, expectedWorkspaceID: workspaceID)
                 }
             )
         }
