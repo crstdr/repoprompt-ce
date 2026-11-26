@@ -75,8 +75,11 @@ final class WorkspaceStickerModel: ObservableObject {
         var color: WorkspaceColor?
     }
 
-    /// An open picker, bound to the workspace it was opened for and the host presenting it.
+    /// An open picker, bound to the workspace it was opened for and the host presenting it. Each
+    /// opening has its own `id`, so an action captured by one opening never applies to a later one,
+    /// even on the same workspace and host.
     struct PickerPresentation: Equatable {
+        let id: UUID
         let workspaceID: UUID
         let host: WorkspaceStickerHost
     }
@@ -108,7 +111,7 @@ final class WorkspaceStickerModel: ObservableObject {
             return
         }
         guard let workspaceID = state.workspaceID else { return }
-        picker = PickerPresentation(workspaceID: workspaceID, host: host)
+        picker = PickerPresentation(id: UUID(), workspaceID: workspaceID, host: host)
     }
 
     func dismissPicker() {
@@ -116,13 +119,26 @@ final class WorkspaceStickerModel: ObservableObject {
         picker = nil
     }
 
-    /// Applies `color` to the workspace the open picker was opened for. The picker stays open.
-    func select(_ color: WorkspaceColor?) {
-        guard let picker else { return }
-        onSelectColor(picker.workspaceID, color)
+    /// Closes the picker only if it is still the opening that asks; a late dismissal from an
+    /// earlier opening leaves a newer one alone.
+    func dismissPicker(_ presentation: PickerPresentation) {
+        guard picker == presentation else { return }
+        picker = nil
+    }
+
+    /// Applies `color` to the workspace `presentation` was opened for, only while that opening is
+    /// still the open picker. The picker stays open.
+    func select(_ color: WorkspaceColor?, in presentation: PickerPresentation) {
+        guard picker == presentation else { return }
+        onSelectColor(presentation.workspaceID, color)
+    }
+
+    /// The open picker if `host` presents it.
+    func presentation(in host: WorkspaceStickerHost) -> PickerPresentation? {
+        picker?.host == host ? picker : nil
     }
 
     func isPickerPresented(in host: WorkspaceStickerHost) -> Bool {
-        picker?.host == host
+        presentation(in: host) != nil
     }
 }

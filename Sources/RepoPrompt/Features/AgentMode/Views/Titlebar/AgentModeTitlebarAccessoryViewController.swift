@@ -50,6 +50,8 @@ struct AgentModeTitlebarWorkspaceStickerButton: View {
 
     var body: some View {
         if model.state.workspaceID != nil {
+            // Captured now, so the popover's swatches and dismissal act only on this opening.
+            let presentation = model.presentation(in: host)
             Button {
                 model.togglePicker(from: host)
             } label: {
@@ -65,20 +67,22 @@ struct AgentModeTitlebarWorkspaceStickerButton: View {
             .accessibilityLabel("Workspace Color")
             .accessibilityValue(model.state.color?.accessibilityLabel ?? "None")
             .accessibilityIdentifier("WorkspaceStickerButton")
-            .popover(isPresented: pickerBinding, arrowEdge: .bottom) {
-                WorkspaceStickerPickerPopover(model: model)
+            .popover(isPresented: pickerBinding(dismissing: presentation), arrowEdge: .bottom) {
+                if let presentation {
+                    WorkspaceStickerPickerPopover(model: model, presentation: presentation)
+                }
             }
         }
     }
 
     /// Presented from the model so toolbar re-evaluation cannot drop it. A dismissal only closes
-    /// this host's picker, never one the other host has since opened.
-    private var pickerBinding: Binding<Bool> {
+    /// the opening this render showed, never one the other host, or a later opening, has since made.
+    private func pickerBinding(dismissing presentation: WorkspaceStickerModel.PickerPresentation?) -> Binding<Bool> {
         Binding(
             get: { model.isPickerPresented(in: host) },
             set: { isPresented in
-                if !isPresented, model.isPickerPresented(in: host) {
-                    model.dismissPicker()
+                if !isPresented, let presentation {
+                    model.dismissPicker(presentation)
                 }
             }
         )
@@ -86,12 +90,14 @@ struct AgentModeTitlebarWorkspaceStickerButton: View {
 }
 
 /// Observes the model so the selection ring follows the stored colour while the popover is open.
+/// Swatches apply only through the opening that rendered them.
 private struct WorkspaceStickerPickerPopover: View {
     @ObservedObject var model: WorkspaceStickerModel
+    let presentation: WorkspaceStickerModel.PickerPresentation
 
     var body: some View {
         WorkspaceColorSwatchPicker(selection: model.state.color) { color in
-            model.select(color)
+            model.select(color, in: presentation)
         }
     }
 }
