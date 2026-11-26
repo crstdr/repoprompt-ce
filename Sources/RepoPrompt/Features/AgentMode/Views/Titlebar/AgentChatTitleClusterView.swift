@@ -13,11 +13,6 @@ final class AgentChatTitleClusterModel: ObservableObject {
         var copiedNotice: String?
         /// Colour of the workspace the title shows; nil draws no dot.
         var workspaceColor: WorkspaceColor?
-        /// Whether the title offers the Workspace Color menu (false for System or no workspace).
-        var allowsWorkspaceColorMenu = false
-        /// The colourable workspace the title shows. Menus bind this ID when they are built, so a
-        /// choice made after a workspace switch cannot recolour a different workspace.
-        var workspaceID: UUID?
     }
 
     @Published private(set) var state: State
@@ -30,17 +25,13 @@ final class AgentChatTitleClusterModel: ObservableObject {
     func update(
         title: String,
         showsChatOptions: Bool,
-        workspaceColor: WorkspaceColor? = nil,
-        allowsWorkspaceColorMenu: Bool = false,
-        workspaceID: UUID? = nil
+        workspaceColor: WorkspaceColor? = nil
     ) {
         let nextState = State(
             title: title,
             showsChatOptions: showsChatOptions,
             copiedNotice: state.copiedNotice,
-            workspaceColor: workspaceColor,
-            allowsWorkspaceColorMenu: allowsWorkspaceColorMenu,
-            workspaceID: workspaceID
+            workspaceColor: workspaceColor
         )
         guard state != nextState else { return }
         state = nextState
@@ -64,24 +55,6 @@ struct AgentChatTitleClusterView: View {
     @ObservedObject var model: AgentChatTitleClusterModel
     let menuSnapshot: () -> AgentChatOptionsMenuSnapshot?
     let menuActions: AgentChatOptionsMenuActions
-    /// Colours the workspace with the given ID when it is still the one the title shows; offered
-    /// only while the state allows it.
-    let onSetWorkspaceColor: (UUID, WorkspaceColor?) -> Void
-
-    @StateObject private var workspaceColorMenuAnchor = StableMenuAnchor()
-
-    /// The title's right-click menu: the `Workspace Color` section bound to the workspace shown when
-    /// the menu is built, or no items (so the click passes through) when the title cannot be coloured.
-    static func workspaceColorContextMenuItems(
-        state: AgentChatTitleClusterModel.State,
-        onSetWorkspaceColor: @escaping (UUID, WorkspaceColor?) -> Void
-    ) -> [StableMenuItem] {
-        guard state.allowsWorkspaceColorMenu, let workspaceID = state.workspaceID else { return [] }
-        return [.header("Workspace Color")]
-            + WorkspaceColor.stableMenuItems(selection: state.workspaceColor) { color in
-                onSetWorkspaceColor(workspaceID, color)
-            }
-    }
 
     var body: some View {
         HStack(spacing: 4) {
@@ -95,25 +68,7 @@ struct AgentChatTitleClusterView: View {
                     .truncationMode(.tail)
                     .frame(maxWidth: 520)
                     .accessibilityIdentifier("AgentChatTitle")
-                    .modifier(WorkspaceColorShowMenuAction(
-                        isEnabled: model.state.allowsWorkspaceColorMenu,
-                        anchor: workspaceColorMenuAnchor
-                    ))
             }
-            .contentShape(Rectangle())
-            // A SwiftUI `.contextMenu` never opens here: in a toolbar item, the window's
-            // toolbar/titlebar handles the secondary click before this view sees it. The region's
-            // app-local event monitor sees the click before window dispatch and presents through
-            // the window-scoped `StableMenuPresenter`; every other event passes through.
-            .overlay(
-                StableMenuContextRegion(anchor: workspaceColorMenuAnchor) {
-                    Self.workspaceColorContextMenuItems(
-                        state: model.state,
-                        onSetWorkspaceColor: onSetWorkspaceColor
-                    )
-                }
-                .accessibilityHidden(true)
-            )
 
             if model.state.showsChatOptions {
                 AgentChatOptionsMenuButton(
@@ -134,23 +89,6 @@ struct AgentChatTitleClusterView: View {
         }
         .fixedSize(horizontal: false, vertical: true)
         .accessibilityElement(children: .contain)
-    }
-}
-
-/// VoiceOver's Show Menu on the title opens the Workspace Color menu, offered only while the title
-/// can be coloured so System titles advertise no dead action.
-private struct WorkspaceColorShowMenuAction: ViewModifier {
-    let isEnabled: Bool
-    let anchor: StableMenuAnchor
-
-    func body(content: Content) -> some View {
-        if isEnabled {
-            content.accessibilityAction(.showMenu) {
-                (anchor.view as? StableMenuContextView)?.presentAtRegionOrigin()
-            }
-        } else {
-            content
-        }
     }
 }
 

@@ -115,7 +115,9 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
         XCTAssertEqual(invocations.map(\.1), Array(repeating: target, count: 5))
     }
 
-    func testWorkspaceColorSubmenuSitsBeforeDeleteAndBindsCapturedWorkspace() throws {
+    /// Workspace colour moved to the sticker: Chat Options offers only session actions, with or
+    /// without Copy Session ID, and no submenu.
+    func testChatOptionsMenuOffersNoWorkspaceColor() {
         let target = AgentChatOptionsMenuTarget(
             windowID: 7,
             workspaceID: UUID(),
@@ -123,47 +125,25 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
             agentSessionID: UUID(),
             tabName: "Captured"
         )
-        let colorWorkspaceID = UUID()
-        var chosen: [(UUID, WorkspaceColor?)] = []
-        var actions = Self.noopActions()
-        actions.setWorkspaceColor = { chosen.append(($0, $1)) }
-        let menu = AgentChatOptionsMenuPresenter.makeMenu(
-            snapshot: AgentChatOptionsMenuSnapshot(
-                target: target,
-                isPinned: false,
-                workspaceColor: AgentChatWorkspaceColorMenuState(workspaceID: colorWorkspaceID, selection: .teal)
-            ),
-            actions: actions
+        let capture = AgentSessionCopyIDTarget(
+            windowID: target.windowID,
+            workspaceID: target.workspaceID,
+            tabID: target.tabID,
+            sessionID: target.agentSessionID,
+            persistentBindingGeneration: UUID(),
+            bindingTransitionGeneration: 1
         )
-        XCTAssertEqual(menu.items.map(\.title), [
-            "Pin",
-            "Rename",
-            "Stash",
-            "Handoff",
-            "Workspace Color",
-            "",
-            "Delete"
-        ])
-
-        let parent = menu.items[4]
-        XCTAssertNotNil(parent.image)
-        let submenu = try XCTUnwrap(parent.submenu)
-        XCTAssertEqual(submenu.items.map(\.title), ["None"] + WorkspaceColor.allCases.map(\.displayName))
-        XCTAssertEqual(submenu.items.filter { $0.state == .on }.map(\.title), ["Teal"])
-
-        for title in ["Blue", "None"] {
-            let item = try XCTUnwrap(submenu.items.first { $0.title == title })
-            XCTAssertTrue(try NSApplication.shared.sendAction(XCTUnwrap(item.action), to: item.target, from: item))
+        for (copyTarget, expected) in [
+            (nil, ["Pin", "Rename", "Stash", "Handoff", "", "Delete"]),
+            (capture, ["Pin", "Rename", "Stash", "Handoff", "Copy Session ID", "", "Delete"])
+        ] as [(AgentSessionCopyIDTarget?, [String])] {
+            let menu = AgentChatOptionsMenuPresenter.makeMenu(
+                snapshot: AgentChatOptionsMenuSnapshot(target: target, isPinned: false, copySessionIDTarget: copyTarget),
+                actions: Self.noopActions()
+            )
+            XCTAssertEqual(menu.items.map(\.title), expected)
+            XCTAssertFalse(menu.items.contains { $0.title == "Workspace Color" || $0.hasSubmenu })
         }
-        XCTAssertEqual(chosen.map(\.0), [colorWorkspaceID, colorWorkspaceID])
-        XCTAssertEqual(chosen.map(\.1), [.blue, nil])
-
-        // No colourable workspace (System): the menu is unchanged.
-        let withoutColor = AgentChatOptionsMenuPresenter.makeMenu(
-            snapshot: AgentChatOptionsMenuSnapshot(target: target, isPinned: false),
-            actions: actions
-        )
-        XCTAssertEqual(withoutColor.items.map(\.title), ["Pin", "Rename", "Stash", "Handoff", "", "Delete"])
     }
 
     func testCopySessionIDItemAppearsOnlyWithAGenerationBearingCaptureAndPassesItThrough() throws {
@@ -473,27 +453,6 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
             XCTAssertNotNil(background)
             XCTAssertEqual(promptManager.activeComposeTabID, fixture.tabAID, "Background creation must not change the active tab")
             XCTAssertEqual(requestedTabIDs, [], "Background creation must not request composer focus")
-        }
-    }
-
-    /// The Chat Options snapshot captures the title's colourable workspace and its colour; the wired
-    /// action applies only to that workspace.
-    func testMenuSnapshotCapturesTitleWorkspaceColorAndActionHonorsCapturedID() async throws {
-        try await withFixture { fixture in
-            await awaitWindowTitleResolution(fixture.window)
-            let snapshot = try XCTUnwrap(fixture.window.agentChatTitleClusterMenuSnapshot())
-            XCTAssertEqual(
-                snapshot.workspaceColor,
-                AgentChatWorkspaceColorMenuState(workspaceID: fixture.workspaceID, selection: nil)
-            )
-
-            let actions = fixture.window.agentChatTitleClusterMenuActions()
-            actions.setWorkspaceColor(UUID(), .red)
-            XCTAssertNil(fixture.window.workspaceManager.workspace(withID: fixture.workspaceID)?.color)
-
-            actions.setWorkspaceColor(fixture.workspaceID, .lime)
-            XCTAssertEqual(fixture.window.workspaceManager.workspace(withID: fixture.workspaceID)?.color, "lime")
-            XCTAssertEqual(fixture.window.agentChatTitleClusterMenuSnapshot()?.workspaceColor?.selection, .lime)
         }
     }
 
@@ -1445,8 +1404,8 @@ final class WorkspaceRestorationTitleTests: XCTestCase {
         XCTAssertEqual(foreignTitle, renamed)
     }
 
-    /// A same-ID colour edit on the active workspace repaints the title dot and edge colour with no
-    /// explicit title request; System never shows a colour or offers the menu.
+    /// A same-ID colour edit on the active workspace repaints the title dot and the sticker with no
+    /// explicit title request; System shows neither and has no sticker.
     func testActiveWorkspaceColorChangeRepaintsTitleClusterWithoutExplicitRequest() async throws {
         let fixture = try await makeFixture(systemNumber: 6)
         let window = fixture.window
@@ -1455,35 +1414,32 @@ final class WorkspaceRestorationTitleTests: XCTestCase {
         )
         _ = await window.workspaceManager.switchWorkspace(to: target, saveState: false, reason: "titleColor")
         await resolveTitle(window)
-        XCTAssertNil(window.workspaceColor)
         XCTAssertNil(window.agentChatTitleCluster.state.workspaceColor)
-        XCTAssertTrue(window.agentChatTitleCluster.state.allowsWorkspaceColorMenu)
-        XCTAssertEqual(window.agentChatTitleCluster.state.workspaceID, target.id)
+        XCTAssertEqual(window.workspaceSticker.state, .init(workspaceID: target.id, color: nil))
 
         let repainted = expectation(description: "title re-resolved for the colour change")
         window.setWindowTitleResolutionDidCompleteHandlerForTesting {
-            guard window.workspaceColor == .teal else { return }
+            guard window.workspaceSticker.state.color == .teal else { return }
             window.setWindowTitleResolutionDidCompleteHandlerForTesting(nil)
             repainted.fulfill()
         }
         window.setTitleWorkspaceColor(.teal, expectedWorkspaceID: target.id)
         await fulfillment(of: [repainted], timeout: 5)
         XCTAssertEqual(window.agentChatTitleCluster.state.workspaceColor, .teal)
+        XCTAssertEqual(window.workspaceSticker.state, .init(workspaceID: target.id, color: .teal))
         XCTAssertEqual(window.workspaceManager.activeWorkspace?.color, "teal")
 
         let system = try XCTUnwrap(window.workspaceManager.workspaces.first(where: \.isSystemWorkspace))
         _ = await window.workspaceManager.switchWorkspace(to: system, saveState: false, reason: "titleColorSystem")
         await resolveTitle(window)
-        XCTAssertNil(window.workspaceColor)
         XCTAssertNil(window.agentChatTitleCluster.state.workspaceColor)
-        XCTAssertFalse(window.agentChatTitleCluster.state.allowsWorkspaceColorMenu)
-        XCTAssertNil(window.agentChatTitleCluster.state.workspaceID)
+        XCTAssertEqual(window.workspaceSticker.state, .init(workspaceID: nil, color: nil))
         window.setTitleWorkspaceColor(.red, expectedWorkspaceID: system.id)
         XCTAssertNil(window.workspaceManager.workspace(withID: system.id)?.color)
     }
 
-    /// A Workspace Color menu binds the workspace shown when it was built; choosing after a switch
-    /// writes nothing to either workspace, and the current workspace's ID still applies.
+    /// A picker opened on one workspace closes when the title switches to another, and a choice
+    /// bound to the first workspace writes nothing to either; the current workspace's ID still applies.
     func testTitleWorkspaceColorWithStaleExpectedWorkspaceWritesNothing() async throws {
         let fixture = try await makeFixture(systemNumber: 6)
         let window = fixture.window
@@ -1495,26 +1451,16 @@ final class WorkspaceRestorationTitleTests: XCTestCase {
         )
         _ = await window.workspaceManager.switchWorkspace(to: first, saveState: false, reason: "titleColorStaleFirst")
         await resolveTitle(window)
-        let capturedID = try XCTUnwrap(window.agentChatTitleCluster.state.workspaceID)
-        XCTAssertEqual(capturedID, first.id)
-        var chosen: [(UUID, WorkspaceColor?)] = []
-        let items = AgentChatTitleClusterView.workspaceColorContextMenuItems(
-            state: window.agentChatTitleCluster.state,
-            onSetWorkspaceColor: { chosen.append(($0, $1)) }
-        )
+        window.workspaceSticker.togglePicker(from: .sidebarToolbar)
+        XCTAssertEqual(window.workspaceSticker.picker, .init(workspaceID: first.id, host: .sidebarToolbar))
 
         _ = await window.workspaceManager.switchWorkspace(to: second, saveState: false, reason: "titleColorStaleSecond")
         await resolveTitle(window)
-        XCTAssertEqual(window.agentChatTitleCluster.state.workspaceID, second.id)
+        XCTAssertNil(window.workspaceSticker.picker, "the switch closes the picker")
+        XCTAssertEqual(window.workspaceSticker.state.workspaceID, second.id)
+        window.workspaceSticker.select(.red)
 
-        // The menu built for the first workspace still carries its ID after the switch.
-        let menu = NSMenu.stableMenu(from: items)
-        let red = try XCTUnwrap(menu.items.first { $0.title == "Red" })
-        XCTAssertTrue(try NSApplication.shared.sendAction(XCTUnwrap(red.action), to: red.target, from: red))
-        XCTAssertEqual(chosen.map(\.0), [first.id])
-        XCTAssertEqual(chosen.map(\.1), [.red])
-
-        window.setTitleWorkspaceColor(.red, expectedWorkspaceID: capturedID)
+        window.setTitleWorkspaceColor(.red, expectedWorkspaceID: first.id)
         XCTAssertNil(window.workspaceManager.workspace(withID: first.id)?.color)
         XCTAssertNil(window.workspaceManager.workspace(withID: second.id)?.color)
 
@@ -1582,40 +1528,6 @@ final class WorkspaceRestorationTitleTests: XCTestCase {
         model.togglePicker(from: .sidebarToolbar)
         XCTAssertTrue(model.update(workspaceID: nil, color: nil), "shown to hidden flips")
         XCTAssertNil(model.picker)
-    }
-
-    /// The title's right-click menu offers nothing for System (so the click passes through) and the
-    /// header plus None and the palette otherwise, each choice carrying the captured workspace ID.
-    func testTitleWorkspaceColorContextMenuItemsFollowStateAndBindWorkspaceID() throws {
-        let workspaceID = UUID()
-        var chosen: [(UUID, WorkspaceColor?)] = []
-        let record: (UUID, WorkspaceColor?) -> Void = { chosen.append(($0, $1)) }
-        var state = AgentChatTitleClusterModel.State(title: "System", showsChatOptions: false)
-        XCTAssertTrue(AgentChatTitleClusterView.workspaceColorContextMenuItems(state: state, onSetWorkspaceColor: record).isEmpty)
-        state.workspaceID = workspaceID
-        XCTAssertTrue(
-            AgentChatTitleClusterView.workspaceColorContextMenuItems(state: state, onSetWorkspaceColor: record).isEmpty,
-            "a disallowed title offers no menu even with a stale ID"
-        )
-
-        state.allowsWorkspaceColorMenu = true
-        state.workspaceColor = .violet
-        let menu = NSMenu.stableMenu(
-            from: AgentChatTitleClusterView.workspaceColorContextMenuItems(state: state, onSetWorkspaceColor: record)
-        )
-        XCTAssertEqual(
-            menu.items.map(\.title),
-            ["Workspace Color", "None"] + WorkspaceColor.allCases.map(\.displayName)
-        )
-        XCTAssertFalse(menu.items[0].isEnabled)
-        XCTAssertEqual(menu.items.filter { $0.state == .on }.map(\.title), ["Violet"])
-
-        for index in [1, 2] {
-            let item = menu.items[index]
-            XCTAssertTrue(try NSApplication.shared.sendAction(XCTUnwrap(item.action), to: item.target, from: item))
-        }
-        XCTAssertEqual(chosen.map(\.0), [workspaceID, workspaceID])
-        XCTAssertEqual(chosen.map(\.1), [nil, .red])
     }
 
     /// Registration during a held switch assigns the target through the manager's established

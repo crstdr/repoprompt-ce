@@ -1572,10 +1572,7 @@ class WindowState: ObservableObject {
                 tabID: target.tabID,
                 sessionID: target.agentSessionID,
                 tabName: tab.name
-            ),
-            workspaceColor: titleColorableWorkspace().map { workspace in
-                AgentChatWorkspaceColorMenuState(workspaceID: workspace.id, selection: workspace.workspaceColor)
-            }
+            )
         )
     }
 
@@ -1623,9 +1620,6 @@ class WindowState: ObservableObject {
             },
             delete: { [weak self] target in
                 self?.confirmDeleteAgentChatFromTitlebar(target: target)
-            },
-            setWorkspaceColor: { [weak self] workspaceID, color in
-                self?.setTitleWorkspaceColor(color, expectedWorkspaceID: workspaceID)
             }
         )
     }
@@ -1659,16 +1653,13 @@ class WindowState: ObservableObject {
     }
 
     private func refreshAgentChatTitleCluster() {
-        let colorableWorkspaceID = titleColorableWorkspace()?.id
         agentChatTitleCluster.update(
             title: displayedWindowTitle,
             showsChatOptions: currentAgentTitlebarChatOptionsTarget() != nil,
-            workspaceColor: coherentTitlePresentation.workspaceColor,
-            allowsWorkspaceColorMenu: colorableWorkspaceID != nil,
-            workspaceID: colorableWorkspaceID
+            workspaceColor: coherentTitlePresentation.workspaceColor
         )
         let stickerVisibilityChanged = workspaceSticker.update(
-            workspaceID: colorableWorkspaceID,
+            workspaceID: titleColorableWorkspace()?.id,
             color: coherentTitlePresentation.workspaceColor
         )
         // The collapsed accessory's width depends on whether it shows the sticker.
@@ -1686,8 +1677,8 @@ class WindowState: ObservableObject {
         return workspace
     }
 
-    /// Title Workspace Color action: colours the workspace whose name the title shows, only while
-    /// it is still the workspace the menu was built for. A switch while the menu is open writes nothing.
+    /// Sticker picker action: colours the workspace whose name the title shows, only while it is
+    /// still the workspace the picker was opened for. A switch while the picker is open writes nothing.
     func setTitleWorkspaceColor(_ color: WorkspaceColor?, expectedWorkspaceID: UUID) {
         guard !isClosing,
               let workspace = titleColorableWorkspace(),
