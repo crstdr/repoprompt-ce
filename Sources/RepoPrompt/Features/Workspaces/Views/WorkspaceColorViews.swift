@@ -16,8 +16,8 @@ struct WorkspaceColorDot: View {
     }
 }
 
-/// The `Workspace Color` context-menu section shared by the toolbar title and Manage Workspaces
-/// rows: None plus the fixed palette, with a native checkmark on the current choice.
+/// The `Workspace Color` context-menu section on Manage Workspaces rows: None plus the fixed
+/// palette, with a native checkmark on the current choice.
 struct WorkspaceColorMenuSection: View {
     let selection: WorkspaceColor?
     let onSelect: (WorkspaceColor?) -> Void
@@ -42,23 +42,6 @@ struct WorkspaceColorMenuSection: View {
             .pickerStyle(.inline)
             .labelsHidden()
         }
-    }
-}
-
-extension WorkspaceColor {
-    /// The AppKit counterpart of `WorkspaceColorMenuSection` for `StableMenuItem` menus (toolbar
-    /// title right-click, Chat Options submenu): None, then the palette in menu order, with a
-    /// checkmark on `selection`. No header: callers add their own section title or parent item.
-    static func stableMenuItems(
-        selection: WorkspaceColor?,
-        onSelect: @escaping (WorkspaceColor?) -> Void
-    ) -> [StableMenuItem] {
-        [.action("None", isSelected: selection == nil) { onSelect(nil) }]
-            + allCases.map { color in
-                .action(color.displayName, isSelected: selection == color, image: color.menuSwatchImage) {
-                    onSelect(color)
-                }
-            }
     }
 }
 
