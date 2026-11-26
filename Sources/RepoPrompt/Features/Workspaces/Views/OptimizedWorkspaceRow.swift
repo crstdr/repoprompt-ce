@@ -7,10 +7,12 @@ struct OptimizedWorkspaceRow: View {
     let onRename: () -> Void
     let onToggleHidden: () -> Void
     let onDelete: () -> Void
-    /// Sets the workspace colour from the row's context menu; nil offers no menu.
+    /// Sets the workspace colour from the row's sticker and context menu; nil shows only the dot
+    /// and offers no menu.
     let onSetColor: ((WorkspaceColor?) -> Void)?
 
     @State private var showingDeleteConfirmation = false
+    @State private var showingColorPicker = false
     @ObservedObject private var fontScale = FontScaleManager.shared
     private var fontPreset: FontScalePreset {
         fontScale.preset
@@ -20,7 +22,9 @@ struct OptimizedWorkspaceRow: View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 HStack(spacing: 6) {
-                    if let color = workspace.workspaceColor {
+                    if let onSetColor {
+                        colorSticker(onSetColor: onSetColor)
+                    } else if let color = workspace.workspaceColor {
                         WorkspaceColorDot(color: color)
                     }
                     Text(workspace.name)
@@ -104,5 +108,22 @@ struct OptimizedWorkspaceRow: View {
         )
         .contentShape(RoundedRectangle(cornerRadius: 8))
         .workspaceColorContextMenu(selection: workspace.workspaceColor, onSelect: onSetColor)
+    }
+
+    /// The workspace sticker at row size; a click opens the same swatch picker as the titlebar.
+    private func colorSticker(onSetColor: @escaping (WorkspaceColor?) -> Void) -> some View {
+        Button {
+            showingColorPicker.toggle()
+        } label: {
+            WorkspaceSticker(color: workspace.workspaceColor, size: 16)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .hoverTooltip("Workspace Color")
+        .accessibilityLabel("Workspace Color")
+        .accessibilityValue(workspace.workspaceColor?.accessibilityLabel ?? "None")
+        .popover(isPresented: $showingColorPicker, arrowEdge: .bottom) {
+            WorkspaceColorSwatchPicker(selection: workspace.workspaceColor, onSelect: onSetColor)
+        }
     }
 }
