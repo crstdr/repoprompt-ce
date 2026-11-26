@@ -219,7 +219,9 @@ struct AgentProviderSwitchPreview: View {
                         Button("Discard handover") { Task { _ = await viewModel.discardProviderSwitchHandover(tabID: preview.session.tabID) } }
                             .disabled(viewModel.providerSwitchMutation != nil)
                     } else {
-                        HStack { ProgressView().controlSize(.small); Text("Finishing change…") }
+                        HStack { ProgressView().controlSize(.small)
+                            Text("Finishing change…")
+                        }
                     }
                 }
                 if preview.updated { Text("Preview updated.").foregroundStyle(.secondary) }

@@ -15842,9 +15842,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             && session.pendingHandoff.providerSwitchDispatch?.dispatchID != nil
         let requiresAttachmentAdmission = isLocalComposerInput && managedTurn == nil && codexAttemptID == nil
             && !taggedFilesToSend.isEmpty && preparedTaggedInput == nil
-        if (session.pendingHandoff.providerSwitchDelivery != nil
-            && session.pendingHandoff.providerSwitchAcceptedID == nil
-            && providerSwitchPreparation == nil && !switchInFlightOnActiveRun)
+        if (
+            session.pendingHandoff.providerSwitchDelivery != nil
+                && session.pendingHandoff.providerSwitchAcceptedID == nil
+                && providerSwitchPreparation == nil && !switchInFlightOnActiveRun
+        )
             || requiresAttachmentAdmission
         {
             let claim: AgentComposerSubmitClaim
@@ -15915,7 +15917,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
                 let admission: Result<ProviderSwitchSendPreparation?, AgentSessionLinkSendFailure> = if switchInFlightOnActiveRun
                     || capturedHandoff.providerSwitchDelivery == nil
-                    || capturedHandoff.providerSwitchAcceptedID != nil {
+                    || capturedHandoff.providerSwitchAcceptedID != nil
+                {
                     .success(nil)
                 } else {
                     await linkExecutionRuntime.providerSwitchSendAdmission(

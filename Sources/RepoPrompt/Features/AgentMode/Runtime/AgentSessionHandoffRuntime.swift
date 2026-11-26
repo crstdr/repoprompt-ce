@@ -117,8 +117,10 @@ final class AgentSessionHandoffRuntime {
               session.oversight.pendingAutoWake?.isPeriodic != true
         else { return false }
         return session.pendingHandoff.providerSwitchAcceptedID == nil
-            && (session.pendingHandoff.providerSwitchDelivery != nil
-                || session.pendingHandoff.payload?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+            && (
+                session.pendingHandoff.providerSwitchDelivery != nil
+                    || session.pendingHandoff.payload?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            )
     }
 
     func prependPendingHandoffIfNeeded(_ text: String, session: AgentTabSession) -> String {

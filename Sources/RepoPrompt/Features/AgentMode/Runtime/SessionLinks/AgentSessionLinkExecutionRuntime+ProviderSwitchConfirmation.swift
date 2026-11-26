@@ -33,13 +33,13 @@ extension AgentSessionLinkExecutionRuntime {
             }
             var markerDurable = markerAlreadyDurable
             var lastFailure = false
-            for attempt in 0..<3 {
+            for attempt in 0 ..< 3 {
                 guard scope.sessions[session.tabID] === session,
                       session.activeAgentSessionID == sessionID,
                       session.pendingHandoff.providerSwitchAcceptedID == acceptedID,
                       session.pendingHandoff.providerSwitchDelivery == .sending
                 else { return }
-                if let record = self.providerSwitchConfirmationRecords[sessionID],
+                if let record = providerSwitchConfirmationRecords[sessionID],
                    record.acceptedID == acceptedID, !record.terminalResolved
                 {
                     return
@@ -50,7 +50,7 @@ extension AgentSessionLinkExecutionRuntime {
                     try? await Task.sleep(nanoseconds: UInt64(attempt) * 100_000_000)
                     if Task.isCancelled { return }
                 }
-                guard let writer = self.providerSwitchConfirmationWriter(for: session) else {
+                guard let writer = providerSwitchConfirmationWriter(for: session) else {
                     lastFailure = true
                     continue
                 }
@@ -63,7 +63,7 @@ extension AgentSessionLinkExecutionRuntime {
                     if Task.isCancelled { return }
                     markerDurable = true
                 }
-                guard let payload = self.providerSwitchConfirmationPayload(
+                guard let payload = providerSwitchConfirmationPayload(
                     for: session, acceptedID: acceptedID
                 ) else {
                     lastFailure = true
@@ -81,8 +81,8 @@ extension AgentSessionLinkExecutionRuntime {
                               session.pendingHandoff.providerSwitchAcceptedID == acceptedID,
                               let transcript = receipt.payload.transcript
                         else { return false }
-                        self.applyProviderSwitchConfirmationReceipt(receipt, to: session, transcript: transcript)
-                        self.providerSwitchConfirmationSaveFailures.remove(sessionID)
+                        applyProviderSwitchConfirmationReceipt(receipt, to: session, transcript: transcript)
+                        providerSwitchConfirmationSaveFailures.remove(sessionID)
                         return true
                     }
                 )
@@ -95,7 +95,7 @@ extension AgentSessionLinkExecutionRuntime {
                   session.pendingHandoff.providerSwitchAcceptedID == acceptedID,
                   lastFailure
             else { return }
-            self.providerSwitchConfirmationSaveFailures.insert(sessionID)
+            providerSwitchConfirmationSaveFailures.insert(sessionID)
             session.providerSwitchConfirmationSaveFailed = true
             scope.noteSettlementChanged()
         }
@@ -134,7 +134,7 @@ extension AgentSessionLinkExecutionRuntime {
                       session.pendingHandoff.providerSwitchAcceptedID == acceptedID,
                       let finalTranscript = receipt.payload.transcript
                 else { return false }
-                self.applyProviderSwitchConfirmationReceipt(receipt, to: session, transcript: finalTranscript)
+                applyProviderSwitchConfirmationReceipt(receipt, to: session, transcript: finalTranscript)
                 return true
             }
         )

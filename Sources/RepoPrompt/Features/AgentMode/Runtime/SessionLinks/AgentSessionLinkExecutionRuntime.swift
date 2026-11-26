@@ -59,6 +59,7 @@ final class AgentSessionLinkExecutionRuntime {
         let sessionID: UUID
         let acceptedID: UUID
     }
+
     var providerSwitchConfirmationFlights: [ProviderSwitchConfirmationKey: UUID] = [:]
     /// Runtime-only failure presentation for an accepted marker whose bounded confirmation save
     /// exhausted its attempts. Hydration clears this and retries from the durable marker.
@@ -70,6 +71,7 @@ final class AgentSessionLinkExecutionRuntime {
         let runID: UUID?
         var terminalResolved: Bool
     }
+
     var providerSwitchConfirmationRecords: [UUID: ProviderSwitchConfirmationRecord] = [:]
     /// Provider producers join separately from terminal-save effects to avoid a terminal cycle.
     var pendingManagedInputEffects: [UUID: PendingSendEffect] = [:]

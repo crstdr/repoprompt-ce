@@ -706,8 +706,10 @@ extension AgentSessionLinkExecutionRuntime {
               composerSubmitClaimIsCurrent(claim),
               liveSession.permitsBoundOperationAndSave,
               providerSwitchPreparation.map({ providerSwitchPreparationIsCurrent($0, session: liveSession) })
-              ?? (liveSession.pendingHandoff.providerSwitchDelivery == nil
-                  || liveSession.pendingHandoff.providerSwitchAcceptedID != nil),
+              ?? (
+                  liveSession.pendingHandoff.providerSwitchDelivery == nil
+                      || liveSession.pendingHandoff.providerSwitchAcceptedID != nil
+              ),
               dispatchIsCurrent()
         else {
             releaseComposerSubmitClaim(claim)

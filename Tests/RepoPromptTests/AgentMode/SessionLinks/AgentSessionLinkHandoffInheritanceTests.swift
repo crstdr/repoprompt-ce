@@ -1684,7 +1684,8 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                         try JSONEncoder().encode(saved).write(to: file, options: .atomic)
                         writes.append(saved)
                         if saved.pendingHandoffProviderSwitchDelivery == nil,
-                           saved.providerSwitchAcceptedID == nil {
+                           saved.providerSwitchAcceptedID == nil
+                        {
                             XCTAssertNil(saved.pendingHandoffProviderSwitchDelivery)
                             XCTAssertNil(saved.pendingHandoffPayload)
                             clearWriteEntered = true

@@ -111,7 +111,8 @@ final class AgentSessionRunStartRuntime {
         guard isCurrent() else { return nil }
         if session.pendingHandoff.providerSwitchDelivery != nil,
            session.pendingHandoff.providerSwitchAcceptedID == nil,
-           providerSwitchPreparation == nil {
+           providerSwitchPreparation == nil
+        {
             let message = environment.providerSwitchRefusal(session)
             startOutcome?.recordStartFailure(message: message)
             return .failed(message: message)
@@ -315,7 +316,8 @@ final class AgentSessionRunStartRuntime {
         // the rendered lane claim the supplement path attaches.
         let switchMessages: (user: String, initial: String)?
         if session.pendingHandoff.providerSwitchDelivery != nil,
-           session.pendingHandoff.providerSwitchAcceptedID == nil {
+           session.pendingHandoff.providerSwitchAcceptedID == nil
+        {
             guard directStartOptions.providerControlCommand?.claudeWakeCompaction == nil else { return nil }
             switchMessages = await links.prepareProviderSwitchHandoverForSend(providerSwitchPreparation, session: session, stopFence: stopFence)
             guard inputIsCurrent() else { return nil }

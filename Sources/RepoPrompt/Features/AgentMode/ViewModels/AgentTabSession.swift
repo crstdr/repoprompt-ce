@@ -1703,6 +1703,7 @@ final class AgentTabSession: ObservableObject {
             if oldValue != providerSwitchConfirmationSaveFailed { objectWillChange.send() }
         }
     }
+
     var pendingHandoff: AgentPendingHandoffState = .init() {
         didSet {
             if oldValue != pendingHandoff { pendingHandoffRevision &+= 1 }
