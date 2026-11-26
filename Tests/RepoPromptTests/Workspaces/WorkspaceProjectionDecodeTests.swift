@@ -1326,6 +1326,34 @@ final class WorkspaceColorPaletteTests: XCTestCase {
         XCTAssertNil(WorkspaceColor.resolve(nil))
     }
 
+    /// The AppKit Workspace Color items: None then the palette in menu order, one checkmark, the
+    /// chosen colour (or nil) passed through, and colour-keeping swatches.
+    @MainActor
+    func testStableMenuItemsListNoneThenPaletteWithOneCheckmarkAndSwatches() throws {
+        var chosen: [WorkspaceColor?] = []
+        for selection in [nil] + WorkspaceColor.allCases.map(Optional.some) {
+            let menu = NSMenu.stableMenu(from: WorkspaceColor.stableMenuItems(selection: selection) { chosen.append($0) })
+            XCTAssertEqual(menu.items.map(\.title), ["None"] + contract.map(\.name))
+            XCTAssertEqual(
+                menu.items.filter { $0.state == .on }.map(\.title),
+                [selection?.displayName ?? "None"]
+            )
+        }
+
+        let menu = NSMenu.stableMenu(from: WorkspaceColor.stableMenuItems(selection: nil) { chosen.append($0) })
+        XCTAssertNil(menu.items[0].image)
+        for (index, color) in WorkspaceColor.allCases.enumerated() {
+            let image = try XCTUnwrap(menu.items[index + 1].image, color.rawValue)
+            XCTAssertFalse(image.isTemplate, color.rawValue)
+        }
+
+        chosen.removeAll()
+        for item in menu.items {
+            XCTAssertTrue(try NSApplication.shared.sendAction(XCTUnwrap(item.action), to: item.target, from: item))
+        }
+        XCTAssertEqual(chosen, [nil] + WorkspaceColor.allCases.map(Optional.some))
+    }
+
     private func rendered(_ color: NSColor, in appearance: NSAppearance) -> UInt32? {
         var hex: UInt32?
         appearance.performAsCurrentDrawingAppearance {

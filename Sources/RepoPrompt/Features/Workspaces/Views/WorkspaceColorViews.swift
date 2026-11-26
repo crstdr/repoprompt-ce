@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// The 8 pt workspace-colour dot shown before a workspace name (toolbar title, picker rows,
@@ -41,6 +42,23 @@ struct WorkspaceColorMenuSection: View {
             .pickerStyle(.inline)
             .labelsHidden()
         }
+    }
+}
+
+extension WorkspaceColor {
+    /// The AppKit counterpart of `WorkspaceColorMenuSection` for `StableMenuItem` menus (toolbar
+    /// title right-click, Chat Options submenu): None, then the palette in menu order, with a
+    /// checkmark on `selection`. No header: callers add their own section title or parent item.
+    static func stableMenuItems(
+        selection: WorkspaceColor?,
+        onSelect: @escaping (WorkspaceColor?) -> Void
+    ) -> [StableMenuItem] {
+        [.action("None", isSelected: selection == nil) { onSelect(nil) }]
+            + allCases.map { color in
+                .action(color.displayName, isSelected: selection == color, image: color.menuSwatchImage) {
+                    onSelect(color)
+                }
+            }
     }
 }
 
