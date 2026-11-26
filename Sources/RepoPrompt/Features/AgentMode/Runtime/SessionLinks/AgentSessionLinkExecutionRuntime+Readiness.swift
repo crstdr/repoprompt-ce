@@ -27,11 +27,14 @@ extension AgentSessionLinkExecutionRuntime {
     }
 
     static func providerSwitchUnconfirmed(_ session: TabSession) -> Bool {
-        session.pendingHandoff.providerSwitchDelivery == .sending && !providerSwitchHasOwnedCarryingAttempt(session)
+        session.pendingHandoff.providerSwitchDelivery == .sending
+            && session.pendingHandoff.providerSwitchAcceptedID == nil
+            && !providerSwitchHasOwnedCarryingAttempt(session)
     }
 
     static func providerSwitchNeedsReview(_ session: TabSession, excluding inputID: UUID? = nil) -> Bool {
-        guard session.pendingHandoff.providerSwitchDelivery != nil else { return false }
+        guard session.pendingHandoff.providerSwitchDelivery != nil,
+              session.pendingHandoff.providerSwitchAcceptedID == nil else { return false }
         // Once the carrying dispatch is physically bound, the handover is already en route to the
         // destination; input accepted after it is ordinary traffic on that run, never staleness.
         if session.pendingHandoff.providerSwitchDispatch?.dispatchID != nil { return false }
@@ -112,7 +115,7 @@ extension AgentSessionLinkExecutionRuntime {
                 && session.selfCompactState.active?.id != ignoresSelfCompactRequestID,
             stopInProgress: session.stopState.isStopping(binding: session.persistentSessionBindingIdentity),
             backgroundCompactionSettling: session.isSettlingACPBackgroundCompaction,
-            providerSwitchUnconfirmed: providerSwitchUnconfirmed(session),
+            providerSwitchUnconfirmed: providerSwitchUnconfirmed(session) || session.providerSwitchConfirmationSaveFailed,
             providerHandoverNeedsReview: !ignoresProviderSwitchStalenessAfterAcceptance && providerSwitchNeedsReview(session),
             hasWaitingPrompt: session.waitingPrompt != nil,
             hasPendingAskUser: session.pendingAskUser != nil,

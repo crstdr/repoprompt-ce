@@ -197,6 +197,11 @@ enum AgentSessionHydrationRuntime {
         guard attempt.ownsBinding else { return false }
         if payload.needsReloadMigrationSave { scope.persistence.scheduleSave(for: session) }
         guard applied.commitReadiness() else { return false }
+        if let linkExecution = scope.linkExecution,
+           session.pendingHandoff.providerSwitchAcceptedID != nil
+        {
+            linkExecution.providerSwitchReconcileConfirmation(for: session, markerAlreadyDurable: true)
+        }
         if attempt.ownsBinding, session.selectedAgent.usesClaudeTooling {
             _ = claude.currentClaudeEffortLevel(for: session)
         }
@@ -301,6 +306,7 @@ enum AgentSessionHydrationRuntime {
         session.providerCleanupHandle = persisted.resolvedProviderCleanupHandle
         session.providerTokenUsageByTurn = persisted.providerTokenUsageByTurn
         session.automationTurnAudit = persisted.automationTurnAudit
+        session.providerSwitchConfirmationSaveFailed = false
         session.pendingHandoff = .init(
             payload: persisted.pendingHandoffPayload, createdAt: persisted.pendingHandoffCreatedAt,
             sourceItemID: persisted.pendingHandoffSourceItemID,
@@ -308,7 +314,8 @@ enum AgentSessionHydrationRuntime {
             isStagedForSend: false,
             awaitsLocalClaudeOverflowInput: persisted.pendingHandoffAwaitsLocalClaudeOverflowInput == true && persisted.pendingHandoffPayload?.isEmpty == false,
             executionLocationFailure: persisted.pendingHandoffExecutionLocationFailure,
-            providerSwitchDelivery: persisted.pendingHandoffProviderSwitchDelivery
+            providerSwitchDelivery: persisted.pendingHandoffProviderSwitchDelivery,
+            providerSwitchAcceptedID: persisted.providerSwitchAcceptedID
         )
         session.selfCompactState = persisted.selfCompactState ?? .init()
         session.selfCompactPersistenceWarning = persisted.selfCompactPersistenceWarning

@@ -25,6 +25,11 @@ extension AgentSessionLinkExecutionRuntime {
         defer { withExtendedLifetime(owner) {} }
         guard commands.isAvailable(), owner.sessions[session.tabID] === session else { return .failure(.targetStopped) }
         guard let delivery = session.pendingHandoff.providerSwitchDelivery else { return .success(nil) }
+        // A known provider acceptance is never re-admitted. Carrier-free ordinary input remains
+        // available; the confirmation reconciler owns only the retained carrier.
+        if session.pendingHandoff.providerSwitchAcceptedID != nil {
+            return .failure(session.providerSwitchConfirmationSaveFailed ? .providerSwitchUnconfirmed : .targetNotIdle)
+        }
         guard delivery == .ready else {
             guard Self.providerSwitchHasOwnedCarryingAttempt(session) else { return .failure(.providerSwitchUnconfirmed) }
             return .failure(Self.providerSwitchNeedsReview(session) ? .providerHandoverNeedsReview : .targetNotIdle)
@@ -278,11 +283,14 @@ extension AgentSessionLinkExecutionRuntime {
                   sessionID: sessionID, expectedWorkspaceID: proof.admission.writerIdentity.workspaceID
               ),
               writer.scope === scope, writer.session === session,
-              writer.identity == proof.admission.writerIdentity, writer.isCurrent else { return nil }
+              (writer.identity == proof.admission.writerIdentity || writer.restoration == proof.binding),
+              writer.identity.workspaceID == proof.admission.writerIdentity.workspaceID,
+              writer.isCurrent else { return nil }
         return writer
     }
 
     func providerSwitchAcquirePhysicalDispatch(session: TabSession, dispatchID: AgentSessionLinkPromptDispatchID) -> Bool {
+        guard session.pendingHandoff.providerSwitchAcceptedID == nil else { return false }
         guard session.pendingHandoff.providerSwitchDelivery != nil else { return true }
         guard session.pendingHandoff.providerSwitchDelivery == .sending,
               session.pendingHandoff.isStagedForSend else { return false }
@@ -322,47 +330,20 @@ extension AgentSessionLinkExecutionRuntime {
               let context, session.pendingHandoff.providerSwitchDelivery == .sending,
               session.pendingHandoff.isStagedForSend,
               let staged = session.pendingHandoff.providerSwitchDispatch,
-              staged.dispatchID == context.dispatchID, staged.binding == session.currentRestorationBindingToken,
-              let writer = providerSwitchWriter(for: session, proof: staged) else { return }
-        // Physical acceptance acknowledges an already-dispatched effect. Retirement blocks a new
-        // dispatch, not this originating acknowledgement or its final durable clear.
-        let sending = session.pendingHandoff
-        let binding = session.currentRestorationBindingToken
-        session.pendingHandoff.clearAfterSend()
-        let cleared = session.pendingHandoff
-        let model = commands.modelDisplayName(session)
-        let text = "Handover sent to \(session.selectedAgent.displayName) / \(model)."
-        session.appendItem(.system(text, sequenceIndex: session.nextSequenceIndex, recoveryDiagnostic: .init(
-            reason: "providerSwitch", outcome: "sent", text: text
-        )))
-        session.isDirty = true
-        let effectID = UUID()
-        let task = Task { @MainActor [self, session, writer] in
-            defer {
-                pendingSendEffects.removeValue(forKey: effectID)
-                writer.scope.noteSettlementChanged()
-            }
-            // Admission and the scheduled write are separate actor turns. Do not let a replaced
-            // claim persist this acknowledgement through the successor's tab slot.
-            guard writer.isCurrent else { return }
-            // A returned frozen clear must survive later save-token drift. The ordinary fresh-save
-            // owner carries it forward; only an unacknowledged write restores uncertainty.
-            var saverReturned = false
-            let result = await flushSaveRequired(writer: writer, observingSavePhase: {
-                if case .writeReturned = $0 { saverReturned = true }
-            })
-            if case .failure = result, !saverReturned, writer.isCurrent,
-               sessions[session.tabID] === session, session.currentRestorationBindingToken == binding,
-               session.pendingHandoff == cleared
-            {
-                session.pendingHandoff = sending
-                session.pendingHandoff.isStagedForSend = false
-                session.pendingHandoff.providerSwitchDispatch = nil
-                session.isDirty = true
-                scheduleSave(for: session.tabID)
-            }
+              staged.dispatchID == context.dispatchID, staged.binding == session.currentRestorationBindingToken
+        else { return }
+        let acceptanceWriter = providerSwitchWriter(for: session, proof: staged)
+        guard acceptanceWriter != nil else { return }
+        // Acceptance is monotonic. Keep the carrier and `.sending` in live memory until the
+        // provider-free projected clear has a durable receipt; duplicate callbacks are no-ops.
+        guard session.pendingHandoff.providerSwitchAcceptedID == nil else {
+            providerSwitchReconcileConfirmation(for: session, markerAlreadyDurable: false)
+            return
         }
-        pendingSendEffects[effectID] = PendingSendEffect(sessionIdentity: ObjectIdentifier(session), task: task)
+        session.pendingHandoff.providerSwitchAcceptedID = UUID()
+        session.providerSwitchConfirmationSaveFailed = false
+        session.isDirty = true
+        providerSwitchReconcileConfirmation(for: session, markerAlreadyDurable: false)
     }
 
     func providerSwitchHistoryToolAllowed(_ session: TabSession, destination: AgentProviderKind? = nil) -> Bool {
@@ -468,13 +449,19 @@ extension AgentSessionLinkExecutionRuntime {
             return .blocked(.endpointPostReadiness)
         }
         let switchPreparation: ProviderSwitchSendPreparation?
-        switch await providerSwitchSendAdmission(session: session, input: dispatchedMessage, isCurrent: {
-            command.isCurrent && stopFence.permitsStart(of: session) && liveness().permitsDelivery && self.composerSubmitClaimIsCurrent(claim)
-        }) {
-        case let .failure(failure):
-            releaseComposerSubmitClaim(claim)
-            return .blocked(failure)
-        case let .success(preparation): switchPreparation = preparation
+        if session.pendingHandoff.providerSwitchAcceptedID != nil {
+            // The accepted carrier is fenced from re-admission, but ordinary carrier-free input
+            // remains allowed while provider-free confirmation is retried.
+            switchPreparation = nil
+        } else {
+            switch await providerSwitchSendAdmission(session: session, input: dispatchedMessage, isCurrent: {
+                command.isCurrent && stopFence.permitsStart(of: session) && liveness().permitsDelivery && self.composerSubmitClaimIsCurrent(claim)
+            }) {
+            case let .failure(failure):
+                releaseComposerSubmitClaim(claim)
+                return .blocked(failure)
+            case let .success(preparation): switchPreparation = preparation
+            }
         }
 
         // 5. The commit awaited, so every identity and readiness fact must be re-proven — including

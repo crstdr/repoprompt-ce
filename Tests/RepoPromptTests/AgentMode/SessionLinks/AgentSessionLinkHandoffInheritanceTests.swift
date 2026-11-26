@@ -1638,13 +1638,23 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     fixture.viewModel.linkExecutionRuntime.providerSwitchRecordPhysicalAcceptance(session: session, context: context)
                     fixture.viewModel.linkExecutionRuntime.providerSwitchRecordPhysicalAcceptance(session: session, context: context)
                     try await AsyncTestWait.waitUntil("clear save settles") {
-                        saves.count >= 2 && (clearFails ? session.pendingHandoff.providerSwitchDelivery == .sending : session.pendingHandoff.providerSwitchDelivery == nil)
+                        saves.count >= 2 && (clearFails ? session.providerSwitchConfirmationSaveFailed : session.pendingHandoff.providerSwitchDelivery == nil)
                     }
                     session.saveDebounceTask?.cancel()
                     session.saveDebounceTask = nil
-                    XCTAssertEqual(session.items.filter { $0.recoveryDiagnostic?.reason == "providerSwitch" }.map(\.text), ["Handover sent to \(session.selectedAgent.displayName) / \(fixture.viewModel.inputBarModelDisplayName(rawModel: session.selectedModelRaw, agentKind: session.selectedAgent))."])
+                    let sentRows = session.items.filter { $0.recoveryDiagnostic?.reason == "providerSwitch" && $0.recoveryDiagnostic?.outcome == "sent" }
+                    if clearFails {
+                        XCTAssertTrue(session.providerSwitchConfirmationSaveFailed)
+                        XCTAssertNotNil(session.pendingHandoff.providerSwitchAcceptedID)
+                        XCTAssertTrue(sentRows.isEmpty)
+                        XCTAssertTrue(session.pendingHandoff.isStagedForSend)
+                    } else {
+                        XCTAssertFalse(session.providerSwitchConfirmationSaveFailed)
+                        XCTAssertNil(session.pendingHandoff.providerSwitchAcceptedID)
+                        XCTAssertEqual(sentRows.map(\.text), ["Handover sent to \(session.selectedAgent.displayName) / \(fixture.viewModel.inputBarModelDisplayName(rawModel: session.selectedModelRaw, agentKind: session.selectedAgent))."])
+                        XCTAssertFalse(session.pendingHandoff.isStagedForSend)
+                    }
                     XCTAssertEqual(session.pendingHandoff.payload, clearFails ? payload : nil)
-                    XCTAssertFalse(session.pendingHandoff.isStagedForSend)
                     XCTAssertNil(session.agentTask)
                 }
             }
@@ -1673,7 +1683,8 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     vm.test_setAgentSessionSaver { saved, _, _ in
                         try JSONEncoder().encode(saved).write(to: file, options: .atomic)
                         writes.append(saved)
-                        if writes.count == 2 {
+                        if saved.pendingHandoffProviderSwitchDelivery == nil,
+                           saved.providerSwitchAcceptedID == nil {
                             XCTAssertNil(saved.pendingHandoffProviderSwitchDelivery)
                             XCTAssertNil(saved.pendingHandoffPayload)
                             clearWriteEntered = true
@@ -3488,7 +3499,9 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                     let context = AgentSessionLinkDispatchContext(session: session, dispatchID: dispatch)
                     vm.linkExecutionRuntime.acceptAgentSessionLinkDispatch(session: session, context: context, claim: nil)
                     vm.linkExecutionRuntime.acceptAgentSessionLinkDispatch(session: session, context: context, claim: nil)
-                    try await AsyncTestWait.waitUntil("native physical acceptance clear save") { saves.count == 2 }
+                    try await AsyncTestWait.waitUntil("native physical acceptance clear save") {
+                        saves.contains(nil) && session.pendingHandoff.providerSwitchDelivery == nil
+                    }
                     XCTAssertNil(session.pendingHandoff.providerSwitchDelivery)
                     XCTAssertEqual(session.items.count(where: { $0.recoveryDiagnostic?.outcome == "sent" }), 1)
                     guard case .success(nil) = await vm.linkExecutionRuntime.providerSwitchSendAdmission(session: session, input: "next") else { return XCTFail("Positive native acceptance must not wedge the next input") }

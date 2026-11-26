@@ -644,6 +644,9 @@ final class AgentSessionRuntimeStore {
                 liveClaimByTabID[tabID] = LiveClaim(sessionID: current)
                 noteSettlementChanged()
                 if let current { liveTabIDsBySessionID[current, default: []].insert(tabID) }
+                if session.pendingHandoff.providerSwitchAcceptedID != nil {
+                    linkExecution?.providerSwitchReconcileConfirmation(for: session, markerAlreadyDurable: true)
+                }
             }
         }
     }

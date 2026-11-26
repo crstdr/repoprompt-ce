@@ -165,6 +165,18 @@
                 let restored = try JSONDecoder().decode(AgentSession.self, from: encoder.encode(decoded))
                 XCTAssertEqual(restored.pendingHandoffProviderSwitchDelivery, expected)
             }
+            let acceptedID = UUID()
+            var acceptedObject = base
+            acceptedObject["pendingHandoffProviderSwitchDelivery"] = "sending"
+            acceptedObject["providerSwitchAcceptedID"] = acceptedID.uuidString
+            let acceptedData = try JSONSerialization.data(withJSONObject: acceptedObject)
+            let accepted = try JSONDecoder().decode(AgentSession.self, from: acceptedData)
+            XCTAssertEqual(accepted.pendingHandoffProviderSwitchDelivery, .sending)
+            XCTAssertEqual(accepted.providerSwitchAcceptedID, acceptedID)
+            let acceptedURL = folder.appendingPathComponent("AgentSession-accepted-\(original.id.uuidString).json")
+            try acceptedData.write(to: acceptedURL)
+            let acceptedStub = try await AgentSessionDataService.shared.loadAgentSessionStub(from: acceptedURL)
+            XCTAssertEqual(acceptedStub.providerSwitchAcceptedID, acceptedID)
         }
 
         @MainActor

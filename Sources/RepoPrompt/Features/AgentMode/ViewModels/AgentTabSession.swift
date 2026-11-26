@@ -1696,11 +1696,19 @@ final class AgentTabSession: ObservableObject {
     /// Handoff payload (injected into provider-facing text on first user send).
     /// Cleared only after the provider accepts the turn.
     private(set) var pendingHandoffRevision: UInt64 = 0
+    /// Runtime-only status for the accepted handover confirmation. It is deliberately not
+    /// persisted; a durable accepted ID always re-enters reconciliation after hydration.
+    var providerSwitchConfirmationSaveFailed = false {
+        didSet {
+            if oldValue != providerSwitchConfirmationSaveFailed { objectWillChange.send() }
+        }
+    }
     var pendingHandoff: AgentPendingHandoffState = .init() {
         didSet {
             if oldValue != pendingHandoff { pendingHandoffRevision &+= 1 }
             if oldValue.executionLocationFailure != pendingHandoff.executionLocationFailure
                 || oldValue.providerSwitchDelivery != pendingHandoff.providerSwitchDelivery
+                || oldValue.providerSwitchAcceptedID != pendingHandoff.providerSwitchAcceptedID
                 || oldValue.providerSwitchDispatch != pendingHandoff.providerSwitchDispatch
                 || oldValue.sourceItemID != pendingHandoff.sourceItemID
                 || oldValue.isStagedForSend != pendingHandoff.isStagedForSend

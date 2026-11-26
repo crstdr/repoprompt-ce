@@ -17,6 +17,8 @@ struct AgentPendingHandoffState: Equatable {
     var executionLocationFailure: String?
     /// Nil retains the existing fork/resume-recovery delivery policy.
     var providerSwitchDelivery: AgentProviderSwitchDelivery?
+    /// Durable provider acceptance proof. The delivery remains `.sending` until confirmation.
+    var providerSwitchAcceptedID: UUID?
     /// Captured by the existing physical fence; never persisted or reused by another dispatch.
     var providerSwitchDispatch: AgentProviderSwitchPhysicalDispatch?
 
@@ -33,6 +35,7 @@ struct AgentPendingHandoffState: Equatable {
         isStagedForSend = false
         awaitsLocalClaudeOverflowInput = false
         providerSwitchDelivery = nil
+        providerSwitchAcceptedID = nil
         providerSwitchDispatch = nil
     }
 }
