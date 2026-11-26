@@ -468,13 +468,12 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
             XCTAssertNil(window.workspaceManager.workspace(withID: fixture.workspaceID)?.color)
 
             window.workspaceSticker.togglePicker(from: .sidebarToolbar)
-            window.workspaceSticker.select(.lime)
+            let presentation = try XCTUnwrap(window.workspaceSticker.picker)
+            XCTAssertEqual(presentation.workspaceID, fixture.workspaceID)
+            XCTAssertEqual(presentation.host, .sidebarToolbar)
+            window.workspaceSticker.select(.lime, in: presentation)
             XCTAssertEqual(window.workspaceManager.workspace(withID: fixture.workspaceID)?.color, "lime")
-            XCTAssertEqual(
-                window.workspaceSticker.picker,
-                .init(workspaceID: fixture.workspaceID, host: .sidebarToolbar),
-                "choosing leaves the picker open"
-            )
+            XCTAssertEqual(window.workspaceSticker.picker, presentation, "choosing leaves the picker open")
 
             window.setAgentSidebarCollapsed(true)
             XCTAssertNil(window.workspaceSticker.picker)
@@ -488,10 +487,8 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
             let window = fixture.window
             await awaitWindowTitleResolution(window)
             window.workspaceSticker.togglePicker(from: .sidebarToolbar)
-            XCTAssertEqual(
-                window.workspaceSticker.picker,
-                .init(workspaceID: fixture.workspaceID, host: .sidebarToolbar)
-            )
+            XCTAssertEqual(window.workspaceSticker.picker?.workspaceID, fixture.workspaceID)
+            XCTAssertEqual(window.workspaceSticker.picker?.host, .sidebarToolbar)
 
             window.setAgentTitlebarAccessoryVisible(false)
             XCTAssertNil(window.workspaceSticker.picker)
@@ -1422,9 +1419,9 @@ final class WorkspaceRestorationTitleTests: XCTestCase {
         XCTAssertEqual(foreignTitle, renamed)
     }
 
-    /// A same-ID colour edit on the active workspace repaints the title dot and the sticker with no
-    /// explicit title request; System shows neither and has no sticker.
-    func testActiveWorkspaceColorChangeRepaintsTitleClusterWithoutExplicitRequest() async throws {
+    /// A same-ID colour edit on the active workspace repaints the sticker with no explicit title
+    /// request; System has no sticker.
+    func testActiveWorkspaceColorChangeRepaintsStickerWithoutExplicitRequest() async throws {
         let fixture = try await makeFixture(systemNumber: 6)
         let window = fixture.window
         let target = window.workspaceManager.createWorkspace(
@@ -1432,7 +1429,6 @@ final class WorkspaceRestorationTitleTests: XCTestCase {
         )
         _ = await window.workspaceManager.switchWorkspace(to: target, saveState: false, reason: "titleColor")
         await resolveTitle(window)
-        XCTAssertNil(window.agentChatTitleCluster.state.workspaceColor)
         XCTAssertEqual(window.workspaceSticker.state, .init(workspaceID: target.id, color: nil))
 
         let repainted = expectation(description: "title re-resolved for the colour change")
@@ -1443,34 +1439,36 @@ final class WorkspaceRestorationTitleTests: XCTestCase {
         }
         window.setTitleWorkspaceColor(.teal, expectedWorkspaceID: target.id)
         await fulfillment(of: [repainted], timeout: 5)
-        XCTAssertEqual(window.agentChatTitleCluster.state.workspaceColor, .teal)
         XCTAssertEqual(window.workspaceSticker.state, .init(workspaceID: target.id, color: .teal))
         XCTAssertEqual(window.workspaceManager.activeWorkspace?.color, "teal")
 
         let system = try XCTUnwrap(window.workspaceManager.workspaces.first(where: \.isSystemWorkspace))
         _ = await window.workspaceManager.switchWorkspace(to: system, saveState: false, reason: "titleColorSystem")
         await resolveTitle(window)
-        XCTAssertNil(window.agentChatTitleCluster.state.workspaceColor)
         XCTAssertEqual(window.workspaceSticker.state, .init(workspaceID: nil, color: nil))
         window.setTitleWorkspaceColor(.red, expectedWorkspaceID: system.id)
         XCTAssertNil(window.workspaceManager.workspace(withID: system.id)?.color)
     }
 
-    /// The colour has no window-level presentation (the former edge line reserved space at the window
-    /// root): a colour change reaches only the title dot and the sticker and publishes nothing on the
-    /// window state the root view observes, so nothing above the content can move.
+    /// The colour has no window-level or title presentation (the former edge line reserved space at
+    /// the window root, and the title no longer shows a dot): a colour change repaints the sticker
+    /// and publishes nothing on the window state the root view observes or on the title cluster.
+    /// Other observers of the workspace list may still re-render; this test does not cover them.
     func testWorkspaceColorChangePublishesNothingOnWindowState() async throws {
         let fixture = try await makeFixture(systemNumber: 6)
         let window = fixture.window
         let target = window.workspaceManager.createWorkspace(
-            name: "Edge \(UUID().uuidString.prefix(6))", repoPaths: [fixture.rootURL.path], ephemeral: true
+            name: "Sticker \(UUID().uuidString.prefix(6))", repoPaths: [fixture.rootURL.path], ephemeral: true
         )
-        _ = await window.workspaceManager.switchWorkspace(to: target, saveState: false, reason: "titleColorEdge")
+        _ = await window.workspaceManager.switchWorkspace(to: target, saveState: false, reason: "titleColorSticker")
         await resolveTitle(window)
 
         var windowPublishes = 0
         let subscription = window.objectWillChange.sink { windowPublishes += 1 }
         defer { subscription.cancel() }
+        var titlePublishes = 0
+        let titleSubscription = window.agentChatTitleCluster.objectWillChange.sink { titlePublishes += 1 }
+        defer { titleSubscription.cancel() }
         let repainted = expectation(description: "title re-resolved for the colour change")
         window.setWindowTitleResolutionDidCompleteHandlerForTesting {
             guard window.workspaceSticker.state.color == .violet else { return }
@@ -1479,8 +1477,9 @@ final class WorkspaceRestorationTitleTests: XCTestCase {
         }
         window.setTitleWorkspaceColor(.violet, expectedWorkspaceID: target.id)
         await fulfillment(of: [repainted], timeout: 5)
-        XCTAssertEqual(window.agentChatTitleCluster.state.workspaceColor, .violet)
+        XCTAssertEqual(window.workspaceSticker.state, .init(workspaceID: target.id, color: .violet))
         XCTAssertEqual(windowPublishes, 0)
+        XCTAssertEqual(titlePublishes, 0, "the title cluster carries no colour")
     }
 
     /// A picker opened on one workspace closes when the title switches to another, and a choice
@@ -1497,13 +1496,15 @@ final class WorkspaceRestorationTitleTests: XCTestCase {
         _ = await window.workspaceManager.switchWorkspace(to: first, saveState: false, reason: "titleColorStaleFirst")
         await resolveTitle(window)
         window.workspaceSticker.togglePicker(from: .sidebarToolbar)
-        XCTAssertEqual(window.workspaceSticker.picker, .init(workspaceID: first.id, host: .sidebarToolbar))
+        let stale = try XCTUnwrap(window.workspaceSticker.picker)
+        XCTAssertEqual(stale.workspaceID, first.id)
+        XCTAssertEqual(stale.host, .sidebarToolbar)
 
         _ = await window.workspaceManager.switchWorkspace(to: second, saveState: false, reason: "titleColorStaleSecond")
         await resolveTitle(window)
         XCTAssertNil(window.workspaceSticker.picker, "the switch closes the picker")
         XCTAssertEqual(window.workspaceSticker.state.workspaceID, second.id)
-        window.workspaceSticker.select(.red)
+        window.workspaceSticker.select(.red, in: stale)
 
         window.setTitleWorkspaceColor(.red, expectedWorkspaceID: first.id)
         XCTAssertNil(window.workspaceManager.workspace(withID: first.id)?.color)
@@ -1514,10 +1515,54 @@ final class WorkspaceRestorationTitleTests: XCTestCase {
         XCTAssertNil(window.workspaceManager.workspace(withID: first.id)?.color)
     }
 
+    /// Detaching the live window or replacing it removes the sticker's anchors, so an open picker
+    /// closes; attaching the same window again keeps it, and a true close publishes nothing.
+    func testLiveWindowDetachOrReplacementClosesStickerPicker() async throws {
+        let fixture = try await makeFixture(systemNumber: 6)
+        let window = fixture.window
+        let target = window.workspaceManager.createWorkspace(
+            name: "Anchored \(UUID().uuidString.prefix(6))", repoPaths: [fixture.rootURL.path], ephemeral: true
+        )
+        _ = await window.workspaceManager.switchWorkspace(to: target, saveState: false, reason: "stickerAnchor")
+        await resolveTitle(window)
+        let sticker = window.workspaceSticker
+
+        sticker.togglePicker(from: .titlebarAccessory)
+        let opened = try XCTUnwrap(sticker.picker)
+        window.attachWindow(fixture.nsWindow)
+        XCTAssertEqual(sticker.picker, opened, "attaching the same window keeps the picker")
+
+        let replacement = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 480, height: 320),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: true
+        )
+        replacement.isReleasedWhenClosed = false
+        window.attachWindow(replacement)
+        XCTAssertNil(sticker.picker, "a replacement window does not inherit the picker")
+
+        sticker.togglePicker(from: .titlebarAccessory)
+        XCTAssertNotNil(sticker.picker)
+        window.attachWindow(nil)
+        XCTAssertNil(sticker.picker, "a live detach closes the picker")
+
+        window.attachWindow(fixture.nsWindow)
+        sticker.togglePicker(from: .sidebarToolbar)
+        let beforeClose = try XCTUnwrap(sticker.picker)
+        var publishes = 0
+        let subscription = sticker.objectWillChange.sink { publishes += 1 }
+        defer { subscription.cancel() }
+        window.beginClose()
+        window.attachWindow(nil)
+        XCTAssertEqual(publishes, 0, "a true close publishes nothing on the sticker")
+        XCTAssertEqual(sticker.picker, beforeClose)
+    }
+
     /// The sticker picker binds the workspace it opened for: same-ID updates keep it open, a switch
     /// closes it and later choices go nowhere. Each host presents only its own picker, and only a
     /// visibility flip asks the host to re-measure.
-    func testWorkspaceStickerModelBindsPickerToOpenedWorkspaceAndHost() {
+    func testWorkspaceStickerModelBindsPickerToOpenedWorkspaceAndHost() throws {
         let model = WorkspaceStickerModel()
         var chosen: [(UUID, WorkspaceColor?)] = []
         model.onSelectColor = { chosen.append(($0, $1)) }
@@ -1527,8 +1572,6 @@ final class WorkspaceRestorationTitleTests: XCTestCase {
         // System or no workspace: no sticker, so nothing opens and nothing is forwarded.
         model.togglePicker(from: .sidebarToolbar)
         XCTAssertNil(model.picker)
-        model.select(.red)
-        XCTAssertTrue(chosen.isEmpty)
         XCTAssertFalse(model.update(workspaceID: nil, color: .red), "no flip while still hidden")
         XCTAssertEqual(model.state, .init(workspaceID: nil, color: nil), "no colour without a workspace")
 
@@ -1539,32 +1582,49 @@ final class WorkspaceRestorationTitleTests: XCTestCase {
         XCTAssertFalse(model.update(workspaceID: first, color: .teal))
 
         model.togglePicker(from: .sidebarToolbar)
-        XCTAssertEqual(model.picker, .init(workspaceID: first, host: .sidebarToolbar))
+        let sidebar = try XCTUnwrap(model.picker)
+        XCTAssertEqual(sidebar.workspaceID, first)
+        XCTAssertEqual(sidebar.host, .sidebarToolbar)
+        XCTAssertEqual(model.presentation(in: .sidebarToolbar), sidebar)
+        XCTAssertNil(model.presentation(in: .titlebarAccessory))
         XCTAssertTrue(model.isPickerPresented(in: .sidebarToolbar))
         XCTAssertFalse(model.isPickerPresented(in: .titlebarAccessory))
 
-        model.select(.lime)
-        model.select(nil)
+        model.select(.lime, in: sidebar)
+        model.select(nil, in: sidebar)
         XCTAssertEqual(chosen.map(\.0), [first, first])
         XCTAssertEqual(chosen.map(\.1), [.lime, nil])
-        XCTAssertNotNil(model.picker, "choosing leaves the picker open")
+        XCTAssertEqual(model.picker, sidebar, "choosing leaves the picker open")
 
         model.update(workspaceID: first, color: .lime)
-        XCTAssertEqual(model.picker, .init(workspaceID: first, host: .sidebarToolbar), "same-ID update keeps it open")
+        XCTAssertEqual(model.picker, sidebar, "same-ID update keeps it open")
 
         // The other host takes over rather than both presenting; toggling the same host closes.
         model.togglePicker(from: .titlebarAccessory)
-        XCTAssertEqual(model.picker, .init(workspaceID: first, host: .titlebarAccessory))
+        XCTAssertEqual(model.picker?.workspaceID, first)
+        XCTAssertEqual(model.picker?.host, .titlebarAccessory)
         XCTAssertFalse(model.isPickerPresented(in: .sidebarToolbar))
         model.togglePicker(from: .titlebarAccessory)
         XCTAssertNil(model.picker)
 
         model.togglePicker(from: .sidebarToolbar)
+        let beforeSwitch = try XCTUnwrap(model.picker)
         model.update(workspaceID: second, color: nil)
         XCTAssertNil(model.picker, "a switch closes the picker")
         chosen.removeAll()
-        model.select(.red)
+        model.select(.red, in: beforeSwitch)
         XCTAssertTrue(chosen.isEmpty, "a choice after the switch goes nowhere")
+
+        // A dismissal from an earlier opening leaves a later one open; its own closes it.
+        model.togglePicker(from: .sidebarToolbar)
+        let earlier = try XCTUnwrap(model.picker)
+        model.togglePicker(from: .sidebarToolbar)
+        model.togglePicker(from: .sidebarToolbar)
+        let later = try XCTUnwrap(model.picker)
+        model.dismissPicker(earlier)
+        XCTAssertEqual(model.picker, later)
+        model.dismissPicker(later)
+        XCTAssertNil(model.picker)
 
         model.togglePicker(from: .sidebarToolbar)
         model.dismissPicker()
@@ -1573,6 +1633,99 @@ final class WorkspaceRestorationTitleTests: XCTestCase {
         model.togglePicker(from: .sidebarToolbar)
         XCTAssertTrue(model.update(workspaceID: nil, color: nil), "shown to hidden flips")
         XCTAssertNil(model.picker)
+    }
+
+    /// A swatch action belongs to the opening that rendered it. Once that opening is replaced (by
+    /// another workspace's picker, by the other host, or by closing and reopening on the same
+    /// workspace and host), the retained action forwards nothing; the current opening still applies,
+    /// including None.
+    func testRetiredSwatchActionCannotWriteThroughNewPresentation() throws {
+        let model = WorkspaceStickerModel()
+        var chosen: [(UUID, WorkspaceColor?)] = []
+        model.onSelectColor = { chosen.append(($0, $1)) }
+        let first = UUID()
+        let second = UUID()
+
+        func assertOnlyCurrentForwards(
+            retired: WorkspaceStickerModel.PickerPresentation,
+            _ message: String,
+            line: UInt = #line
+        ) throws {
+            let current = try XCTUnwrap(model.picker, message, line: line)
+            XCTAssertNotEqual(current.id, retired.id, message, line: line)
+            chosen.removeAll()
+            model.select(.red, in: retired)
+            model.select(nil, in: retired)
+            XCTAssertTrue(chosen.isEmpty, "retired action forwarded: \(message)", line: line)
+            model.select(.teal, in: current)
+            model.select(nil, in: current)
+            XCTAssertEqual(chosen.map(\.0), [current.workspaceID, current.workspaceID], message, line: line)
+            XCTAssertEqual(chosen.map(\.1), [.teal, nil], message, line: line)
+        }
+
+        // (a) Another workspace's picker replaces the first opening.
+        model.update(workspaceID: first, color: nil)
+        model.togglePicker(from: .sidebarToolbar)
+        let onFirst = try XCTUnwrap(model.picker)
+        model.update(workspaceID: second, color: nil)
+        model.togglePicker(from: .sidebarToolbar)
+        XCTAssertEqual(model.picker?.workspaceID, second)
+        try assertOnlyCurrentForwards(retired: onFirst, "another workspace's picker")
+
+        // (b) The other host takes over the same workspace's picker.
+        model.togglePicker(from: .sidebarToolbar)
+        model.togglePicker(from: .sidebarToolbar)
+        let inSidebar = try XCTUnwrap(model.picker)
+        model.togglePicker(from: .titlebarAccessory)
+        XCTAssertEqual(model.picker?.workspaceID, second)
+        XCTAssertEqual(model.picker?.host, .titlebarAccessory)
+        try assertOnlyCurrentForwards(retired: inSidebar, "the other host")
+
+        // (c) Closing and reopening on the same workspace and host.
+        model.togglePicker(from: .titlebarAccessory)
+        XCTAssertNil(model.picker)
+        model.togglePicker(from: .titlebarAccessory)
+        let reopenedOnce = try XCTUnwrap(model.picker)
+        model.dismissPicker()
+        model.togglePicker(from: .titlebarAccessory)
+        XCTAssertEqual(model.picker?.workspaceID, reopenedOnce.workspaceID)
+        XCTAssertEqual(model.picker?.host, reopenedOnce.host)
+        try assertOnlyCurrentForwards(retired: reopenedOnce, "close and reopen on the same workspace and host")
+    }
+
+    /// The actions a sticker view captures for one opening (swatches and popover dismissal) do
+    /// nothing once that opening is retired, so a stale popover can neither recolour nor close a
+    /// newer picker.
+    func testRetiredOpeningActionsCannotSelectOrDismissNewerPicker() throws {
+        let model = WorkspaceStickerModel()
+        var chosen: [(UUID, WorkspaceColor?)] = []
+        model.onSelectColor = { chosen.append(($0, $1)) }
+        let workspaceID = UUID()
+        model.update(workspaceID: workspaceID, color: nil)
+
+        XCTAssertNil(model.actions(in: .sidebarToolbar), "no actions while the host shows no picker")
+        model.togglePicker(from: .sidebarToolbar)
+        let retired = try XCTUnwrap(model.actions(in: .sidebarToolbar))
+        XCTAssertNil(model.actions(in: .titlebarAccessory))
+
+        // Retire the opening, then reopen on the same workspace and host.
+        model.togglePicker(from: .sidebarToolbar)
+        model.togglePicker(from: .sidebarToolbar)
+        let current = try XCTUnwrap(model.actions(in: .sidebarToolbar))
+        XCTAssertNotEqual(current.presentation.id, retired.presentation.id)
+
+        retired.select(.red)
+        retired.dismiss()
+        XCTAssertTrue(chosen.isEmpty, "a retired swatch must not forward")
+        XCTAssertEqual(model.picker, current.presentation, "a retired dismissal must not close the newer picker")
+
+        current.select(.teal)
+        XCTAssertEqual(chosen.map(\.0), [workspaceID])
+        XCTAssertEqual(chosen.map(\.1), [.teal])
+        current.dismiss()
+        XCTAssertNil(model.picker)
+        current.select(.red)
+        XCTAssertEqual(chosen.count, 1, "actions of a closed opening do nothing")
     }
 
     /// Registration during a held switch assigns the target through the manager's established

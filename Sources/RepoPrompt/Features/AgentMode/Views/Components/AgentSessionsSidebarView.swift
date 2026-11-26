@@ -154,19 +154,31 @@ struct AgentModeSessionsSidebarView: View {
         }
     }
 
-    /// The sidebar column's trailing titlebar cluster: list actions, compose, then the workspace sticker.
+    /// The sidebar column's titlebar strip: list actions and compose, then the workspace sticker. On
+    /// macOS 26 a flexible spacer pushes the sticker to the column's trailing edge; earlier releases
+    /// keep it as the last button of the group.
     @ToolbarContentBuilder
     private var titlebarActions: some ToolbarContent {
         if #available(macOS 26.0, *) {
-            titlebarActionsGroup
+            titlebarActionsGroup(includesSticker: false)
+                .sharedBackgroundVisibility(.hidden)
+            ToolbarSpacer(.flexible, placement: .primaryAction)
+            titlebarStickerItem
                 .sharedBackgroundVisibility(.hidden)
         } else {
-            titlebarActionsGroup
+            titlebarActionsGroup(includesSticker: true)
         }
     }
 
     @ToolbarContentBuilder
-    private var titlebarActionsGroup: some ToolbarContent {
+    private var titlebarStickerItem: some ToolbarContent {
+        ToolbarItem(placement: .primaryAction) {
+            AgentModeTitlebarWorkspaceStickerButton(model: workspaceSticker, host: .sidebarToolbar)
+        }
+    }
+
+    @ToolbarContentBuilder
+    private func titlebarActionsGroup(includesSticker: Bool) -> some ToolbarContent {
         ToolbarItemGroup(placement: .primaryAction) {
             let searchText = sidebarUI.snapshot.searchText
             AgentSidebarCollapseAllButton(
@@ -181,7 +193,9 @@ struct AgentModeSessionsSidebarView: View {
                 action: toggleAllThreads
             )
             AgentModeTitlebarNewSessionButton(action: onNewSession)
-            AgentModeTitlebarWorkspaceStickerButton(model: workspaceSticker, host: .sidebarToolbar)
+            if includesSticker {
+                AgentModeTitlebarWorkspaceStickerButton(model: workspaceSticker, host: .sidebarToolbar)
+            }
         }
     }
 

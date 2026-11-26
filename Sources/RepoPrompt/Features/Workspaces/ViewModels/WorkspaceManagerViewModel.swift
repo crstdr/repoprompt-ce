@@ -2487,6 +2487,10 @@ class WorkspaceManagerViewModel: ObservableObject {
             savePathComposeTabReloadCountForTesting = 0
         }
 
+        func hasPendingWorkspaceColorIntentForTesting(workspaceID: UUID) -> Bool {
+            workspaceColorIntentByID[workspaceID] != nil
+        }
+
         func workspaceSaveDiagnosticsForTesting(workspaceID: UUID) -> (
             attemptCount: Int,
             capturePublicationCount: Int,
@@ -15677,10 +15681,12 @@ class WorkspaceManagerViewModel: ObservableObject {
     /// Sets or clears (`nil`) a workspace's colour. Mirrors the optimistic hidden-state flow: memory
     /// first, then one `workspace.json` save and a cross-window reload notice. The colour is not an
     /// index field, so the workspace index is not rebuilt. Ephemeral workspaces keep the colour in
-    /// memory only; System workspaces are never coloured.
+    /// memory only; System workspaces and consolidated recovery copies are never coloured. Both are
+    /// judged from the current record, not the caller's copy, so a retained row action cannot colour
+    /// a workspace that has since become a recovery copy.
     func setWorkspaceColor(_ workspace: WorkspaceModel, color: WorkspaceColor?) {
         guard let index = workspaces.firstIndex(where: { $0.id == workspace.id }),
-              !workspaces[index].isSystemWorkspace
+              Self.acceptsWorkspaceColor(workspaces[index])
         else { return }
         let colorID = color?.rawValue
         guard workspaces[index].color != colorID else { return }
@@ -15695,15 +15701,16 @@ class WorkspaceManagerViewModel: ObservableObject {
         let intentDateModified = workspaces[index].dateModified
         workspaceColorIntentByID[workspaceID] = intentID
         Task { @MainActor [weak self] in
-            guard let self,
-                  workspaceColorIntentByID[workspaceID] == intentID,
-                  var workspaceToSave = workspaces.first(where: { $0.id == workspaceID })
-            else { return }
+            guard let self, workspaceColorIntentByID[workspaceID] == intentID else { return }
             defer {
                 if workspaceColorIntentByID[workspaceID] == intentID {
                     workspaceColorIntentByID.removeValue(forKey: workspaceID)
                 }
             }
+            // The workspace may have been reclassified since admission; such a record is not saved.
+            guard var workspaceToSave = workspaces.first(where: { $0.id == workspaceID }),
+                  Self.acceptsWorkspaceColor(workspaceToSave)
+            else { return }
             workspaceToSave.color = colorID
             workspaceToSave.dateModified = max(workspaceToSave.dateModified, intentDateModified)
             if let currentIndex = workspaces.firstIndex(where: { $0.id == workspaceID }) {
@@ -15722,6 +15729,10 @@ class WorkspaceManagerViewModel: ObservableObject {
                 print("Error saving color for workspace: \(error)")
             }
         }
+    }
+
+    private static func acceptsWorkspaceColor(_ workspace: WorkspaceModel) -> Bool {
+        !workspace.isSystemWorkspace && workspace.consolidatedIntoWorkspaceID == nil
     }
 
     private func validateConsolidationLifecycle(_ workspace: WorkspaceModel) throws {

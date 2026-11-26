@@ -88,7 +88,7 @@ struct CoherentWindowTitlePresentation: Equatable {
     let workspaceDisplayName: String
     let renderedTitle: String
     /// Colour of the workspace this title shows; nil for None, System, or no workspace. Resolved
-    /// with the title so the dot and sticker never describe a different workspace than the text.
+    /// with the title so the sticker never describes a different workspace than the text.
     var workspaceColor: WorkspaceColor?
 
     static let appDefault = CoherentWindowTitlePresentation(
@@ -1128,6 +1128,7 @@ class WindowState: ObservableObject {
         // Detach path (always do the cleanup even if both are nil)
         if window == nil {
             let oldWindow = nsWindow
+            dismissStickerPickerBeforeLosingAnchor()
             detachTitlebarAccessoryControllers(from: oldWindow)
             nsWindow = nil
             removeFocusObservers()
@@ -1153,6 +1154,7 @@ class WindowState: ObservableObject {
         }
 
         if let oldWindow = nsWindow, oldWindow !== window {
+            dismissStickerPickerBeforeLosingAnchor()
             detachTitlebarAccessoryControllers(from: oldWindow)
         }
         nsWindow = window
@@ -1173,6 +1175,13 @@ class WindowState: ObservableObject {
         // Install Agent mode titlebar accessory if requested before window was attached
         applyAgentTitlebarAccessoryIfPossible()
         StartupPhaseLog.mark(.windowAttached, window: windowID)
+    }
+
+    /// A live detach or window replacement removes the sticker's anchors, and the next window's
+    /// hosts must not inherit an open picker. A true close publishes nothing.
+    private func dismissStickerPickerBeforeLosingAnchor() {
+        guard !shouldSuppressObservationSideEffects else { return }
+        workspaceSticker.dismissPicker()
     }
 
     private func configureWindowChrome(for window: NSWindow) {
@@ -1649,8 +1658,7 @@ class WindowState: ObservableObject {
     private func refreshAgentChatTitleCluster() {
         agentChatTitleCluster.update(
             title: displayedWindowTitle,
-            showsChatOptions: currentAgentTitlebarChatOptionsTarget() != nil,
-            workspaceColor: coherentTitlePresentation.workspaceColor
+            showsChatOptions: currentAgentTitlebarChatOptionsTarget() != nil
         )
         let stickerVisibilityChanged = workspaceSticker.update(
             workspaceID: titleColorableWorkspace()?.id,

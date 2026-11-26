@@ -47,9 +47,14 @@ struct AgentModeTitlebarWorkspaceStickerButton: View {
     @ObservedObject var model: WorkspaceStickerModel
     let host: WorkspaceStickerHost
     @State private var isHovering = false
+    /// The last opening this host showed, kept so the popover keeps its swatches while it closes.
+    @State private var lastPresentation: WorkspaceStickerModel.PickerPresentation?
 
     var body: some View {
         if model.state.workspaceID != nil {
+            // Captured now: whether the popover shows, its swatches and its dismissal all describe
+            // this one opening, so they cannot disagree before the next render.
+            let actions = model.actions(in: host)
             Button {
                 model.togglePicker(from: host)
             } label: {
@@ -65,20 +70,28 @@ struct AgentModeTitlebarWorkspaceStickerButton: View {
             .accessibilityLabel("Workspace Color")
             .accessibilityValue(model.state.color?.accessibilityLabel ?? "None")
             .accessibilityIdentifier("WorkspaceStickerButton")
-            .popover(isPresented: pickerBinding, arrowEdge: .bottom) {
-                WorkspaceStickerPickerPopover(model: model)
+            .popover(isPresented: pickerBinding(actions), arrowEdge: .bottom) {
+                // While closing, the retired opening's swatches stay visible; they no longer apply.
+                if let shown = actions ?? lastPresentation.map(model.actions(for:)) {
+                    WorkspaceStickerPickerPopover(model: model, actions: shown)
+                }
+            }
+            .onChange(of: actions?.presentation, initial: true) { _, presentation in
+                if let presentation {
+                    lastPresentation = presentation
+                }
             }
         }
     }
 
     /// Presented from the model so toolbar re-evaluation cannot drop it. A dismissal only closes
-    /// this host's picker, never one the other host has since opened.
-    private var pickerBinding: Binding<Bool> {
+    /// the opening this render showed, never one the other host, or a later opening, has since made.
+    private func pickerBinding(_ actions: WorkspaceStickerModel.PickerActions?) -> Binding<Bool> {
         Binding(
-            get: { model.isPickerPresented(in: host) },
+            get: { actions != nil },
             set: { isPresented in
-                if !isPresented, model.isPickerPresented(in: host) {
-                    model.dismissPicker()
+                if !isPresented {
+                    actions?.dismiss()
                 }
             }
         )
@@ -86,12 +99,14 @@ struct AgentModeTitlebarWorkspaceStickerButton: View {
 }
 
 /// Observes the model so the selection ring follows the stored colour while the popover is open.
+/// Swatches apply only through the opening that rendered them.
 private struct WorkspaceStickerPickerPopover: View {
     @ObservedObject var model: WorkspaceStickerModel
+    let actions: WorkspaceStickerModel.PickerActions
 
     var body: some View {
         WorkspaceColorSwatchPicker(selection: model.state.color) { color in
-            model.select(color)
+            actions.select(color)
         }
     }
 }

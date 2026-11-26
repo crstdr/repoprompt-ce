@@ -11,8 +11,6 @@ final class AgentChatTitleClusterModel: ObservableObject {
         /// The native chat-options menu dismisses the moment an item is chosen, so success feedback
         /// for Copy Session ID cannot live on the menu itself.
         var copiedNotice: String?
-        /// Colour of the workspace the title shows; nil draws no dot.
-        var workspaceColor: WorkspaceColor?
     }
 
     @Published private(set) var state: State
@@ -22,16 +20,11 @@ final class AgentChatTitleClusterModel: ObservableObject {
         state = State(title: title, showsChatOptions: false, copiedNotice: nil)
     }
 
-    func update(
-        title: String,
-        showsChatOptions: Bool,
-        workspaceColor: WorkspaceColor? = nil
-    ) {
+    func update(title: String, showsChatOptions: Bool) {
         let nextState = State(
             title: title,
             showsChatOptions: showsChatOptions,
-            copiedNotice: state.copiedNotice,
-            workspaceColor: workspaceColor
+            copiedNotice: state.copiedNotice
         )
         guard state != nextState else { return }
         state = nextState
@@ -58,17 +51,12 @@ struct AgentChatTitleClusterView: View {
 
     var body: some View {
         HStack(spacing: 4) {
-            HStack(spacing: 6) {
-                if let workspaceColor = model.state.workspaceColor {
-                    WorkspaceColorDot(color: workspaceColor)
-                }
-                Text(model.state.title)
-                    .font(.system(size: 13, weight: .semibold))
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .frame(maxWidth: 520)
-                    .accessibilityIdentifier("AgentChatTitle")
-            }
+            Text(model.state.title)
+                .font(.system(size: 13, weight: .semibold))
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(maxWidth: 520)
+                .accessibilityIdentifier("AgentChatTitle")
 
             if model.state.showsChatOptions {
                 AgentChatOptionsMenuButton(

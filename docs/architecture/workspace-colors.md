@@ -1,6 +1,6 @@
 # Workspace Colors
 
-A workspace can carry one color from a fixed palette, so windows are easy to tell apart at a glance. The color belongs to the workspace, not to a window: every window that shows the workspace shows the same color, and the color stays visible in the workspace lists while no window is open.
+A workspace can carry one color from a fixed palette, so windows are easy to tell apart at a glance. The color belongs to the workspace, not to a window: it is saved with the workspace, and every window reads the same value. To mark a window, the color appears only on the workspace sticker in Agent mode: in the strip above the sidebar or, while the sidebar is hidden, in the titlebar. Other modes and the window title do not show it. Manage Workspaces and the dots in the workspace picker also show the color, including for workspaces that no window has open. See [Where it shows](#where-it-shows).
 
 ## Saved contract
 
@@ -37,8 +37,8 @@ The id `grey` keeps its British spelling for compatibility with existing readers
 
 ## Where it shows
 
-- The workspace sticker, a 20 pt rounded square filled with the color. It is the last of the buttons above the Agent sidebar, after New Session. While the sidebar is hidden, it moves to the titlebar beside the window's close, minimize and zoom buttons, after the sidebar toggle and New Session. With None it shows a dashed outline. The System workspace has no sticker.
-- An 8 pt dot before the toolbar title and before workspace names in the workspace picker. With None, there is no dot.
+- The workspace sticker, a 20 pt rounded square filled with the color. It sits in the strip above the Agent sidebar: on macOS 26 and later at the strip's trailing edge, on earlier macOS as the last button, after New Session. While the sidebar is hidden, it moves to the titlebar beside the window's close, minimize and zoom buttons, after the sidebar toggle and New Session. With None it shows a dashed outline. The System workspace has no sticker.
+- An 8 pt dot before workspace names in the workspace picker. With None, there is no dot. The window title shows no color.
 - A 16 pt sticker at the start of each Manage Workspaces row. Consolidated recovery copies show the dot instead, and only when a color is set.
 
 To set a color, click the sticker and choose a swatch. The color applies at once and the picker stays open. In Manage Workspaces, click a row's sticker, or right-click the row and choose from the `Workspace Color` section. The System workspace and consolidated recovery copies cannot be colored.
