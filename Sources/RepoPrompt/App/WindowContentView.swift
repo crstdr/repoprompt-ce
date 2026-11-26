@@ -30,6 +30,7 @@ struct WindowContentView: View {
             .safeAreaInset(edge: .top) { GlobalSettingsPersistenceBlockBanner(allowsSessionDismissal: true) }
             .safeAreaInset(edge: .top) { WorkspaceRecoveryBackupBlockBanner(workspaceManager: windowState.workspaceManager) }
             .debugBuildWindowEdge()
+            .workspaceColorWindowEdge(windowState.workspaceColor)
             .environmentObject(windowState) // If your subviews need it
             .environment(\.windowIsPresentationVisible, windowState.isPresentationVisible)
             .environment(\.agentModePerfRecorder, windowState.agentModeViewModel.perfRecorder)

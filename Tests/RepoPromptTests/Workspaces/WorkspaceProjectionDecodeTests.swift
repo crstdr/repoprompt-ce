@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
@@ -1262,3 +1263,138 @@ import XCTest
         }
     }
 #endif
+
+/// Pins the workspace colour palette, which external readers (the Agents Map) copy by id and hex.
+final class WorkspaceColorPaletteTests: XCTestCase {
+    private struct Row {
+        let id: String
+        let name: String
+        let light: UInt32
+        let dark: UInt32
+    }
+
+    /// The documented contract table (`docs/architecture/workspace-colors.md`), in menu order.
+    private let contract: [Row] = [
+        Row(id: "red", name: "Red", light: 0xDC2626, dark: 0xF87171),
+        Row(id: "orange", name: "Orange", light: 0xEA580C, dark: 0xFB923C),
+        Row(id: "yellow", name: "Yellow", light: 0xCA8A04, dark: 0xFACC15),
+        Row(id: "lime", name: "Lime", light: 0x65A30D, dark: 0xA3E635),
+        Row(id: "green", name: "Green", light: 0x16A34A, dark: 0x4ADE80),
+        Row(id: "teal", name: "Teal", light: 0x0D9488, dark: 0x2DD4BF),
+        Row(id: "aqua", name: "Aqua", light: 0x0891B2, dark: 0x22D3EE),
+        Row(id: "blue", name: "Blue", light: 0x2563EB, dark: 0x60A5FA),
+        Row(id: "indigo", name: "Indigo", light: 0x4F46E5, dark: 0x818CF8),
+        Row(id: "violet", name: "Violet", light: 0x7C3AED, dark: 0xA78BFA),
+        Row(id: "magenta", name: "Magenta", light: 0xC026D3, dark: 0xE879F9),
+        Row(id: "pink", name: "Pink", light: 0xDB2777, dark: 0xF472B6),
+        Row(id: "brown", name: "Brown", light: 0x92633A, dark: 0xC8A27C),
+        Row(id: "grey", name: "Gray", light: 0x6B7280, dark: 0x9CA3AF)
+    ]
+
+    func testPaletteMatchesDocumentedIdsNamesAndOrder() {
+        XCTAssertEqual(WorkspaceColor.allCases.map(\.rawValue), contract.map(\.id))
+        XCTAssertEqual(WorkspaceColor.allCases.map(\.displayName), contract.map(\.name))
+        XCTAssertEqual(Set(WorkspaceColor.allCases.map(\.id)).count, 14)
+        XCTAssertEqual(WorkspaceColor.blue.accessibilityLabel, "Workspace color: Blue")
+        XCTAssertEqual(WorkspaceColor.grey.accessibilityLabel, "Workspace color: Gray")
+    }
+
+    func testPaletteIsSupersetOfAgentsMapIds() {
+        let mapIDs: Set = ["red", "orange", "yellow", "green", "aqua", "blue", "violet", "magenta", "grey"]
+        XCTAssertTrue(mapIDs.isSubset(of: Set(WorkspaceColor.allCases.map(\.rawValue))))
+    }
+
+    /// The rendered colour, not just a stored constant, resolves to the exact hex per appearance.
+    func testRenderedColorResolvesExactHexPerAppearance() throws {
+        let lightAppearance = try XCTUnwrap(NSAppearance(named: .aqua))
+        let darkAppearance = try XCTUnwrap(NSAppearance(named: .darkAqua))
+        for row in contract {
+            let color = try XCTUnwrap(WorkspaceColor(rawValue: row.id))
+            XCTAssertEqual(color.lightHex, row.light, row.id)
+            XCTAssertEqual(color.darkHex, row.dark, row.id)
+            XCTAssertEqual(rendered(color.nsColor, in: lightAppearance), row.light, "\(row.id) light")
+            XCTAssertEqual(rendered(color.nsColor, in: darkAppearance), row.dark, "\(row.id) dark")
+        }
+    }
+
+    func testResolveNormalizesAndTreatsUnknownOrEmptyAsNone() {
+        XCTAssertEqual(WorkspaceColor.resolve("  Blue "), .blue)
+        XCTAssertEqual(WorkspaceColor.resolve("GREY"), .grey)
+        XCTAssertNil(WorkspaceColor.resolve("gray"), "only the persisted id spelling is accepted")
+        XCTAssertNil(WorkspaceColor.resolve("chartreuse"))
+        XCTAssertNil(WorkspaceColor.resolve("   "))
+        XCTAssertNil(WorkspaceColor.resolve(nil))
+    }
+
+    private func rendered(_ color: NSColor, in appearance: NSAppearance) -> UInt32? {
+        var hex: UInt32?
+        appearance.performAsCurrentDrawingAppearance {
+            guard let srgb = color.usingColorSpace(.sRGB) else { return }
+            let r = UInt32((srgb.redComponent * 255).rounded())
+            let g = UInt32((srgb.greenComponent * 255).rounded())
+            let b = UInt32((srgb.blueComponent * 255).rounded())
+            hex = (r << 16) | (g << 8) | b
+        }
+        return hex
+    }
+}
+
+/// Pins the `workspace.json` `color` key: optional, raw id, tolerant of unknown values.
+final class WorkspaceModelColorCodingTests: XCTestCase {
+    func testColorRoundTripsUnderTopLevelColorKey() throws {
+        let workspace = WorkspaceModel(name: "Colored", repoPaths: ["/tmp/colored"], color: "teal")
+        let data = try JSONEncoder().encode(workspace)
+
+        XCTAssertEqual(try topLevelObject(data)["color"] as? String, "teal")
+        let decoded = try JSONDecoder().decode(WorkspaceModel.self, from: data)
+        XCTAssertEqual(decoded.color, "teal")
+        XCTAssertEqual(decoded.workspaceColor, .teal)
+        XCTAssertEqual(decoded, workspace)
+    }
+
+    func testLegacyDocumentWithoutColorDecodesToNoneAndReencodesWithoutKey() throws {
+        let legacy = WorkspaceModel(name: "Legacy", repoPaths: [])
+        var object = try topLevelObject(JSONEncoder().encode(legacy))
+        object.removeValue(forKey: "color")
+        let legacyData = try JSONSerialization.data(withJSONObject: object)
+
+        let decoded = try JSONDecoder().decode(WorkspaceModel.self, from: legacyData)
+        XCTAssertNil(decoded.color)
+        XCTAssertNil(decoded.workspaceColor)
+        XCTAssertFalse(try topLevelObject(JSONEncoder().encode(decoded)).keys.contains("color"))
+    }
+
+    func testUnknownIdIsPreservedOnReencodeButRendersAsNone() throws {
+        let decoded = try decodeWorkspace(color: "chartreuse")
+        XCTAssertEqual(decoded.color, "chartreuse")
+        XCTAssertNil(decoded.workspaceColor)
+        XCTAssertEqual(try topLevelObject(JSONEncoder().encode(decoded))["color"] as? String, "chartreuse")
+    }
+
+    func testDecodeNormalizesCaseAndWhitespaceAndDropsEmptyOrMistypedValues() throws {
+        XCTAssertEqual(try decodeWorkspace(color: "  Blue ").color, "blue")
+        XCTAssertNil(try decodeWorkspace(color: "").color)
+        XCTAssertNil(try decodeWorkspace(color: "   ").color)
+        XCTAssertNil(try decodeWorkspace(color: 7).color, "a mistyped value must not fail the workspace decode")
+    }
+
+    func testColorParticipatesInEquality() {
+        let base = WorkspaceModel(name: "Same", repoPaths: [])
+        var colored = base
+        colored.color = "red"
+        XCTAssertNotEqual(base, colored)
+    }
+
+    private func decodeWorkspace(color: Any) throws -> WorkspaceModel {
+        var object = try topLevelObject(JSONEncoder().encode(WorkspaceModel(name: "Fixture", repoPaths: [])))
+        object["color"] = color
+        return try JSONDecoder().decode(
+            WorkspaceModel.self,
+            from: JSONSerialization.data(withJSONObject: object)
+        )
+    }
+
+    private func topLevelObject(_ data: Data) throws -> [String: Any] {
+        try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    }
+}

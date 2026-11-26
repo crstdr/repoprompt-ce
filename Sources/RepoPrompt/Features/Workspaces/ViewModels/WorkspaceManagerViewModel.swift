@@ -1983,6 +1983,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     private var pendingFullDocumentWrites: [UUID: PendingFullDocumentWrite] = [:]
     private var workspaceRenameIntentByID: [UUID: UUID] = [:]
     private var workspaceHiddenIntentByID: [UUID: UUID] = [:]
+    private var workspaceColorIntentByID: [UUID: UUID] = [:]
     private var workspaceCreationTasksByID: [UUID: Task<Void, Never>] = [:]
     private var domainWorkspaceCatalogRevision: UInt64 = 0
     #if DEBUG
@@ -15052,6 +15053,9 @@ class WorkspaceManagerViewModel: ObservableObject {
         if merged.activePresetID == nil {
             merged.activePresetID = duplicates.lazy.compactMap(\.activePresetID).first
         }
+        if merged.color == nil {
+            merged.color = duplicates.lazy.compactMap(\.color).first
+        }
 
         var composeTabIDs = Set(merged.composeTabs.map(\.id))
         for duplicate in duplicates {
@@ -15514,6 +15518,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         forgetWorkingPublicationTracking(workspaceID: workspace.id)
         workspaceRenameIntentByID.removeValue(forKey: workspace.id)
         workspaceHiddenIntentByID.removeValue(forKey: workspace.id)
+        workspaceColorIntentByID.removeValue(forKey: workspace.id)
         removeConsolidatedRestoreTracking(workspaceID: workspace.id)
         if activeWorkspaceID == workspace.id {
             activeWorkspaceID = nil
@@ -15665,6 +15670,56 @@ class WorkspaceManagerViewModel: ObservableObject {
                 }
             } catch {
                 print("Error saving hidden state for workspace: \(error)")
+            }
+        }
+    }
+
+    /// Sets or clears (`nil`) a workspace's colour. Mirrors the optimistic hidden-state flow: memory
+    /// first, then one `workspace.json` save and a cross-window reload notice. The colour is not an
+    /// index field, so the workspace index is not rebuilt. Ephemeral workspaces keep the colour in
+    /// memory only; System workspaces are never coloured.
+    func setWorkspaceColor(_ workspace: WorkspaceModel, color: WorkspaceColor?) {
+        guard let index = workspaces.firstIndex(where: { $0.id == workspace.id }),
+              !workspaces[index].isSystemWorkspace
+        else { return }
+        let colorID = color?.rawValue
+        guard workspaces[index].color != colorID else { return }
+        workspaces[index].color = colorID
+        workspaces[index].dateModified = Date()
+        guard !workspaces[index].isEphemeral else { return }
+
+        // The intent token lets an authority projection replace the array element without losing
+        // this request, while a newer colour choice supersedes the older task.
+        let workspaceID = workspace.id
+        let intentID = UUID()
+        let intentDateModified = workspaces[index].dateModified
+        workspaceColorIntentByID[workspaceID] = intentID
+        Task { @MainActor [weak self] in
+            guard let self,
+                  workspaceColorIntentByID[workspaceID] == intentID,
+                  var workspaceToSave = workspaces.first(where: { $0.id == workspaceID })
+            else { return }
+            defer {
+                if workspaceColorIntentByID[workspaceID] == intentID {
+                    workspaceColorIntentByID.removeValue(forKey: workspaceID)
+                }
+            }
+            workspaceToSave.color = colorID
+            workspaceToSave.dateModified = max(workspaceToSave.dateModified, intentDateModified)
+            if let currentIndex = workspaces.firstIndex(where: { $0.id == workspaceID }) {
+                workspaces[currentIndex].color = workspaceToSave.color
+                workspaces[currentIndex].dateModified = workspaceToSave.dateModified
+            }
+            do {
+                let finalURL = try await saveWorkspaceToFileAsync(workspaceToSave, source: .setWorkspaceColor)
+                await workspaceDiskWriter.flush(url: finalURL)
+                NotificationCenter.default.post(
+                    name: .workspaceListDidChange,
+                    object: nil,
+                    userInfo: ["managerID": instanceID]
+                )
+            } catch {
+                print("Error saving color for workspace: \(error)")
             }
         }
     }

@@ -87,6 +87,9 @@ struct CoherentWindowTitlePresentation: Equatable {
     let tabID: UUID?
     let workspaceDisplayName: String
     let renderedTitle: String
+    /// Colour of the workspace this title shows; nil for None, System, or no workspace. Resolved
+    /// with the title so the dot and edge line never describe a different workspace than the text.
+    var workspaceColor: WorkspaceColor?
 
     static let appDefault = CoherentWindowTitlePresentation(
         workspaceID: nil,
@@ -94,6 +97,29 @@ struct CoherentWindowTitlePresentation: Equatable {
         workspaceDisplayName: WindowTitleFormatter.defaultTitle,
         renderedTitle: WindowTitleFormatter.defaultTitle
     )
+}
+
+/// The active workspace's title-relevant model facts. A window re-resolves its title only when these
+/// change, so a same-ID edit (colour, rename) repaints while edits to any other workspace — about 40
+/// windows each hold this subscription — emit nothing.
+struct ActiveWorkspaceTitleFacts: Equatable {
+    let name: String
+    let color: WorkspaceColor?
+
+    static func publisher(
+        workspaces: some Publisher<[WorkspaceModel], Never>,
+        activeWorkspaceID: some Publisher<UUID?, Never>
+    ) -> AnyPublisher<ActiveWorkspaceTitleFacts?, Never> {
+        workspaces
+            .combineLatest(activeWorkspaceID)
+            .map { workspaces, activeWorkspaceID in
+                activeWorkspaceID
+                    .flatMap { id in workspaces.first { $0.id == id } }
+                    .map { ActiveWorkspaceTitleFacts(name: $0.name, color: $0.workspaceColor) }
+            }
+            .removeDuplicates()
+            .eraseToAnyPublisher()
+    }
 }
 
 enum PendingInteractionSurface {
@@ -375,6 +401,9 @@ class WindowState: ObservableObject {
     /// app display name whenever it refreshes the window chrome.
     @Published private(set) var displayedWindowTitle: String = WindowTitleFormatter.defaultTitle
 
+    /// Colour of the workspace the installed title shows (drives the window edge line).
+    @Published private(set) var workspaceColor: WorkspaceColor?
+
     /// The last complete title resolution. Retained, never partially updated, while the active
     /// workspace model is unresolved or a real switch has not yet assigned the target's number.
     private var coherentTitlePresentation = CoherentWindowTitlePresentation.appDefault
@@ -436,7 +465,8 @@ class WindowState: ObservableObject {
             workspaceID: workspaceID,
             tabID: selectedTab?.id,
             workspaceDisplayName: label,
-            renderedTitle: WindowTitleFormatter.applyingOverseerPrefix(to: baseTitle, isOverseer: isOverseer)
+            renderedTitle: WindowTitleFormatter.applyingOverseerPrefix(to: baseTitle, isOverseer: isOverseer),
+            workspaceColor: workspace.isSystemWorkspace ? nil : workspace.workspaceColor
         )
     }
 
@@ -453,6 +483,7 @@ class WindowState: ObservableObject {
         case activeComposeTabChanged
         case agentSessionNameChanged
         case agentSessionOverseerProjectionChanged
+        case activeWorkspaceModelChanged
         case explicit
         case unspecified
     }
@@ -972,6 +1003,17 @@ class WindowState: ObservableObject {
                 self?.requestWindowTitleUpdate(reason: .workspaceChanged)
             }
             .store(in: &cancellables)
+        // Same-ID model edits (colour, rename) do not republish the active ID. The initial value is
+        // covered by the active-ID subscription above.
+        ActiveWorkspaceTitleFacts.publisher(
+            workspaces: workspaceManager.$workspaces,
+            activeWorkspaceID: workspaceManager.$activeWorkspaceID
+        )
+        .dropFirst()
+        .sink { [weak self] _ in
+            self?.requestWindowTitleUpdate(reason: .activeWorkspaceModelChanged)
+        }
+        .store(in: &cancellables)
         // A queued owner adoption ends when the pane publishes its installed target (awaiting owner →
         // owner); reevaluate a title retained for it. Stable targets do not retrigger on content.
         agentModeViewModel.ui.transcript.$snapshot
@@ -1312,6 +1354,9 @@ class WindowState: ObservableObject {
         if displayedWindowTitle != title {
             displayedWindowTitle = title
         }
+        if workspaceColor != coherentTitlePresentation.workspaceColor {
+            workspaceColor = coherentTitlePresentation.workspaceColor
+        }
         refreshAgentChatTitleCluster()
         guard let window = nsWindow else { return }
         if window.title == title, lastAppliedWindowTitle == title {
@@ -1604,8 +1649,25 @@ class WindowState: ObservableObject {
     private func refreshAgentChatTitleCluster() {
         agentChatTitleCluster.update(
             title: displayedWindowTitle,
-            showsChatOptions: currentAgentTitlebarChatOptionsTarget() != nil
+            showsChatOptions: currentAgentTitlebarChatOptionsTarget() != nil,
+            workspaceColor: coherentTitlePresentation.workspaceColor,
+            allowsWorkspaceColorMenu: titleColorableWorkspace() != nil
         )
+    }
+
+    /// The workspace the installed title shows, when it can be coloured (not System).
+    private func titleColorableWorkspace() -> WorkspaceModel? {
+        guard let workspaceID = coherentTitlePresentation.workspaceID,
+              let workspace = workspaceManager.workspace(withID: workspaceID),
+              !workspace.isSystemWorkspace
+        else { return nil }
+        return workspace
+    }
+
+    /// Title right-click action: colours the workspace whose name the title shows.
+    func setTitleWorkspaceColor(_ color: WorkspaceColor?) {
+        guard !isClosing, let workspace = titleColorableWorkspace() else { return }
+        workspaceManager.setWorkspaceColor(workspace, color: color)
     }
 
     private func toggleAgentChatPinFromTitlebar(target: AgentChatOptionsMenuTarget) {

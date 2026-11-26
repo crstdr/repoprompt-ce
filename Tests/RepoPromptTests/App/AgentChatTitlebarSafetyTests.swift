@@ -1327,6 +1327,41 @@ final class WorkspaceRestorationTitleTests: XCTestCase {
         XCTAssertEqual(foreignTitle, renamed)
     }
 
+    /// A same-ID colour edit on the active workspace repaints the title dot and edge colour with no
+    /// explicit title request; System never shows a colour or offers the menu.
+    func testActiveWorkspaceColorChangeRepaintsTitleClusterWithoutExplicitRequest() async throws {
+        let fixture = try await makeFixture(systemNumber: 6)
+        let window = fixture.window
+        let target = window.workspaceManager.createWorkspace(
+            name: "Colored \(UUID().uuidString.prefix(6))", repoPaths: [fixture.rootURL.path], ephemeral: true
+        )
+        _ = await window.workspaceManager.switchWorkspace(to: target, saveState: false, reason: "titleColor")
+        await resolveTitle(window)
+        XCTAssertNil(window.workspaceColor)
+        XCTAssertNil(window.agentChatTitleCluster.state.workspaceColor)
+        XCTAssertTrue(window.agentChatTitleCluster.state.allowsWorkspaceColorMenu)
+
+        let repainted = expectation(description: "title re-resolved for the colour change")
+        window.setWindowTitleResolutionDidCompleteHandlerForTesting {
+            guard window.workspaceColor == .teal else { return }
+            window.setWindowTitleResolutionDidCompleteHandlerForTesting(nil)
+            repainted.fulfill()
+        }
+        window.setTitleWorkspaceColor(.teal)
+        await fulfillment(of: [repainted], timeout: 5)
+        XCTAssertEqual(window.agentChatTitleCluster.state.workspaceColor, .teal)
+        XCTAssertEqual(window.workspaceManager.activeWorkspace?.color, "teal")
+
+        let system = try XCTUnwrap(window.workspaceManager.workspaces.first(where: \.isSystemWorkspace))
+        _ = await window.workspaceManager.switchWorkspace(to: system, saveState: false, reason: "titleColorSystem")
+        await resolveTitle(window)
+        XCTAssertNil(window.workspaceColor)
+        XCTAssertNil(window.agentChatTitleCluster.state.workspaceColor)
+        XCTAssertFalse(window.agentChatTitleCluster.state.allowsWorkspaceColorMenu)
+        window.setTitleWorkspaceColor(.red)
+        XCTAssertNil(window.workspaceManager.workspace(withID: system.id)?.color)
+    }
+
     /// Registration during a held switch assigns the target through the manager's established
     /// allocation point; the outgoing selection still keeps the title from mixing identities.
     func testRegistrationDuringHeldSwitchNeverMixesTitle() async throws {
@@ -1847,6 +1882,44 @@ private func awaitWindowTitleResolution(
             continuation.resume(returning: window.displayedWindowTitle)
         }
         window.requestWindowTitleUpdate(reason: .explicit)
+    }
+}
+
+/// About 40 windows each subscribe to their active workspace's title facts; only a change to that
+/// workspace's name or colour may re-resolve a window's title.
+final class ActiveWorkspaceTitleFactsTests: XCTestCase {
+    func testOnlyChangesToTheActiveWorkspaceFactsEmit() {
+        let x = WorkspaceModel(name: "X", repoPaths: [])
+        let y = WorkspaceModel(name: "Y", repoPaths: [])
+        let workspaces = CurrentValueSubject<[WorkspaceModel], Never>([x, y])
+        let activeWorkspaceID = CurrentValueSubject<UUID?, Never>(y.id)
+        var emitted: [ActiveWorkspaceTitleFacts?] = []
+        let subscription = ActiveWorkspaceTitleFacts.publisher(
+            workspaces: workspaces,
+            activeWorkspaceID: activeWorkspaceID
+        ).sink { emitted.append($0) }
+        defer { subscription.cancel() }
+        XCTAssertEqual(emitted, [ActiveWorkspaceTitleFacts(name: "Y", color: nil)])
+
+        var coloredX = x
+        coloredX.color = "red"
+        workspaces.send([coloredX, y])
+        XCTAssertEqual(emitted.count, 1, "a colour change on X must not emit for a window showing Y")
+
+        var touchedY = y
+        touchedY.dateModified = .distantFuture
+        touchedY.color = "chartreuse"
+        workspaces.send([coloredX, touchedY])
+        XCTAssertEqual(emitted.count, 1, "non-title fields and ids that render as None must not emit")
+
+        var coloredY = y
+        coloredY.color = "teal"
+        workspaces.send([coloredX, coloredY])
+        workspaces.send([coloredX, coloredY])
+        XCTAssertEqual(emitted, [
+            ActiveWorkspaceTitleFacts(name: "Y", color: nil),
+            ActiveWorkspaceTitleFacts(name: "Y", color: .teal)
+        ], "the active workspace's own change emits exactly once")
     }
 }
 
