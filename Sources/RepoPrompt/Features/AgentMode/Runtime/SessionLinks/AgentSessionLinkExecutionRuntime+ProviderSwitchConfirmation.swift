@@ -39,11 +39,6 @@ extension AgentSessionLinkExecutionRuntime {
                       session.pendingHandoff.providerSwitchAcceptedID == acceptedID,
                       session.pendingHandoff.providerSwitchDelivery == .sending
                 else { return }
-                if let record = providerSwitchConfirmationRecords[sessionID],
-                   record.acceptedID == acceptedID, !record.terminalResolved
-                {
-                    return
-                }
                 if attempt > 0 {
                     // Bounded and event-driven: the delay is only within this single flight and
                     // never parks a timer after persistent failure.
@@ -62,6 +57,11 @@ extension AgentSessionLinkExecutionRuntime {
                     }
                     if Task.isCancelled { return }
                     markerDurable = true
+                }
+                if let record = providerSwitchConfirmationRecords[sessionID],
+                   record.acceptedID == acceptedID, !record.terminalResolved
+                {
+                    return
                 }
                 guard let payload = providerSwitchConfirmationPayload(
                     for: session, acceptedID: acceptedID
