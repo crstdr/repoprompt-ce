@@ -114,13 +114,16 @@ final class AgentModeRunService {
             await claudeRunner.testConsumeAndFinalizeQuietEvents(events, session: session, runID: runID, owner: owner)
         }
 
-        func test_publishNaturalCompletion(_ session: AgentTabSession, supportsFollowUp: Bool = false) async {
+        func test_publishNaturalCompletion(
+            _ session: AgentTabSession, supportsFollowUp: Bool = false,
+            terminalState: AgentSessionRunState = .completed
+        ) async {
             guard let ownership = session.activeRunOwnership else { return }
             _ = await terminalCommitBarrier.commit(.init(
                 binding: hooks.bindTerminalSession(session),
                 ownership: ownership,
                 expectedRunID: session.runID,
-                terminalState: .completed,
+                terminalState: terminalState,
                 source: "test.naturalCompletion",
                 attachmentDisposition: .deleteFiles,
                 finalizeNonCodexUsage: false,

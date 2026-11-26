@@ -109,7 +109,10 @@ final class AgentSessionRunStartRuntime {
             return nil
         }
         guard isCurrent() else { return nil }
-        if session.pendingHandoff.providerSwitchDelivery != nil, providerSwitchPreparation == nil {
+        if session.pendingHandoff.providerSwitchDelivery != nil,
+           session.pendingHandoff.providerSwitchAcceptedID == nil,
+           providerSwitchPreparation == nil
+        {
             let message = environment.providerSwitchRefusal(session)
             startOutcome?.recordStartFailure(message: message)
             return .failed(message: message)
@@ -312,7 +315,9 @@ final class AgentSessionRunStartRuntime {
         // work with nothing to act on. Skipping it is what keeps the turn's only new provider input
         // the rendered lane claim the supplement path attaches.
         let switchMessages: (user: String, initial: String)?
-        if session.pendingHandoff.providerSwitchDelivery != nil {
+        if session.pendingHandoff.providerSwitchDelivery != nil,
+           session.pendingHandoff.providerSwitchAcceptedID == nil
+        {
             guard directStartOptions.providerControlCommand?.claudeWakeCompaction == nil else { return nil }
             switchMessages = await links.prepareProviderSwitchHandoverForSend(providerSwitchPreparation, session: session, stopFence: stopFence)
             guard inputIsCurrent() else { return nil }

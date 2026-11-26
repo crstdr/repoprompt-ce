@@ -108,6 +108,8 @@ private struct AgentProviderSwitchBanner: View {
     @ObservedObject var viewModel: AgentModeViewModel
     @ObservedObject var session: AgentTabSession
 
+    private static let confirmationSaveFailedText = AgentProviderSwitchPreview.confirmationSaveFailedText
+
     var body: some View {
         if viewModel.providerSwitchIsCompletingInBackground(session) {
             HStack {
@@ -125,7 +127,25 @@ private struct AgentProviderSwitchBanner: View {
             }
             .providerSwitchBannerStyle()
         }
-        if session.pendingHandoff.providerSwitchDelivery != nil {
+        if session.pendingHandoff.providerSwitchAcceptedID != nil {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Switch not confirmed").font(.headline)
+                Text("\(session.selectedAgent.displayName) may already have the handover.")
+                if session.providerSwitchConfirmationSaveFailed {
+                    Text(Self.confirmationSaveFailedText)
+                    Button("Discard handover") {
+                        viewModel.requestProviderSwitchBannerAction(for: session, discard: true)
+                    }
+                    .disabled(viewModel.providerSwitchMutation != nil)
+                } else {
+                    HStack {
+                        ProgressView().controlSize(.small)
+                        Text("Finishing change…")
+                    }
+                }
+            }
+            .providerSwitchBannerStyle()
+        } else if session.pendingHandoff.providerSwitchDelivery != nil {
             VStack(alignment: .leading, spacing: 6) {
                 if AgentSessionLinkExecutionRuntime.providerSwitchUnconfirmed(session) {
                     Text("Switch not confirmed").font(.headline)
@@ -149,6 +169,8 @@ private struct AgentProviderSwitchBanner: View {
 }
 
 struct AgentProviderSwitchPreview: View {
+    static let confirmationSaveFailedText = "The provider accepted the handover, but RepoPrompt couldn't save the confirmation."
+
     @ObservedObject var viewModel: AgentModeViewModel
     @State private var showsPayload = false
     @State private var payload = ""
@@ -192,6 +214,16 @@ struct AgentProviderSwitchPreview: View {
             VStack(alignment: .leading, spacing: 14) {
                 Text("Switch to \(preview.destination.displayName) / \(viewModel.inputBarModelDisplayName(rawModel: preview.model, agentKind: preview.destination))")
                     .font(.headline)
+                if preview.session.pendingHandoff.providerSwitchAcceptedID != nil {
+                    if preview.session.providerSwitchConfirmationSaveFailed {
+                        Button("Discard handover") { Task { _ = await viewModel.discardProviderSwitchHandover(tabID: preview.session.tabID) } }
+                            .disabled(viewModel.providerSwitchMutation != nil)
+                    } else {
+                        HStack { ProgressView().controlSize(.small)
+                            Text("Finishing change…")
+                        }
+                    }
+                }
                 if preview.updated { Text("Preview updated.").foregroundStyle(.secondary) }
                 if preview.building { ProgressView() }
                 ForEach(Self.visibleChoices(preview.choices), id: \.mode.rawValue) { choice in

@@ -49,6 +49,7 @@ enum AgentSessionPayloadBuilder {
             organizationalParentID: session.organizationalParentID,
             delegationScopeID: session.delegationScopeID,
             pendingHandoffProviderSwitchDelivery: session.pendingHandoff.providerSwitchDelivery,
+            providerSwitchAcceptedID: session.pendingHandoff.providerSwitchAcceptedID,
             pendingHandoffPayload: session.pendingHandoff.payload,
             pendingHandoffAwaitsLocalClaudeOverflowInput: session.pendingHandoff.awaitsLocalClaudeOverflowInput ? true : nil,
             pendingHandoffCreatedAt: session.pendingHandoff.createdAt,
@@ -113,6 +114,7 @@ enum AgentSessionPayloadBuilder {
         payload.worktreeBindings = session.worktreeBindings
         payload.worktreeMergeOperations = session.worktreeMergeOperations
         payload.pendingHandoffProviderSwitchDelivery = session.pendingHandoff.providerSwitchDelivery
+        payload.providerSwitchAcceptedID = session.pendingHandoff.providerSwitchAcceptedID
         payload.pendingHandoffPayload = session.pendingHandoff.payload
         payload.pendingHandoffAwaitsLocalClaudeOverflowInput = session.pendingHandoff.awaitsLocalClaudeOverflowInput ? true : nil
         payload.pendingHandoffCreatedAt = session.pendingHandoff.createdAt

@@ -184,6 +184,9 @@ extension AgentSavedSessionTargetLoader {
         switch writer.admitCommand() {
         case let .failure(reason): return .failure(.init(reason: .commandRejected(reason), effects: .loadingClaimRetained))
         case .success:
+            if let acceptedID = payload.persistedSession.providerSwitchAcceptedID {
+                scope.linkExecution?.providerSwitchConfirmationHydrated(session, acceptedID: acceptedID)
+            }
             return .success(.init(writer: writer, source: .savedPayload, requiresSave: session.isDirty))
         }
     }

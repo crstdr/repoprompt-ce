@@ -116,8 +116,11 @@ final class AgentSessionHandoffRuntime {
               scope.sessions[session.tabID] === session, !session.bindingTransitionInProgress,
               session.oversight.pendingAutoWake?.isPeriodic != true
         else { return false }
-        return session.pendingHandoff.providerSwitchDelivery != nil
-            || session.pendingHandoff.payload?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        return session.pendingHandoff.providerSwitchAcceptedID == nil
+            && (
+                session.pendingHandoff.providerSwitchDelivery != nil
+                    || session.pendingHandoff.payload?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            )
     }
 
     func prependPendingHandoffIfNeeded(_ text: String, session: AgentTabSession) -> String {

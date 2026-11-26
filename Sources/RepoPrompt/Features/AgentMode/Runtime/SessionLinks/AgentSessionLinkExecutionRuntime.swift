@@ -53,6 +53,37 @@ final class AgentSessionLinkExecutionRuntime {
 
     var pendingSelfCompactEffects: [UUID: SelfCompactEffect] = [:]
     var pendingSendEffects: [UUID: PendingSendEffect] = [:]
+    /// One provider-free confirmation flight per live session. The task is runtime-only; the
+    /// accepted UUID remains the sole persisted authority across restart.
+    struct ProviderSwitchConfirmationKey: Hashable {
+        let sessionID: UUID
+        let acceptedID: UUID
+    }
+
+    var providerSwitchConfirmationFlights: [ProviderSwitchConfirmationKey: UUID] = [:]
+    /// Triggers that arrived while a flight held the key. Each ending flight consumes its entry
+    /// and reconciles exactly once more; no timer or self-perpetuating retry is involved.
+    var providerSwitchConfirmationRerunRequested: Set<ProviderSwitchConfirmationKey> = []
+    /// Runtime-only failure presentation for an accepted marker whose bounded confirmation save
+    /// exhausted its attempts. Hydration clears this and retries from the durable marker.
+    var providerSwitchConfirmationSaveFailures: Set<UUID> = []
+    /// Runtime-only confirmation evidence for one accepted marker. Save A may run only for the
+    /// originating writer; Save B requires durable-marker evidence and terminal settlement.
+    struct ProviderSwitchConfirmationRecord {
+        let acceptedID: UUID
+        let binding: AgentSessionRestorationBindingToken?
+        let runOwnership: AgentRunOwnership?
+        let runID: UUID?
+        /// The exact writer that recorded the late provider acceptance. `nil` for a hydrated marker,
+        /// which has no originating writer in this process and is already durable.
+        let originWriter: AgentSessionRuntimeStore.WriterIdentity?
+        var terminalResolved: Bool
+        /// Set only by a Save A receipt, an ordinary durable receipt whose payload carries this
+        /// accepted ID, or hydration of a payload carrying it.
+        var markerDurable: Bool
+    }
+
+    var providerSwitchConfirmationRecords: [UUID: ProviderSwitchConfirmationRecord] = [:]
     /// Provider producers join separately from terminal-save effects to avoid a terminal cycle.
     var pendingManagedInputEffects: [UUID: PendingSendEffect] = [:]
     var pendingStopEffects: [UUID: PendingSendEffect] = [:]

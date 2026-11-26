@@ -380,6 +380,8 @@ final class AgentSessionPersistenceRuntime {
         guard saveQueue.begin(sessionID: sessionID) else {
             return .deferred("A save for this session is already in flight.")
         }
+        // Accepted provider-switch ID carried by a committed receipt's payload, if any.
+        var committedAcceptedID: UUID?
         defer {
             defer { scope?.noteSettlementChanged() }
             if saveQueue.finish(sessionID: sessionID) {
@@ -390,6 +392,11 @@ final class AgentSessionPersistenceRuntime {
                 {
                     scheduleSave(for: tabID)
                 }
+            }
+            if sessions[tabID] === session, session.pendingHandoff.providerSwitchAcceptedID != nil {
+                scope?.linkExecution?.providerSwitchConfirmationSaveSettled(
+                    session, sessionID: sessionID, committedAcceptedID: committedAcceptedID
+                )
             }
         }
         // Queue admission and its completion owner precede the first suspension, including
@@ -507,6 +514,7 @@ final class AgentSessionPersistenceRuntime {
                 return .deferred(message)
             case let .committed(committed):
                 receipt = committed
+                committedAcceptedID = committed.payload.providerSwitchAcceptedID
             }
             guard permits(expectation, tabID: tabID) else {
                 return .deferred("The originating writer changed after persistence committed.")
@@ -568,6 +576,135 @@ final class AgentSessionPersistenceRuntime {
             for: writer.binding.tabID, workspaceID: writer.identity.workspaceID,
             writer: .exact(writer), observingSavePhase: observingSavePhase
         )
+    }
+
+    /// Writes a frozen provider-switch confirmation projection without mutating the live handoff
+    /// until the payload writer returns a durable receipt. The caller owns the projection and must
+    /// re-check its accepted-ID fence in the synchronous apply closure.
+    func flushProviderSwitchProjectedSave(
+        payload: AgentSession,
+        writer: AgentSessionRuntimeStore.Writer,
+        canonicalItemCount: Int,
+        rebuildPayload: (@MainActor () -> AgentSession?)? = nil,
+        observingSavePhase: ((RequiredSavePhase) -> Void)? = nil,
+        apply: @MainActor (AgentSessionSaveRuntime.Receipt) -> Bool
+    ) async -> Result<Void, AgentSessionPersistenceFailure> {
+        guard writer.scope === scope, writer.isCurrent, sessions[writer.session.tabID] === writer.session,
+              let sessionID = writer.session.activeAgentSessionID,
+              payload.id == sessionID
+        else {
+            return .failure(.init(operation: .save, tabID: writer.session.tabID, message: "The provider-switch confirmation writer changed."))
+        }
+        while queue.inFlightSessionIDs.contains(sessionID) {
+            await waitForInFlightSave(sessionID: sessionID)
+            guard writer.scope === scope, writer.isCurrent, sessions[writer.session.tabID] === writer.session else {
+                return .failure(.init(operation: .save, tabID: writer.session.tabID, message: "The provider-switch confirmation writer changed."))
+            }
+        }
+        guard queue.begin(sessionID: sessionID) else {
+            return .failure(.init(operation: .save, tabID: writer.session.tabID, message: "A save for this session is already in flight."))
+        }
+        let session = writer.session
+        defer {
+            defer { scope?.noteSettlementChanged() }
+            if queue.finish(sessionID: sessionID), let currentOwner = currentOwner(for: sessionID) {
+                scheduleSave(for: currentOwner.tabID)
+            }
+            if session.providerSwitchConfirmationSaveFailed == false,
+               let acceptedID = session.pendingHandoff.providerSwitchAcceptedID,
+               scope?.linkExecution?.providerSwitchConfirmationFlights[
+                   .init(sessionID: sessionID, acceptedID: acceptedID)
+               ] == nil
+            {
+                // A projected clear never carries the marker, so this is a wake-up, not evidence.
+                scope?.linkExecution?.providerSwitchReconcileConfirmation(for: session)
+            }
+        }
+        let projectedPayload: AgentSession
+        if let rebuildPayload {
+            guard let rebuilt = rebuildPayload() else {
+                return .failure(.init(operation: .save, tabID: session.tabID, message: "The provider-switch confirmation projection is stale."))
+            }
+            projectedPayload = rebuilt
+        } else {
+            projectedPayload = payload
+        }
+        let projectedItemCount = rebuildPayload == nil ? canonicalItemCount : projectedPayload.effectiveCanonicalItemCount
+        session.saveDebounceTask?.cancel()
+        session.saveDebounceTask = nil
+        session.saveDebounceRequestID = nil
+        let primaryWorkspace = await composition?.readWorkspace()
+        let workspace: WorkspaceModel? = if let primaryWorkspace,
+                                            primaryWorkspace.id == writer.identity.workspaceID
+        {
+            primaryWorkspace
+        } else {
+            await composition?.readWorkspace(withID: writer.identity.workspaceID)
+        }
+        guard let workspace,
+              workspace.id == writer.identity.workspaceID,
+              writer.isCurrent, sessions[session.tabID] === session
+        else {
+            return .failure(.init(operation: .save, tabID: session.tabID, message: "The provider-switch confirmation workspace changed."))
+        }
+        guard let token = makeSaveCommitToken(for: session, workspace: workspace),
+              token.binding == writer.binding,
+              token.matches(session)
+        else {
+            return .failure(.init(operation: .save, tabID: session.tabID, message: "The provider-switch confirmation revision changed."))
+        }
+        let prepared: AgentSessionSaveRuntime.PreparedWrite
+        do {
+            prepared = try AgentSessionSaveRuntime.prepare(payload: projectedPayload, session: session, creation: nil)
+        } catch {
+            return .failure(.init(operation: .save, tabID: session.tabID, message: error.localizedDescription))
+        }
+        do {
+            let outcome = try await AgentSessionSaveRuntime.commit(
+                prepared,
+                workspace: workspace,
+                canonicalItemCount: projectedItemCount,
+                writer: writer,
+                token: token,
+                storageIsCurrent: { [self] in
+                    let primary = await composition?.readWorkspace()
+                    let current = if let primary, primary.id == workspace.id {
+                        primary
+                    } else {
+                        await composition?.readWorkspace(withID: workspace.id)
+                    }
+                    guard let current,
+                          current.id == workspace.id,
+                          writer.isCurrent, isSaveCommitTokenCurrent(token, requireWorkspaceMatch: composition?.canonicalStorage == nil)
+                    else { return false }
+                    return sessionSaveWorkspaceDirectoryPath(for: current) == token.workspaceDirectoryPath
+                },
+                currentName: { composition?.displayName(session.tabID) ?? AgentSessionRestoreSupport.normalizedSessionTitle(nil) },
+                observingPhase: observingSavePhase,
+                saver: saver
+            )
+            switch outcome {
+            case let .committed(receipt):
+                guard !Task.isCancelled else {
+                    session.isDirty = true
+                    return .failure(.init(operation: .save, tabID: session.tabID, message: "The provider-switch confirmation was cancelled before live application."))
+                }
+                guard writer.isCurrent, sessions[session.tabID] === session,
+                      session.currentRestorationBindingToken == receipt.binding,
+                      apply(receipt)
+                else {
+                    session.isDirty = true
+                    return .failure(.init(operation: .save, tabID: session.tabID, message: "The provider-switch confirmation could not be applied to its live owner."))
+                }
+                observingSavePhase?(.durablySaved(receipt.binding))
+                return .success(())
+            case let .deferred(message, requestFreshSave):
+                if requestFreshSave { requestFreshSaveForCurrentOwner(sessionID: sessionID, fallbackSession: session) }
+                return .failure(.init(operation: .save, tabID: session.tabID, message: message))
+            }
+        } catch {
+            return .failure(.init(operation: .save, tabID: session.tabID, message: String(describing: error)))
+        }
     }
 
     /// Bound tab ingress must capture its writer before callbacks or queue suspension.

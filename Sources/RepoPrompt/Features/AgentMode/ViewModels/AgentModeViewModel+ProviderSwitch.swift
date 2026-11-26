@@ -530,7 +530,8 @@ extension AgentModeViewModel {
 
     @discardableResult
     func openProviderSwitchPreview(agent: AgentProviderKind, model: String, tabID: UUID, updated: Bool = false, cursorParameterIntent: ProviderSwitchCursorParameterIntent? = nil, retainingSummary: ProviderSwitchGeneratedSummary? = nil, explicitSelection: AgentProviderHandover.Mode? = nil) async -> UUID? {
-        guard providerSwitchMutation == nil, let session = sessions[tabID] else { return nil }
+        guard providerSwitchMutation == nil, let session = sessions[tabID],
+              session.pendingHandoff.providerSwitchAcceptedID == nil else { return nil }
         providerSwitchBackgroundOutcome = nil
         let descriptor = session.pendingHandoff.providerSwitchDelivery != nil
             ? session.pendingHandoff.payload.flatMap(ProviderSwitchCarrierDescriptor.init) : nil
@@ -1117,6 +1118,9 @@ extension AgentModeViewModel {
     @discardableResult
     func discardProviderSwitchHandover(tabID: UUID) async -> Bool {
         guard providerSwitchMutation == nil, let session = sessions[tabID], session.pendingHandoff.providerSwitchDelivery != nil else { return false }
+        if session.pendingHandoff.providerSwitchAcceptedID != nil {
+            return await linkExecutionRuntime.providerSwitchDiscardAcceptedConfirmation(for: session)
+        }
         // Discard needs exact local ownership, not a valid source descriptor or a rendered sheet.
         var preview = captureProviderSwitchPreview(session, agent: session.selectedAgent, model: session.selectedModelRaw, source: nil, descriptor: nil)
         preview.building = false
@@ -1129,6 +1133,7 @@ extension AgentModeViewModel {
         let forcing = force && !discard && !preview.isReview
         guard !preview.building,
               preview.generationItemID == nil,
+              preview.session.pendingHandoff.providerSwitchAcceptedID == nil,
               discard
               ? providerSwitchDiscardBlocker(preview) == nil
               : providerSwitchPreviewAdmission(preview).isAdmissible(forcing: forcing),

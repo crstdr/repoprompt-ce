@@ -141,6 +141,14 @@ actor AgentSessionDataService {
         }
     }
 
+    private struct LenientUUID: Decodable {
+        let value: UUID?
+
+        init(from decoder: Decoder) throws {
+            value = try? UUID(from: decoder)
+        }
+    }
+
     private struct AgentSessionHeader: Decodable {
         let id: UUID
         let serializationVersion: Int?
@@ -185,6 +193,7 @@ actor AgentSessionDataService {
         let worktreeBindings: [AgentSessionWorktreeBinding]?
         let worktreeMergeOperations: [AgentSessionWorktreeMergeOperation]?
         let pendingHandoffProviderSwitchDelivery: AgentProviderSwitchDelivery?
+        let providerSwitchAcceptedID: LenientUUID?
         let pendingHandoffPayload: String?
         let pendingHandoffAwaitsLocalClaudeOverflowInput: Bool?
         let pendingHandoffCreatedAt: Date?
@@ -1521,6 +1530,7 @@ actor AgentSessionDataService {
                 organizationalParentID: header.organizationalParentID,
                 delegationScopeID: header.delegationScopeID,
                 pendingHandoffProviderSwitchDelivery: header.pendingHandoffProviderSwitchDelivery,
+                providerSwitchAcceptedID: header.providerSwitchAcceptedID?.value,
                 pendingHandoffPayload: header.pendingHandoffPayload,
                 pendingHandoffAwaitsLocalClaudeOverflowInput: header.pendingHandoffAwaitsLocalClaudeOverflowInput,
                 pendingHandoffCreatedAt: header.pendingHandoffCreatedAt,

@@ -306,6 +306,9 @@ struct AgentSession: Codable, Identifiable {
     /// Pending handoff payload (injected into the provider-facing text on the destination tab's
     /// first user send, then cleared). Persisted so it survives close/reopen.
     var pendingHandoffProviderSwitchDelivery: AgentProviderSwitchDelivery?
+    /// Durable proof that the provider accepted the physical handover. While non-nil the
+    /// delivery remains `.sending` until the provider-free confirmation save completes.
+    var providerSwitchAcceptedID: UUID?
     var pendingHandoffPayload: String?
     var pendingHandoffAwaitsLocalClaudeOverflowInput: Bool?
     var pendingHandoffCreatedAt: Date?
@@ -370,6 +373,7 @@ struct AgentSession: Codable, Identifiable {
         organizationalParentID: UUID? = nil,
         delegationScopeID: UUID? = nil,
         pendingHandoffProviderSwitchDelivery: AgentProviderSwitchDelivery? = nil,
+        providerSwitchAcceptedID: UUID? = nil,
         pendingHandoffPayload: String? = nil,
         pendingHandoffAwaitsLocalClaudeOverflowInput: Bool? = nil,
         pendingHandoffCreatedAt: Date? = nil,
@@ -424,6 +428,7 @@ struct AgentSession: Codable, Identifiable {
         self.organizationalParentID = organizationalParentID
         self.delegationScopeID = delegationScopeID
         self.pendingHandoffProviderSwitchDelivery = pendingHandoffProviderSwitchDelivery
+        self.providerSwitchAcceptedID = providerSwitchAcceptedID
         self.pendingHandoffPayload = pendingHandoffPayload
         self.pendingHandoffAwaitsLocalClaudeOverflowInput = pendingHandoffAwaitsLocalClaudeOverflowInput
         self.pendingHandoffCreatedAt = pendingHandoffCreatedAt
@@ -480,6 +485,7 @@ struct AgentSession: Codable, Identifiable {
         case organizationalParentID
         case delegationScopeID
         case pendingHandoffProviderSwitchDelivery
+        case providerSwitchAcceptedID
         case pendingHandoffPayload
         case pendingHandoffAwaitsLocalClaudeOverflowInput
         case pendingHandoffCreatedAt
@@ -545,7 +551,19 @@ struct AgentSession: Codable, Identifiable {
         createdByOverseerSessionID = try container.decodeIfPresent(UUID.self, forKey: .createdByOverseerSessionID)
         organizationalParentID = try container.decodeIfPresent(UUID.self, forKey: .organizationalParentID)
         delegationScopeID = try container.decodeIfPresent(UUID.self, forKey: .delegationScopeID)
-        pendingHandoffProviderSwitchDelivery = try container.decodeIfPresent(AgentProviderSwitchDelivery.self, forKey: .pendingHandoffProviderSwitchDelivery)
+        let decodedDelivery = try container.decodeIfPresent(AgentProviderSwitchDelivery.self, forKey: .pendingHandoffProviderSwitchDelivery)
+        let acceptedKeyPresent = container.contains(.providerSwitchAcceptedID)
+        let decodedAcceptedID = try? container.decode(UUID.self, forKey: .providerSwitchAcceptedID)
+        if acceptedKeyPresent, decodedDelivery == .ready {
+            pendingHandoffProviderSwitchDelivery = .sending
+            providerSwitchAcceptedID = nil
+        } else if decodedAcceptedID != nil, decodedDelivery != .sending {
+            pendingHandoffProviderSwitchDelivery = decodedDelivery
+            providerSwitchAcceptedID = nil
+        } else {
+            pendingHandoffProviderSwitchDelivery = decodedDelivery
+            providerSwitchAcceptedID = decodedAcceptedID
+        }
         pendingHandoffPayload = try container.decodeIfPresent(String.self, forKey: .pendingHandoffPayload)
         pendingHandoffAwaitsLocalClaudeOverflowInput = try container.decodeIfPresent(Bool.self, forKey: .pendingHandoffAwaitsLocalClaudeOverflowInput)
         pendingHandoffCreatedAt = try container.decodeIfPresent(Date.self, forKey: .pendingHandoffCreatedAt)
