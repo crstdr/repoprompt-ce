@@ -3362,7 +3362,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         let id = UUID()
         let arguments = args?.filter { $0.key != MCPExportResponseDeliveryDeadlineRegistry.requestIdentityArgumentKey }
         await fireToolCalledObservers(runID: runID, invocationID: id, toolName: name, args: arguments)
-        guard runIDByConnectionID[connectionID] == runID else { return }
+        // Complete the row on its call-time run, even if delivery overlapped a rebind.
         await fireToolCompletedObservers(
             runID: runID, invocationID: id, toolName: name, args: arguments,
             resultJSON: String(decoding: data, as: UTF8.self), isError: true

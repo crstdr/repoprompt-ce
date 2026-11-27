@@ -1731,9 +1731,15 @@ import XCTest
                         }
                     )
                 )
+                let connectionID = admitted.endpoint.connectionID
+                let reboundRunID = UUID()
                 let observer = await manager.registerToolEventObserver(for: admitted.runID, observer: .init(onCalled: { id, tool, args in
                     await MainActor.run {
                         runner.testHandleTrackerToolCall(invocationID: id, toolName: tool, args: args, session: session)
+                    }
+                    if tool == "call_tool" {
+                        // The refusal handler awaits this callback. Rebind before it can complete.
+                        await manager.debugSeedConnectionRunRouting(connectionID: connectionID, runID: reboundRunID, purpose: .agentModeRun)
                     }
                 }, onCompleted: { id, tool, args, output, isError in
                     await MainActor.run {
@@ -1776,6 +1782,13 @@ import XCTest
                     let rows = session.items.dropFirst(before).filter { $0.toolName != nil }
                     XCTAssertEqual(rows.compactMap(\.toolName), [scenario.row])
                     XCTAssertEqual(rows.first?.toolIsError, scenario.error)
+                    if scenario.row == "call_tool" {
+                        let row = try XCTUnwrap(rows.first)
+                        let recorded = try XCTUnwrap(vm.rawToolResultPayloadForRendering(tabID: session.tabID, itemID: row.id) ?? row.toolResultJSON)
+                        let decoded = try JSONSerialization.jsonObject(with: Data(recorded.utf8)) as? NSArray
+                        XCTAssertEqual(decoded, result["content"] as? NSArray)
+                        await manager.debugSeedConnectionRunRouting(connectionID: connectionID, runID: admitted.runID, purpose: .agentModeRun)
+                    }
                     XCTAssertEqual(accounting.inputs, index + 1)
                     XCTAssertEqual(accounting.outputs, index + 1)
                     XCTAssertEqual(session.activeNonCodexTurnTokenAccumulator?.estimatedToolInputTokens, 0)
