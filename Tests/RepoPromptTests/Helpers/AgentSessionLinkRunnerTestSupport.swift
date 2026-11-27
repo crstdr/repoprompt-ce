@@ -648,13 +648,24 @@ final class AgentSessionLinkCapturingACPProvider: ACPAgentProvider, @unchecked S
 
     func buildPromptBlocks(
         for message: AgentMessage,
-        request _: ACPRunRequest
+        request: ACPRunRequest
     ) throws -> [[String: Any]] {
         lock.lock()
         captured.append(message)
         lock.unlock()
-        let padding = Int(environment["ACP_TEST_PROMPT_PADDING"] ?? "") ?? 0
-        return [["type": "text", "text": String(repeating: "x", count: padding) + message.userMessage]]
+        let padding = String(repeating: "x", count: Int(environment["ACP_TEST_PROMPT_PADDING"] ?? "") ?? 0)
+        guard environment["ACP_TEST_ANTIGRAVITY_PROMPT"] == "1" else {
+            return [["type": "text", "text": padding + message.userMessage]]
+        }
+        let antigravity = AntigravityACPAgentProvider(
+            executablePath: commandPath, harnessPath: nil, installedRuntime: { nil },
+            prepareSessionHome: { FileManager.default.temporaryDirectory },
+            toolNames: .init(isRepoPromptServerIdentifier: { _ in false }, canonicalRepoPromptToolName: { _ in nil }, isRepoPromptToolNameWithServerPrefix: { _ in false })
+        )
+        return try antigravity.buildPromptBlocks(for: message, request: request).map { block in
+            guard let text = block["text"] as? String else { return block }
+            return block.merging(["text": padding + text]) { _, padded in padded }
+        }
     }
 
     func normalizeSessionUpdate(

@@ -763,6 +763,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         provider.environment["ACP_TEST_PROMPT_PADDING"] = "192000"
         provider.environment["ACP_RPC_LOG"] = trace.path
         provider.environment["ACP_TEST_IMAGE_INPUT"] = "1"
+        provider.environment["ACP_TEST_ANTIGRAVITY_PROMPT"] = "1"
         let gate = try AgentSessionLinkACPResponseGate(directory: trace.deletingLastPathComponent())
         defer { gate.release() }
         provider.environment["ACP_HOLD_METHOD"] = "session/new"
@@ -816,8 +817,41 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .ready)
         XCTAssertEqual(session.pendingHandoff.payload, carrier)
         XCTAssertEqual(AgentSessionLinkExecutionRuntime.providerSwitchNeedsReview(session), newerDraft != nil)
+        XCTAssertNil(session.providerSessionID, "An unwritten first turn must not leave a resumable identity")
+        XCTAssertNil(session.providerCleanupHandle)
         if newerDraft == nil { XCTAssertTrue(session.pendingFileAttachments.contains(attachment)) }
         XCTAssertEqual(try Data(contentsOf: attachmentURL), Data([1, 2, 3]))
+        guard newerDraft == nil else { return }
+
+        provider.environment.removeValue(forKey: "ACP_TEST_PROMPT_PADDING")
+        provider.environment.removeValue(forKey: "ACP_HOLD_METHOD")
+        guard case let .success(.some(retry)) = await f.runtime.providerSwitchSendAdmission(session: session, input: draft) else {
+            return XCTFail("The recovered handover should admit a retry")
+        }
+        _ = await host.startCanonicalRequest(
+            command: retry.command, message: draft, options: .init(), outcome: nil, providerSwitchPreparation: retry
+        )
+        await session.agentTask?.value
+        XCTAssertEqual(provider.promptedMessages.count, 2)
+        let retryMessage = try XCTUnwrap(provider.promptedMessages.last)
+        let instructions = retryMessage.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        XCTAssertFalse(instructions.isEmpty)
+        let traceLines = try String(contentsOf: trace, encoding: .utf8).split(separator: "\n")
+        let rpcRequests = try traceLines.compactMap { line -> [String: Any]? in
+            let trace = try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+            guard trace?["direction"] as? String == "request" else { return nil }
+            return trace?["payload"] as? [String: Any]
+        }
+        XCTAssertFalse(rpcRequests.contains { $0["method"] as? String == "session/load" })
+        XCTAssertEqual(rpcRequests.count { $0["method"] as? String == "session/new" }, 2)
+        let writes = rpcRequests.filter { $0["method"] as? String == "session/prompt" }
+        XCTAssertEqual(writes.count, 1)
+        let params = try XCTUnwrap(writes.first?["params"] as? [String: Any])
+        let blocks = try XCTUnwrap(params["prompt"] as? [[String: Any]])
+        let sent = try XCTUnwrap(blocks.first?["text"] as? String)
+        XCTAssertTrue(sent.hasPrefix(instructions + "\n\n"))
+        XCTAssertEqual(sent.components(separatedBy: instructions).count, 2)
+        XCTAssertTrue(sent.contains(draft))
     }
 
     func testCanonicalComposerProducerRetainsOriginalHostAndWriterAcrossScheduling() async throws {

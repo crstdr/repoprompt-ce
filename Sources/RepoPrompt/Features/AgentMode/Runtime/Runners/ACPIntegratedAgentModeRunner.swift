@@ -1219,6 +1219,8 @@ final class ACPIntegratedAgentModeRunner {
                     runRequest: runRequest,
                     attachmentReservationID: attachmentReservationID,
                     events: events, receipt: receipt, providerLaunchInput: providerLaunchInput, retainsControllerOnRefusal: false, phase: &phase,
+                    freshSessionID: runRequest.resumeSessionID == nil || bootstrap.didFallbackToNewSessionAfterLoadFailure
+                        ? (bootstrap.providerSessionIdentity.loadSessionID ?? bootstrap.providerSessionIdentity.runtimeSessionID) : nil,
                     startOutcome: startOutcome,
                     localComposerCandidate: localComposerCandidate
                 )
@@ -1453,6 +1455,7 @@ final class ACPIntegratedAgentModeRunner {
         retainsControllerOnRefusal: Bool,
         phase: inout PromptPhase,
         dedicatedNoteID: AgentSelfCompactionDispatchID? = nil,
+        freshSessionID: String? = nil,
         startOutcome: AgentRunStartOutcomeRecorder? = nil,
         localComposerCandidate: UUID? = nil
     ) async -> TransientOperationResult {
@@ -1599,6 +1602,19 @@ final class ACPIntegratedAgentModeRunner {
             log("controller.prompt returned; awaiting event consumer", runID: runID)
         } catch is ACPAgentSessionController.PromptTextBudgetExceeded {
             consumeTask.cancel()
+            // An empty session loaded on retry would omit Antigravity's inline first-turn instructions.
+            // Clear only the identity installed by this exact fresh attempt, before saving ready.
+            if let freshSessionID, session.providerSessionID == freshSessionID,
+               session.selectedAgent == .antigravity, session.acpController === controller,
+               isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID),
+               receipt.disposition(for: session) == .current
+            {
+                session.providerSessionID = nil
+                session.providerCleanupHandle = nil
+                session.isDirty = true
+                hooks.persistence.scheduleSave(session)
+                hooks.bindingObservation.updateBindings(session)
+            }
             hooks.providerInput.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, oversightDispatch)
             let recover = startOutcome?.recoverUnwrittenProviderSwitch
             startOutcome?.recoverUnwrittenProviderSwitch = nil
