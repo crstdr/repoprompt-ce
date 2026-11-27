@@ -203,14 +203,18 @@ final actor ServerController: ObservableObject {
         // executable verification. Do not consult the generic allow-list for these
         // spoofable client names.
         let isRepoCLI = Self.isRepoPromptCLIClientName(clientName)
-        let verifiedHelperPID: Int? = if let approvalOverride { approvalOverride.verifiedHelperPID }
-        else { await bundledRepoPromptHelperPID(connectionID: connectionID) }
+        let verifiedPeer = if let approvalOverride {
+            approvalOverride.verifiedHelperPID.flatMap(Int32.init(exactly:)).flatMap(MCPApprovalProcessIdentity.read(pid:))
+        } else {
+            await bundledRepoPromptHelperIdentity(connectionID: connectionID)
+        }
+        let verifiedHelperPID = approvalOverride?.verifiedHelperPID ?? verifiedPeer.map { Int($0.pid) }
         let verifiedBundledCLI = verifiedHelperPID != nil
         let appManagedAgent = if let verifiedHelperPID {
             await networkManager.authorizeAutomaticAppManagedAgentAdmission(
                 connectionID: connectionID,
                 clientName: clientName,
-                verifiedBundledHelperPID: verifiedHelperPID
+                verifiedBundledHelperPID: verifiedHelperPID, verifiedPeer: verifiedPeer
             )
         } else {
             false
@@ -375,15 +379,13 @@ final actor ServerController: ObservableObject {
     #endif
 
     /// Only a kernel-observed peer matching the bundled helper can enter either automatic path.
-    private func bundledRepoPromptHelperPID(connectionID: UUID) async -> Int? {
+    private func bundledRepoPromptHelperIdentity(connectionID: UUID) async -> MCPApprovalProcessIdentity? {
         guard let expectedURL = Bundle.main.url(forAuxiliaryExecutable: "repoprompt-mcp"),
-              let peerPID = await networkManager.peerPID(for: connectionID),
-              peerPID > 1,
-              let actualPath = Self.executablePath(forPID: peerPID)
+              let peerPID = await networkManager.peerPID(for: connectionID).flatMap(Int32.init(exactly:)),
+              let peer = MCPApprovalProcessIdentity.read(pid: peerPID)
         else { return nil }
         let expected = expectedURL.resolvingSymlinksInPath().standardizedFileURL.path
-        let actual = URL(fileURLWithPath: actualPath).resolvingSymlinksInPath().standardizedFileURL.path
-        return actual == expected ? peerPID : nil
+        return peer.executablePath == expected ? peer : nil
     }
 
     private func approvalPeerIdentity(connectionID: UUID) async -> MCPApprovalProcessIdentity? {

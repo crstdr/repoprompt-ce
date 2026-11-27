@@ -1255,8 +1255,19 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         let runID: UUID
         let authorityGeneration: UInt64
         let observedHelperPID: Int
+        let verifiedPeer: MCPApprovalProcessIdentity?
         let source: Source
     }
+
+    /// Transport identity survives physical-window turn settlement; run authority does not.
+    private struct PhysicalWarmTransport: Equatable {
+        let route: AgentSessionLinkRunCatalogRouteToken
+        let peer: MCPApprovalProcessIdentity
+    }
+
+    private var physicalWarmTransports: [UUID: PhysicalWarmTransport] = [:]
+    private var lastPhysicalWarmGeneration: UInt64 = 0
+    private var physicalWarmCleanupCounts: [UUID: Int] = [:]
 
     /// One initialize handoff only; never a standing connection/name grant.
     private var automaticAgentAdmissions: [UUID: AutomaticAgentAdmission] = [:]
@@ -3233,6 +3244,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
     /// Uses the same immutable domain advertisement and client shaping as tools/list. No route
     /// discovery, persistence, provider lookup, or session census is performed here.
     private func wantsCompactToolCatalog(_ connectionID: UUID) -> Bool {
+        if physicalWarmTransports[connectionID] != nil, runIDByConnectionID[connectionID] == nil { return true }
         guard let runID = runIDByConnectionID[connectionID],
               runPolicyStateByRunID[runID]?.usesCompactToolCatalog == true,
               let client = clientIdentifier(forConnection: connectionID)
@@ -5547,6 +5559,14 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         let originalRegistration = runPolicyStateByRunID[runID]?.cleanupReceipt
         let originalAuthorityGeneration = runRoutingAuthorityGenerationByRunID[runID]
         guard originalRegistration?.routeOwner == nil else { return }
+        let tracksWarmCleanup = physicalWarmTransports.values.contains { $0.route.runID == runID }
+        if tracksWarmCleanup { physicalWarmCleanupCounts[runID, default: 0] += 1 }
+        defer {
+            if tracksWarmCleanup {
+                let remaining = physicalWarmCleanupCounts[runID, default: 1] - 1
+                physicalWarmCleanupCounts[runID] = remaining > 0 ? remaining : nil
+            }
+        }
         let observerCleanup = includingObserversAndWaiter ? prepareToolObserverUnregistration(for: runID) : nil
         func stillOwnsOriginalRegistration() -> Bool {
             runPolicyStateByRunID[runID]?.cleanupReceipt == originalRegistration
@@ -7668,6 +7688,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
             bootstrapClaimedPIDByConnectionID.removeValue(forKey: id)
             bootstrapObservedPeerPIDByConnectionID.removeValue(forKey: id)
             automaticAgentAdmissions.removeValue(forKey: id)
+            physicalWarmTransports.removeValue(forKey: id)
             #if DEBUG
                 debugDomainPeerIdentityByConnectionID.removeValue(forKey: id)
             #endif
@@ -8736,6 +8757,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         bootstrapClaimedPIDByConnectionID.removeValue(forKey: id)
         bootstrapObservedPeerPIDByConnectionID.removeValue(forKey: id)
         automaticAgentAdmissions.removeValue(forKey: id)
+        physicalWarmTransports.removeValue(forKey: id)
         connectionTasks.removeValue(forKey: id)
         pendingConnections.removeValue(forKey: id)
         connectionStats.removeValue(forKey: id)
@@ -9077,7 +9099,8 @@ actor ServerNetworkManager: MCPServerConnectionHost {
     func authorizeAutomaticAppManagedAgentAdmission(
         connectionID: UUID,
         clientName: String,
-        verifiedBundledHelperPID: Int
+        verifiedBundledHelperPID: Int,
+        verifiedPeer: MCPApprovalProcessIdentity? = nil
     ) async -> Bool {
         automaticAgentAdmissions.removeValue(forKey: connectionID)
         guard let generation = connectionLifecycleGenerationByID[connectionID] else { return false }
@@ -9092,7 +9115,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
             else { return false }
             if tryAuthorizeAutomaticAppManagedAgentAdmission(
                 connectionID: connectionID, clientName: clientName,
-                verifiedBundledHelperPID: verifiedBundledHelperPID
+                verifiedBundledHelperPID: verifiedBundledHelperPID, verifiedPeer: verifiedPeer
             ) { return true }
             guard hasPIDGatedPendingPolicy(for: clientName), Date() < deadline else { return false }
             try? await Task.sleep(for: .milliseconds(50))
@@ -9102,13 +9125,15 @@ actor ServerNetworkManager: MCPServerConnectionHost {
     private func tryAuthorizeAutomaticAppManagedAgentAdmission(
         connectionID: UUID,
         clientName: String,
-        verifiedBundledHelperPID: Int
+        verifiedBundledHelperPID: Int,
+        verifiedPeer: MCPApprovalProcessIdentity?
     ) -> Bool {
         automaticAgentAdmissions.removeValue(forKey: connectionID)
         guard let generation = connectionLifecycleGenerationByID[connectionID],
               isCurrentConnection(connectionID, lifecycleGeneration: generation),
               verifiedBundledHelperPID > 1,
-              bootstrapObservedPeerPIDByConnectionID[connectionID] == verifiedBundledHelperPID
+              bootstrapObservedPeerPIDByConnectionID[connectionID] == verifiedBundledHelperPID,
+              verifiedPeer.map({ Int($0.pid) == verifiedBundledHelperPID && MCPApprovalProcessIdentity.read(pid: $0.pid) == $0 }) ?? true
         else { return false }
 
         func ownsLiveRun(_ runID: UUID) -> Bool {
@@ -9139,7 +9164,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
             else { return false }
             automaticAgentAdmissions[connectionID] = AutomaticAgentAdmission(
                 runID: runID, authorityGeneration: authorityGeneration,
-                observedHelperPID: verifiedBundledHelperPID,
+                observedHelperPID: verifiedBundledHelperPID, verifiedPeer: verifiedPeer,
                 source: .pendingPolicy(key: entry.key, id: entry.policy.id)
             )
             return true
@@ -9157,7 +9182,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         else { return false }
         automaticAgentAdmissions[connectionID] = AutomaticAgentAdmission(
             runID: affinity.runID, authorityGeneration: authorityGeneration,
-            observedHelperPID: verifiedBundledHelperPID, source: .liveToken(sessionKey)
+            observedHelperPID: verifiedBundledHelperPID, verifiedPeer: verifiedPeer, source: .liveToken(sessionKey)
         )
         return true
     }
@@ -9172,6 +9197,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
               runRoutingAuthorityGenerationByRunID[proof.runID] == proof.authorityGeneration,
               revocationFenceGenerationByRunID[proof.runID] != proof.authorityGeneration,
               bootstrapObservedPeerPIDByConnectionID[connectionID] == proof.observedHelperPID,
+              proof.verifiedPeer.map({ MCPApprovalProcessIdentity.read(pid: $0.pid) == $0 }) ?? true,
               isExpectedAgentDescendant(clientName: clientName, clientPid: proof.observedHelperPID, runID: proof.runID) == true
         else { return false }
         switch proof.source {
@@ -9251,7 +9277,20 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                 runIDByConnectionID[connectionID] == automaticAdmission.runID,
                 admittedPolicyRunIDs.contains(automaticAdmission.runID)
             else { return false }
+            if ownedRegistration?.routeOwner == nil,
+               Self.clientStorageKey(clientName) == "antigravity-client",
+               let peer = automaticAdmission.verifiedPeer,
+               let route = await authoritativeRunCatalogRouteToken(for: automaticAdmission.runID),
+               route.connectionID == connectionID,
+               isCurrentAutomaticAgentAdmission(
+                   automaticAdmission, connectionID: connectionID, clientName: clientName, requiresPendingPolicy: false
+               ), connectionLifecycleState.isLive(connectionID: connectionID, generation: expectedLifecycleGeneration)
+            {
+                physicalWarmTransports[connectionID] = .init(route: route, peer: peer)
+                lastPhysicalWarmGeneration = max(lastPhysicalWarmGeneration, route.routingAuthorityGeneration)
+            }
         }
+        guard isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return false }
         notifyConnectionWaiters(
             connectionID: connectionID,
             clientName: clientName,
@@ -9715,9 +9754,12 @@ actor ServerNetworkManager: MCPServerConnectionHost {
             let committedConnectionID = purpose == .agentModeRun
                 ? lateCommittedRunRouteCandidate(runID: runID, windowID: windowID, tabID: tabID) : nil
             let committedWorkspaceID = committedConnectionID.flatMap { cachedModelRunRoute(connectionID: $0)?.workspaceID }
+            let generationBase = storageKey == "antigravity-client" && routingOwner == nil
+                ? max(previousGeneration, lastPhysicalWarmGeneration) : previousGeneration
+            guard generationBase < UInt64.max else { return nil }
             let receipt = MCPRunRoutingCleanupReceipt(
                 managerIdentity: ObjectIdentifier(self), policyID: policy.id, runID: runID,
-                routeID: windowID, routingAuthorityGeneration: previousGeneration &+ 1,
+                routeID: windowID, routingAuthorityGeneration: generationBase + 1,
                 routingWaitGeneration: routingWaitGeneration, routeOwner: routingOwner,
                 providerContextResolver: providerContextResolver,
                 usesExplicitProviderContext: originatingContextSource != nil
@@ -9750,6 +9792,9 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                 }
             }
             runRoutingAuthorityGenerationByRunID[runID] = receipt.routingAuthorityGeneration
+            if storageKey == "antigravity-client", routingOwner == nil {
+                lastPhysicalWarmGeneration = receipt.routingAuthorityGeneration
+            }
             revocationFenceGenerationByRunID.removeValue(forKey: runID)
             policy.cleanupReceipt = receipt
             if let connectionID = committedConnectionID, routingOwner == nil || transferredPIDOrigin != nil {
@@ -9866,7 +9911,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         runID: UUID,
         windowID: Int? = nil,
         registration: MCPRunRoutingCleanupReceipt? = nil
-    ) -> Bool {
+    ) async -> Bool {
         guard registration.map({ ownsRunRegistration($0) && $0.runID == runID && (windowID == nil || $0.routeID == windowID) }) ?? true else { return false }
         pruneExpiredPolicies(for: clientName)
         let keys = matchingClientKeys(for: clientName, in: Array(pendingPoliciesByClient.keys))
@@ -9904,7 +9949,65 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                 ]
             )
         #endif
+        if armed, registration == nil, Self.clientStorageKey(clientName) == "antigravity-client",
+           let entry = oldestPendingPolicyEntry(for: clientName, where: {
+               $0.runID == runID && $0.windowID == windowID && $0.reservationConnectionID == nil
+                   && $0.purpose == .agentModeRun && $0.oneShot && $0.requiresExpectedAgentPID
+                   && $0.cleanupReceipt?.routeOwner == nil
+           })
+        {
+            await rebindWarmPhysicalTransport(entry, clientName: clientName)
+        }
         return armed
+    }
+
+    private func warmPhysicalTransportIsCurrent(
+        _ transport: PhysicalWarmTransport, policy: ClientConnectionPolicy, clientName: String
+    ) -> Bool {
+        let route = transport.route
+        let id = route.connectionID
+        return !Task.isCancelled && physicalWarmCleanupCounts[route.runID] == nil
+            && policy.runID == route.runID && policy.tabID == route.observerEndpoint.tabID
+            && policy.windowID == route.observerEndpoint.windowID
+            && policy.cleanupReceipt.map(ownsRunRegistration) == true
+            && physicalWarmTransports[id] == transport
+            && MCPClientIdentity.sameFamily(clientIdentifier(forConnection: id), clientName)
+            && connectionLifecycleState.isLive(connectionID: id, generation: route.connectionLifecycleGeneration)
+            && bootstrapObservedPeerPIDByConnectionID[id] == Int(transport.peer.pid)
+            && MCPApprovalProcessIdentity.read(pid: transport.peer.pid) == transport.peer
+            && canConsumePendingPolicy(policy, clientName: clientName, clientPid: Int(transport.peer.pid))
+    }
+
+    private func rebindWarmPhysicalTransport(
+        _ entry: (key: String, index: Int, policy: ClientConnectionPolicy), clientName: String
+    ) async {
+        guard let runID = entry.policy.runID, !admittedPolicyRunIDs.contains(runID),
+              pendingPolicyApplicationIDByRunID[runID] == nil
+        else { return }
+        let transports = physicalWarmTransports.values.filter {
+            warmPhysicalTransportIsCurrent($0, policy: entry.policy, clientName: clientName)
+        }
+        guard transports.count == 1, let transport = transports.first else { return }
+        let route = transport.route
+        let connectionID = route.connectionID
+        let currentEndpoint = await MainActor.run {
+            WindowStatesManager.shared.window(withID: entry.policy.windowID)?.agentModeViewModel.linkExecutionRuntime
+                .agentSessionLinkObserverEndpoint(tabID: route.observerEndpoint.tabID)
+        }
+        guard currentEndpoint == route.observerEndpoint,
+              warmPhysicalTransportIsCurrent(transport, policy: entry.policy, clientName: clientName),
+              !admittedPolicyRunIDs.contains(runID), pendingPolicyApplicationIDByRunID[runID] == nil,
+              pendingPolicyApplicationIDByConnectionID[connectionID] == nil,
+              runIDByConnectionID[connectionID] == nil,
+              let policy = reserveOneShotPendingPolicy(entry, for: connectionID)
+        else { return }
+        let remaining = max(0, (pendingPoliciesByClient[entry.key]?.count ?? 1) - 1)
+        _ = await applyConnectionPolicy(
+            policy, clientName: clientName, connectionID: connectionID,
+            clientPid: Int(transport.peer.pid), bootstrapClientName: clientName,
+            requireRunRouting: true, expectedLifecycleGeneration: route.connectionLifecycleGeneration,
+            queue: (entry.key, remaining, remaining), warmTransport: transport
+        )
     }
 
     #if DEBUG
@@ -12620,6 +12723,8 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         connectionID: UUID,
         reason: String
     ) async -> Bool {
+        // A dormant verified transport may only obtain a route from the next armed policy.
+        guard physicalWarmTransports[connectionID] == nil else { return false }
         let existingRestricted = restrictedToolsByConnection[connectionID] ?? []
         let existingAdditional = additionalToolsByConnection[connectionID] ?? []
         let existingPurpose = runPurposeByConnection[connectionID] ?? .unknown
@@ -13121,12 +13226,16 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         requireRunRouting: Bool,
         expectedLifecycleGeneration: UInt64?,
         queue: (key: String, afterPop: Int, afterStore: Int)? = nil,
-        reconnect: (proof: AutomaticAgentAdmission, state: RunConnectionPolicyState)? = nil
+        reconnect: (proof: AutomaticAgentAdmission, state: RunConnectionPolicyState)? = nil,
+        warmTransport: PhysicalWarmTransport? = nil
     ) async -> PendingPolicyApplicationOutcome {
         let queueKey = queue?.key ?? "owned_reconnect"
         let remainingAfterPop = queue?.afterPop ?? 0
         let remainingAfterRequeue = queue?.afterStore ?? 0
         func reconnectProofIsCurrent() -> Bool {
+            if let warmTransport, !warmPhysicalTransportIsCurrent(warmTransport, policy: policy, clientName: clientName) {
+                return false
+            }
             guard let reconnect else { return true }
             return !Task.isCancelled
                 && expectedLifecycleGeneration.map {
@@ -13140,7 +13249,10 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                     reconnect.proof, connectionID: connectionID, clientName: clientName, requiresPendingPolicy: false
                 )
         }
-        guard reconnectProofIsCurrent() else { return .rejected(runID: policy.runID, reason: "stale_connection") }
+        guard reconnectProofIsCurrent() else {
+            if policy.oneShot { _ = rollbackOneShotPendingPolicyReservation(id: policy.id, key: queueKey, connectionID: connectionID) }
+            return .rejected(runID: policy.runID, reason: "stale_connection")
+        }
         if reconnect != nil, pendingPolicyApplicationIDByConnectionID[connectionID] != nil
             || policy.runID.map({ pendingPolicyApplicationIDByRunID[$0] != nil }) == true
         {
@@ -13291,6 +13403,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                 restorePoint: restorePoint,
                 applicationID: pendingPolicyApplicationID,
                 restoreRunPolicy: reconnect == nil,
+                requireCurrentRunPolicy: warmTransport != nil,
                 routingWaitGeneration: routingWaitGeneration,
                 signalRoutingFailure: false
             )
@@ -13324,7 +13437,9 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                     windowID: policy.windowID,
                     tabID: tabID,
                     runID: runID,
-                    signalRouting: false
+                    signalRouting: false,
+                    warmEndpoint: warmTransport?.route.observerEndpoint,
+                    warmPolicyID: warmTransport == nil ? nil : policy.id
                 )
                 routed = installation.routed
                 pendingPolicyRunIDMappingToken = installation.replacementToken
@@ -13362,6 +13477,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                     restorePoint: restorePoint,
                     applicationID: pendingPolicyApplicationID,
                     restoreRunPolicy: reconnect == nil,
+                    requireCurrentRunPolicy: warmTransport != nil,
                     routingWaitGeneration: routingWaitGeneration,
                     pendingPolicyRunIDMappingToken: pendingPolicyRunIDMappingToken
                 )
@@ -13383,6 +13499,11 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                     routeMappingToken.map { token in
                         guard let window = WindowStatesManager.shared.window(withID: policy.windowID) else {
                             return false
+                        }
+                        if let warmTransport {
+                            let prior = warmTransport.route.observerEndpoint
+                            guard window.agentModeViewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: prior.tabID) == prior
+                            else { return false }
                         }
                         return window.mcpServer.isCurrentPendingPolicyRunIDMapping(route: window.mcpServer.routeResources, token)
                     } ?? true
@@ -13416,6 +13537,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                     restorePoint: restorePoint,
                     applicationID: pendingPolicyApplicationID,
                     restoreRunPolicy: reconnect == nil,
+                    requireCurrentRunPolicy: warmTransport != nil,
                     routingWaitGeneration: routingWaitGeneration,
                     pendingPolicyRunIDMappingToken: pendingPolicyRunIDMappingToken,
                     signalRoutingFailure: false
@@ -13438,6 +13560,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                 restorePoint: restorePoint,
                 applicationID: pendingPolicyApplicationID,
                 restoreRunPolicy: reconnect == nil,
+                requireCurrentRunPolicy: warmTransport != nil,
                 routingWaitGeneration: routingWaitGeneration,
                 pendingPolicyRunIDMappingToken: pendingPolicyRunIDMappingToken
             )
@@ -13479,6 +13602,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                 restorePoint: restorePoint,
                 applicationID: pendingPolicyApplicationID,
                 restoreRunPolicy: reconnect == nil,
+                requireCurrentRunPolicy: warmTransport != nil,
                 routingWaitGeneration: routingWaitGeneration,
                 pendingPolicyRunIDMappingToken: pendingPolicyRunIDMappingToken,
                 signalRoutingFailure: false
@@ -13618,6 +13742,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         restorePoint: PendingPolicyRestorePoint,
         applicationID: UUID,
         restoreRunPolicy: Bool = true,
+        requireCurrentRunPolicy: Bool = false,
         routingWaitGeneration: UUID? = nil,
         pendingPolicyRunIDMappingToken: MCPServerViewModel.PendingPolicyRunIDMappingToken? = nil,
         signalRoutingFailure: Bool = true
@@ -13660,6 +13785,11 @@ actor ServerNetworkManager: MCPServerConnectionHost {
 
         var ownsConnectionState = pendingPolicyApplicationIDByConnectionID[connectionID] == applicationID
         var ownsRunState = policy.runID.map { pendingPolicyApplicationIDByRunID[$0] == applicationID } ?? false
+        if requireCurrentRunPolicy, let runID = policy.runID,
+           runPolicyStateByRunID[runID]?.cleanupReceipt != policy.cleanupReceipt
+        {
+            ownsRunState = false
+        }
         switch mappingRollbackResult {
         case .supersededBySameConnection:
             ownsConnectionState = false
@@ -13768,7 +13898,9 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         windowID: Int,
         tabID: UUID,
         runID: UUID,
-        signalRouting: Bool = true
+        signalRouting: Bool = true,
+        warmEndpoint: DomainAgentSessionLinkEndpointIdentity? = nil,
+        warmPolicyID: UUID? = nil
     ) async -> (routed: Bool, replacementToken: MCPServerViewModel.PendingPolicyRunIDMappingToken?) {
         let resolved = await MainActor.run {
             () -> (
@@ -13786,8 +13918,29 @@ actor ServerNetworkManager: MCPServerConnectionHost {
             ) else {
                 return nil
             }
-            let replacementToken = windowState.mcpServer.installTabContext(
-                route: windowState.mcpServer.routeResources,
+            let server = windowState.mcpServer
+            let owner = server.routeResources
+            if let warmEndpoint {
+                guard owner.identity.kind != .independent, resolved.workspaceID == warmEndpoint.workspaceID,
+                      windowState.agentModeViewModel.linkExecutionRuntime.agentSessionLinkObserverEndpoint(tabID: tabID) == warmEndpoint,
+                      let connectionID = UUID(uuidString: clientID),
+                      owner.runRouteBindings.connectionIDByRunID[runID] == nil,
+                      owner.runRouteBindings.connectionIDToRunID[connectionID] == nil
+                else { return nil }
+                // Legacy settlement can leave a tab snapshot after retiring the mapping.
+                // Remove only the retired turn's snapshot before installing the fresh policy.
+                if let prior = owner.runRouteBindings.tabContextByConnectionID[connectionID] {
+                    guard prior.runID == runID, prior.tabID == tabID, prior.windowID == windowID,
+                          prior.workspaceID == warmEndpoint.workspaceID, !prior.explicitlyBound
+                    else { return nil }
+                    server.removeTabContext(
+                        route: owner, forConnectionID: connectionID, clientName: nil, windowID: windowID,
+                        runID: runID, removeQueuedPendingContext: false
+                    )
+                }
+            }
+            let replacementToken = server.installTabContext(
+                route: owner,
                 clientID: clientID,
                 clientName: clientName,
                 windowID: windowID,
@@ -13806,7 +13959,9 @@ actor ServerNetworkManager: MCPServerConnectionHost {
             return (false, nil)
         }
 
-        if resolved.routed, let cached = runPolicyStateByRunID[runID] {
+        if resolved.routed, let cached = runPolicyStateByRunID[runID],
+           warmPolicyID == nil || cached.cleanupReceipt?.policyID == warmPolicyID
+        {
             seedRunPolicyState(
                 runID: runID,
                 windowID: windowID,
