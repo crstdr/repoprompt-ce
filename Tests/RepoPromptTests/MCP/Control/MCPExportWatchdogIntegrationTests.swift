@@ -2,6 +2,7 @@ import Darwin
 import Foundation
 import JSONSchema
 import MCP
+import RepoPromptACPProviders
 import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 @testable import RepoPromptApp
@@ -1619,6 +1620,145 @@ import XCTest
                 if let agent { try await AgentSessionDataService.shared.deleteAgentSessionFile(agent.fileURL) }
                 try await fixture.assertCleanedUp()
                 if let failure { throw failure }
+            }
+        }
+
+        private func withReadyCompactSocket(
+            _ body: @MainActor (ServerNetworkManager, QueuedSessionAdminAgent, AgentSessionLinkRunCatalogRouteToken) async throws -> Void
+        ) async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease, domainRuntime: AppDomainRuntimeComposition.shared.runtime)
+                let manager = fixture.networkManager
+                var agent: QueuedSessionAdminAgent?
+                var failure: Error?
+                do {
+                    let admitted = try await Self.prepareQueuedSessionAdminAgent(fixture, context: fixture.contextA, antigravity: true)
+                    agent = admitted
+                    let routeCandidate = await manager.authoritativeRunCatalogRouteToken(
+                        runID: admitted.runID, windowID: admitted.context.window.windowID, tabID: admitted.context.tabID
+                    )
+                    let route = try XCTUnwrap(routeCandidate)
+                    await manager.debugSetActiveSessionLinkEndpointsForTesting([route.observerEndpoint])
+                    _ = try await admitted.endpoint.client.request(method: "tools/list", params: [:], timeoutSeconds: 5)
+                    let projection = await manager.debugRunCatalogProjection(for: admitted.runID)
+                    XCTAssertTrue(try XCTUnwrap(projection).isReady)
+                    try await body(manager, admitted, route)
+                } catch {
+                    failure = error
+                }
+                await manager.setEnabled(true)
+                await manager.debugSetActiveSessionLinkEndpointsForTesting(nil)
+                if let agent {
+                    await manager.clearExpectedAgentPID(getpid(), for: agent.endpoint.clientName, runID: agent.runID)
+                    await manager.clearClientConnectionPolicy(for: agent.endpoint.clientName, windowID: agent.context.window.windowID, runID: agent.runID)
+                    await Self.cleanupEndpoint(agent.endpoint, manager: manager)
+                    await manager.cleanupRunRoutingState(for: agent.runID, windowID: agent.context.window.windowID)
+                }
+                await fixture.cleanup()
+                if let agent { try await AgentSessionDataService.shared.deleteAgentSessionFile(agent.fileURL) }
+                try await fixture.assertCleanedUp()
+                if let failure { throw failure }
+            }
+        }
+
+        func testAntigravityCompactReadinessFollowsSameClientLeaseRenewal() async throws {
+            try await withReadyCompactSocket { manager, admitted, route in
+                let socket = admitted.endpoint
+                await manager.installClientConnectionPolicy(
+                    for: socket.clientName, windowID: admitted.context.window.windowID,
+                    restrictedTools: [MCPWindowToolName.agentManage], reason: "Renew compact catalog fixture", ttl: 60,
+                    tabID: admitted.context.tabID, runID: admitted.runID, additionalTools: [],
+                    purpose: .agentModeRun, allowsAgentExternalControlTools: true, requiresExpectedAgentPID: true
+                )
+                let routeAfterInstall = await manager.authoritativeRunCatalogRouteToken(
+                    runID: admitted.runID, windowID: admitted.context.window.windowID, tabID: admitted.context.tabID
+                )
+                let refreshedRoute = try XCTUnwrap(routeAfterInstall)
+                XCTAssertNotEqual(route, refreshedRoute)
+                XCTAssertTrue(route.hasSameClientIncarnation(as: refreshedRoute))
+                let afterRenewal = await manager.debugRunCatalogProjection(for: admitted.runID)
+                XCTAssertEqual(afterRenewal?.routeToken, refreshedRoute)
+                XCTAssertTrue(try XCTUnwrap(afterRenewal).isReady)
+                let described = try await socket.callTool(name: "describe_tool", arguments: ["name": "prompt"])
+                XCTAssertNotEqual(try (Self.responseObject(from: described)["result"] as? [String: Any])?["isError"] as? Bool, true)
+            }
+        }
+
+        func testAntigravityGlobalDisableRetractsCompactReadinessWithoutRelist() async throws {
+            try await withReadyCompactSocket { manager, admitted, _ in
+                await manager.setEnabled(false)
+                let afterDisable = await manager.debugRunCatalogProjection(for: admitted.runID)
+                XCTAssertFalse(try XCTUnwrap(afterDisable).isReady)
+                let refused = try await admitted.endpoint.callTool(name: "call_tool", arguments: ["name": "prompt", "arguments": ["op": "get"]])
+                XCTAssertEqual(try (Self.responseObject(from: refused)["result"] as? [String: Any])?["isError"] as? Bool, true)
+                await manager.setEnabled(true)
+                let afterEnable = await manager.debugRunCatalogProjection(for: admitted.runID)
+                XCTAssertTrue(try XCTUnwrap(afterEnable).isReady)
+            }
+        }
+
+        func testAntigravityCompactEventsAccountOnlyTheTargetOrTheRefusedWrapper() async throws {
+            try await withReadyCompactSocket { manager, admitted, _ in
+                let vm = admitted.context.window.agentModeViewModel
+                let session = vm.session(for: admitted.context.tabID)
+                _ = session.beginRunAttempt(source: "compact-event-fixture")
+                let attemptID = try XCTUnwrap(session.activeRunAttemptID)
+                let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
+                let runner = ACPIntegratedAgentModeRunner(
+                    hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier(),
+                    toolTrackingHooks: vm.runtimeSessionStore.stream.makeToolTrackingHooks()
+                )
+                let observer = await manager.registerToolEventObserver(for: admitted.runID, observer: .init(onCalled: { id, tool, args in
+                    await MainActor.run {
+                        runner.testHandleTrackerToolCall(invocationID: id, toolName: tool, args: args, session: session)
+                    }
+                }, onCompleted: { id, tool, args, output, isError in
+                    await MainActor.run {
+                        runner.testHandleTrackerToolResult(invocationID: id, toolName: tool, args: args, resultJSON: output, isError: isError, session: session)
+                    }
+                }))
+                func deliver(_ payload: [String: Any]) async {
+                    for update in ACPDefaultSessionUpdateNormalizer.normalize(payload, providerID: .antigravity) {
+                        if case let .stream(result) = update {
+                            await vm.test_handleStreamResult(result, session: session, runID: admitted.runID, runAttemptID: attemptID)
+                        }
+                    }
+                }
+                defer { session.activeNonCodexTurnTokenAccumulator = nil }
+                let scenarios: [(target: String, args: [String: Any], row: String, error: Bool)] = [
+                    ("prompt", ["op": "get"], "prompt", false),
+                    ("read_file", ["path": "missing-\(UUID()).txt"], "read_file", true),
+                    (MCPWindowToolName.agentManage, [:], "call_tool", true)
+                ]
+                for (index, scenario) in scenarios.enumerated() {
+                    let args: [String: Any] = ["name": scenario.target, "arguments": scenario.args]
+                    let providerID = "call_compact_fixture_\(index)"
+                    session.activeNonCodexTurnTokenAccumulator = .init()
+                    let before = session.items.count
+                    await deliver([
+                        "sessionUpdate": "tool_call", "toolCallId": providerID,
+                        "title": "Run mcp_RepoPromptCE_call_tool", "kind": "other", "status": "in_progress", "rawInput": args
+                    ])
+                    XCTAssertEqual(session.activeNonCodexTurnTokenAccumulator?.estimatedToolInputTokens, 0)
+                    let response = try await admitted.endpoint.callTool(name: "call_tool", arguments: args)
+                    let result = try XCTUnwrap(Self.responseObject(from: response)["result"] as? [String: Any])
+                    XCTAssertEqual(result["isError"] as? Bool ?? false, scenario.error)
+                    let input = try XCTUnwrap(session.activeNonCodexTurnTokenAccumulator?.estimatedToolInputTokens)
+                    let output = try XCTUnwrap(session.activeNonCodexTurnTokenAccumulator?.estimatedToolOutputTokens)
+                    XCTAssertGreaterThan(input, 0)
+                    XCTAssertGreaterThan(output, 0)
+                    // Antigravity's terminal update can omit the wrapper title.
+                    await deliver([
+                        "sessionUpdate": "tool_call_update", "toolCallId": providerID,
+                        "status": scenario.error ? "failed" : "completed", "rawOutput": result["content"] ?? []
+                    ])
+                    let rows = session.items.dropFirst(before).filter { $0.toolName != nil }
+                    XCTAssertEqual(rows.compactMap(\.toolName), [scenario.row])
+                    XCTAssertEqual(rows.first?.toolIsError, scenario.error)
+                    XCTAssertEqual(session.activeNonCodexTurnTokenAccumulator?.estimatedToolInputTokens, input)
+                    XCTAssertEqual(session.activeNonCodexTurnTokenAccumulator?.estimatedToolOutputTokens, output)
+                }
+                await manager.unregisterToolEventObserver(for: admitted.runID, token: observer)
             }
         }
 

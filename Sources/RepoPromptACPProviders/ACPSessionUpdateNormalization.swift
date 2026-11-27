@@ -191,9 +191,9 @@ package enum ACPDefaultSessionUpdateNormalizer {
             guard let text = ACPRuntimeEventParsing.extractContentText(from: payload["content"]), !text.isEmpty else { return [] }
             return [.stream(RepoPromptDomainRuntime.AIStreamResult(type: "reasoning", text: nil, reasoning: text))]
         case "tool_call":
-            return normalizeToolCall(payload, toolNames: toolNames)
+            return normalizeToolCall(payload, toolNames: toolNames, compactWrapper: isAntigravityCompactDispatch(payload, providerID: providerID))
         case "tool_call_update":
-            return normalizeToolCallUpdate(payload, toolNames: toolNames)
+            return normalizeToolCallUpdate(payload, toolNames: toolNames, compactWrapper: isAntigravityCompactDispatch(payload, providerID: providerID))
         case "usage_update":
             return normalizeUsageUpdate(payload)
         case "session_info_update":
@@ -215,9 +215,18 @@ package enum ACPDefaultSessionUpdateNormalizer {
         }
     }
 
-    private static func normalizeToolCall(_ payload: [String: Any], toolNames: ACPToolNameResolution) -> [NormalizedAgentRuntimeEvent] {
+    private static func isAntigravityCompactDispatch(_ payload: [String: Any], providerID: ACPProviderID) -> Bool {
+        guard providerID == .antigravity else { return false }
+        let name = "mcp_\(RepoPromptMCPServerConfiguration.defaultServerName)_call_tool"
+        let title = payload["title"] as? String
+        return title == "Run \(name)" || title == name || payload["toolName"] as? String == name
+    }
+
+    private static func normalizeToolCall(
+        _ payload: [String: Any], toolNames: ACPToolNameResolution, compactWrapper: Bool
+    ) -> [NormalizedAgentRuntimeEvent] {
         let toolCallID = ACPRuntimeEventParsing.firstString(in: payload, keys: ["toolCallId"]) ?? UUID().uuidString
-        let toolName = ACPRuntimeEventParsing.normalizedToolName(from: payload, toolNames: toolNames)
+        let toolName = compactWrapper ? "call_tool" : ACPRuntimeEventParsing.normalizedToolName(from: payload, toolNames: toolNames)
         let argsJSON = ACPRuntimeEventParsing.serializeJSON(payload["rawInput"])
         return [
             .stream(
@@ -233,9 +242,11 @@ package enum ACPDefaultSessionUpdateNormalizer {
         ]
     }
 
-    private static func normalizeToolCallUpdate(_ payload: [String: Any], toolNames: ACPToolNameResolution) -> [NormalizedAgentRuntimeEvent] {
+    private static func normalizeToolCallUpdate(
+        _ payload: [String: Any], toolNames: ACPToolNameResolution, compactWrapper: Bool
+    ) -> [NormalizedAgentRuntimeEvent] {
         let toolCallID = ACPRuntimeEventParsing.firstString(in: payload, keys: ["toolCallId"]) ?? UUID().uuidString
-        let toolName = ACPRuntimeEventParsing.normalizedToolName(from: payload, toolNames: toolNames)
+        let toolName = compactWrapper ? "call_tool" : ACPRuntimeEventParsing.normalizedToolName(from: payload, toolNames: toolNames)
         let invocationID = ACPRuntimeEventParsing.stableInvocationUUID(rawValue: toolCallID)
         let status = ACPRuntimeEventParsing.firstString(in: payload, keys: ["status"])?.lowercased()
         let argsJSON = ACPRuntimeEventParsing.serializeJSON(payload["rawInput"])

@@ -3290,9 +3290,11 @@ actor ServerNetworkManager: MCPServerConnectionHost {
     private func refreshCompactLinkReadiness(connectionID: UUID) async {
         guard let runID = runIDByConnectionID[connectionID],
               let observation = runCatalogObservationByRunID[runID],
-              let route = observation.routeToken, route.connectionID == connectionID,
+              let offeredRoute = observation.routeToken, offeredRoute.connectionID == connectionID,
               let wrapperSurface = try? AgentSessionLinkCatalogSurface.fingerprint(MCPCompactToolCatalog.wrappers),
-              observation.returnedSurface == wrapperSurface else { return }
+              observation.returnedSurface == wrapperSurface,
+              let route = await authoritativeRunCatalogRouteToken(for: runID),
+              route.hasSameClientIncarnation(as: offeredRoute) else { return }
         let advertisement = await compactAdvertisement(route: route)
         let catalog = advertisement?.catalog
         let grants = advertisement?.grants
@@ -3317,7 +3319,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         let hasReachableLink = matches && reachable
         let anyLink = matches ? grants?.hasAnyActiveLink : nil
         let outbound = matches ? grants?.hasActiveOutboundLink : nil
-        guard observation.hasCompactAgentSessionLink != hasReachableLink
+        guard offeredRoute != route || observation.hasCompactAgentSessionLink != hasReachableLink
             || observation.hasAnyActiveLink != anyLink || observation.hasActiveOutboundLink != outbound
             || observation.compactLinkExpiresAt != linkExpiry else { return }
         _ = await publishRunCatalogObservation(
@@ -3329,6 +3331,41 @@ actor ServerNetworkManager: MCPServerConnectionHost {
             expectedSurface: observation.expectedSurface, returnedSurface: observation.returnedSurface,
             returnedCatalog: observation.returnedCatalog, offerInputs: observation.offerInputs,
             offerExpiresAt: observation.offerExpiresAt, supersedesWaiters: false
+        )
+    }
+
+    private final class CompactDispatchObservation: @unchecked Sendable {
+        let runID: UUID
+        private let lock = NSLock()
+        private var targetStarted = false
+
+        init(runID: UUID) {
+            self.runID = runID
+        }
+
+        func noteTargetStart() {
+            lock.withLock { targetStarted = true }
+        }
+
+        var hasStartedTarget: Bool {
+            lock.withLock { targetStarted }
+        }
+    }
+
+    private func recordCompactDispatchRefusal(
+        connectionID: UUID, runID: UUID, args: [String: Value]?, result: CallTool.Result
+    ) async {
+        guard runIDByConnectionID[connectionID] == runID, wantsCompactToolCatalog(connectionID),
+              !connectionsBeingRemoved.contains(connectionID),
+              let data = try? JSONEncoder().encode(result.content) else { return }
+        let name = MCPCompactToolEnvelope.call
+        let id = UUID()
+        let arguments = args?.filter { $0.key != MCPExportResponseDeliveryDeadlineRegistry.requestIdentityArgumentKey }
+        await fireToolCalledObservers(runID: runID, invocationID: id, toolName: name, args: arguments)
+        guard runIDByConnectionID[connectionID] == runID else { return }
+        await fireToolCompletedObservers(
+            runID: runID, invocationID: id, toolName: name, args: arguments,
+            resultJSON: String(decoding: data, as: UTF8.self), isError: true
         )
     }
 
@@ -9777,6 +9814,11 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                 )
             }
         #endif
+        if let runID, let connectionID = runCatalogObservationByRunID[runID]?.routeToken?.connectionID,
+           wantsCompactToolCatalog(connectionID)
+        {
+            await refreshCompactLinkReadiness(connectionID: connectionID)
+        }
         return policy.cleanupReceipt
     }
 
@@ -13968,7 +14010,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         // ------------------------------------------------------------------
         //  tools/call  (UPDATED)
         // ------------------------------------------------------------------
-        await server.withMethodHandler(CallTool.self) { [weak self] params in
+        let dispatchToolCall: @Sendable (CallTool.Parameters, CompactDispatchObservation?) async -> CallTool.Result = { [weak self] params, compactObservation in
             guard let self else {
                 return CallTool.Result(
                     content: [MCP.Tool.Content.text(text: "Server unavailable", annotations: nil, _meta: nil)],
@@ -15088,6 +15130,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                                     codexCallID: candidateCodexCallID,
                                     codexThreadID: candidateCodexThreadID
                                 )
+                                compactObservation?.noteTargetStart()
                                 if let runID = observerRunIDForCallbacksFinal {
                                     let observerState = EditFlowPerf.begin(
                                         EditFlowPerf.Stage.MCPToolCall.observerCallbacks,
@@ -15662,6 +15705,23 @@ actor ServerNetworkManager: MCPServerConnectionHost {
             } // LimiterEnvelope wrapper
             return await finalizeToolResult(result)
         }
+        await server.withMethodHandler(CallTool.self) { [weak self] params in
+            let observation: CompactDispatchObservation? = if let self, params.name == MCPCompactToolEnvelope.call,
+                                                              await wantsCompactToolCatalog(connectionID),
+                                                              let runID = await runIDByConnectionID[connectionID]
+            {
+                CompactDispatchObservation(runID: runID)
+            } else {
+                nil
+            }
+            let result = await dispatchToolCall(params, observation)
+            if let observation, !observation.hasStartedTarget, result.isError == true {
+                await self?.recordCompactDispatchRefusal(
+                    connectionID: connectionID, runID: observation.runID, args: params.arguments, result: result
+                )
+            }
+            return result
+        }
     }
 
     /// Update the enabled state and notify clients
@@ -15672,6 +15732,12 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         Self.catalogAdvertisementDidChange()
         isEnabledState = enabled
         log.notice("RepoPrompt MCP enabled state changed to: \(enabled)")
+
+        // Compact readiness must change even for clients that do not relist.
+        let compactConnections = connections.keys.filter { wantsCompactToolCatalog($0) }
+        for connectionID in compactConnections {
+            await refreshCompactLinkReadiness(connectionID: connectionID)
+        }
 
         // Notify all connected clients that the tool list has changed
         for (_, connectionManager) in connections {
