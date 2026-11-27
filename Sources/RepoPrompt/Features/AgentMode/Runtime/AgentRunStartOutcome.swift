@@ -226,6 +226,9 @@ final class AgentRunStartOutcomeRecorder {
         didSet { hasRecordedOutcome = true }
     }
 
+    /// Kept with the originating launch, not inferred from a terminal error or transcript row.
+    var recoverUnwrittenProviderSwitch: (@MainActor (AgentSessionLinkPromptDispatchID) async -> Void)?
+
     init() {}
 
     func recordAccepted() {

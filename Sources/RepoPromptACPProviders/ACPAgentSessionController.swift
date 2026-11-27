@@ -814,10 +814,13 @@ package actor ACPAgentSessionController {
         advertisedCommandsState.withLock { $0 }
     }
 
+    package struct PromptTextBudgetExceeded: Error {}
+
     package func prompt(
         _ message: AgentMessage,
         request overrideRunRequest: ACPRunRequest? = nil,
-        writeReceipt: PromptWriteReceipt? = nil
+        writeReceipt: PromptWriteReceipt? = nil,
+        maximumTextBytes: Int? = nil
     ) async throws {
         guard state == .sessionOpen || state == .promptRunning, let sessionID else {
             throw ControllerError.invalidState(expected: "sessionOpen or promptRunning", actual: state)
@@ -825,7 +828,10 @@ package actor ACPAgentSessionController {
         if state == .promptRunning, activePromptTurnID != nil {
             throw ControllerError.invalidState(expected: "no active prompt turn", actual: state)
         }
-        try await submitPromptTurn(.message(message), sessionID: sessionID, overrideRunRequest: overrideRunRequest, writeReceipt: writeReceipt)
+        try await submitPromptTurn(
+            .message(message), sessionID: sessionID, overrideRunRequest: overrideRunRequest,
+            writeReceipt: writeReceipt, maximumTextBytes: maximumTextBytes
+        )
     }
 
     /// Sends exactly `/<name>` to the idle session that still advertises it. The run's current
@@ -866,6 +872,12 @@ package actor ACPAgentSessionController {
         )
     }
 
+    package nonisolated static func promptTextExceedsBudget(_ blocks: [[String: Any]], maximumBytes: Int) -> Bool {
+        let text = blocks.compactMap { $0["text"] as? String }
+        // Include the separator between any additional text blocks (for example image titles).
+        return text.reduce(max(0, text.count - 1) * "\n\n".utf8.count) { $0 + $1.utf8.count } > maximumBytes
+    }
+
     private enum PromptPayload {
         case message(AgentMessage)
         case providerCommand(String)
@@ -875,7 +887,8 @@ package actor ACPAgentSessionController {
         _ payload: PromptPayload,
         sessionID: String,
         overrideRunRequest: ACPRunRequest?,
-        writeReceipt: PromptWriteReceipt? = nil
+        writeReceipt: PromptWriteReceipt? = nil,
+        maximumTextBytes: Int? = nil
     ) async throws {
         suppressSessionLoadReplayUpdates = false
         recentDevinToolCalls.removeAll()
@@ -904,6 +917,9 @@ package actor ACPAgentSessionController {
                 try provider.buildPromptBlocks(for: message, request: promptRequest)
             case let .providerCommand(text):
                 try ACPPromptContentBuilder.blocks(text: text, attachments: [])
+            }
+            if let maximumTextBytes, Self.promptTextExceedsBudget(promptBlocks, maximumBytes: maximumTextBytes) {
+                throw PromptTextBudgetExceeded()
             }
             #if DEBUG
                 if isRawACPCaptureEnabled {
@@ -961,7 +977,7 @@ package actor ACPAgentSessionController {
             #endif
             settlePromptTurn(promptTurnID, result: .failure(error))
             // Local admission refused before construction or transport; the connection is intact.
-            if refusedUnsupportedImages {
+            if refusedUnsupportedImages || error is PromptTextBudgetExceeded {
                 if state == .promptRunning { state = .sessionOpen }
                 throw error
             }

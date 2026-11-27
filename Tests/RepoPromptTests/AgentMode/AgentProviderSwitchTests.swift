@@ -1,6 +1,7 @@
 #if DEBUG
     import Darwin
     import Foundation
+    import RepoPromptACPProviders
     @testable import RepoPromptApp
     import RepoPromptDomainRuntime
     import XCTest
@@ -658,6 +659,42 @@
             XCTAssertEqual(recent.turnIndices, [1])
             XCTAssertTrue(budget.fits(recent))
             XCTAssertLessThanOrEqual((Handover.render(recent) + "\n\n" + input).unicodeScalars.count, Handover.codexMaximumInputScalars)
+        }
+
+        func testAntigravityHandoverKeepsCompleteUserInputBelowProviderByteLimit() throws {
+            let request = "Continue with the complete input: " + String(repeating: "🧪", count: 12000)
+            let system = "Provider instructions"
+            let instructions = [system, ""]
+            let transcript = AgentTranscript(turns: [
+                fixture(request: String(repeating: "a", count: 120_000)),
+                fixture(request: String(repeating: "b", count: 40000))
+            ])
+            let projection = try Handover.project(transcript)
+            let full = Handover.history(projection, source: source(), historyReference: nil)
+            let fullInput = system + "\n\n" + Handover.render(full) + "\n\n" + request
+            XCTAssertFalse(String(decoding: fullInput.utf8.prefix(192_000), as: UTF8.self).hasSuffix(request))
+            let uncapped = Handover.Budget(catalogWindow: 1_000_000, instructions: instructions, composedInput: request, isPreview: false)
+            XCTAssertTrue(uncapped.fits(full))
+            for isPreview in [true, false] {
+                let budget = Handover.Budget(
+                    catalogWindow: 1_000_000, instructions: instructions, composedInput: "\n\n" + request, isPreview: isPreview,
+                    antigravityCarrierBytes: Handover.antigravityCarrierAllowance(composedInput: request, instructions: instructions)
+                )
+                XCTAssertFalse(budget.fits(full))
+                let recent = try XCTUnwrap(Handover.newestCompleteTurns(projection, source: source(), historyReference: nil, budget: budget))
+                XCTAssertEqual(recent.turnIndices, [1])
+                let input = system + "\n\n" + Handover.render(recent) + "\n\n" + request
+                XCTAssertLessThanOrEqual(input.utf8.count, 192_000)
+                XCTAssertTrue(String(decoding: input.utf8.prefix(192_000), as: UTF8.self).hasSuffix(request))
+            }
+        }
+
+        func testAntigravityFinalPromptBudgetCountsUTF8AndExtraTextBlocks() {
+            let body = String(repeating: "🧪", count: 47999)
+            let blocks = [["type": "text", "text": body], ["type": "text", "text": "ok"]]
+            XCTAssertFalse(ACPAgentSessionController.promptTextExceedsBudget(blocks, maximumBytes: 192_000))
+            let oversized = [["type": "text", "text": body], ["type": "text", "text": "yes"]]
+            XCTAssertTrue(ACPAgentSessionController.promptTextExceedsBudget(oversized, maximumBytes: 192_000))
         }
 
         func testCodexScalarBoundaryCountsUnicodeScalarsNotBytesOrGraphemes() {

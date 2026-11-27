@@ -35,6 +35,9 @@ extension AgentSessionLinkExecutionRuntime {
             recordAgentSessionLinkPhysicalDispatchNotAttempted: { [self] session, dispatch in agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: dispatch) },
             recordAgentSessionLinkPhysicalDispatchFailure: { [self] session, dispatch in agentSessionLinkRecordPhysicalDispatchFailure(for: session, dispatchID: dispatch) },
             acceptAgentSessionLinkPrompt: { [self] session, context, claim in acceptAgentSessionLinkDispatch(session: session, context: context, claim: claim) },
+            recoverUnwrittenProviderSwitch: { [self] session, dispatch in
+                await providerSwitchRecoverUnwrittenDispatch(session: session, dispatchID: dispatch)
+            },
             proveAgentSessionLinkProviderInput: { [self] session, claim in await agentSessionLinkProveProviderInput(for: session, claim: claim) },
             handoffAgentSessionLinkProviderInput: { [self] session, dispatch, claim, proof in agentSessionLinkHandoffProviderInput(for: session, dispatchID: dispatch, claim: claim, proof: proof) }
         )

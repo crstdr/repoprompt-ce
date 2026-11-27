@@ -1605,6 +1605,54 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             }
         }
 
+        func testAntigravityUnwrittenHandoverRearmsOnlyTheExactDispatch() async throws {
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                try installSwitch(fixture)
+                session.selectedAgent = .antigravity
+                session.selectedModelRaw = "gemini-4-neon-medium"
+                let carrier = session.pendingHandoff.payload
+                let oversized = await vm.linkExecutionRuntime.providerSwitchSendAdmission(
+                    session: session, input: String(repeating: "🧪", count: 48001)
+                )
+                guard case .failure(.providerHandoverDoesNotFit) = oversized else {
+                    return XCTFail("Oversized input must be refused before staging")
+                }
+                XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .ready)
+                let item = AgentChatItem.user("ordinary input", sequenceIndex: session.nextSequenceIndex)
+                let preparation = try await switchPreparation(fixture).accepting(item.id, session: session)
+                session.appendItem(item)
+                var deliverySaves: [AgentProviderSwitchDelivery?] = []
+                vm.test_setAgentSessionSaver { saved, _, _ in
+                    deliverySaves.append(saved.pendingHandoffProviderSwitchDelivery)
+                    return fixture.rootURL.appendingPathComponent("switch-unwritten.json")
+                }
+                let staged = await vm.linkExecutionRuntime.prepareProviderSwitchHandoverForSend(preparation, session: session, stopFence: .init(session: session))
+                XCTAssertNotNil(staged)
+                let runID = UUID()
+                session.installRunID(runID)
+                session.beginRunAttempt(source: "test.switch.unwritten")
+                let dispatch = AgentSessionLinkPromptDispatchID.headlessRun(runID: runID)
+                XCTAssertTrue(vm.linkExecutionRuntime.providerSwitchAcquirePhysicalDispatch(session: session, dispatchID: dispatch))
+                await vm.linkExecutionRuntime.providerSwitchRecoverUnwrittenDispatch(session: session, dispatchID: dispatch, inputID: UUID()) {
+                    XCTFail("A different submission must not own recovery")
+                }
+                XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .sending)
+                var recovered = 0
+                for _ in 0 ..< 2 {
+                    await vm.linkExecutionRuntime.providerSwitchRecoverUnwrittenDispatch(session: session, dispatchID: dispatch, inputID: item.id) {
+                        recovered += 1
+                    }
+                }
+                XCTAssertEqual(recovered, 1)
+                XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .ready)
+                XCTAssertEqual(session.pendingHandoff.payload, carrier)
+                XCTAssertNil(session.pendingHandoff.providerSwitchDispatch)
+                XCTAssertEqual(deliverySaves, [.sending, .ready])
+            }
+        }
+
         func testSwitchExactStagedPhysicalSendClearsOnceAndClearSaveFailureRestoresUncertainty() async throws {
             enum Fault: Error { case clear }
             for clearFails in [false, true] {

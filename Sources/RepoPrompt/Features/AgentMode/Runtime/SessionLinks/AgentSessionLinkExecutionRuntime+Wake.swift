@@ -910,6 +910,19 @@ extension AgentSessionLinkExecutionRuntime {
         agentSessionLinkDrainAutoWakeReevaluationIfOwed(session: session)
     }
 
+    /// An exact acquired provider-switch dispatch was refused before its transport write.
+    /// Keep the wake identity until run settlement; no ambiguous suppression is warranted.
+    func agentSessionLinkMarkAcquiredWakeUnwritten(session: TabSession, effectiveID: AgentSessionLinkPromptDispatchID) {
+        guard let wakeID = effectiveID.autoWakeID,
+              var attempt = session.oversight.pendingAutoWake, attempt.wakeID == wakeID,
+              attempt.phase == .dispatching, attempt.physicalOutcome == .ambiguous,
+              !attempt.isPeriodic || attempt.periodicProducerDispatchID == effectiveID
+        else { return }
+        attempt.physicalOutcome = .notAttempted
+        session.oversight.pendingAutoWake = attempt
+        session.noteMonitorObservationInputsChanged()
+    }
+
     func agentSessionLinkRecordPhysicalDispatchFailure(
         for session: TabSession,
         dispatchID: AgentSessionLinkPromptDispatchID

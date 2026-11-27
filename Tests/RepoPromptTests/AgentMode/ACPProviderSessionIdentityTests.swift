@@ -332,6 +332,33 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
         }
     }
 
+    func testExplicitTextBudgetRefusesBeforeWritingAndLeavesControllerReusable() async throws {
+        let workspace = try makeTemporaryDirectory()
+        let record = workspace.appendingPathComponent("requests.jsonl")
+        let provider = try FakeACPProvider(
+            providerID: .cursor,
+            commandPath: makeFakeACPServerScript().path,
+            environment: ["ACP_RECORD_PATH": record.path, "ACP_PROMPT_CAPABILITIES": "{}"],
+            builds: BuildObserver()
+        )
+        let controller = try ACPAgentSessionController(
+            provider: provider,
+            runRequest: makeRunRequest(agentKind: .cursor, workspacePath: workspace.path),
+            requestTimeouts: .init(bootstrapSeconds: 5, operationalSeconds: 5),
+            allowsProviderProcessLaunchForTesting: true
+        )
+        _ = try await controller.bootstrap()
+        do {
+            try await controller.prompt(AgentMessage(userMessage: "🧪!"), maximumTextBytes: 4)
+            XCTFail("An over-budget prompt must be refused before transport")
+        } catch is ACPAgentSessionController.PromptTextBudgetExceeded {
+            XCTAssertTrue(recordedPrompts(at: record).isEmpty)
+        }
+        try await controller.prompt(AgentMessage(userMessage: "🧪"), maximumTextBytes: 4)
+        XCTAssertEqual(recordedPrompts(at: record).count, 1)
+        await controller.shutdown()
+    }
+
     func testNonImageAttachmentsDoNotNeedImageInputAndReachThePromptAsText() async throws {
         let workspace = try makeTemporaryDirectory()
         let record = workspace.appendingPathComponent("requests.jsonl")

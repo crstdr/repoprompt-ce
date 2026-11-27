@@ -111,7 +111,9 @@ extension AgentSessionLinkExecutionRuntime {
             catalogWindow: catalogWindow,
             instructions: budgetInstructions, composedInput: "\n\n" + initial, isPreview: false,
             codexCarrierScalars: agent == .codexExec
-                ? AgentProviderHandover.codexCarrierAllowance(composedInput: initial, parkedNote: session.selfCompactState.parkedNote?.frame) : nil
+                ? AgentProviderHandover.codexCarrierAllowance(composedInput: initial, parkedNote: session.selfCompactState.parkedNote?.frame) : nil,
+            antigravityCarrierBytes: agent == .antigravity
+                ? AgentProviderHandover.antigravityCarrierAllowance(composedInput: initial, instructions: budgetInstructions) : nil
         )
         guard let mode = AgentProviderHandover.Mode(rawValue: descriptor.mode), budget.fits(payload: payload, mode: mode)
         else { return .failure(.providerHandoverDoesNotFit) }
@@ -251,6 +253,37 @@ extension AgentSessionLinkExecutionRuntime {
               let proof = sending.providerSwitchDispatch, proof.binding == session.currentRestorationBindingToken,
               proof.runOwnership == nil, proof.runID == nil, proof.dispatchID == nil,
               !session.runState.isActive, session.activeRunOwnership == nil else { return }
+        await providerSwitchPersistReady(writer: writer, sending: sending)
+    }
+
+    /// Only called with the controller's typed refusal before writing the ACP request.
+    func providerSwitchRecoverUnwrittenDispatch(
+        session: TabSession, dispatchID: AgentSessionLinkPromptDispatchID, inputID: UUID? = nil,
+        restoreComposer: () -> Void = {}
+    ) async {
+        let sending = session.pendingHandoff
+        guard session.selectedAgent == .antigravity,
+              sending.providerSwitchDelivery == .sending, sending.providerSwitchAcceptedID == nil,
+              sending.isStagedForSend, let proof = sending.providerSwitchDispatch,
+              let effectiveID = proof.dispatchID,
+              effectiveID == agentSessionLinkEffectiveDispatchID(for: session, dispatchID: dispatchID),
+              inputID == nil || proof.acceptedInputID == inputID,
+              proof.binding == session.currentRestorationBindingToken,
+              proof.stopFence.permitsStart(of: session),
+              let ownership = proof.runOwnership, let runID = proof.runID,
+              session.isCurrentRunAttempt(ownership, expectedRunID: runID),
+              let writer = providerSwitchWriter(for: session, proof: proof)
+        else { return }
+        agentSessionLinkMarkAcquiredWakeUnwritten(session: session, effectiveID: effectiveID)
+        // If composer state has changed, its rollback leaves the original row and new draft
+        // alone. The retained input makes the ready carrier stale and requires review.
+        restoreComposer()
+        guard writer.isCurrent, proof.stopFence.permitsStart(of: session), session.pendingHandoff == sending else { return }
+        await providerSwitchPersistReady(writer: writer, sending: sending)
+    }
+
+    private func providerSwitchPersistReady(writer: AgentSessionRuntimeStore.Writer, sending: PendingHandoffState) async {
+        let session = writer.session
         let binding = session.currentRestorationBindingToken
         session.pendingHandoff.providerSwitchDelivery = .ready
         session.pendingHandoff.isStagedForSend = false
