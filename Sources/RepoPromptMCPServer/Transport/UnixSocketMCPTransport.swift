@@ -290,6 +290,7 @@ package final class MCPExportResponseDeliveryDeadlineRegistry: @unchecked Sendab
         let hadNewline = frame.last == UInt8(ascii: "\n")
         guard let json = try? JSONSerialization.jsonObject(with: frame) else { return frame }
         var recordedTokens: [Token] = []
+        var changed = false
 
         func annotate(_ value: Any) -> Any {
             if var object = value as? [String: Any] {
@@ -299,9 +300,11 @@ package final class MCPExportResponseDeliveryDeadlineRegistry: @unchecked Sendab
                       var params = object["params"] as? [String: Any],
                       let requestedToolName = params["name"] as? String
                 else { return object }
-                let canonicalToolName = MCPToolNameCanonicalizer.canonicalToolName(for: requestedToolName)
-                guard canonicalToolName == "prompt" || canonicalToolName == "workspace_context" else {
-                    return object
+                let forwarded = requestedToolName == MCPCompactToolEnvelope.call
+                var targetName = requestedToolName
+                if !forwarded {
+                    let directName = MCPToolNameCanonicalizer.canonicalToolName(for: targetName)
+                    guard directName == "prompt" || directName == "workspace_context" else { return object }
                 }
                 var arguments: [String: Any] = [:]
                 if let presentArguments = params["arguments"] {
@@ -311,6 +314,20 @@ package final class MCPExportResponseDeliveryDeadlineRegistry: @unchecked Sendab
                     guard let objectArguments = presentArguments as? [String: Any] else { return object }
                     arguments = objectArguments
                 }
+                if forwarded {
+                    let hadUntrustedIdentity = arguments.removeValue(forKey: Self.requestIdentityArgumentKey) != nil
+                    if hadUntrustedIdentity {
+                        params["arguments"] = arguments
+                        object["params"] = params
+                        changed = true
+                    }
+                    guard let nested = MCPCompactToolEnvelope.forwardedTarget(arguments, string: { $0 as? String }, object: { $0 as? [String: Any] }) else {
+                        return object
+                    }
+                    targetName = nested.name
+                    let canonical = MCPToolNameCanonicalizer.canonicalToolName(for: targetName)
+                    guard canonical == "prompt" || canonical == "workspace_context" else { return object }
+                }
                 arguments[Self.requestIdentityArgumentKey] = [
                     "connection_id": connectionID,
                     "connection_generation": String(connectionGeneration),
@@ -318,6 +335,7 @@ package final class MCPExportResponseDeliveryDeadlineRegistry: @unchecked Sendab
                 ]
                 params["arguments"] = arguments
                 object["params"] = params
+                changed = true
                 recordedTokens.append(Token(
                     connectionID: connectionID,
                     connectionGeneration: connectionGeneration,
@@ -332,7 +350,7 @@ package final class MCPExportResponseDeliveryDeadlineRegistry: @unchecked Sendab
         }
 
         let annotated = annotate(json)
-        guard !recordedTokens.isEmpty,
+        guard changed,
               var encoded = try? JSONSerialization.data(withJSONObject: annotated, options: [.sortedKeys])
         else { return frame }
         if hadNewline { encoded.append(UInt8(ascii: "\n")) }
@@ -423,11 +441,9 @@ package final class MCPExportResponseDeliveryDeadlineRegistry: @unchecked Sendab
         ).compactMap(\.id)
         lock.withLock {
             for requestID in responseIDs {
-                deadlines.removeValue(forKey: Token(
-                    connectionID: connectionID,
-                    connectionGeneration: connectionGeneration,
-                    requestID: requestID
-                ))
+                let token = Token(connectionID: connectionID, connectionGeneration: connectionGeneration, requestID: requestID)
+                pendingRequests.remove(token)
+                deadlines.removeValue(forKey: token)
             }
         }
     }

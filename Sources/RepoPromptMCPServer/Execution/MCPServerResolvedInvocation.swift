@@ -16,6 +16,7 @@ package struct MCPServerResolvedInvocation: Sendable {
     private let securityContext: DomainToolInvocationSecurityContext
     private let admittedContext: MCPDomainAdmittedContext?
     private let admissionDeadline: MCPDomainAdmissionDeadline?
+    private let validateProviderAdmission: (@Sendable () async throws -> Void)?
 
     package init(
         host: @escaping @Sendable () async -> MCPDomainHost,
@@ -25,7 +26,8 @@ package struct MCPServerResolvedInvocation: Sendable {
         arguments: [String: Value],
         securityContext: DomainToolInvocationSecurityContext,
         admittedContext: MCPDomainAdmittedContext?,
-        admissionDeadline: MCPDomainAdmissionDeadline?
+        admissionDeadline: MCPDomainAdmissionDeadline?,
+        validateProviderAdmission: (@Sendable () async throws -> Void)? = nil
     ) {
         self.host = host
         self.invocationID = invocationID
@@ -35,6 +37,7 @@ package struct MCPServerResolvedInvocation: Sendable {
         self.securityContext = securityContext
         self.admittedContext = admittedContext
         self.admissionDeadline = admissionDeadline
+        self.validateProviderAdmission = validateProviderAdmission
     }
 
     package func invoke(
@@ -47,6 +50,10 @@ package struct MCPServerResolvedInvocation: Sendable {
             try await MCPInvocationContextBridge.withInvocation(context) {
                 #if DEBUG
                     if let operation = await testOperation() {
+                        if let validateProviderAdmission {
+                            try await validateProviderAdmission()
+                            try Task.checkCancellation()
+                        }
                         try providerEntry?.providerWillEnter()
                         MCPLifecycleDiagnostics.shared.record(.providerEntered, connectionID: connectionID, invocationID: invocationID)
                         defer {
@@ -63,6 +70,7 @@ package struct MCPServerResolvedInvocation: Sendable {
                     securityContext: securityContext,
                     admittedContext: admittedContext,
                     admissionDeadline: admissionDeadline,
+                    validateProviderAdmission: validateProviderAdmission,
                     onProviderEntry: {
                         try providerEntry?.providerWillEnter()
                         MCPLifecycleDiagnostics.shared.record(.providerEntered, connectionID: connectionID, invocationID: invocationID)

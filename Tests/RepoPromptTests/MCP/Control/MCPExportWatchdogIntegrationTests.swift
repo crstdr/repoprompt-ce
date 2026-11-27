@@ -1449,7 +1449,7 @@ import XCTest
         }
 
         private static func prepareQueuedSessionAdminAgent(
-            _ fixture: PersistentMCPTestFixture, context: PersistentMCPTestContext
+            _ fixture: PersistentMCPTestFixture, context: PersistentMCPTestContext, antigravity: Bool = false
         ) async throws -> QueuedSessionAdminAgent {
             try await fixture.registerDomainWorkspace(context)
             let window = context.window
@@ -1460,7 +1460,7 @@ import XCTest
             // finish its real index refresh after socket setup; it must find the same durable row.
             let fileURL = try await AgentSessionDataService.shared.saveAgentSession(AgentSession(
                 id: sessionID, workspaceID: configuredWorkspace.id, composeTabID: context.tabID,
-                name: configuredTab.name, agentKind: AgentProviderKind.claudeCode.rawValue, autoEditEnabled: false
+                name: configuredTab.name, agentKind: (antigravity ? AgentProviderKind.antigravity : .claudeCode).rawValue, autoEditEnabled: false
             ), for: configuredWorkspace)
             try await activateWorkspace(for: context)
             let vm = window.agentModeViewModel
@@ -1476,7 +1476,7 @@ import XCTest
             XCTAssertEqual(boundWorkspace.composeTabs.first { $0.id == context.tabID }?.activeAgentSessionID, sessionID)
             window.promptManager.loadComposeTabsFromWorkspace(boundWorkspace, syncPromptText: true)
             let name = tab.name
-            session.selectedAgent = .claudeCode
+            session.selectedAgent = antigravity ? .antigravity : .claudeCode
             session.hasLoadedPersistedState = true
             session.oversight.autoWakeOnUpdates = false
             // This fixture starts at an explicitly restored session; it does not model
@@ -1487,16 +1487,20 @@ import XCTest
             let runID = UUID()
             session.installRunID(runID)
             WindowStatesManager.shared.attachAgentSessionLinkBridge()
-            let clientName = "queued-policy-\(UUID())"
+            let clientName = antigravity ? "antigravity-client" : "queued-policy-\(UUID())"
             await fixture.networkManager.installClientConnectionPolicy(
-                for: clientName, windowID: window.windowID, restrictedTools: [],
+                for: clientName, windowID: window.windowID, restrictedTools: antigravity ? [MCPWindowToolName.agentManage] : [],
                 reason: "Queued session administration fixture", ttl: 60,
                 tabID: context.tabID, runID: runID, additionalTools: [], purpose: .agentModeRun,
-                allowsAgentExternalControlTools: true
+                allowsAgentExternalControlTools: true, requiresExpectedAgentPID: antigravity
             )
+            if antigravity {
+                await fixture.networkManager.registerExpectedAgentPID(getpid(), for: clientName, runID: runID)
+            }
             let endpoint = try await PersistentMCPTestEndpoint.make(
                 label: "queued-policy", networkManager: fixture.networkManager, clientName: clientName,
-                requiredToolNames: [MCPWindowToolName.sessionAdmin, MCPWindowToolName.readFile]
+                useProductionAgentAdmission: antigravity,
+                requiredToolNames: antigravity ? ["describe_tool", "call_tool"] : [MCPWindowToolName.sessionAdmin, MCPWindowToolName.readFile]
             )
             XCTAssertEqual(window.mcpServer.runRouteBindings.connectionIDByRunID[runID], endpoint.connectionID)
             let resolved = try AgentSessionLinkEndpointTestSupport.endpoint(vm, tabID: context.tabID)
@@ -1507,6 +1511,115 @@ import XCTest
             }
             XCTAssertTrue(placementReady, "Restored fixture placement must be published by the real workspace index")
             return QueuedSessionAdminAgent(context: context, endpoint: endpoint, runID: runID, sessionID: sessionID, originalName: name, fileURL: fileURL)
+        }
+
+        func testAntigravityCompactDispatchUsesTargetPolicyAndLiteralOfferEvidence() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease, domainRuntime: AppDomainRuntimeComposition.shared.runtime)
+                let manager = fixture.networkManager
+                var agent: QueuedSessionAdminAgent?
+                var failure: Error?
+                do {
+                    let admitted = try await Self.prepareQueuedSessionAdminAgent(fixture, context: fixture.contextA, antigravity: true)
+                    agent = admitted
+                    let socket = admitted.endpoint
+                    let route = await manager.authoritativeRunCatalogRouteToken(
+                        runID: admitted.runID, windowID: admitted.context.window.windowID, tabID: admitted.context.tabID
+                    )
+                    let endpoint = try XCTUnwrap(route?.observerEndpoint)
+                    await manager.debugSetActiveSessionLinkEndpointsForTesting([endpoint])
+                    let wire = try await socket.client.request(method: "tools/list", params: [:], timeoutSeconds: 5)
+                    let result = try XCTUnwrap(Self.responseObject(from: wire)["result"] as? [String: Any])
+                    let tools = try XCTUnwrap(result["tools"] as? [[String: Any]])
+                    let names = Set(tools.compactMap { $0["name"] as? String })
+                    XCTAssertTrue(names.isSubset(of: ["describe_tool", "call_tool", "self_compact", "self_noop", "set_status"]))
+                    XCTAssertTrue(names.isSuperset(of: ["describe_tool", "call_tool", "self_noop"]))
+                    let observation = await manager.debugRunCatalogProjection(for: admitted.runID)
+                    let projection = try XCTUnwrap(observation)
+                    XCTAssertTrue(projection.isReady)
+                    XCTAssertFalse(try XCTUnwrap(projection.hasAgentSessionLink))
+                    XCTAssertNil(projection.returnedCatalog?[MCPWindowToolName.agentSessionLink])
+
+                    let arguments: [String: Any] = ["op": "get", "_rawJSON": true]
+                    let direct = try await socket.callTool(name: "prompt", arguments: arguments)
+                    let wrapped = try await socket.callTool(name: "call_tool", arguments: ["name": "prompt", "arguments": arguments])
+                    let directResult = try XCTUnwrap(Self.responseObject(from: direct)["result"] as? NSDictionary)
+                    let wrappedResult = try XCTUnwrap(Self.responseObject(from: wrapped)["result"] as? NSDictionary)
+                    XCTAssertNotEqual(directResult["isError"] as? Bool, true)
+                    XCTAssertEqual(directResult, wrappedResult)
+                    for name in [MCPWindowToolName.agentManage, "describe_tool", "call_tool"] {
+                        let rejected = try await socket.callTool(name: "call_tool", arguments: ["name": name, "arguments": [:]])
+                        let denied = try XCTUnwrap(Self.responseObject(from: rejected)["result"] as? [String: Any])
+                        XCTAssertEqual(denied["isError"] as? Bool, true, name)
+                    }
+                    let deniedDescribe = try await socket.callTool(name: "describe_tool", arguments: ["name": MCPWindowToolName.agentManage])
+                    let denied = try XCTUnwrap(Self.responseObject(from: deniedDescribe)["result"] as? [String: Any])
+                    XCTAssertEqual(denied["isError"] as? Bool, true)
+                    let directDenied = try await socket.callTool(name: MCPWindowToolName.agentManage, arguments: [:])
+                    let directDenial = try XCTUnwrap(Self.responseObject(from: directDenied)["result"] as? [String: Any])
+                    XCTAssertEqual(directDenial["isError"] as? Bool, true)
+                    let wrongRoute = try await socket.callTool(name: "call_tool", arguments: [
+                        "name": "prompt", "arguments": ["op": "get", "context_id": UUID().uuidString]
+                    ])
+                    XCTAssertEqual(try (Self.responseObject(from: wrongRoute)["result"] as? [String: Any])?["isError"] as? Bool, true)
+                    await manager.debugSetActiveSessionLinkEndpointsForTesting([])
+                    await manager.notifyToolListChanged(connectionID: socket.connectionID)
+                    let withdrawn = await manager.debugRunCatalogProjection(for: admitted.runID)
+                    XCTAssertFalse(try XCTUnwrap(withdrawn).isReady)
+                    func pauseReadinessRefresh() async throws -> (Task<Void, Never>, MCPQueuedPolicyAdmissionGate) {
+                        let paused = expectation(description: "readiness refresh sampled before publication")
+                        let gate = MCPQueuedPolicyAdmissionGate()
+                        await manager.debugSetBeforeCompactReadinessPublicationForTesting {
+                            await gate.hold(onRegistered: { paused.fulfill() })
+                        }
+                        let refresh = Task { await manager.notifyToolListChanged(connectionID: socket.connectionID) }
+                        await fulfillment(of: [paused], timeout: 5)
+                        guard await gate.isHolding else {
+                            await manager.debugSetBeforeCompactReadinessPublicationForTesting(nil)
+                            await gate.release()
+                            await refresh.value
+                            throw MCPQueuedPolicyFixtureError.admissionNotReached
+                        }
+                        return (refresh, gate)
+                    }
+                    let (staleRefresh, refreshGate) = try await pauseReadinessRefresh()
+                    let expiry = Date().addingTimeInterval(120)
+                    await manager.debugSetActiveSessionLinkEndpointsForTesting([endpoint], compactConsentExpiry: expiry)
+                    ServerNetworkManager.catalogAdvertisementDidChange()
+                    await manager.notifyToolListChanged(connectionID: socket.connectionID)
+                    await refreshGate.release()
+                    await staleRefresh.value
+                    let renewed = await manager.debugRunCatalogProjection(for: admitted.runID)
+                    XCTAssertTrue(try XCTUnwrap(renewed).isReady, "Restoring target reachability does not need the provider to relist")
+                    XCTAssertEqual(renewed?.compactLinkExpiresAt, expiry, "Overlapping refreshes cannot publish membership without its sampled expiry")
+
+                    await manager.debugSetActiveSessionLinkEndpointsForTesting([])
+                    ServerNetworkManager.catalogAdvertisementDidChange()
+                    let (staleWithdrawal, withdrawalGate) = try await pauseReadinessRefresh()
+                    await manager.debugSetActiveSessionLinkEndpointsForTesting([endpoint], compactConsentExpiry: expiry)
+                    ServerNetworkManager.catalogAdvertisementDidChange()
+                    await manager.notifyToolListChanged(connectionID: socket.connectionID)
+                    await withdrawalGate.release()
+                    await staleWithdrawal.value
+                    let unchanged = await manager.debugRunCatalogProjection(for: admitted.runID)
+                    XCTAssertEqual(unchanged?.projectionRevision, renewed?.projectionRevision)
+                    XCTAssertTrue(try XCTUnwrap(unchanged).isReady)
+                    XCTAssertEqual(unchanged?.compactLinkExpiresAt, expiry)
+                } catch {
+                    failure = error
+                }
+                await manager.debugSetActiveSessionLinkEndpointsForTesting(nil)
+                if let agent {
+                    await manager.clearExpectedAgentPID(getpid(), for: agent.endpoint.clientName, runID: agent.runID)
+                    await manager.clearClientConnectionPolicy(for: agent.endpoint.clientName, windowID: agent.context.window.windowID, runID: agent.runID)
+                    await Self.cleanupEndpoint(agent.endpoint, manager: manager)
+                    await manager.cleanupRunRoutingState(for: agent.runID, windowID: agent.context.window.windowID)
+                }
+                await fixture.cleanup()
+                if let agent { try await AgentSessionDataService.shared.deleteAgentSessionFile(agent.fileURL) }
+                try await fixture.assertCleanedUp()
+                if let failure { throw failure }
+            }
         }
 
         func testExpiredClientEnvelopeRejectsBeforeProviderAndJournalForBothPublicTools() async throws {

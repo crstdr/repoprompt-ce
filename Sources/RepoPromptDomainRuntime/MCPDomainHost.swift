@@ -70,6 +70,7 @@ package struct MCPDomainHostInvocation: Sendable {
     package let securityContext: DomainToolInvocationSecurityContext
     package let admittedContext: MCPDomainAdmittedContext?
     package let admissionDeadline: MCPDomainAdmissionDeadline?
+    package let validateProviderAdmission: (@Sendable () async throws -> Void)?
     /// Synchronous so the caller can establish execution timing without opening a
     /// reentrancy gap between final host admission and provider invocation.
     package let onProviderEntry: @Sendable () throws -> Void
@@ -86,6 +87,7 @@ package struct MCPDomainHostInvocation: Sendable {
         securityContext: DomainToolInvocationSecurityContext,
         admittedContext: MCPDomainAdmittedContext? = nil,
         admissionDeadline: MCPDomainAdmissionDeadline? = nil,
+        validateProviderAdmission: (@Sendable () async throws -> Void)? = nil,
         onProviderEntry: @escaping @Sendable () throws -> Void = {},
         onProviderReturn: @escaping @Sendable () -> Void = {},
         submittedAt: ContinuousClock.Instant = ContinuousClock().now
@@ -98,6 +100,7 @@ package struct MCPDomainHostInvocation: Sendable {
         self.securityContext = securityContext
         self.admittedContext = admittedContext
         self.admissionDeadline = admissionDeadline
+        self.validateProviderAdmission = validateProviderAdmission
         self.onProviderEntry = onProviderEntry
         self.onProviderReturn = onProviderReturn
         self.submittedAt = submittedAt
@@ -283,6 +286,7 @@ package actor MCPDomainHost {
         let securityContext = invocation.securityContext
         let admittedContext = invocation.admittedContext
         let admissionDeadline = invocation.admissionDeadline
+        let validateProviderAdmission = invocation.validateProviderAdmission
         let onProviderEntry = invocation.onProviderEntry
         let onProviderReturn = invocation.onProviderReturn
         #if DEBUG
@@ -313,6 +317,13 @@ package actor MCPDomainHost {
                                 await beforeProviderActivation(connectionID, toolName, invocationID)
                             }
                         #endif
+                        if let validateProviderAdmission {
+                            try await validateProviderAdmission()
+                            guard await registry.isActive(resolved.handle) else {
+                                throw MCPDomainHostError.staleRegistration(toolName: toolName)
+                            }
+                            try Task.checkCancellation()
+                        }
                         try admissionDeadline?.check()
                         try onProviderEntry()
                         defer { onProviderReturn() }

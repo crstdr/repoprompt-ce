@@ -29,9 +29,15 @@ package struct MCPToolCallPreparation: Sendable {
         operationID = supplied.isEmpty ? invocationID.uuidString : supplied
     }
 
-    package static func normalize(params: [String: Value]?, originalToolName: String, canonicalToolName: String) -> NormalizedArgs {
+    package static func normalize(
+        params: [String: Value]?, originalToolName: String, canonicalToolName: String,
+        transportIdentityArgumentKey: String? = nil
+    ) -> NormalizedArgs {
         EditFlowPerf.measure(EditFlowPerf.Stage.MCPToolCall.normalizeArgs, EditFlowPerf.Dimensions(toolName: canonicalToolName)) {
-            MCPToolArgsNormalizer.normalize(params: params, originalToolName: originalToolName, canonicalToolName: canonicalToolName)
+            MCPToolArgsNormalizer.normalize(
+                params: params, originalToolName: originalToolName, canonicalToolName: canonicalToolName,
+                transportIdentityArgumentKey: transportIdentityArgumentKey
+            )
         }
     }
 

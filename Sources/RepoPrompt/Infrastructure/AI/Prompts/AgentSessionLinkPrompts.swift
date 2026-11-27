@@ -230,11 +230,12 @@ enum AgentSessionLinkPrompts {
     static func render(
         kind: AgentSessionLinkPromptSupplementKind,
         inventory: AgentSessionLinkPromptInventory,
-        toolReference: String
+        toolReference: String,
+        antigravity: Bool = false
     ) -> String {
         switch kind {
         case .inventory:
-            inventorySupplement(inventory: inventory, toolReference: toolReference)
+            inventorySupplement(inventory: inventory, toolReference: toolReference, antigravity: antigravity)
         case .revocation:
             revocationSupplement(revision: inventory.linkSetRevision, toolReference: toolReference)
         case .suspension:
@@ -253,7 +254,7 @@ enum AgentSessionLinkPrompts {
     ) -> AgentSessionLinkPromptRenderResult {
         guard let passive = request.passiveNotices, passive.hasDeliverableContent else {
             let fragment = request.membershipKind.map {
-                render(kind: $0, inventory: request.inventory, toolReference: request.toolReference)
+                render(kind: $0, inventory: request.inventory, toolReference: request.toolReference, antigravity: request.providerContext == .antigravity)
             } ?? ""
             return AgentSessionLinkPromptRenderResult(fragment: fragment)
         }
@@ -267,6 +268,7 @@ enum AgentSessionLinkPrompts {
             let minimumInventory = kind == .inventory ? inventorySupplement(
                 inventory: request.inventory,
                 toolReference: request.toolReference,
+                antigravity: request.providerContext == .antigravity,
                 maximumBytes: 0
             ) : nil
             let reservationBudget = minimumInventory.map {
@@ -288,13 +290,15 @@ enum AgentSessionLinkPrompts {
                 fragments.append(inventorySupplement(
                     inventory: request.inventory,
                     toolReference: request.toolReference,
+                    antigravity: request.providerContext == .antigravity,
                     maximumBytes: inventoryBudget
                 ))
             } else {
                 fragments.append(render(
                     kind: kind,
                     inventory: request.inventory,
-                    toolReference: request.toolReference
+                    toolReference: request.toolReference,
+                    antigravity: request.providerContext == .antigravity
                 ))
             }
         }
@@ -745,9 +749,10 @@ enum AgentSessionLinkPrompts {
     private static func inventorySupplement(
         inventory: AgentSessionLinkPromptInventory,
         toolReference: String,
+        antigravity: Bool,
         maximumBytes: Int = AgentSessionLinkPrompts.maximumRenderedBytes
     ) -> String {
-        let guidance = guidance(toolReference: toolReference)
+        let guidance = guidance(toolReference: toolReference, antigravity: antigravity)
         var renderedRows: [String] = []
         for item in inventory.items {
             let candidateRows = renderedRows + [sessionRow(item)]
@@ -866,11 +871,15 @@ enum AgentSessionLinkPrompts {
 
     // MARK: Guidance
 
-    private static func guidance(toolReference: String) -> String {
+    private static func guidance(toolReference: String, antigravity: Bool) -> String {
         var lines = [
             "Current capabilities: this block replaces earlier overseen-session lists and capability wording, including your own earlier refusals based on them. Each row is one direct grant; `managed=\"true\"` permits managed prompt inspection, `respond`, and `steer`, while `managed=\"false\"` does not. Use `\(toolReference)` for these sessions."
         ]
-        lines.append(contentsOf: hostNamingGuidance(toolReference: toolReference))
+        if antigravity {
+            lines.append("If RepoPrompt offers `describe_tool` and `call_tool`, use them to inspect and run `\(toolReference)` and `session_admin` by name. Otherwise use the advertised RepoPrompt tools directly.")
+        } else {
+            lines.append(contentsOf: hostNamingGuidance(toolReference: toolReference))
+        }
         lines.append(contentsOf: autonomyContract)
         lines.append(contentsOf: [
             MCPDomainSessionAdminToolDefinition.overseerPlaybook,

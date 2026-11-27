@@ -81,7 +81,8 @@ package enum MCPToolArgsNormalizer {
     package static func normalize(
         params: [String: Value]?,
         originalToolName: String,
-        canonicalToolName: String
+        canonicalToolName: String,
+        transportIdentityArgumentKey: String? = nil
     ) -> NormalizedArgs {
         guard var raw = params else {
             return NormalizedArgs(
@@ -291,6 +292,9 @@ package enum MCPToolArgsNormalizer {
             }
         }
 
+        if let transportIdentityArgumentKey {
+            raw.removeValue(forKey: transportIdentityArgumentKey)
+        }
         return NormalizedArgs(
             payload: raw,
             tabID: extractedTabID,

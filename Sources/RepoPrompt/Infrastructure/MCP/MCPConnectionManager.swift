@@ -1367,6 +1367,8 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         private var debugAfterLegacyCleanupWaiterCapture: (@Sendable (UUID) async -> Void)?
         private var debugAnyActiveSessionLinkEndpointsForTesting: Set<DomainAgentSessionLinkEndpointIdentity>?
         private var debugOutboundSessionLinkEndpointsForTesting: Set<DomainAgentSessionLinkEndpointIdentity>?
+        private var debugCompactConsentExpiryForTesting: Date?
+        private var debugBeforeCompactReadinessPublicationForTesting: (@Sendable () async -> Void)?
     #endif
 
     /// Invalidates queued internal-management admission only for this connection.
@@ -1444,6 +1446,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         let taskLabelKind: AgentModelCatalog.TaskLabelKind?
         let allowsAgentExternalControlTools: Bool
         let updatedAt: Date
+        let usesCompactToolCatalog: Bool
         /// Rehydration timestamps are not policy changes. This identity changes only
         /// when semantic policy changes, including rollback or removal/reseeding.
         var admissionRevision = UUID()
@@ -1460,6 +1463,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                 && (additionalTools ?? []) == (other.additionalTools ?? [])
                 && purpose == other.purpose && taskLabelKind == other.taskLabelKind
                 && allowsAgentExternalControlTools == other.allowsAgentExternalControlTools
+                && usesCompactToolCatalog == other.usesCompactToolCatalog
         }
     }
 
@@ -1559,6 +1563,8 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         let routingAuthorityGeneration: UInt64?
         let connectionLifecycleGeneration: UInt64?
         let hasAgentSessionLink: Bool?
+        let hasCompactAgentSessionLink: Bool
+        let compactLinkExpiresAt: Date?
         let hasAnyActiveLink: Bool?
         let hasActiveOutboundLink: Bool?
         let expectedSurface: Data?
@@ -1589,6 +1595,8 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                 routeToken: routeToken,
                 projectionRevision: projectionRevision,
                 hasAgentSessionLink: hasAgentSessionLink,
+                hasCompactAgentSessionLink: hasCompactAgentSessionLink,
+                compactLinkExpiresAt: compactLinkExpiresAt,
                 hasAnyActiveLink: hasAnyActiveLink,
                 hasActiveOutboundLink: hasActiveOutboundLink,
                 expectedSurface: expectedSurface,
@@ -3223,11 +3231,165 @@ actor ServerNetworkManager: MCPServerConnectionHost {
 
     /// Uses the same immutable domain advertisement and client shaping as tools/list. No route
     /// discovery, persistence, provider lookup, or session census is performed here.
+    private func wantsCompactToolCatalog(_ connectionID: UUID) -> Bool {
+        guard let runID = runIDByConnectionID[connectionID],
+              runPolicyStateByRunID[runID]?.usesCompactToolCatalog == true,
+              let client = clientIdentifier(forConnection: connectionID)
+        else { return false }
+        return Self.clientStorageKey(client) == Self.clientStorageKey("antigravity-client")
+    }
+
+    private func compactAdvertisement(
+        route: AgentSessionLinkRunCatalogRouteToken?
+    ) async -> (
+        catalog: MCPDomainCatalogAdvertisementResult, surface: AgentSessionLinkToolSurface,
+        purpose: MCPRunPurpose, grants: LiveSessionLinkGrantSnapshot, linkExpiry: Date?, inputs: MCPRunCatalogOfferInputs
+    )? {
+        guard let route else { return nil }
+        let connectionID = route.connectionID
+        guard wantsCompactToolCatalog(connectionID),
+              let initial = await collectRunCatalogOfferInputs(route: route)
+        else { return nil }
+        let (disabled, scopeExpiry) = await MainActor.run {
+            (
+                ToolAvailabilityStore.shared.effectiveDisabledTools,
+                AgentSessionLinkRuntimeBridge.shared.delegationScopes.catalogOfferExpiresAt(grantedTo: route.observerEndpoint.sessionID)
+            )
+        }
+        let liveLinkExpiry = await AppDomainRuntimeComposition.shared.runtime.agentSessionLinkAuthority.catalogConsentExpiresAt(endpoint: route.observerEndpoint)
+        #if DEBUG
+            let linkExpiry = debugCompactConsentExpiryForTesting ?? liveLinkExpiry
+        #else
+            let linkExpiry = liveLinkExpiry
+        #endif
+        let expiry = [scopeExpiry, linkExpiry].compactMap(\.self).min()
+        let grants = await liveSessionLinkGrantSnapshot(connectionID: connectionID)
+        let policy = effectivePolicyState(for: connectionID)
+        guard isEnabledState, let grants, grants.routeToken == route else { return nil }
+        let surface = grants.toolSurface
+        let result = await domainHost.advertisedCatalog(.init(
+            isGloballyEnabled: isEnabledState,
+            disabledToolNames: disabled,
+            policy: MCPToolAdmissionPolicy.clientPolicySnapshot(
+                restricted: policy.restricted,
+                additional: policy.additional.union(grants.additionalGrants),
+                taskLabelKind: policy.taskLabelKind,
+                allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools,
+                hasExactAgentSessionLinkGrant: grants.hasAnyActiveLink,
+                canBecomeOverseer: grants.canListBecomeOverseer,
+                hasActivatedOverseer: grants.hasActivatedOverseer
+            ),
+            agentSessionLinkSurface: surface
+        ))
+        guard await collectRunCatalogOfferInputs(route: route) == initial,
+              wantsCompactToolCatalog(connectionID), isEnabledState,
+              expiry.map({ $0 > Date() }) ?? true else { return nil }
+        return (result, surface, policy.purpose, grants, linkExpiry, initial)
+    }
+
+    private func refreshCompactLinkReadiness(connectionID: UUID) async {
+        guard let runID = runIDByConnectionID[connectionID],
+              let observation = runCatalogObservationByRunID[runID],
+              let route = observation.routeToken, route.connectionID == connectionID,
+              let wrapperSurface = try? AgentSessionLinkCatalogSurface.fingerprint(MCPCompactToolCatalog.wrappers),
+              observation.returnedSurface == wrapperSurface else { return }
+        let advertisement = await compactAdvertisement(route: route)
+        let catalog = advertisement?.catalog
+        let grants = advertisement?.grants
+        let linkExpiry = advertisement?.linkExpiry
+        #if DEBUG
+            if let beforePublication = debugBeforeCompactReadinessPublicationForTesting {
+                debugBeforeCompactReadinessPublicationForTesting = nil
+                await beforePublication()
+            }
+        #endif
+        // A refresh that does not change readiness need not publish a new projection.
+        // Fence the sample against its authority inputs, not just publication order.
+        if let advertisement {
+            guard await collectRunCatalogOfferInputs(route: route) == advertisement.inputs else { return }
+        } else if isEnabledState {
+            return
+        }
+        guard runCatalogObservationByRunID[runID]?.projectionRevision == observation.projectionRevision,
+              isCurrentCatalogRouteToken(route) else { return }
+        let reachable = catalog?.definitions.contains { $0.name == MCPWindowToolName.agentSessionLink } == true
+        let matches = grants?.routeToken == route
+        let hasReachableLink = matches && reachable
+        let anyLink = matches ? grants?.hasAnyActiveLink : nil
+        let outbound = matches ? grants?.hasActiveOutboundLink : nil
+        guard observation.hasCompactAgentSessionLink != hasReachableLink
+            || observation.hasAnyActiveLink != anyLink || observation.hasActiveOutboundLink != outbound
+            || observation.compactLinkExpiresAt != linkExpiry else { return }
+        _ = await publishRunCatalogObservation(
+            runID: runID, routeToken: route,
+            hasAgentSessionLink: observation.hasAgentSessionLink,
+            hasCompactAgentSessionLink: hasReachableLink,
+            compactLinkExpiresAt: linkExpiry,
+            hasAnyActiveLink: anyLink, hasActiveOutboundLink: outbound,
+            expectedSurface: observation.expectedSurface, returnedSurface: observation.returnedSurface,
+            returnedCatalog: observation.returnedCatalog, offerInputs: observation.offerInputs,
+            offerExpiresAt: observation.offerExpiresAt, supersedesWaiters: false
+        )
+    }
+
+    private func describeCompactTool(
+        _ arguments: [String: Value], route: AgentSessionLinkRunCatalogRouteToken
+    ) async -> CallTool.Result {
+        let name = arguments["name"]?.stringValue
+        guard arguments.keys.allSatisfy({ $0 == "name" }),
+              arguments["name"] == nil || name.map({ !$0.isEmpty }) == true
+        else { return Self.toolErrorResult(rawJSON: false, message: MCPCompactToolCatalog.malformedDescribe) }
+        guard let (catalog, surface, purpose, _, _, _) = await compactAdvertisement(route: route) else {
+            return Self.toolErrorResult(rawJSON: false, message: MCPCompactToolCatalog.unavailable)
+        }
+        let text: String
+        if let name {
+            let canonical = Self.canonicalToolName(for: name)
+            do {
+                let tool: MCP.Tool
+                if let wrapper = MCPCompactToolCatalog.wrappers.first(where: { $0.name == canonical }) {
+                    tool = wrapper
+                } else if let definition = catalog.definitions.first(where: { $0.name == canonical }) {
+                    let schema = try await cachedSchema(for: definition.name, schema: definition.inputSchema, purpose: purpose, agentSessionLinkSurface: surface)
+                    tool = MCP.Tool(
+                        name: definition.name,
+                        description: advertisedToolDescription(for: definition.name, baseDescription: definition.description, purpose: purpose),
+                        inputSchema: schema,
+                        annotations: definition.annotations.mcpAnnotations
+                    )
+                    guard let (current, currentSurface, currentPurpose, _, _, _) = await compactAdvertisement(route: route),
+                          currentSurface == surface, currentPurpose == purpose,
+                          current.definitions.first(where: { $0.name == canonical }) == definition
+                    else { return Self.toolErrorResult(rawJSON: false, message: MCPCompactToolCatalog.unavailableTarget(canonical)) }
+                } else {
+                    return Self.toolErrorResult(rawJSON: false, message: MCPCompactToolCatalog.unavailableTarget(canonical))
+                }
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.sortedKeys]
+                text = try String(decoding: encoder.encode(tool), as: UTF8.self)
+            } catch {
+                return Self.toolErrorResult(rawJSON: false, message: MCPCompactToolCatalog.unavailableTarget(canonical))
+            }
+        } else {
+            text = MCPCompactToolCatalog.directory(catalog.definitions.map { definition in
+                MCP.Tool(
+                    name: definition.name,
+                    description: advertisedToolDescription(for: definition.name, baseDescription: definition.description, purpose: purpose),
+                    inputSchema: .object([:])
+                )
+            })
+        }
+        return CallTool.Result(content: [.text(text: text, annotations: nil, _meta: nil)], isError: false)
+    }
+
     private func expectedSessionLinkCatalogSurface(
         connectionID: UUID,
         snapshot: LiveSessionLinkGrantSnapshot?
     ) async -> Data? {
         guard let snapshot else { return nil }
+        if wantsCompactToolCatalog(connectionID) {
+            return try? AgentSessionLinkCatalogSurface.fingerprint(isEnabledState ? MCPCompactToolCatalog.wrappers : [])
+        }
         let policy = effectivePolicyState(for: connectionID)
         let disabled = await MainActor.run { ToolAvailabilityStore.shared.effectiveDisabledTools }
         let domainPolicy = MCPToolAdmissionPolicy.clientPolicySnapshot(
@@ -3278,6 +3440,8 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         // Advertisement crossed other owners above. This fresh read is intentional: reusing its
         // initial role sample could qualify a catalog after revocation, rebind or activation change.
         let finalSnapshot = await liveSessionLinkGrantSnapshot(connectionID: connectionID)
+        let compactSample = await compactAdvertisement(route: finalSnapshot?.routeToken)
+        let compactTargetIsEligible = compactSample?.catalog.definitions.contains { $0.name == MCPWindowToolName.agentSessionLink } == true
         let currentOfferInputs: MCPRunCatalogOfferInputs? = if let route = finalSnapshot?.routeToken {
             await runCatalogOfferInputs(route: route)
         } else {
@@ -3313,17 +3477,25 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         // A late predecessor completion still fails `routeIsCurrent` and cannot overwrite a
         // successor observation it does not own.
         let ownsObservation = routeIsCurrent || currentRouteToken == initialRouteToken
-        if ownsObservation {
+        let offerIsCurrent = routeIsCurrent && catalogIsCurrent && offerInputs != nil && offerInputs == currentOfferInputs
+            && offerInputs?.advertisementRevision == Self.catalogAdvertisementRevision
+        let compactLinkOffered = offerIsCurrent && membershipAgrees && compactTargetIsEligible
+            && MCPCompactToolCatalog.hasExactWrapperPair(returnedCatalog?.values.flatMap(\.self) ?? [])
+        // An overlapping older list cannot retract the same live wrapper offer.
+        let preservesNewerCompactOffer = hasNewerObservation && currentRouteToken == initialRouteToken
+            && wantsCompactToolCatalog(connectionID) && currentObservation?.returnedSurface == returnedSurface
+        if ownsObservation, !preservesNewerCompactOffer {
             _ = await publishRunCatalogObservation(
                 runID: runID,
                 routeToken: routeIsCurrent ? finalSnapshot?.routeToken : nil,
                 hasAgentSessionLink: routeIsCurrent ? returnedSessionLinkPresence : nil,
+                hasCompactAgentSessionLink: compactLinkOffered,
+                compactLinkExpiresAt: compactLinkOffered ? compactSample?.linkExpiry : nil,
                 hasAnyActiveLink: routeIsCurrent ? liveAnyLinkPresence : nil,
                 hasActiveOutboundLink: routeIsCurrent ? liveOutboundPresence : nil,
                 expectedSurface: routeIsCurrent ? expectedSurface : nil,
                 returnedSurface: routeIsCurrent ? returnedSurface : nil,
-                returnedCatalog: routeIsCurrent && catalogIsCurrent && offerInputs != nil && offerInputs == currentOfferInputs
-                    && offerInputs?.advertisementRevision == Self.catalogAdvertisementRevision ? returnedCatalog : nil,
+                returnedCatalog: offerIsCurrent ? returnedCatalog : nil,
                 offerInputs: offerInputs,
                 offerExpiresAt: offerExpiresAt,
                 supersedesWaiters: false
@@ -3420,6 +3592,8 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         runID: UUID,
         routeToken: AgentSessionLinkRunCatalogRouteToken?,
         hasAgentSessionLink: Bool?,
+        hasCompactAgentSessionLink: Bool = false,
+        compactLinkExpiresAt: Date? = nil,
         hasAnyActiveLink: Bool?,
         hasActiveOutboundLink: Bool?,
         expectedSurface: Data? = nil,
@@ -3437,6 +3611,8 @@ actor ServerNetworkManager: MCPServerConnectionHost {
             routingAuthorityGeneration: routeToken?.routingAuthorityGeneration,
             connectionLifecycleGeneration: routeToken?.connectionLifecycleGeneration,
             hasAgentSessionLink: hasAgentSessionLink,
+            hasCompactAgentSessionLink: hasCompactAgentSessionLink,
+            compactLinkExpiresAt: compactLinkExpiresAt,
             hasAnyActiveLink: hasAnyActiveLink,
             hasActiveOutboundLink: hasActiveOutboundLink,
             expectedSurface: expectedSurface,
@@ -3696,6 +3872,10 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         for (connectionID, runID) in runIDByConnectionID
             where matchingRunIDs.contains(runID) && !connectionsBeingRemoved.contains(connectionID)
         {
+            if wantsCompactToolCatalog(connectionID) {
+                await notifyToolListChanged(connectionID: connectionID)
+                continue
+            }
             let initialRevision = runCatalogObservationByRunID[runID]?.projectionRevision ?? 0
             let snapshot = await liveSessionLinkGrantSnapshot(connectionID: connectionID)
             let routeToken = snapshot?.routeToken
@@ -4879,7 +5059,8 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         allowsAgentExternalControlTools: Bool = false,
         updatedAt: Date,
         cleanupReceipt: MCPRunRoutingCleanupReceipt? = nil,
-        replacesRegistration: Bool = false
+        replacesRegistration: Bool = false,
+        usesCompactToolCatalog: Bool? = nil
     ) {
         if let existing = runPolicyStateByRunID[runID], existing.updatedAt >= updatedAt,
            !replacesRegistration
@@ -4896,6 +5077,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
             taskLabelKind: taskLabelKind,
             allowsAgentExternalControlTools: allowsAgentExternalControlTools,
             updatedAt: updatedAt,
+            usesCompactToolCatalog: usesCompactToolCatalog ?? runPolicyStateByRunID[runID]?.usesCompactToolCatalog ?? false,
             cleanupReceipt: cleanupReceipt ?? runPolicyStateByRunID[runID]?.cleanupReceipt
         ), for: runID)
         presentationWindowByRun[runID] = windowID
@@ -9510,7 +9692,10 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                 allowsAgentExternalControlTools: allowsAgentExternalControlTools,
                 updatedAt: policy.createdAt,
                 cleanupReceipt: policy.cleanupReceipt,
-                replacesRegistration: true
+                replacesRegistration: true,
+                // This input is set by the app-selected provider's PID-gated lease, not initialize.clientInfo.
+                usesCompactToolCatalog: purpose == .agentModeRun && requiresExpectedAgentPID
+                    && storageKey == Self.clientStorageKey("antigravity-client")
             )
             if let originID = transferredPIDOrigin, let process = reusingProcess {
                 runPolicyStateByRunID[runID]?.expectedAgentPIDsByClient[storageKey, default: []].insert(process.pid)
@@ -12002,10 +12187,16 @@ actor ServerNetworkManager: MCPServerConnectionHost {
 
         /// Compatibility helper for tests whose linked endpoints are all outbound observers.
         func debugSetActiveSessionLinkEndpointsForTesting(
-            _ endpoints: Set<DomainAgentSessionLinkEndpointIdentity>?
+            _ endpoints: Set<DomainAgentSessionLinkEndpointIdentity>?,
+            compactConsentExpiry: Date? = nil
         ) {
             debugAnyActiveSessionLinkEndpointsForTesting = endpoints
             debugOutboundSessionLinkEndpointsForTesting = endpoints
+            debugCompactConsentExpiryForTesting = compactConsentExpiry
+        }
+
+        func debugSetBeforeCompactReadinessPublicationForTesting(_ hook: (@Sendable () async -> Void)?) {
+            debugBeforeCompactReadinessPublicationForTesting = hook
         }
 
         /// Models catalog reachability independently from outbound observer authority.
@@ -12239,6 +12430,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
     }
 
     func notifyToolListChanged(connectionID: UUID) async {
+        if wantsCompactToolCatalog(connectionID) { await refreshCompactLinkReadiness(connectionID: connectionID) }
         if let mgr = connections[connectionID] {
             await mgr.notifyToolListChanged()
         }
@@ -13737,6 +13929,13 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                 )
             }
 
+            let compact = await wantsCompactToolCatalog(connectionID)
+            if compact {
+                let routeMatches = offerRoute?.connectionID == connectionID && offerRoute == sessionLinkGrantSnapshot?.routeToken
+                let enabled = await isEnabledState
+                guard routeMatches else { throw MCPError.internalError("Tool catalog not ready. Please retry.") }
+                tools = MCPCompactToolCatalog.project(tools, compact: true, enabled: enabled)
+            }
             #if DEBUG
                 await debugPolicyDiagnostic("toolsList", connectionID: connectionID, policy: policy, extra: [
                     "advertisedToolCount": String(tools.count),
@@ -13761,6 +13960,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                 offerExpiresAt: offerRoute == sessionLinkGrantSnapshot?.routeToken ? offerExpiresAt : nil,
                 catalogStartRevision: catalogStartRevision
             )
+            if compact { await refreshCompactLinkReadiness(connectionID: connectionID) }
             connectionLog("Returning \(tools.count) available tools for \(connectionID)")
             return ListTools.Result(tools: tools)
         }
@@ -13777,7 +13977,57 @@ actor ServerNetworkManager: MCPServerConnectionHost {
             }
 
             let originalName = params.name
-            let toolName = Self.canonicalToolName(for: originalName)
+            let isForwarded = originalName == MCPCompactToolEnvelope.call
+            let isDescriptor = originalName == MCPCompactToolEnvelope.describe
+            let compact = await wantsCompactToolCatalog(connectionID)
+            let compactRoute: AgentSessionLinkRunCatalogRouteToken? = if compact, let runID = await runIDByConnectionID[connectionID],
+                                                                         let route = await authoritativeRunCatalogRouteToken(for: runID), route.connectionID == connectionID
+            {
+                route
+            } else {
+                nil
+            }
+            if compact || isForwarded || isDescriptor {
+                guard compactRoute != nil else {
+                    return Self.toolErrorResult(rawJSON: false, message: MCPCompactToolCatalog.unavailable)
+                }
+            }
+            if isDescriptor, let compactRoute {
+                guard let limiter = await connectionCallLimiterResolution(for: connectionID) else {
+                    return Self.toolErrorResult(rawJSON: false, message: MCPCompactToolCatalog.unavailable)
+                }
+                return await withConnectionCallPermit(
+                    connectionID: connectionID, lane: .ordinary, resolution: limiter,
+                    cancellationResult: { Self.toolErrorResult(rawJSON: false, message: MCPCompactToolCatalog.unavailable) }
+                ) {
+                    await self.describeCompactTool(params.arguments ?? [:], route: compactRoute)
+                }
+            }
+            var outerArguments = params.arguments ?? [:]
+            let rawDispatchIdentity = outerArguments.removeValue(forKey: MCPExportResponseDeliveryDeadlineRegistry.requestIdentityArgumentKey)
+            let requestedName: String
+            var targetArguments: [String: Value]
+            if isForwarded {
+                guard let target = MCPCompactToolEnvelope.forwardedTarget(outerArguments, string: { $0.stringValue }, object: { $0.objectValue }) else {
+                    return Self.toolErrorResult(rawJSON: false, message: MCPCompactToolCatalog.malformedCall)
+                }
+                requestedName = target.name
+                if MCPCompactToolEnvelope.isWrapper(Self.canonicalToolName(for: requestedName)) {
+                    return Self.toolErrorResult(rawJSON: false, message: MCPCompactToolCatalog.recursiveCall)
+                }
+                targetArguments = target.arguments
+                targetArguments.removeValue(forKey: MCPExportResponseDeliveryDeadlineRegistry.requestIdentityArgumentKey)
+                targetArguments.removeValue(forKey: MCPTimeoutPolicy.promptExportReservedEnvelopeArgumentKey)
+            } else {
+                requestedName = originalName
+                targetArguments = outerArguments
+            }
+            let toolName = Self.canonicalToolName(for: requestedName)
+            if let compactRoute {
+                guard let (catalog, _, _, _, _, _) = await compactAdvertisement(route: compactRoute),
+                      catalog.definitions.contains(where: { $0.name == toolName })
+                else { return Self.toolErrorResult(rawJSON: false, message: MCPCompactToolCatalog.unavailableTarget(toolName)) }
+            }
             connectionLog("tools/call received original=\(originalName) canonical=\(toolName) connection=\(connectionID)")
             if toolName == MCPWindowToolName.agentSessionLink {
                 let context = await agentSessionLinkCatalogDiagnosticContext(for: connectionID)
@@ -13821,12 +14071,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                     }
                 }
             #endif
-            var transportAnnotatedArguments = params.arguments ?? [:]
-            let transportDispatchIdentity = MCPExportResponseDeliveryDeadlineRegistry.dispatchIdentity(
-                from: transportAnnotatedArguments.removeValue(
-                    forKey: MCPExportResponseDeliveryDeadlineRegistry.requestIdentityArgumentKey
-                )
-            )
+            let transportDispatchIdentity = MCPExportResponseDeliveryDeadlineRegistry.dispatchIdentity(from: rawDispatchIdentity)
             #if DEBUG
                 if let transportDispatchIdentity {
                     await debugBeforeToolRequestIdentityClaimForTesting?(
@@ -13940,9 +14185,10 @@ actor ServerNetworkManager: MCPServerConnectionHost {
             // Normalize arguments using shared module
             connectionLog("tools/call \(toolName): normalizing args")
             let normalized = MCPToolCallPreparation.normalize(
-                params: transportAnnotatedArguments,
-                originalToolName: originalName,
-                canonicalToolName: toolName
+                params: targetArguments,
+                originalToolName: requestedName,
+                canonicalToolName: toolName,
+                transportIdentityArgumentKey: isForwarded ? MCPExportResponseDeliveryDeadlineRegistry.requestIdentityArgumentKey : nil
             )
 
             // Log any warnings from normalization
@@ -14024,17 +14270,24 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                     return Self.toolErrorResult(rawJSON: capturedRawJSON, message: memoryRouteUnavailableMessage)
                 }
             }
-            var dispatchTabContextHint: MCPServerViewModel.TabContextHint? = modelRouteToken.map {
+            if let endpoint = compactRoute?.observerEndpoint {
+                guard extractedWindowID.map({ $0 == endpoint.windowID }) ?? true,
+                      extractedTabID.map({ $0 == endpoint.tabID }) ?? true,
+                      extractedContextID.map({ $0 == endpoint.tabID }) ?? true
+                else { return Self.toolErrorResult(rawJSON: capturedRawJSON, message: MCPCompactToolCatalog.unavailableTarget(toolName)) }
+            }
+            let pinnedRoute = modelRouteToken ?? compactRoute
+            var dispatchTabContextHint: MCPServerViewModel.TabContextHint? = pinnedRoute.map {
                 .init(tabID: $0.observerEndpoint.tabID, workspaceID: $0.observerEndpoint.workspaceID, windowID: $0.observerEndpoint.windowID)
             }
-            var preResolvedWindowID: Int? = modelRouteToken?.observerEndpoint.windowID
+            var preResolvedWindowID: Int? = pinnedRoute?.observerEndpoint.windowID
             do {
                 let logicalContextState = EditFlowPerf.begin(
                     EditFlowPerf.Stage.MCPToolCall.logicalContextResolution,
                     EditFlowPerf.Dimensions(toolName: toolName)
                 )
                 defer { EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.logicalContextResolution, logicalContextState) }
-                if !isMemoryOnlyModelCall, !Self.shouldBypassLogicalContextPreResolution(for: toolName) {
+                if !isMemoryOnlyModelCall, compactRoute == nil, !Self.shouldBypassLogicalContextPreResolution(for: toolName) {
                     do {
                         let logicalBinding: MCPLogicalContextBindingResolution? = if extractedContextID == nil,
                                                                                      extractedTabID == nil,
@@ -14291,7 +14544,8 @@ actor ServerNetworkManager: MCPServerConnectionHost {
 
             // Create immutable copies for Swift 6 concurrency safety
             let capturedTabContextHint = dispatchTabContextHint
-            let capturedWindowID = extractedWindowID
+            // A matching selector on a compact connection is an assertion, not a rebinding request.
+            let capturedWindowID = compactRoute == nil ? extractedWindowID : nil
             let capturedPreResolvedWindowID = preResolvedWindowID
             let capturedArguments = dispatchArguments
             let capturedArgsForFormatter = argsForFormatter
@@ -15177,7 +15431,14 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                                         arguments: effectiveArgs,
                                         securityContext: invocationSecurityContext,
                                         admittedContext: admittedDomainContext,
-                                        admissionDeadline: promptExportExecutionEnvelope?.admissionDeadline
+                                        admissionDeadline: promptExportExecutionEnvelope?.admissionDeadline,
+                                        validateProviderAdmission: compactRoute.map { route in
+                                            { @Sendable in
+                                                guard let (catalog, _, _, _, _, _) = await self.compactAdvertisement(route: route),
+                                                      catalog.definitions.contains(where: { $0.name == toolName })
+                                                else { throw MCPError.invalidParams(MCPCompactToolCatalog.unavailableTarget(toolName)) }
+                                            }
+                                        }
                                     )
                                     let resolvedOperation: @Sendable (PromptExportProviderEntryBridge?, ToolInvocationContext) async throws -> Value = { providerEntryBridge, invocationContext in
                                         let diagnosticAdapter = MCPInvocationDiagnosticAdapter()
@@ -15425,9 +15686,9 @@ actor ServerNetworkManager: MCPServerConnectionHost {
     func broadcastToolListChanged() async {
         connectionLog("Broadcasting ToolListChanged notification to all clients")
         invalidateToolSchemaCache()
-        for (connectionID, connectionManager) in connections where !connectionsBeingRemoved.contains(connectionID) {
+        for connectionID in connections.keys where !connectionsBeingRemoved.contains(connectionID) {
             Task {
-                await connectionManager.notifyToolListChanged()
+                await self.notifyToolListChanged(connectionID: connectionID)
             }
         }
     }

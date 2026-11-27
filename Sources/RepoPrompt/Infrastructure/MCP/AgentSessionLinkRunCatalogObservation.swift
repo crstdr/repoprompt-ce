@@ -18,6 +18,8 @@ struct AgentSessionLinkRunCatalogProjection: Equatable {
     let routeToken: AgentSessionLinkRunCatalogRouteToken?
     let projectionRevision: UInt64
     let hasAgentSessionLink: Bool?
+    let hasCompactAgentSessionLink: Bool
+    let compactLinkExpiresAt: Date?
     /// Exact live membership in either direction; catalog reachability, never outbound authority.
     let hasAnyActiveLink: Bool?
     let hasActiveOutboundLink: Bool?
@@ -36,6 +38,8 @@ struct AgentSessionLinkRunCatalogProjection: Equatable {
         routeToken: AgentSessionLinkRunCatalogRouteToken?,
         projectionRevision: UInt64,
         hasAgentSessionLink: Bool?,
+        hasCompactAgentSessionLink: Bool = false,
+        compactLinkExpiresAt: Date? = nil,
         hasAnyActiveLink: Bool?,
         hasActiveOutboundLink: Bool? = true,
         expectedSurface: Data? = nil,
@@ -48,6 +52,8 @@ struct AgentSessionLinkRunCatalogProjection: Equatable {
         self.routeToken = routeToken
         self.projectionRevision = projectionRevision
         self.hasAgentSessionLink = hasAgentSessionLink
+        self.hasCompactAgentSessionLink = hasCompactAgentSessionLink
+        self.compactLinkExpiresAt = compactLinkExpiresAt
         self.hasAnyActiveLink = hasAnyActiveLink
         self.hasActiveOutboundLink = hasActiveOutboundLink
         self.expectedSurface = expectedSurface
@@ -76,7 +82,11 @@ struct AgentSessionLinkRunCatalogProjection: Equatable {
     }
 
     var isReady: Bool {
-        routeToken != nil && hasAgentSessionLink == true && hasActiveOutboundLink == true
+        routeToken != nil && hasActiveOutboundLink == true
+            && (
+                hasAgentSessionLink == true
+                    || (hasCompactAgentSessionLink && (compactLinkExpiresAt.map { $0 > Date() } ?? true))
+            )
     }
 }
 
@@ -91,7 +101,7 @@ enum AgentSessionLinkCatalogSurface {
 
     static func fingerprint(_ tools: [MCP.Tool]) throws -> Data {
         let family = tools.filter {
-            toolNames.contains($0.name)
+            toolNames.contains($0.name) || MCPCompactToolEnvelope.isWrapper($0.name)
         }.sorted { $0.name < $1.name }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
