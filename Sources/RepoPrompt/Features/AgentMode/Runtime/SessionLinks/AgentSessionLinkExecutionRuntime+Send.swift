@@ -291,8 +291,8 @@ extension AgentSessionLinkExecutionRuntime {
 
     func providerSwitchAcquirePhysicalDispatch(session: TabSession, dispatchID: AgentSessionLinkPromptDispatchID) -> Bool {
         // An accepted marker fences the retained carrier, but ordinary provider input is
-        // carrier-free and must not be mistaken for a second physical handover. A duplicate
-        // acquisition of the exact accepted dispatch remains rejected.
+        // carrier-free and must not be mistaken for a second physical handover. This gate does
+        // not classify replayed provider text.
         if session.pendingHandoff.providerSwitchAcceptedID != nil {
             return !session.pendingHandoff.isStagedForSend
         }
@@ -456,9 +456,10 @@ extension AgentSessionLinkExecutionRuntime {
         let computerUseArmedAtAdmission = session.isCodexComputerUseArmed
         let dispatchedMessage = computerUseArmedAtAdmission
             ? CodexComputerUseWorkflow.renderProviderPrompt(userInstructions: providerMessage) : providerMessage
-        if case let .failure(failure) = await providerSwitchSendAdmission(session: session, input: dispatchedMessage, isCurrent: {
-            command.isCurrent && stopFence.permitsStart(of: session) && liveness().permitsDelivery
-        }) { return .blocked(failure) }
+        if session.pendingHandoff.providerSwitchAcceptedID == nil,
+           case let .failure(failure) = await providerSwitchSendAdmission(session: session, input: dispatchedMessage, isCurrent: {
+               command.isCurrent && stopFence.permitsStart(of: session) && liveness().permitsDelivery
+           }) { return .blocked(failure) }
 
         // 3. Local composer claim. Losing it means a local user Send won the race, which is exactly
         //    `target_not_idle` — the observer polls and retries rather than queueing behind the user.
@@ -478,6 +479,7 @@ extension AgentSessionLinkExecutionRuntime {
         // Only a switch carries admission evidence across authorization. Ordinary SEND keeps its
         // existing postauthorization composition behavior in persistAndStartNoncomposerTurn.
         if session.pendingHandoff.providerSwitchDelivery != nil,
+           session.pendingHandoff.providerSwitchAcceptedID == nil,
            session.isCodexComputerUseArmed != computerUseArmedAtAdmission
         {
             releaseComposerSubmitClaim(claim)
@@ -602,7 +604,9 @@ extension AgentSessionLinkExecutionRuntime {
         defer { withExtendedLifetime(command) {} }
         let writer = command.writer
         var switchPreparation = providerSwitchPreparation
-        if liveSession.pendingHandoff.providerSwitchDelivery != nil, switchPreparation == nil {
+        if liveSession.pendingHandoff.providerSwitchDelivery != nil,
+           liveSession.pendingHandoff.providerSwitchAcceptedID == nil, switchPreparation == nil
+        {
             let input = liveSession.isCodexComputerUseArmed
                 ? CodexComputerUseWorkflow.renderProviderPrompt(userInstructions: providerMessage) : providerMessage
             switch await providerSwitchSendAdmission(session: liveSession, input: input, isCurrent: {
