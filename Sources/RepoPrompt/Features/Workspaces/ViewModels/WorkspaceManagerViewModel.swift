@@ -15673,17 +15673,10 @@ class WorkspaceManagerViewModel: ObservableObject {
         let intentID = UUID()
         let intentDateModified = workspaces[index].dateModified
         workspaceHiddenIntentByID[workspaceID] = intentID
-        let intent = WorkspaceSaveFieldIntent { [weak self] workspace in
-            // Showing a recovery copy is a restore, which `setWorkspaceHidden` routes elsewhere; a
-            // consolidation or restore since the request also ends it.
-            guard self?.workspaceHiddenIntentByID[workspaceID] == intentID,
-                  workspace.consolidatedIntoWorkspaceID == lifecycle,
-                  hidden || workspace.consolidatedIntoWorkspaceID == nil
-            else { return false }
-            workspace.isHiddenInMenus = hidden
-            workspace.dateModified = max(workspace.dateModified, intentDateModified)
-            return true
-        }
+        let intent = hiddenFieldIntent(
+            workspaceID: workspaceID, intentID: intentID, hidden: hidden,
+            lifecycle: lifecycle, intentDateModified: intentDateModified
+        )
         Task { @MainActor [weak self] in
             guard let self,
                   workspaceHiddenIntentByID[workspaceID] == intentID,
@@ -15828,6 +15821,26 @@ class WorkspaceManagerViewModel: ObservableObject {
         return !pendingConsolidatedRestoreIDs.contains(workspaceID)
     }
 
+    /// The hidden-state change of one request. Showing a recovery copy is a restore, which
+    /// `setWorkspaceHidden` routes elsewhere; a consolidation or restore since the request ends it.
+    private func hiddenFieldIntent(
+        workspaceID: UUID,
+        intentID: UUID,
+        hidden: Bool,
+        lifecycle: UUID?,
+        intentDateModified: Date
+    ) -> WorkspaceSaveFieldIntent {
+        WorkspaceSaveFieldIntent { [weak self] workspace in
+            guard self?.workspaceHiddenIntentByID[workspaceID] == intentID,
+                  workspace.consolidatedIntoWorkspaceID == lifecycle,
+                  hidden || workspace.consolidatedIntoWorkspaceID == nil
+            else { return false }
+            workspace.isHiddenInMenus = hidden
+            workspace.dateModified = max(workspace.dateModified, intentDateModified)
+            return true
+        }
+    }
+
     func setWorkspaceHiddenFromSnapshot(_ workspace: WorkspaceModel, hidden: Bool) async throws -> WorkspaceModel {
         var current = self.workspace(withID: workspace.id)
         var isAuthorityIncompleteRestore = authorityIncompleteConsolidatedRestoreIDs.contains(workspace.id)
@@ -15921,9 +15934,21 @@ class WorkspaceManagerViewModel: ObservableObject {
                 workspaces.append(updated)
             }
 
+            // Same intent as the UI setter, so another window's save during this one keeps it.
+            let intentID = UUID()
+            workspaceHiddenIntentByID[updated.id] = intentID
+            defer {
+                if workspaceHiddenIntentByID[updated.id] == intentID {
+                    workspaceHiddenIntentByID.removeValue(forKey: updated.id)
+                }
+            }
             let finalURL = try await saveWorkspaceToFileAsync(
                 updated,
-                source: .setWorkspaceHiddenFromSnapshot
+                source: .setWorkspaceHiddenFromSnapshot,
+                fieldIntent: hiddenFieldIntent(
+                    workspaceID: updated.id, intentID: intentID, hidden: hidden,
+                    lifecycle: current.consolidatedIntoWorkspaceID, intentDateModified: updated.dateModified
+                )
             )
             await workspaceDiskWriter.flush(url: finalURL)
 
@@ -15935,7 +15960,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 object: nil,
                 userInfo: ["managerID": instanceID]
             )
-            return updated
+            return self.workspace(withID: updated.id) ?? updated
         }
 
         guard !activeConsolidatedRestoreIDs.contains(workspace.id) else {

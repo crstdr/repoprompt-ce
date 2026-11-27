@@ -2520,6 +2520,62 @@ import XCTest
             }
         }
 
+        func testWorkspaceMetadataSaveRebasesAfterPeerProjection() async throws {
+            for rename in [true, false] {
+                try await withProjectionSaveFixture { fixture in
+                    let manager = fixture.manager
+                    let initial = try XCTUnwrap(manager.workspace(withID: fixture.workspace.id))
+                    let prepared = expectation(description: "metadata save prepared")
+                    let finished = expectation(description: "metadata save finished")
+                    let gate = WorkspaceDeleteSuspensionGate()
+                    manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { id, _, remaining in
+                        guard id == initial.id, remaining == 1 else { return }
+                        prepared.fulfill()
+                        await gate.wait()
+                    }
+                    let notifications = NotificationCenter.default.publisher(for: .workspaceListDidChange)
+                        .filter { $0.userInfo?["managerID"] is UUID }
+                        .first()
+                        .sink { _ in finished.fulfill() }
+                    defer {
+                        notifications.cancel()
+                        manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil)
+                        Task { await gate.open() }
+                    }
+                    if rename {
+                        manager.renameWorkspace(initial, newName: "Renamed workspace")
+                    } else {
+                        manager.setWorkspaceHidden(initial, hidden: true)
+                    }
+                    try await self.awaitSaveCheckpoint(prepared)
+                    let generation = fixture.bridge.projectionObservationStateForTesting.generation
+                    _ = try await self.restoreArchivedTabRemotely(in: fixture)
+                    let catalog = await fixture.runtime.workspaceStore.snapshot()
+                    let checkpoint = await fixture.observer.waitForProjection(
+                        afterGeneration: generation, through: catalog.publicationSequence, requireCatalogApplication: true
+                    )
+                    _ = try XCTUnwrap(checkpoint)
+                    let projected = try XCTUnwrap(manager.workspace(withID: initial.id))
+                    XCTAssertEqual(projected.name, initial.name)
+                    XCTAssertFalse(projected.isHiddenInMenus)
+                    XCTAssertTrue(projected.composeTabs.contains { $0.id == fixture.restoredTab.id })
+
+                    await gate.open()
+                    try await self.awaitSaveCheckpoint(finished)
+                    let snapshot = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(initial.id)
+                    let saved = try XCTUnwrap(snapshot)
+                    let canonical = try JSONDecoder().decode(WorkspaceModel.self, from: saved.document.documentBytes)
+                    XCTAssertEqual(canonical.name, rename ? "Renamed workspace" : initial.name)
+                    XCTAssertEqual(canonical.isHiddenInMenus, !rename)
+                    XCTAssertEqual(canonical.composeTabs, projected.composeTabs)
+                    XCTAssertNil(saved.revisions.dirtyRevision)
+                    XCTAssertEqual(manager.workspace(withID: initial.id)?.name, canonical.name)
+                    XCTAssertEqual(manager.workspace(withID: initial.id)?.isHiddenInMenus, canonical.isHiddenInMenus)
+                    try await self.assertCanonicalAndDiskRemain(saved, in: fixture)
+                }
+            }
+        }
+
         func testPreparationDriftRecapturesOnceAndPersistsTheLatestModel() async throws {
             try await assertPreparationDrift(changeCount: 1)
         }
@@ -3245,6 +3301,16 @@ import XCTest
             for (label, model) in [("canonical", persisted.canonical), ("disk", persisted.disk)] {
                 XCTAssertEqual(model.composeTabs.first?.promptText, "Peer edit", "TARGET control: \(label) document lost the winning peer edit")
             }
+        }
+
+        // MARK: - MCP snapshot hide path
+
+        func testSnapshotHideSurvivesPeerSaveAdoptedDuringRetry() async throws {
+            try await assertFieldSurvivesPeerSaveDuringRetry(.hide, adoption: .manualCatalogApply, route: .snapshot)
+        }
+
+        func testSnapshotHideSurvivesPeerSaveThatWinsRevisionCheck() async throws {
+            try await assertFieldSurvivesPeerSaveThatWinsRevisionCheck(.hide, route: .snapshot)
         }
 
         // MARK: - Superseded intent
@@ -4107,6 +4173,72 @@ import XCTest
             case presentationBridge
         }
 
+        /// How a field change is requested: the UI setter's deferred save, or the awaited MCP
+        /// snapshot hide path (hide only).
+        private enum FieldRoute {
+            case setter
+            case snapshot
+
+            @MainActor
+            func name(_ field: Field) -> String {
+                switch self {
+                case .setter: "\(field)"
+                case .snapshot: "snapshot-\(field)"
+                }
+            }
+        }
+
+        /// Starts the request. The setter route queues the deferred save; the snapshot route returns
+        /// the task awaiting `setWorkspaceHiddenFromSnapshot`.
+        private func startRequest(
+            _ field: Field,
+            route: FieldRoute,
+            on manager: WorkspaceManagerViewModel,
+            _ workspace: WorkspaceModel,
+            name: String
+        ) -> Task<Result<WorkspaceModel, Error>, Never>? {
+            switch route {
+            case .setter:
+                field.request(on: manager, workspace)
+                XCTAssertTrue(field.isPending(in: manager, workspaceID: workspace.id), "SETUP \(name): the setter queued no save")
+                return nil
+            case .snapshot:
+                precondition(field == .hide, "only hide/show has a snapshot route")
+                return Task { @MainActor in
+                    do {
+                        return try await .success(manager.setWorkspaceHiddenFromSnapshot(workspace, hidden: true))
+                    } catch {
+                        return .failure(error)
+                    }
+                }
+            }
+        }
+
+        /// Waits for the request to finish: the setter's pending flag clears, or the snapshot call
+        /// returns its live model, which must carry the change and the adopted peer edit.
+        private func finishRequest(
+            _ snapshotSave: Task<Result<WorkspaceModel, Error>, Never>?,
+            _ field: Field,
+            on manager: WorkspaceManagerViewModel,
+            workspaceID: UUID,
+            name: String,
+            timeout: Duration = .seconds(10)
+        ) async {
+            guard let snapshotSave else {
+                let finished = await waitUntil(timeout: timeout) { !field.isPending(in: manager, workspaceID: workspaceID) }
+                XCTAssertTrue(finished, "SETUP \(name): the deferred save did not finish")
+                return
+            }
+            switch await snapshotSave.value {
+            case let .success(returned):
+                XCTAssertTrue(field.isApplied(to: returned), "TARGET \(name): the returned live model lacks the change (\(Self.describe(returned)))")
+                XCTAssertEqual(returned.composeTabs.first?.promptText, "Peer edit", "TARGET \(name): the returned live model lost the peer edit")
+            case let .failure(error):
+                XCTFail("TARGET \(name): the snapshot save threw \(error)")
+            }
+            XCTAssertFalse(field.isPending(in: manager, workspaceID: workspaceID), "TARGET \(name): the snapshot save left its hidden intent pending")
+        }
+
         private struct AuthorityWindow {
             let runtime: MCPDomainRuntime
             let manager: WorkspaceManagerViewModel
@@ -4117,104 +4249,109 @@ import XCTest
 
         /// Parks the setter's first attempt, commits a peer prompt edit, lets W2 adopt it, then
         /// releases the save: its retry must carry both the field and the peer edit.
-        private func assertFieldSurvivesPeerSaveDuringRetry(_ field: Field, adoption: Adoption) async throws {
-            let window = try await makeAuthorityWindow(adoption: adoption, profile: "field-intent-\(field)")
+        private func assertFieldSurvivesPeerSaveDuringRetry(
+            _ field: Field,
+            adoption: Adoption,
+            route: FieldRoute = .setter
+        ) async throws {
+            let name = route.name(field)
+            let window = try await makeAuthorityWindow(adoption: adoption, profile: "field-intent-\(name)")
             let manager = window.manager
             let workspaceID = window.seeded.id
             let beforeValue = await window.runtime.workspaceStore.canonicalWorkspaceSnapshot(workspaceID)
-            let before = try XCTUnwrap(beforeValue, "SETUP \(field): seed missing from the authority")
-            let initial = try XCTUnwrap(manager.workspace(withID: workspaceID), "SETUP \(field): W2 did not load the seed")
-            XCTAssertFalse(field.isApplied(to: initial), "SETUP \(field): the seed already carries the change")
+            let before = try XCTUnwrap(beforeValue, "SETUP \(name): seed missing from the authority")
+            let initial = try XCTUnwrap(manager.workspace(withID: workspaceID), "SETUP \(name): W2 did not load the seed")
+            XCTAssertFalse(field.isApplied(to: initial), "SETUP \(name): the seed already carries the change")
 
             let gate = installGate(on: manager, workspaceID: workspaceID)
-            field.request(on: manager, initial)
-            XCTAssertTrue(field.isPending(in: manager, workspaceID: workspaceID), "SETUP \(field): the setter queued no save")
+            let snapshotSave = startRequest(field, route: route, on: manager, initial, name: name)
             let parked = await waitUntil { await gate.parkedCount == 1 }
-            XCTAssertTrue(parked, "SETUP \(field): the setter's save never reached the first-attempt gate")
+            XCTAssertTrue(parked, "SETUP \(name): the setter's save never reached the first-attempt gate")
             guard parked else { return }
 
             let generationBeforePeer = window.bridge?.projectionObservationStateForTesting.generation ?? 0
             let peerBase = try await peerSave(prompt: "Peer edit", workspaceID: workspaceID, runtime: window.runtime)
-            XCTAssertEqual(peerBase.revisions, before.revisions, "SETUP \(field): the authority advanced before the peer save")
+            XCTAssertEqual(peerBase.revisions, before.revisions, "SETUP \(name): the authority advanced before the peer save")
             try await adoptPeerSave(in: window, generationBeforePeer: generationBeforePeer)
-            let adopted = try XCTUnwrap(manager.workspace(withID: workspaceID), "SETUP \(field): W2 lost the workspace")
-            XCTAssertEqual(adopted.composeTabs.first?.promptText, "Peer edit", "SETUP \(field): W2 did not adopt the peer save")
-            XCTAssertFalse(field.isApplied(to: adopted), "SETUP \(field): the adopted copy already has the change; no retry exercised")
+            let adopted = try XCTUnwrap(manager.workspace(withID: workspaceID), "SETUP \(name): W2 lost the workspace")
+            XCTAssertEqual(adopted.composeTabs.first?.promptText, "Peer edit", "SETUP \(name): W2 did not adopt the peer save")
+            XCTAssertFalse(field.isApplied(to: adopted), "SETUP \(name): the adopted copy already has the change; no retry exercised")
 
             await gate.open()
-            let finished = await waitUntil { !field.isPending(in: manager, workspaceID: workspaceID) }
-            XCTAssertTrue(finished, "SETUP \(field): the deferred save did not finish")
+            await finishRequest(snapshotSave, field, on: manager, workspaceID: workspaceID, name: name)
             let attempts = await gate.attempts
-            XCTAssertEqual(attempts, [1, 0], "TARGET \(field): expected the first attempt plus exactly one retry")
+            XCTAssertEqual(attempts, [1, 0], "TARGET \(name): expected the first attempt plus exactly one retry")
 
             let persisted = try await readBack(workspaceID, runtime: window.runtime)
             for (label, model) in [("canonical", persisted.canonical), ("disk", persisted.disk)] {
-                XCTAssertTrue(field.isApplied(to: model), "TARGET \(field): \(label) document lost the change (\(Self.describe(model)))")
-                XCTAssertEqual(model.composeTabs.first?.promptText, "Peer edit", "TARGET \(field): \(label) document lost the peer edit")
+                XCTAssertTrue(field.isApplied(to: model), "TARGET \(name): \(label) document lost the change (\(Self.describe(model)))")
+                XCTAssertEqual(model.composeTabs.first?.promptText, "Peer edit", "TARGET \(name): \(label) document lost the peer edit")
             }
             if let observer = window.observer {
                 let finalSequence = await window.runtime.workspaceStore.snapshot().publicationSequence
                 let settled = await observer.waitForProjection(afterGeneration: 0, through: finalSequence, timeout: .seconds(10))
-                XCTAssertNotNil(settled, "SETUP \(field): the bridge never observed its own final save")
+                XCTAssertNotNil(settled, "SETUP \(name): the bridge never observed its own final save")
             }
-            let local = try XCTUnwrap(manager.workspace(withID: workspaceID), "TARGET \(field): W2 lost the workspace")
-            XCTAssertTrue(field.isApplied(to: local), "TARGET \(field): W2 memory lost the change (\(Self.describe(local)))")
-            XCTAssertEqual(local.composeTabs.first?.promptText, "Peer edit", "TARGET \(field): W2 memory lost the peer edit")
+            let local = try XCTUnwrap(manager.workspace(withID: workspaceID), "TARGET \(name): W2 lost the workspace")
+            XCTAssertTrue(field.isApplied(to: local), "TARGET \(name): W2 memory lost the change (\(Self.describe(local)))")
+            XCTAssertEqual(local.composeTabs.first?.promptText, "Peer edit", "TARGET \(name): W2 memory lost the peer edit")
         }
 
         /// The setter's authority command is dispatched against the seed revision, then parked in
         /// the client right before the store executes it. A peer save advances the revision, so the
         /// released command fails the store's revision check after every local capture check passed.
         /// Recovery must adopt the winning save and replay only the field over it.
-        private func assertFieldSurvivesPeerSaveThatWinsRevisionCheck(_ field: Field) async throws {
+        private func assertFieldSurvivesPeerSaveThatWinsRevisionCheck(
+            _ field: Field,
+            route: FieldRoute = .setter
+        ) async throws {
+            let name = route.name(field)
             let commandGate = CommandGate()
             commandGates.append(commandGate)
-            let window = try await makeAuthorityWindow(adoption: .presentationBridge, profile: "field-conflict-\(field)") { client in
+            let window = try await makeAuthorityWindow(adoption: .presentationBridge, profile: "field-conflict-\(name)") { client in
                 client.commandWillExecuteForTesting = { envelope in await commandGate.arrive(envelope) }
             }
             let manager = window.manager
             let workspaceID = window.seeded.id
             let beforeValue = await window.runtime.workspaceStore.canonicalWorkspaceSnapshot(workspaceID)
-            let before = try XCTUnwrap(beforeValue, "SETUP conflict \(field): seed missing from the authority")
-            let initial = try XCTUnwrap(manager.workspace(withID: workspaceID), "SETUP conflict \(field): W2 did not load the seed")
-            XCTAssertFalse(field.isApplied(to: initial), "SETUP conflict \(field): the seed already carries the change")
+            let before = try XCTUnwrap(beforeValue, "SETUP conflict \(name): seed missing from the authority")
+            let initial = try XCTUnwrap(manager.workspace(withID: workspaceID), "SETUP conflict \(name): W2 did not load the seed")
+            XCTAssertFalse(field.isApplied(to: initial), "SETUP conflict \(name): the seed already carries the change")
             await commandGate.arm(workspaceID: workspaceID)
 
-            field.request(on: manager, initial)
-            XCTAssertTrue(field.isPending(in: manager, workspaceID: workspaceID), "SETUP conflict \(field): the setter queued no save")
+            let snapshotSave = startRequest(field, route: route, on: manager, initial, name: "conflict \(name)")
             let parked = await waitUntil { await commandGate.parkedCount == 1 }
-            XCTAssertTrue(parked, "SETUP conflict \(field): the setter's working-document command never reached the store")
+            XCTAssertTrue(parked, "SETUP conflict \(name): the setter's working-document command never reached the store")
             guard parked else { return }
             let parkedRevisions = await commandGate.replaceRevisions
             XCTAssertEqual(
                 parkedRevisions, [before.revisions.workingRevision],
-                "SETUP conflict \(field): the parked command does not expect the seed revision"
+                "SETUP conflict \(name): the parked command does not expect the seed revision"
             )
 
             let peerBase = try await peerSave(prompt: "Peer edit", workspaceID: workspaceID, runtime: window.runtime)
-            XCTAssertEqual(peerBase.revisions, before.revisions, "SETUP conflict \(field): the authority advanced before the peer save")
+            XCTAssertEqual(peerBase.revisions, before.revisions, "SETUP conflict \(name): the authority advanced before the peer save")
             await commandGate.open()
-            let finished = await waitUntil(timeout: .seconds(15)) { !field.isPending(in: manager, workspaceID: workspaceID) }
-            XCTAssertTrue(finished, "SETUP conflict \(field): the deferred save did not finish")
+            await finishRequest(snapshotSave, field, on: manager, workspaceID: workspaceID, name: "conflict \(name)", timeout: .seconds(15))
             let commands = await commandGate.replaceRevisions
-            print("REPRO conflict \(field): replaceWorkingDocument expectedRevisions=\(commands)")
-            XCTAssertGreaterThanOrEqual(commands.count, 2, "TARGET conflict \(field): the field was not replayed after the conflict")
+            print("REPRO conflict \(name): replaceWorkingDocument expectedRevisions=\(commands)")
+            XCTAssertGreaterThanOrEqual(commands.count, 2, "TARGET conflict \(name): the field was not replayed after the conflict")
             if commands.count >= 2, let stale = commands.first ?? nil, let replay = commands.last ?? nil {
-                XCTAssertGreaterThan(replay, stale, "TARGET conflict \(field): the replay did not rebase onto the winning revision")
+                XCTAssertGreaterThan(replay, stale, "TARGET conflict \(name): the replay did not rebase onto the winning revision")
             }
 
             let persisted = try await readBack(workspaceID, runtime: window.runtime)
             for (label, model) in [("canonical", persisted.canonical), ("disk", persisted.disk)] {
-                XCTAssertTrue(field.isApplied(to: model), "TARGET conflict \(field): \(label) document lost the change (\(Self.describe(model)))")
-                XCTAssertEqual(model.composeTabs.first?.promptText, "Peer edit", "TARGET conflict \(field): \(label) document lost the peer edit")
+                XCTAssertTrue(field.isApplied(to: model), "TARGET conflict \(name): \(label) document lost the change (\(Self.describe(model)))")
+                XCTAssertEqual(model.composeTabs.first?.promptText, "Peer edit", "TARGET conflict \(name): \(label) document lost the peer edit")
             }
             if let observer = window.observer {
                 let finalSequence = await window.runtime.workspaceStore.snapshot().publicationSequence
                 let settled = await observer.waitForProjection(afterGeneration: 0, through: finalSequence, timeout: .seconds(10))
-                XCTAssertNotNil(settled, "SETUP conflict \(field): the bridge never observed the final save")
+                XCTAssertNotNil(settled, "SETUP conflict \(name): the bridge never observed the final save")
             }
-            let local = try XCTUnwrap(manager.workspace(withID: workspaceID), "TARGET conflict \(field): W2 lost the workspace")
-            XCTAssertEqual(Self.describe(local), Self.describe(persisted.canonical), "TARGET conflict \(field): W2 memory differs from canonical")
+            let local = try XCTUnwrap(manager.workspace(withID: workspaceID), "TARGET conflict \(name): W2 lost the workspace")
+            XCTAssertEqual(Self.describe(local), Self.describe(persisted.canonical), "TARGET conflict \(name): W2 memory differs from canonical")
         }
 
         /// Seeds "Original" (not hidden, no colour, prompt "Initial prompt"), starts a runtime and W2
