@@ -680,6 +680,51 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
         }
     }
 
+    func testAcceptedProviderSwitchDoesNotBlockFreshLinkedOrNoncomposerInput() async throws {
+        for saveFailed in [false, true] {
+            for linked in [true, false] {
+                let fixture = try makeFixture()
+                let session = fixture.session
+                let runtime = fixture.viewModel.linkExecutionRuntime
+                let acceptedID = UUID()
+                let carrier = "already accepted handover"
+                let request = makeRequest()
+                session.pendingHandoff = .init(payload: carrier, createdAt: Date(), providerSwitchDelivery: .sending)
+                session.pendingHandoff.providerSwitchAcceptedID = acceptedID
+                session.providerSwitchConfirmationSaveFailed = saveFailed
+
+                let outcome: AgentSessionLinkSendTransactionOutcome
+                if linked {
+                    outcome = await send(fixture, request: request)
+                } else {
+                    let target = try XCTUnwrap(fixture.viewModel.makeComposerSubmitTarget(tabID: fixture.tabID, session: session))
+                    let attempt = AgentComposerSubmitAttempt(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: "")
+                    guard case let .claimed(claim) = fixture.viewModel.claimComposerSubmitAttempt(attempt, requireActiveTabOwnership: false) else {
+                        return XCTFail("Expected direct-host claim")
+                    }
+                    outcome = await runtime.persistAndStartNoncomposerTurn(
+                        session: session, tabID: fixture.tabID, workspaceID: fixture.workspaceID, claim: claim,
+                        displayText: request.message, providerMessage: request.message, workflow: nil,
+                        attribution: nil, stopFence: .init(session: session), dispatchIsCurrent: { true }
+                    )
+                }
+                guard case let .delivered(delivery) = outcome else {
+                    XCTFail("Known acceptance must allow fresh input, got \(outcome)")
+                    continue
+                }
+                XCTAssertEqual(delivery.deliveryState, .runStarted)
+                let rows = session.items.filter { $0.kind == .user }
+                XCTAssertEqual(rows.map(\.id), [delivery.targetItemID])
+                let row = try XCTUnwrap(rows.first)
+                XCTAssertEqual(row.text, request.message)
+                XCTAssertEqual(row.crossSessionAttribution?.sourceSessionID, linked ? request.observerSessionID : nil)
+                XCTAssertFalse(try XCTUnwrap(row.dispatchedProviderText).contains(carrier))
+                XCTAssertTrue(fixture.events.saveHappenedBeforeProviderStart())
+                XCTAssertEqual(session.pendingHandoff.providerSwitchAcceptedID, acceptedID)
+            }
+        }
+    }
+
     func testDeliversAttributedRowDurablyBeforeProviderStart() async throws {
         let fixture = try makeFixture()
         let request = makeRequest()
