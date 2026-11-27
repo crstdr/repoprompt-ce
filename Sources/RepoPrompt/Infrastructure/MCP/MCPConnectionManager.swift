@@ -14374,6 +14374,28 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                     watchdogEnvironment: executionWatchdogEnvironment
                 )
                 : nil
+            // One absolute deadline bounds both queue waits (connection lane, then window lease).
+            let admissionDeadline = promptExportExecutionEnvelope?.admissionDeadline ?? mutationCall?.preWriteWaitDeadline
+            func mutationAdmissionTimeoutResult() -> CallTool.Result {
+                let failure = MCPMutationRetryableFailure.admissionTimeout()
+                var metadata: [String: Value] = [
+                    "retryable": .bool(failure.retryable),
+                    "retry_after_ms": .int(failure.retryAfterMilliseconds),
+                    "mutation_state": .string("not_applied"),
+                    "settlement": .string("admission_timeout"),
+                    "tool": .string(toolName),
+                    "suggestion": .string(failure.suggestion)
+                ]
+                if toolName == MCPWindowToolName.applyEdits {
+                    metadata["edits_applied"] = .int(0)
+                }
+                return Self.executionContractToolErrorResult(
+                    rawJSON: capturedRawJSON,
+                    code: failure.errorCode,
+                    message: failure.errorMessage,
+                    metadata: metadata
+                )
+            }
             connectionLog("tools/call \(toolName): acquiring limiter lane=\(callLane.rawValue)")
             if let admissionTimeout = promptExportAdmissionTimeoutResultIfExpired() {
                 return await finishRequestProgress(admissionTimeout)
@@ -14452,9 +14474,12 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                     resolution: limiterResolution,
                     toolName: toolName,
                     lifecycleCorrelation: lifecycleCorrelation,
-                    admissionDeadline: promptExportExecutionEnvelope?.admissionDeadline,
+                    admissionDeadline: admissionDeadline,
                     admissionTimeoutResult: {
                         endLaneQueue(.expired)
+                        if mutationCall != nil {
+                            return mutationAdmissionTimeoutResult()
+                        }
                         return promptExportAdmissionTimeoutResultIfExpired()
                             ?? Self.executionContractToolErrorResult(
                                 rawJSON: capturedRawJSON,
@@ -14768,7 +14793,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                                     toolName: toolName,
                                     admissionClass: admissionClass,
                                     windowID: chosenID,
-                                    deadline: promptExportExecutionEnvelope?.admissionDeadline,
+                                    deadline: admissionDeadline,
                                     evidenceClass: evidenceClass,
                                     operationIdentity: evidenceOperationIdentity
                                 ) {
@@ -14782,6 +14807,9 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                                     }
                                     if deadlineExpired, let result = promptExportAdmissionTimeoutResultIfExpired() {
                                         return result
+                                    }
+                                    if deadlineExpired, mutationCall != nil {
+                                        return mutationAdmissionTimeoutResult()
                                     }
                                     return Self.executionContractToolErrorResult(rawJSON: capturedRawJSON, code: code, message: message)
                                 }
