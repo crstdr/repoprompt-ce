@@ -4363,19 +4363,24 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         windowID: Int,
         tabID: UUID?,
         expectedAgentPID: pid_t? = nil,
-        registration: MCPRunRoutingCleanupReceipt? = nil
+        registration: MCPRunRoutingCleanupReceipt? = nil,
+        expectedConnectionID: UUID? = nil
     ) async -> Bool {
         guard registration.map({ ownsRunRegistration($0) && $0.runID == runID && $0.routeID == windowID }) ?? true else { return false }
         let connectionID = await MainActor.run { () -> UUID? in
             let bindings: MCPRunRouteBindings? = if let registration { registration.routeOwner?.runRouteBindings }
             else { WindowStatesManager.shared.window(withID: windowID)?.mcpServer.runRouteBindings }
             guard let bindings, let connectionID = bindings.connectionIDByRunID[runID],
-                  bindings.hasCurrentMapping(runID: runID, connectionID: connectionID, expectedTabID: tabID)
+                  bindings.hasCurrentMapping(runID: runID, connectionID: connectionID, expectedTabID: tabID),
+                  registration.map({ bindings.cleanupOwnership(for: connectionID)?.policyID == $0.policyID }) ?? true
             else { return nil }
             return connectionID
         }
+        let authorityGeneration = runRoutingAuthorityGenerationByRunID[runID]
+        let policyRevision = runPolicyStateByRunID[runID]?.admissionRevision
         guard registration.map(ownsRunRegistration) ?? true,
-              let connectionID,
+              let connectionID, expectedConnectionID == nil || connectionID == expectedConnectionID,
+              registration.map({ runCleanupOwnershipByConnectionID[connectionID]?.policyID == $0.policyID }) ?? true,
               let actorSnapshot = authoritativeRunRouteActorSnapshot(
                   runID: runID,
                   connectionID: connectionID,
@@ -4393,8 +4398,15 @@ actor ServerNetworkManager: MCPServerConnectionHost {
             let bindings: MCPRunRouteBindings? = if let registration { registration.routeOwner?.runRouteBindings }
             else { WindowStatesManager.shared.window(withID: windowID)?.mcpServer.runRouteBindings }
             return bindings?.hasCurrentMapping(runID: runID, connectionID: connectionID, expectedTabID: tabID) == true
+                && (registration.map { bindings?.cleanupOwnership(for: connectionID)?.policyID == $0.policyID } ?? true)
         }
         guard registration.map(ownsRunRegistration) ?? true, mappingIsStillCurrent,
+              registration.map({
+                  authorityGeneration == $0.routingAuthorityGeneration
+                      && runRoutingAuthorityGenerationByRunID[runID] == authorityGeneration
+                      && runPolicyStateByRunID[runID]?.admissionRevision == policyRevision
+                      && runCleanupOwnershipByConnectionID[connectionID]?.policyID == $0.policyID
+              }) ?? true,
               let revalidatedActorSnapshot = authoritativeRunRouteActorSnapshot(
                   runID: runID,
                   connectionID: connectionID,
@@ -9205,12 +9217,14 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         if let automaticAdmission,
            !isCurrentAutomaticAgentAdmission(automaticAdmission, connectionID: connectionID, clientName: clientName, requiresPendingPolicy: true)
         { return false }
+        let ownedRegistration = automaticAdmission.flatMap { runPolicyStateByRunID[$0.runID]?.cleanupReceipt }
         let policyOutcome = await applyPendingPolicyIfAvailable(
             clientName: clientName,
             connectionID: connectionID,
             clientPid: clientPid,
             bootstrapClientName: bootstrapClientName,
-            expectedLifecycleGeneration: expectedLifecycleGeneration
+            expectedLifecycleGeneration: expectedLifecycleGeneration,
+            automaticAdmission: automaticAdmission
         )
         guard isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return false }
         if case let .rejected(runID, reason) = policyOutcome {
@@ -9221,6 +9235,16 @@ actor ServerNetworkManager: MCPServerConnectionHost {
             return false
         }
         if let automaticAdmission {
+            if let ownedRegistration, ownedRegistration.routeOwner != nil {
+                guard policyOutcome == .applied(runID: automaticAdmission.runID),
+                      await isRunRouteAuthoritativelyCommitted(
+                          runID: automaticAdmission.runID, windowID: ownedRegistration.routeID,
+                          tabID: runPolicyStateByRunID[automaticAdmission.runID]?.tabID,
+                          registration: ownedRegistration, expectedConnectionID: connectionID
+                      ), !Task.isCancelled,
+                      isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration)
+                else { return false }
+            }
             guard isCurrentAutomaticAgentAdmission(
                 automaticAdmission, connectionID: connectionID, clientName: clientName, requiresPendingPolicy: false
             ),
@@ -12782,7 +12806,8 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         bootstrapClientName: String? = nil,
         pidGateTimeout: TimeInterval = 2.0,
         requireRunRouting: Bool = true,
-        expectedLifecycleGeneration: UInt64? = nil
+        expectedLifecycleGeneration: UInt64? = nil,
+        automaticAdmission: AutomaticAgentAdmission? = nil
     ) async -> PendingPolicyApplicationOutcome {
         let initialSessionKey = connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID]
         let initialRunID = runIDByConnectionID[connectionID]
@@ -12944,6 +12969,41 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         }
         let matchedQueueEntry = oldestPendingPolicyEntry(for: clientName, where: eligible)
         guard let matchedQueueEntry else {
+            if let liveAffinity, let state = runPolicyStateByRunID[liveAffinity.runID],
+               let receipt = state.cleanupReceipt, receipt.routeOwner != nil
+            {
+                guard requireRunRouting, let automaticAdmission, case .liveToken = automaticAdmission.source,
+                      automaticAdmission.runID == liveAffinity.runID,
+                      isCurrentAutomaticAgentAdmission(
+                          automaticAdmission, connectionID: connectionID, clientName: clientName, requiresPendingPolicy: false
+                      ), pendingPolicyApplicationIDByConnectionID[connectionID] == nil,
+                      pendingPolicyApplicationIDByRunID[liveAffinity.runID] == nil,
+                      state.tabID != nil, state.workspaceID != nil, state.windowID == receipt.routeID,
+                      state.windowID == liveAffinity.windowID, state.purpose == .agentModeRun,
+                      ownsRunRegistration(receipt), !Task.isCancelled
+                else { return .rejected(runID: liveAffinity.runID, reason: "stale_connection") }
+                if await isRunRouteAuthoritativelyCommitted(
+                    runID: liveAffinity.runID, windowID: state.windowID, tabID: state.tabID,
+                    registration: receipt, expectedConnectionID: connectionID
+                ) {
+                    return .applied(runID: liveAffinity.runID)
+                }
+                // Connection-only projection of the current registration; never queued or consumed.
+                let policy = ClientConnectionPolicy(
+                    id: receipt.policyID, windowID: state.windowID, restrictedTools: state.restrictedTools,
+                    oneShot: false, reason: nil, createdAt: state.updatedAt, ttl: 0, prunesOnlyAfterSettlement: true,
+                    tabID: state.tabID, runID: liveAffinity.runID, additionalTools: state.additionalTools,
+                    purpose: state.purpose, taskLabelKind: state.taskLabelKind,
+                    allowsAgentExternalControlTools: state.allowsAgentExternalControlTools,
+                    requiresExpectedAgentPID: true, cleanupReceipt: receipt
+                )
+                return await applyConnectionPolicy(
+                    policy, clientName: clientName, connectionID: connectionID, clientPid: clientPid,
+                    bootstrapClientName: bootstrapClientName, requireRunRouting: requireRunRouting,
+                    expectedLifecycleGeneration: expectedLifecycleGeneration,
+                    reconnect: (automaticAdmission, state)
+                )
+            }
             if liveAffinity != nil {
                 await applyRoutingFallback(clientName: clientName, connectionID: connectionID, clientPid: clientPid)
                 return .fallback
@@ -13044,11 +13104,53 @@ actor ServerNetworkManager: MCPServerConnectionHost {
             return .rejected(runID: policyRunID, reason: "session_token_bound_to_other_run")
         }
 
+        return await applyConnectionPolicy(
+            policy, clientName: clientName, connectionID: connectionID, clientPid: clientPid,
+            bootstrapClientName: bootstrapClientName, requireRunRouting: requireRunRouting,
+            expectedLifecycleGeneration: expectedLifecycleGeneration,
+            queue: (matchedQueueEntry.key, remainingAfterPop, remainingAfterRequeue)
+        )
+    }
+
+    private func applyConnectionPolicy(
+        _ policy: ClientConnectionPolicy,
+        clientName: String,
+        connectionID: UUID,
+        clientPid: Int?,
+        bootstrapClientName: String?,
+        requireRunRouting: Bool,
+        expectedLifecycleGeneration: UInt64?,
+        queue: (key: String, afterPop: Int, afterStore: Int)? = nil,
+        reconnect: (proof: AutomaticAgentAdmission, state: RunConnectionPolicyState)? = nil
+    ) async -> PendingPolicyApplicationOutcome {
+        let queueKey = queue?.key ?? "owned_reconnect"
+        let remainingAfterPop = queue?.afterPop ?? 0
+        let remainingAfterRequeue = queue?.afterStore ?? 0
+        func reconnectProofIsCurrent() -> Bool {
+            guard let reconnect else { return true }
+            return !Task.isCancelled
+                && expectedLifecycleGeneration.map {
+                    connectionLifecycleState.isLive(connectionID: connectionID, generation: $0)
+                } == true
+                && runPolicyStateByRunID[reconnect.proof.runID]?.admissionRevision == reconnect.state.admissionRevision
+                && isPendingPolicyApplicationCurrent(
+                    connectionID: connectionID, clientName: clientName, expectedLifecycleGeneration: expectedLifecycleGeneration
+                )
+                && isCurrentAutomaticAgentAdmission(
+                    reconnect.proof, connectionID: connectionID, clientName: clientName, requiresPendingPolicy: false
+                )
+        }
+        guard reconnectProofIsCurrent() else { return .rejected(runID: policy.runID, reason: "stale_connection") }
+        if reconnect != nil, pendingPolicyApplicationIDByConnectionID[connectionID] != nil
+            || policy.runID.map({ pendingPolicyApplicationIDByRunID[$0] != nil }) == true
+        {
+            return .rejected(runID: policy.runID, reason: "stale_connection")
+        }
         if let receipt = policy.cleanupReceipt, receipt.routeOwner != nil,
            !ownsRunRegistration(receipt) || runRoutingAuthorityGenerationByRunID[receipt.runID] != receipt.routingAuthorityGeneration
         {
             if policy.oneShot {
-                _ = rollbackOneShotPendingPolicyReservation(id: policy.id, key: matchedQueueEntry.key, connectionID: connectionID)
+                _ = rollbackOneShotPendingPolicyReservation(id: policy.id, key: queueKey, connectionID: connectionID)
             }
             return .rejected(runID: policy.runID, reason: "stale_connection")
         }
@@ -13071,7 +13173,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
             nil
         }
 
-        guard isPendingPolicyApplicationOwner(
+        guard reconnectProofIsCurrent(), isPendingPolicyApplicationOwner(
             pendingPolicyApplicationID,
             connectionID: connectionID,
             runID: policy.runID,
@@ -13079,7 +13181,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         ) else {
             if policy.oneShot {
                 _ = rollbackOneShotPendingPolicyReservation(
-                    id: policy.id, key: matchedQueueEntry.key, connectionID: connectionID
+                    id: policy.id, key: queueKey, connectionID: connectionID
                 )
             }
             finishPendingPolicyApplication(pendingPolicyApplicationID, connectionID: connectionID, runID: policy.runID)
@@ -13111,7 +13213,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
             #endif
         }
 
-        guard isPendingPolicyApplicationOwner(
+        guard reconnectProofIsCurrent(), isPendingPolicyApplicationOwner(
             pendingPolicyApplicationID,
             connectionID: connectionID,
             runID: policy.runID,
@@ -13119,7 +13221,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         ) else {
             if policy.oneShot {
                 _ = rollbackOneShotPendingPolicyReservation(
-                    id: policy.id, key: matchedQueueEntry.key, connectionID: connectionID
+                    id: policy.id, key: queueKey, connectionID: connectionID
                 )
             }
             finishPendingPolicyApplication(pendingPolicyApplicationID, connectionID: connectionID, runID: policy.runID)
@@ -13145,9 +13247,9 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         setConnectionRestrictedTools(policy.restrictedTools, for: connectionID)
         setConnectionPreassigned(true, for: connectionID)
         setConnectionRunPurpose(policy.purpose, for: connectionID)
-        cacheRunPolicyStateIfNeeded(policy)
+        if reconnect == nil { cacheRunPolicyStateIfNeeded(policy) }
         if let runID = policy.runID {
-            admittedPolicyRunIDs.insert(runID)
+            if reconnect == nil { admittedPolicyRunIDs.insert(runID) }
             setConnectionRunID(runID, for: connectionID)
             runCleanupOwnershipByConnectionID[connectionID] = policy.cleanupReceipt?.mappingOwnership
         }
@@ -13163,7 +13265,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
             await debugSuspendPendingPolicyRouteInstallationIfNeeded()
         #endif
 
-        guard isPendingPolicyApplicationOwner(
+        guard reconnectProofIsCurrent(), isPendingPolicyApplicationOwner(
             pendingPolicyApplicationID,
             connectionID: connectionID,
             runID: policy.runID,
@@ -13178,7 +13280,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
             if policy.oneShot {
                 _ = rollbackOneShotPendingPolicyReservation(
                     id: policy.id,
-                    key: matchedQueueEntry.key,
+                    key: queueKey,
                     connectionID: connectionID
                 )
             }
@@ -13188,6 +13290,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                 connectionID: connectionID,
                 restorePoint: restorePoint,
                 applicationID: pendingPolicyApplicationID,
+                restoreRunPolicy: reconnect == nil,
                 routingWaitGeneration: routingWaitGeneration,
                 signalRoutingFailure: false
             )
@@ -13203,7 +13306,8 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                 )
                 pendingPolicyRunIDMappingToken = installation?.token
                 routed = installation != nil && ownsRunRegistration(receipt)
-                if routed, let installation, let cached = runPolicyStateByRunID[runID] {
+                    && (reconnect.map { installation?.workspaceID == $0.state.workspaceID && installation?.tabID == $0.state.tabID } ?? true)
+                if reconnect == nil, routed, let installation, let cached = runPolicyStateByRunID[runID] {
                     seedRunPolicyState(
                         runID: runID, windowID: policy.windowID, workspaceID: installation.workspaceID,
                         tabID: installation.tabID ?? policy.tabID, restrictedTools: cached.restrictedTools,
@@ -13248,7 +13352,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
             guard routed else {
                 let reservationRolledBack = !policy.oneShot || rollbackOneShotPendingPolicyReservation(
                     id: policy.id,
-                    key: matchedQueueEntry.key,
+                    key: queueKey,
                     connectionID: connectionID
                 )
                 await rollbackPendingPolicyApplication(
@@ -13257,6 +13361,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                     connectionID: connectionID,
                     restorePoint: restorePoint,
                     applicationID: pendingPolicyApplicationID,
+                    restoreRunPolicy: reconnect == nil,
                     routingWaitGeneration: routingWaitGeneration,
                     pendingPolicyRunIDMappingToken: pendingPolicyRunIDMappingToken
                 )
@@ -13283,7 +13388,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                     } ?? true
                 }
             }
-            guard routeMappingIsCurrent,
+            guard routeMappingIsCurrent, reconnectProofIsCurrent(),
                   (policy.cleanupReceipt.map { $0.routeOwner == nil || ownsRunRegistration($0) } ?? true),
                   isPendingPolicyApplicationOwner(
                       pendingPolicyApplicationID,
@@ -13300,7 +13405,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                 if policy.oneShot {
                     _ = rollbackOneShotPendingPolicyReservation(
                         id: policy.id,
-                        key: matchedQueueEntry.key,
+                        key: queueKey,
                         connectionID: connectionID
                     )
                 }
@@ -13310,6 +13415,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                     connectionID: connectionID,
                     restorePoint: restorePoint,
                     applicationID: pendingPolicyApplicationID,
+                    restoreRunPolicy: reconnect == nil,
                     routingWaitGeneration: routingWaitGeneration,
                     pendingPolicyRunIDMappingToken: pendingPolicyRunIDMappingToken,
                     signalRoutingFailure: false
@@ -13321,7 +13427,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         if policy.oneShot,
            !consumeOneShotPendingPolicy(
                id: policy.id,
-               key: matchedQueueEntry.key,
+               key: queueKey,
                connectionID: connectionID
            )
         {
@@ -13331,6 +13437,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                 connectionID: connectionID,
                 restorePoint: restorePoint,
                 applicationID: pendingPolicyApplicationID,
+                restoreRunPolicy: reconnect == nil,
                 routingWaitGeneration: routingWaitGeneration,
                 pendingPolicyRunIDMappingToken: pendingPolicyRunIDMappingToken
             )
@@ -13353,7 +13460,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         } else {
             true
         }
-        guard finalRouteIsCurrent, isPendingPolicyApplicationOwner(
+        guard finalRouteIsCurrent, reconnectProofIsCurrent(), isPendingPolicyApplicationOwner(
             pendingPolicyApplicationID,
             connectionID: connectionID,
             runID: policy.runID,
@@ -13371,6 +13478,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                 connectionID: connectionID,
                 restorePoint: restorePoint,
                 applicationID: pendingPolicyApplicationID,
+                restoreRunPolicy: reconnect == nil,
                 routingWaitGeneration: routingWaitGeneration,
                 pendingPolicyRunIDMappingToken: pendingPolicyRunIDMappingToken,
                 signalRoutingFailure: false
@@ -13407,7 +13515,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
             "Applying connection policy to \(connectionID) client=\(clientName) window=\(policy.windowID) grants=\(grantDescription) restricted=\(restrictedDescription) reason=\(policy.reason ?? "-") tabID=\(policy.tabID?.uuidString ?? "nil") runID=\(policy.runID?.uuidString ?? "nil")"
         )
         mcpPolicyLog(
-            "applied policy client=\(clientName) matchedKey=\(matchedQueueEntry.key) connection=\(connectionID) window=\(policy.windowID) purpose=\(policy.purpose.rawValue) oneShot=\(policy.oneShot) runID=\(policy.runID?.uuidString ?? "nil") tabID=\(policy.tabID?.uuidString ?? "nil") queueAfterPop=\(remainingAfterPop) queueAfterStore=\(remainingAfterRequeue)"
+            "applied policy client=\(clientName) matchedKey=\(queueKey) connection=\(connectionID) window=\(policy.windowID) purpose=\(policy.purpose.rawValue) oneShot=\(policy.oneShot) runID=\(policy.runID?.uuidString ?? "nil") tabID=\(policy.tabID?.uuidString ?? "nil") queueAfterPop=\(remainingAfterPop) queueAfterStore=\(remainingAfterRequeue)"
         )
         #if DEBUG
             if let runID = policy.runID {
@@ -13419,7 +13527,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                         "client_name": clientName,
                         "bootstrap_client_name": bootstrapClientName ?? "nil",
                         "helper_peer_pid": clientPid.map(String.init) ?? "nil",
-                        "pending_policy_key": matchedQueueEntry.key,
+                        "pending_policy_key": queueKey,
                         "window_id": String(policy.windowID),
                         "tab_id": policy.tabID?.uuidString ?? "nil",
                         "purpose": policy.purpose.rawValue,
@@ -13432,7 +13540,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                 "clientName": clientName,
                 "clientPid": clientPid.map(String.init) ?? "nil",
                 "bootstrapClientName": bootstrapClientName ?? "nil",
-                "matchedKey": matchedQueueEntry.key,
+                "matchedKey": queueKey,
                 "windowID": String(policy.windowID),
                 "tabID": policy.tabID?.uuidString ?? "nil",
                 "runID": policy.runID?.uuidString ?? "nil",
@@ -13446,6 +13554,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                 "queueAfterStore": String(remainingAfterRequeue)
             ])
         #endif
+        guard reconnectProofIsCurrent() else { return .rejected(runID: policy.runID, reason: "stale_connection") }
         if let runID = policy.runID {
             updateLiveRunAffinity(
                 clientName: clientName,
@@ -13467,6 +13576,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         if let receipt = policy.cleanupReceipt, receipt.routeOwner != nil, !ownsRunRegistration(receipt) {
             return .rejected(runID: policy.runID, reason: "stale_connection")
         }
+        guard reconnectProofIsCurrent() else { return .rejected(runID: policy.runID, reason: "stale_connection") }
         if let runID = policy.runID {
             signalRunRouteChanged(runID: runID)
         }
@@ -13507,6 +13617,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         connectionID: UUID,
         restorePoint: PendingPolicyRestorePoint,
         applicationID: UUID,
+        restoreRunPolicy: Bool = true,
         routingWaitGeneration: UUID? = nil,
         pendingPolicyRunIDMappingToken: MCPServerViewModel.PendingPolicyRunIDMappingToken? = nil,
         signalRoutingFailure: Bool = true
@@ -13563,7 +13674,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
             connectionID: connectionID,
             policyRunID: policy.runID,
             restoreConnectionScopedState: ownsConnectionState,
-            restoreRunScopedState: ownsRunState
+            restoreRunScopedState: restoreRunPolicy && ownsRunState
         )
         finishPendingPolicyApplication(
             applicationID,

@@ -184,7 +184,11 @@ final actor ServerController: ObservableObject {
     }
 
     /// Shared by live socket initialization and isolated transport regression tests.
-    private func authorizeConnection(connectionID: UUID, clientName: String) async -> Bool {
+    private func authorizeConnection(
+        connectionID: UUID,
+        clientName: String,
+        approvalOverride: (globalAutoApproval: Bool, verifiedHelperPID: Int?)? = nil
+    ) async -> Bool {
         serverControllerDebugLog("Approval handler called for client: '\(clientName)' connectionID: \(connectionID)")
 
         // Reserve a slot BEFORE any UI to avoid stampedes
@@ -195,21 +199,12 @@ final actor ServerController: ObservableObject {
             return false
         }
 
-        // The explicit global bypass applies in both approval modes; strict mode
-        // only disables name-based grants (built-in and saved client names).
-        if autoApproveAllClients {
-            serverControllerDebugLog("Auto-approving '\(clientName)' (global auto-approve enabled)")
-            if let service = mcpService {
-                await service.clientConnectedSuccessfully(name: clientName)
-            }
-            return true
-        }
-
         // Built-in auto-approve for RepoPrompt's own CLI clients requires
         // executable verification. Do not consult the generic allow-list for these
         // spoofable client names.
         let isRepoCLI = Self.isRepoPromptCLIClientName(clientName)
-        let verifiedHelperPID = await bundledRepoPromptHelperPID(connectionID: connectionID)
+        let verifiedHelperPID: Int? = if let approvalOverride { approvalOverride.verifiedHelperPID }
+        else { await bundledRepoPromptHelperPID(connectionID: connectionID) }
         let verifiedBundledCLI = verifiedHelperPID != nil
         let appManagedAgent = if let verifiedHelperPID {
             await networkManager.authorizeAutomaticAppManagedAgentAdmission(
@@ -219,6 +214,13 @@ final actor ServerController: ObservableObject {
             )
         } else {
             false
+        }
+        // Global consent permits the connection, not a run association. Collect the
+        // verified routing proof above even when global consent is already granted.
+        if approvalOverride?.globalAutoApproval ?? autoApproveAllClients {
+            serverControllerDebugLog("Auto-approving '\(clientName)' (global auto-approve enabled)")
+            await mcpService?.clientConnectedSuccessfully(name: clientName)
+            return true
         }
         if Self.canAutomaticallyApprove(clientName: clientName, bundledCLI: verifiedBundledCLI) || appManagedAgent {
             serverControllerDebugLog("Auto-approving '\(clientName)' (bundled helper verified; appManagedAgent=\(appManagedAgent))")
@@ -344,8 +346,12 @@ final actor ServerController: ObservableObject {
     }
 
     #if DEBUG
-        func test_authorizeConnection(connectionID: UUID, clientName: String) async -> Bool {
-            await authorizeConnection(connectionID: connectionID, clientName: clientName)
+        func test_authorizeConnection(
+            connectionID: UUID,
+            clientName: String,
+            approvalOverride: (globalAutoApproval: Bool, verifiedHelperPID: Int?)? = nil
+        ) async -> Bool {
+            await authorizeConnection(connectionID: connectionID, clientName: clientName, approvalOverride: approvalOverride)
         }
 
         func test_timeoutApproval(generation: UInt64) async {
