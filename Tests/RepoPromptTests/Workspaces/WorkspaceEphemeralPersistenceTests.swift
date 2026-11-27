@@ -2520,6 +2520,62 @@ import XCTest
             }
         }
 
+        func testWorkspaceMetadataSaveRebasesAfterPeerProjection() async throws {
+            for rename in [true, false] {
+                try await withProjectionSaveFixture { fixture in
+                    let manager = fixture.manager
+                    let initial = try XCTUnwrap(manager.workspace(withID: fixture.workspace.id))
+                    let prepared = expectation(description: "metadata save prepared")
+                    let finished = expectation(description: "metadata save finished")
+                    let gate = WorkspaceDeleteSuspensionGate()
+                    manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { id, _, remaining in
+                        guard id == initial.id, remaining == 1 else { return }
+                        prepared.fulfill()
+                        await gate.wait()
+                    }
+                    let notifications = NotificationCenter.default.publisher(for: .workspaceListDidChange)
+                        .filter { $0.userInfo?["managerID"] is UUID }
+                        .first()
+                        .sink { _ in finished.fulfill() }
+                    defer {
+                        notifications.cancel()
+                        manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil)
+                        Task { await gate.open() }
+                    }
+                    if rename {
+                        manager.renameWorkspace(initial, newName: "Renamed workspace")
+                    } else {
+                        manager.setWorkspaceHidden(initial, hidden: true)
+                    }
+                    try await self.awaitSaveCheckpoint(prepared)
+                    let generation = fixture.bridge.projectionObservationStateForTesting.generation
+                    _ = try await self.restoreArchivedTabRemotely(in: fixture)
+                    let catalog = await fixture.runtime.workspaceStore.snapshot()
+                    let checkpoint = await fixture.observer.waitForProjection(
+                        afterGeneration: generation, through: catalog.publicationSequence, requireCatalogApplication: true
+                    )
+                    _ = try XCTUnwrap(checkpoint)
+                    let projected = try XCTUnwrap(manager.workspace(withID: initial.id))
+                    XCTAssertEqual(projected.name, initial.name)
+                    XCTAssertFalse(projected.isHiddenInMenus)
+                    XCTAssertTrue(projected.composeTabs.contains { $0.id == fixture.restoredTab.id })
+
+                    await gate.open()
+                    try await self.awaitSaveCheckpoint(finished)
+                    let snapshot = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(initial.id)
+                    let saved = try XCTUnwrap(snapshot)
+                    let canonical = try JSONDecoder().decode(WorkspaceModel.self, from: saved.document.documentBytes)
+                    XCTAssertEqual(canonical.name, rename ? "Renamed workspace" : initial.name)
+                    XCTAssertEqual(canonical.isHiddenInMenus, !rename)
+                    XCTAssertEqual(canonical.composeTabs, projected.composeTabs)
+                    XCTAssertNil(saved.revisions.dirtyRevision)
+                    XCTAssertEqual(manager.workspace(withID: initial.id)?.name, canonical.name)
+                    XCTAssertEqual(manager.workspace(withID: initial.id)?.isHiddenInMenus, canonical.isHiddenInMenus)
+                    try await self.assertCanonicalAndDiskRemain(saved, in: fixture)
+                }
+            }
+        }
+
         func testPreparationDriftRecapturesOnceAndPersistsTheLatestModel() async throws {
             try await assertPreparationDrift(changeCount: 1)
         }
@@ -3079,6 +3135,1655 @@ import XCTest
                 ),
                 inside
             )
+        }
+    }
+
+    /// Regression coverage for the workspace-save lost update: a rename, hide or colour change
+    /// whose deferred save is suspended while another window's save is adopted must still reach
+    /// the authority, together with that window's edit. Every test drives the public setters.
+    /// `TARGET` messages are the property under test; `SETUP` messages mean the interleaving
+    /// itself was not reached.
+    @MainActor
+    final class WorkspaceSaveRetryFieldIntentTests: XCTestCase {
+        private var originalMCPAutoStart = false
+        private var originalStoragePath: String?
+        private var storageRoot: URL!
+        private var managers: [WorkspaceManagerViewModel] = []
+        private var bridges: [DomainWorkspacePresentationBridge] = []
+        private var runtimes: [MCPDomainRuntime] = []
+        private var gates: [SavePreparationGate] = []
+        private var commandGates: [CommandGate] = []
+        private var seededWorkspaceIDs: [UUID] = []
+
+        override func setUp() async throws {
+            try await super.setUp()
+            originalMCPAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            originalStoragePath = UserDefaults.standard.string(forKey: "GlobalCustomStorageURL")
+            storageRoot = FileManager.default.temporaryDirectory
+                .appendingPathComponent("WorkspaceSaveRetryFieldIntentTests-\(UUID().uuidString)", isDirectory: true)
+            storageRoot = AppProfileLocations.current.customWorkspaceDirectory(selectedDirectory: storageRoot)
+            try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
+            UserDefaults.standard.set(storageRoot.path, forKey: "GlobalCustomStorageURL")
+            await WorkspaceDiskWriterComposition.processWriter.removeAllForTesting()
+        }
+
+        override func tearDown() async throws {
+            // A failed test can leave a save parked; release it before closing its window.
+            for gate in gates {
+                await gate.open()
+            }
+            gates.removeAll()
+            for gate in commandGates {
+                await gate.open()
+            }
+            commandGates.removeAll()
+            // Let released setter tasks settle (they may still await a bridge refresh) before the
+            // bridges stop and the shared storage and settings reset.
+            let settled = await waitUntil(timeout: .seconds(10)) { pendingSetterIntents().isEmpty }
+            if !settled {
+                XCTFail("TEARDOWN: setter saves still pending after 10s: \(pendingSetterIntents())")
+            }
+            seededWorkspaceIDs.removeAll()
+            for bridge in bridges {
+                await bridge.stopAndJoinForTesting()
+            }
+            bridges.removeAll()
+            for manager in managers {
+                manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil)
+                manager.prepareForWindowClose()
+            }
+            managers.removeAll()
+            for runtime in runtimes {
+                _ = await runtime.shutdown()
+            }
+            runtimes.removeAll()
+            await WorkspaceDiskWriterComposition.processWriter.removeAllForTesting()
+            try? FileManager.default.removeItem(at: storageRoot)
+            if let originalStoragePath {
+                UserDefaults.standard.set(originalStoragePath, forKey: "GlobalCustomStorageURL")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "GlobalCustomStorageURL")
+            }
+            GlobalSettingsStore.shared.setMCPAutoStart(originalMCPAutoStart, commit: false)
+            try await super.tearDown()
+        }
+
+        // MARK: - Peer save adopted during the retry (manual catalog apply)
+
+        func testFieldChangeSurvivesPeerSaveAdoptedDuringRetryForRename() async throws {
+            try await assertFieldSurvivesPeerSaveDuringRetry(.rename, adoption: .manualCatalogApply)
+        }
+
+        func testFieldChangeSurvivesPeerSaveAdoptedDuringRetryForHide() async throws {
+            try await assertFieldSurvivesPeerSaveDuringRetry(.hide, adoption: .manualCatalogApply)
+        }
+
+        func testFieldChangeSurvivesPeerSaveAdoptedDuringRetryForColour() async throws {
+            try await assertFieldSurvivesPeerSaveDuringRetry(.colour, adoption: .manualCatalogApply)
+        }
+
+        // MARK: - Peer save adopted during the retry (real presentation bridge)
+
+        func testFieldChangeSurvivesPeerSaveThroughPresentationBridgeForRename() async throws {
+            try await assertFieldSurvivesPeerSaveDuringRetry(.rename, adoption: .presentationBridge)
+        }
+
+        func testFieldChangeSurvivesPeerSaveThroughPresentationBridgeForHide() async throws {
+            try await assertFieldSurvivesPeerSaveDuringRetry(.hide, adoption: .presentationBridge)
+        }
+
+        func testFieldChangeSurvivesPeerSaveThroughPresentationBridgeForColour() async throws {
+            try await assertFieldSurvivesPeerSaveDuringRetry(.colour, adoption: .presentationBridge)
+        }
+
+        // MARK: - Peer save wins the authority revision check
+
+        func testFieldChangeSurvivesPeerSaveThatWinsRevisionCheckForRename() async throws {
+            try await assertFieldSurvivesPeerSaveThatWinsRevisionCheck(.rename)
+        }
+
+        func testFieldChangeSurvivesPeerSaveThatWinsRevisionCheckForHide() async throws {
+            try await assertFieldSurvivesPeerSaveThatWinsRevisionCheck(.hide)
+        }
+
+        func testFieldChangeSurvivesPeerSaveThatWinsRevisionCheckForColour() async throws {
+            try await assertFieldSurvivesPeerSaveThatWinsRevisionCheck(.colour)
+        }
+
+        /// Control: the same interleaving without a field intent still fails closed. A generic save
+        /// does not know which of its changes to replay over the winning save.
+        func testSaveWithoutFieldIntentStillFailsClosedOnRevisionConflict() async throws {
+            let commandGate = CommandGate()
+            commandGates.append(commandGate)
+            let window = try await makeAuthorityWindow(adoption: .presentationBridge, profile: "no-intent-conflict") { client in
+                client.commandWillExecuteForTesting = { envelope in await commandGate.arrive(envelope) }
+            }
+            let manager = window.manager
+            let workspaceID = window.seeded.id
+            let beforeValue = await window.runtime.workspaceStore.canonicalWorkspaceSnapshot(workspaceID)
+            let before = try XCTUnwrap(beforeValue, "SETUP control: seed missing from the authority")
+            await commandGate.arm(workspaceID: workspaceID)
+
+            let index = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == workspaceID }, "SETUP control: W2 lacks the seed")
+            XCTAssertFalse(manager.workspaces[index].composeTabs.isEmpty, "SETUP control: seed has no compose tab")
+            manager.workspaces[index].composeTabs[0].promptText = "Local edit"
+            let proposal = manager.workspaces[index]
+            let save = Task { @MainActor () -> Error? in
+                do {
+                    _ = try await manager.saveWorkspaceToFileAsync(proposal)
+                    return nil
+                } catch {
+                    return error
+                }
+            }
+            let parked = await waitUntil { await commandGate.parkedCount == 1 }
+            XCTAssertTrue(parked, "SETUP control: the save's working-document command never reached the store")
+            guard parked else { return }
+            let parkedRevisions = await commandGate.replaceRevisions
+            XCTAssertEqual(parkedRevisions, [before.revisions.workingRevision], "SETUP control: the parked command does not expect the seed revision")
+
+            let peerBase = try await peerSave(prompt: "Peer edit", workspaceID: workspaceID, runtime: window.runtime)
+            XCTAssertEqual(peerBase.revisions, before.revisions, "SETUP control: the authority advanced before the peer save")
+            await commandGate.open()
+            let error = await save.value
+
+            let failure = try XCTUnwrap(
+                error as? DomainWorkspaceAuthorityOperationError,
+                "TARGET control: expected an authority conflict, got \(String(describing: error))"
+            )
+            XCTAssertEqual(failure.outcome.disposition, .conflict, "TARGET control: not a conflict")
+            XCTAssertEqual(failure.outcome.errorCode, .stateConflict, "TARGET control: not a state conflict")
+            XCTAssertEqual(failure.outcome.diagnostic, "workspace_revision_mismatch", "TARGET control: not a revision mismatch")
+            let commands = await commandGate.replaceRevisions
+            XCTAssertEqual(commands.count, 1, "TARGET control: a save without a field intent was replayed (\(commands))")
+            let persisted = try await readBack(workspaceID, runtime: window.runtime)
+            for (label, model) in [("canonical", persisted.canonical), ("disk", persisted.disk)] {
+                XCTAssertEqual(model.composeTabs.first?.promptText, "Peer edit", "TARGET control: \(label) document lost the winning peer edit")
+            }
+        }
+
+        // MARK: - MCP snapshot hide path
+
+        func testSnapshotHideSurvivesPeerSaveAdoptedDuringRetry() async throws {
+            try await assertFieldSurvivesPeerSaveDuringRetry(.hide, adoption: .manualCatalogApply, route: .snapshot)
+        }
+
+        func testSnapshotHideSurvivesPeerSaveThatWinsRevisionCheck() async throws {
+            try await assertFieldSurvivesPeerSaveThatWinsRevisionCheck(.hide, route: .snapshot)
+        }
+
+        // MARK: - Superseded intent
+
+        /// The older rename is parked at its first attempt; the newer one saves while it waits.
+        /// When the older save retries onto the adopted peer copy, its superseded intent must not
+        /// re-apply "First" over "Second".
+        func testNewerRenameWinsOverParkedOlderRenameAfterPeerSave() async throws {
+            let window = try await makeAuthorityWindow(adoption: .manualCatalogApply, profile: "newer-rename")
+            let manager = window.manager
+            let workspaceID = window.seeded.id
+            let gate = installGate(on: manager, workspaceID: workspaceID)
+            let completions = ListChangeRecorder()
+            let retryEntries = EvidenceLog()
+            manager.setWorkspaceSaveConflictHandlerForTesting { evidence in
+                retryEntries.lines.append(evidence["remainingRetries"] ?? "?")
+            }
+
+            let original = try XCTUnwrap(manager.workspace(withID: workspaceID), "SETUP newer: W2 lacks the seed")
+            manager.renameWorkspace(original, newName: "First")
+            let olderParked = await waitUntil { await gate.parkedCount == 1 }
+            XCTAssertTrue(olderParked, "SETUP newer: older rename never reached the first-attempt gate")
+            guard olderParked else { return }
+
+            let afterFirst = try XCTUnwrap(manager.workspace(withID: workspaceID), "SETUP newer: W2 lost the workspace")
+            manager.renameWorkspace(afterFirst, newName: "Second")
+            // The older task's token no longer owns the map entry, so this clears once the newer one finishes.
+            let newerFinished = await waitUntil {
+                !manager.hasPendingWorkspaceRenameIntentForTesting(workspaceID: workspaceID)
+            }
+            XCTAssertTrue(newerFinished, "SETUP newer: newer rename did not finish while the older one was parked")
+            XCTAssertEqual(completions.managerIDs.count, 1, "SETUP newer: newer rename did not report success")
+
+            _ = try await peerSave(prompt: "Peer edit", workspaceID: workspaceID, runtime: window.runtime)
+            try await adoptPeerSave(in: window, generationBeforePeer: 0)
+            let adopted = try XCTUnwrap(manager.workspace(withID: workspaceID), "SETUP newer: W2 lost the workspace")
+            XCTAssertEqual(adopted.composeTabs.first?.promptText, "Peer edit", "SETUP newer: W2 did not adopt the peer save")
+            XCTAssertEqual(adopted.name, "Second", "SETUP newer: the peer save was not based on the newer rename")
+
+            let retriesBeforeGate = retryEntries.lines.count
+            await gate.open()
+            // The older save re-enters the retry. Its superseded intent either abandons the save
+            // synchronously there, or (if it still applied) starts a retry attempt that must finish.
+            let olderRetried = await waitUntil { retryEntries.lines.count > retriesBeforeGate }
+            XCTAssertTrue(olderRetried, "SETUP newer: the parked older save never re-entered the retry after the gate opened")
+            try await Task.sleep(for: .milliseconds(200))
+            let attempts = await gate.attempts
+            if attempts.dropFirst(2).contains(0) {
+                let olderFinished = await waitUntil { completions.managerIDs.count >= 2 }
+                XCTAssertTrue(olderFinished, "SETUP newer: the older save's retry attempt never finished")
+            }
+            XCTAssertEqual(Set(completions.managerIDs).count, 1, "SETUP newer: completions came from more than one manager")
+            print("REPRO newer: preparationAttempts=\(attempts) retryEntries=\(retryEntries.lines) successes=\(completions.managerIDs.count)")
+            XCTAssertEqual(attempts.prefix(2), [1, 1], "SETUP newer: expected the parked older and the newer first attempts")
+
+            let persisted = try await readBack(workspaceID, runtime: window.runtime)
+            for (label, model) in [("canonical", persisted.canonical), ("disk", persisted.disk)] {
+                XCTAssertEqual(model.name, "Second", "TARGET newer: \(label) document lost the newer rename")
+                XCTAssertEqual(model.composeTabs.first?.promptText, "Peer edit", "TARGET newer: \(label) document lost the peer edit")
+            }
+            let local = try XCTUnwrap(manager.workspace(withID: workspaceID), "TARGET newer: W2 lost the workspace")
+            XCTAssertEqual(local.name, "Second", "TARGET newer: W2 memory lost the newer rename")
+            XCTAssertEqual(local.composeTabs.first?.promptText, "Peer edit", "TARGET newer: W2 memory lost the peer edit")
+        }
+
+        // MARK: - Same-field rule and rebase stop conditions
+
+        /// A's older rename is parked; B's newer rename and C's hide commit, and A adopts both. A's
+        /// replay must not overwrite the name another window saved after A's request.
+        func testOlderRenameInOtherWindowDoesNotOverwriteNewerSavedRename() async throws {
+            let seeded = try seedWorkspace(name: "Original")
+            try writeLegacyIndex([seeded])
+            let runtime = try await makeRuntime(profileIdentifier: "older-rename-other-window")
+            let windowA = await makeBridgedWindow(runtime: runtime, windowID: -901)
+            let windowB = await makeBridgedWindow(runtime: runtime, windowID: -902)
+            let windowC = await makeBridgedWindow(runtime: runtime, windowID: -903)
+            let id = seeded.id
+            let gate = installGate(on: windowA.manager, workspaceID: id)
+            let completions = ListChangeRecorder()
+            let retries = EvidenceLog()
+            windowA.manager.setWorkspaceSaveConflictHandlerForTesting { _ in retries.lines.append("retry") }
+
+            try windowA.manager.renameWorkspace(XCTUnwrap(windowA.manager.workspace(withID: id), "SETUP other: A lacks the seed"), newName: "First")
+            let parked = await waitUntil { await gate.parkedCount == 1 }
+            XCTAssertTrue(parked, "SETUP other: A's rename never reached the first-attempt gate")
+            guard parked else { return }
+
+            try windowB.manager.renameWorkspace(XCTUnwrap(windowB.manager.workspace(withID: id), "SETUP other: B lacks the seed"), newName: "Second")
+            let renamed = await waitUntil { !windowB.manager.hasPendingWorkspaceRenameIntentForTesting(workspaceID: id) }
+            XCTAssertTrue(renamed, "SETUP other: B's rename did not finish")
+            XCTAssertEqual(completions.managerIDs.count, 1, "SETUP other: B's rename did not report success")
+            let cAdoptedRename = await waitUntilProjectedLatest(windowC.observer, runtime: runtime, requireCatalogApplication: true)
+            XCTAssertTrue(cAdoptedRename, "SETUP other: C's bridge did not project B's rename")
+            XCTAssertEqual(windowC.manager.workspace(withID: id)?.name, "Second", "SETUP other: C did not adopt B's rename")
+
+            try windowC.manager.setWorkspaceHidden(XCTUnwrap(windowC.manager.workspace(withID: id), "SETUP other: C lacks the seed"), hidden: true)
+            let hid = await waitUntil { !windowC.manager.hasPendingWorkspaceHiddenIntentForTesting(workspaceID: id) }
+            XCTAssertTrue(hid, "SETUP other: C's hide did not finish")
+            XCTAssertEqual(completions.managerIDs.count, 2, "SETUP other: C's hide did not report success")
+            let beforeRelease = try await readBack(id, runtime: runtime).canonical
+            XCTAssertEqual(beforeRelease.name, "Second", "SETUP other: B's rename is not canonical")
+            XCTAssertTrue(beforeRelease.isHiddenInMenus, "SETUP other: C's hide is not canonical")
+
+            let aAdopted = await waitUntilProjectedLatest(windowA.observer, runtime: runtime, requireCatalogApplication: true)
+            XCTAssertTrue(aAdopted, "SETUP other: A's bridge did not project B's and C's saves while A was parked")
+            let adopted = try XCTUnwrap(windowA.manager.workspace(withID: id), "SETUP other: A lost the workspace")
+            XCTAssertEqual(adopted.name, "Second", "SETUP other: A did not adopt B's rename")
+            XCTAssertTrue(adopted.isHiddenInMenus, "SETUP other: A did not adopt C's hide")
+
+            await gate.open()
+            let cleared = await waitUntil { !windowA.manager.hasPendingWorkspaceRenameIntentForTesting(workspaceID: id) }
+            XCTAssertTrue(cleared, "TARGET other: A's pending rename intent never cleared")
+            XCTAssertEqual(retries.lines.count, 1, "SETUP other: A's parked save did not re-enter the retry once")
+            XCTAssertEqual(completions.managerIDs.count, 2, "TARGET other: A's superseded rename reported success")
+            let attempts = await gate.attempts
+            XCTAssertEqual(attempts, [1], "TARGET other: A's superseded rename started another save attempt")
+
+            let persisted = try await readBack(id, runtime: runtime)
+            for (label, model) in [("canonical", persisted.canonical), ("disk", persisted.disk)] {
+                XCTAssertEqual(model.name, "Second", "TARGET other: \(label) name is not B's newer saved rename")
+                XCTAssertTrue(model.isHiddenInMenus, "TARGET other: \(label) lost C's hide")
+            }
+            for (label, window) in [("A", windowA), ("B", windowB), ("C", windowC)] {
+                let settled = await waitUntilProjectedLatest(window.observer, runtime: runtime, requireCatalogApplication: false)
+                XCTAssertTrue(settled, "SETUP other: \(label)'s bridge never observed the final publication")
+                let local = try XCTUnwrap(window.manager.workspace(withID: id), "TARGET other: \(label) lost the workspace")
+                XCTAssertEqual(local.name, "Second", "TARGET other: \(label) memory name is not B's rename")
+                XCTAssertTrue(local.isHiddenInMenus, "TARGET other: \(label) memory lost C's hide")
+            }
+        }
+
+        /// W's Red pick is parked; a peer saves Blue and W adopts it. Re-choosing the shown Blue
+        /// supersedes Red and saves; Red must never reach the authority.
+        func testReselectingShownColourIsNotOverwrittenByParkedOlderPick() async throws {
+            try await assertReselectingShownColourSupersedesParkedPick(seedColour: nil, peerColour: .blue)
+        }
+
+        /// The hide's command is parked after every pre-command lifecycle check passed, then a peer
+        /// consolidates the record. The conflict rebase adopts that marker and must not replay the
+        /// hide onto it: the replayed save would pass lifecycle validation, since both copies now
+        /// carry the marker.
+        func testHideDoesNotReapplyAfterWorkspaceLifecycleChanged() async throws {
+            let commandGate = CommandGate()
+            commandGates.append(commandGate)
+            let (window, _, _) = try await makeBridgedAuthorityWindow(profile: "hide-lifecycle") { client in
+                client.commandWillExecuteForTesting = { envelope in await commandGate.arrive(envelope) }
+            }
+            let manager = window.manager
+            let id = window.seeded.id
+            let completions = ListChangeRecorder()
+            let initial = try XCTUnwrap(manager.workspace(withID: id), "SETUP lifecycle: W lacks the seed")
+            XCTAssertFalse(initial.isHiddenInMenus, "SETUP lifecycle: the seed is already hidden")
+            XCTAssertNil(initial.consolidatedIntoWorkspaceID, "SETUP lifecycle: the seed is already consolidated")
+            await commandGate.arm(workspaceID: id)
+
+            manager.setWorkspaceHidden(initial, hidden: true)
+            XCTAssertTrue(manager.hasPendingWorkspaceHiddenIntentForTesting(workspaceID: id), "SETUP lifecycle: the hide queued no save")
+            let parked = await waitUntil { await commandGate.parkedCount == 1 }
+            XCTAssertTrue(parked, "SETUP lifecycle: the hide's working-document command never reached the store")
+            guard parked else { return }
+
+            let survivorID = UUID()
+            let peer = try await peerCommit(workspaceID: id, runtime: window.runtime) { $0.consolidatedIntoWorkspaceID = survivorID }
+            guard peer.outcome.saved?.disposition == .applied else {
+                throw XCTSkip(
+                    "The authority rejected a consolidation marker saved through a peer client: "
+                        + String(describing: peer.outcome.saved ?? peer.outcome.working)
+                )
+            }
+            let peerSaved = try await readBack(id, runtime: window.runtime).canonical
+            XCTAssertEqual(peerSaved.consolidatedIntoWorkspaceID, survivorID, "SETUP lifecycle: the marker is not canonical")
+            XCTAssertFalse(peerSaved.isHiddenInMenus, "SETUP lifecycle: the peer's consolidated copy is already hidden")
+
+            await commandGate.open()
+            let cleared = await waitUntil(timeout: .seconds(15)) { !manager.hasPendingWorkspaceHiddenIntentForTesting(workspaceID: id) }
+            XCTAssertTrue(cleared, "TARGET lifecycle: the hide's pending intent never cleared")
+            XCTAssertEqual(
+                manager.workspace(withID: id)?.consolidatedIntoWorkspaceID, survivorID,
+                "SETUP lifecycle: the conflict rebase did not adopt the consolidation marker"
+            )
+            XCTAssertEqual(completions.managerIDs.count, 0, "TARGET lifecycle: the hide reported success")
+            let commands = await commandGate.replaceRevisions
+            XCTAssertEqual(commands.count, 1, "TARGET lifecycle: the hide was replayed onto the consolidated record (\(commands))")
+
+            let persisted = try await readBack(id, runtime: window.runtime)
+            for (label, model) in [("canonical", persisted.canonical), ("disk", persisted.disk)] {
+                XCTAssertEqual(model.isHiddenInMenus, peerSaved.isHiddenInMenus, "TARGET lifecycle: \(label) hidden is not what the peer saved")
+                XCTAssertEqual(model.consolidatedIntoWorkspaceID, survivorID, "TARGET lifecycle: \(label) lost the consolidation marker")
+            }
+            XCTAssertEqual(
+                manager.workspace(withID: id)?.isHiddenInMenus, peerSaved.isHiddenInMenus,
+                "TARGET lifecycle: W memory hidden is not what the peer saved"
+            )
+        }
+
+        /// The stale command conflicts; the bridge stops inside the refresh the rebase awaits. With
+        /// no adoption proven, the save must stop instead of sending another authority command.
+        func testRebaseStopsWhenBridgeStopsDuringConflictRefresh() async throws {
+            let commandGate = CommandGate()
+            commandGates.append(commandGate)
+            let (window, bridge, _) = try await makeBridgedAuthorityWindow(profile: "rebase-bridge-stop") { client in
+                client.commandWillExecuteForTesting = { envelope in await commandGate.arrive(envelope) }
+            }
+            let manager = window.manager
+            let id = window.seeded.id
+            let beforeValue = await window.runtime.workspaceStore.canonicalWorkspaceSnapshot(id)
+            let before = try XCTUnwrap(beforeValue, "SETUP stop: seed missing from the authority")
+            await commandGate.arm(workspaceID: id)
+
+            try manager.renameWorkspace(XCTUnwrap(manager.workspace(withID: id), "SETUP stop: W lacks the seed"), newName: "Renamed")
+            let parked = await waitUntil { await commandGate.parkedCount == 1 }
+            XCTAssertTrue(parked, "SETUP stop: the rename's working-document command never reached the store")
+            guard parked else { return }
+            let parkedRevisions = await commandGate.replaceRevisions
+            XCTAssertEqual(parkedRevisions, [before.revisions.workingRevision], "SETUP stop: the parked command does not expect the seed revision")
+            _ = try await peerSave(prompt: "Peer edit", workspaceID: id, runtime: window.runtime)
+
+            // Armed only now: the first catalog refresh after the release is the conflict rebase's
+            // (or one the peer event provoked); either way the bridge stops before projecting it.
+            let stops = EvidenceLog()
+            bridge.afterCatalogReloadForTesting = { [weak bridge] in
+                guard stops.lines.isEmpty else { return }
+                stops.lines.append("stopped")
+                bridge?.stop()
+            }
+            await commandGate.open()
+            let cleared = await waitUntil(timeout: .seconds(15)) { !manager.hasPendingWorkspaceRenameIntentForTesting(workspaceID: id) }
+            XCTAssertTrue(cleared, "TARGET stop: the rename's pending intent never cleared")
+            XCTAssertEqual(stops.lines, ["stopped"], "SETUP stop: no catalog refresh ran after the stale command was released")
+            let commands = await commandGate.replaceRevisions
+            XCTAssertEqual(commands.count, 1, "TARGET stop: another authority command was sent after the bridge stopped (\(commands))")
+            let canonical = try await readBack(id, runtime: window.runtime).canonical
+            XCTAssertEqual(canonical.composeTabs.first?.promptText, "Peer edit", "TARGET stop: canonical lost the peer edit")
+            XCTAssertEqual(canonical.name, "Original", "TARGET stop: the rename reached the authority without a proven adoption")
+        }
+
+        // MARK: - Remembered prior values, colour supersession, staggered field saves
+
+        func testNewestOfTwoQuickLocalRenamesSurvivesUnrelatedPeerSave() async throws {
+            try await assertNewestOfTwoQuickChoicesSurvivesUnrelatedPeerSave(
+                label: "rename",
+                choose: { manager, id in
+                    try manager.renameWorkspace(XCTUnwrap(manager.workspace(withID: id)), newName: "First")
+                    try manager.renameWorkspace(XCTUnwrap(manager.workspace(withID: id)), newName: "Second")
+                },
+                isPending: { $0.hasPendingWorkspaceRenameIntentForTesting(workspaceID: $1) },
+                holdsNewest: { $0.name == "Second" }
+            )
+        }
+
+        func testNewestOfTwoQuickLocalColoursSurvivesUnrelatedPeerSave() async throws {
+            try await assertNewestOfTwoQuickChoicesSurvivesUnrelatedPeerSave(
+                label: "colour",
+                choose: { manager, id in
+                    try manager.setWorkspaceColor(XCTUnwrap(manager.workspace(withID: id)), color: .red)
+                    try manager.setWorkspaceColor(XCTUnwrap(manager.workspace(withID: id)), color: .blue)
+                },
+                isPending: { $0.hasPendingWorkspaceColorIntentForTesting(workspaceID: $1) },
+                holdsNewest: { $0.color == WorkspaceColor.blue.rawValue }
+            )
+        }
+
+        /// Two choices made without yielding: the older task never saves, and the newer one is
+        /// parked. An unrelated peer save is adopted, so the field shows the value from before both
+        /// choices; the newer choice must still re-apply over it.
+        private func assertNewestOfTwoQuickChoicesSurvivesUnrelatedPeerSave(
+            label: String,
+            choose: @MainActor (WorkspaceManagerViewModel, UUID) throws -> Void,
+            isPending: @MainActor (WorkspaceManagerViewModel, UUID) -> Bool,
+            holdsNewest: (WorkspaceModel) -> Bool
+        ) async throws {
+            let (window, _, observer) = try await makeBridgedAuthorityWindow(profile: "quick-\(label)")
+            let manager = window.manager
+            let id = window.seeded.id
+            let gate = installGate(on: manager, workspaceID: id)
+            let completions = ListChangeRecorder()
+
+            try choose(manager, id)
+            XCTAssertTrue(isPending(manager, id), "SETUP quick \(label): the choices queued no save")
+            let parked = await waitUntil { await gate.parkedCount == 1 }
+            XCTAssertTrue(parked, "SETUP quick \(label): the surviving save never reached the first-attempt gate")
+            guard parked else { return }
+
+            let generationBeforePeer = window.bridge?.projectionObservationStateForTesting.generation ?? 0
+            _ = try await peerSave(prompt: "Peer edit", workspaceID: id, runtime: window.runtime)
+            try await adoptPeerSave(in: window, generationBeforePeer: generationBeforePeer)
+            let adopted = try XCTUnwrap(manager.workspace(withID: id), "SETUP quick \(label): W lost the workspace")
+            XCTAssertEqual(adopted.composeTabs.first?.promptText, "Peer edit", "SETUP quick \(label): W did not adopt the peer save")
+            XCTAssertFalse(holdsNewest(adopted), "SETUP quick \(label): the adopted copy already holds the newest choice; no replay exercised")
+
+            await gate.open()
+            let cleared = await waitUntil { !isPending(manager, id) }
+            XCTAssertTrue(cleared, "TARGET quick \(label): the newest choice's pending intent never cleared")
+            let attempts = await gate.attempts
+            XCTAssertEqual(attempts, [1, 0], "TARGET quick \(label): expected one first attempt (the older task never saves) and one retry")
+            XCTAssertEqual(completions.managerIDs.count, 1, "TARGET quick \(label): the newest choice did not report success")
+
+            let persisted = try await readBack(id, runtime: window.runtime)
+            for (labelSuffix, model) in [("canonical", persisted.canonical), ("disk", persisted.disk)] {
+                XCTAssertTrue(holdsNewest(model), "TARGET quick \(label): \(labelSuffix) lost the newest choice (\(Self.describe(model)))")
+                XCTAssertEqual(model.composeTabs.first?.promptText, "Peer edit", "TARGET quick \(label): \(labelSuffix) lost the peer edit")
+            }
+            let settled = await waitUntilProjectedLatest(observer, runtime: window.runtime, requireCatalogApplication: false)
+            XCTAssertTrue(settled, "SETUP quick \(label): W's bridge never observed the final publication")
+            let local = try XCTUnwrap(manager.workspace(withID: id), "TARGET quick \(label): W lost the workspace")
+            XCTAssertTrue(holdsNewest(local), "TARGET quick \(label): W memory lost the newest choice (\(Self.describe(local)))")
+            XCTAssertEqual(local.composeTabs.first?.promptText, "Peer edit", "TARGET quick \(label): W memory lost the peer edit")
+        }
+
+        func testReselectingOriginalColourSupersedesParkedPick() async throws {
+            try await assertReselectingShownColourSupersedesParkedPick(seedColour: .blue, peerColour: nil)
+        }
+
+        func testReselectingNoColourSupersedesParkedPick() async throws {
+            try await assertReselectingShownColourSupersedesParkedPick(seedColour: nil, peerColour: nil)
+        }
+
+        /// Red is parked; a peer save (a prompt edit, plus `peerColour` when given) is adopted, so W
+        /// shows the original colour again or the peer's. Re-choosing the shown colour must supersede
+        /// Red and save it, and Red must never reach the authority.
+        private func assertReselectingShownColourSupersedesParkedPick(
+            seedColour: WorkspaceColor?,
+            peerColour: WorkspaceColor?
+        ) async throws {
+            let shownColour = peerColour ?? seedColour
+            let label = "\(seedColour?.rawValue ?? "none")->\(shownColour?.rawValue ?? "none")"
+            let submitted = SubmittedColourLog()
+            let (window, _, observer) = try await makeBridgedAuthorityWindow(
+                profile: "reselect-\(seedColour?.rawValue ?? "none")-\(shownColour?.rawValue ?? "none")", seedColor: seedColour?.rawValue
+            ) { client in
+                client.commandWillExecuteForTesting = { envelope in await submitted.record(envelope) }
+            }
+            let manager = window.manager
+            let id = window.seeded.id
+            let gate = installGate(on: manager, workspaceID: id)
+            let completions = ListChangeRecorder()
+            let retries = EvidenceLog()
+            manager.setWorkspaceSaveConflictHandlerForTesting { _ in retries.lines.append("retry") }
+            let initial = try XCTUnwrap(manager.workspace(withID: id), "SETUP reselect \(label): W lacks the seed")
+            XCTAssertEqual(initial.color, seedColour?.rawValue, "SETUP reselect \(label): the seed colour was not loaded")
+
+            manager.setWorkspaceColor(initial, color: .red)
+            XCTAssertTrue(manager.hasPendingWorkspaceColorIntentForTesting(workspaceID: id), "SETUP reselect \(label): Red queued no save")
+            let parked = await waitUntil { await gate.parkedCount == 1 }
+            XCTAssertTrue(parked, "SETUP reselect \(label): Red never reached the first-attempt gate")
+            guard parked else { return }
+
+            let generationBeforePeer = window.bridge?.projectionObservationStateForTesting.generation ?? 0
+            let peer = try await peerCommit(workspaceID: id, runtime: window.runtime) { workspace in
+                if !workspace.composeTabs.isEmpty {
+                    workspace.composeTabs[0].promptText = "Peer edit"
+                }
+                if let peerColour {
+                    workspace.color = peerColour.rawValue
+                }
+            }
+            XCTAssertEqual(peer.outcome.saved?.disposition, .applied, "SETUP reselect \(label): the peer save was not applied")
+            try await adoptPeerSave(in: window, generationBeforePeer: generationBeforePeer)
+            let adopted = try XCTUnwrap(manager.workspace(withID: id), "SETUP reselect \(label): W lost the workspace")
+            XCTAssertEqual(adopted.color, shownColour?.rawValue, "SETUP reselect \(label): W does not show the expected colour after adoption")
+            XCTAssertEqual(adopted.composeTabs.first?.promptText, "Peer edit", "SETUP reselect \(label): W did not adopt the peer save")
+
+            manager.setWorkspaceColor(adopted, color: shownColour)
+            let reselectSaved = await waitUntil { completions.managerIDs.count == 1 }
+            XCTAssertTrue(reselectSaved, "TARGET reselect \(label): re-choosing the shown colour did not supersede and save")
+
+            await gate.open()
+            let redRetried = await waitUntil { !retries.lines.isEmpty }
+            XCTAssertTrue(redRetried, "SETUP reselect \(label): the parked Red save never re-entered the retry")
+            // The superseded retry ends synchronously; a replay would show up as another attempt.
+            try await Task.sleep(for: .milliseconds(200))
+            let cleared = await waitUntil { !manager.hasPendingWorkspaceColorIntentForTesting(workspaceID: id) }
+            XCTAssertTrue(cleared, "TARGET reselect \(label): a colour intent is still pending")
+            let attempts = await gate.attempts
+            XCTAssertEqual(attempts, [1, 1], "TARGET reselect \(label): expected Red's and the reselection's first attempts only")
+            XCTAssertEqual(completions.managerIDs.count, 1, "TARGET reselect \(label): the parked Red pick reported success")
+            let colours = await submitted.colours
+            XCTAssertFalse(colours.contains("red"), "TARGET reselect \(label): Red reached the authority (\(colours))")
+
+            let persisted = try await readBack(id, runtime: window.runtime)
+            for (labelSuffix, model) in [("canonical", persisted.canonical), ("disk", persisted.disk)] {
+                XCTAssertEqual(model.color, shownColour?.rawValue, "TARGET reselect \(label): \(labelSuffix) colour is not the reselected one")
+                XCTAssertEqual(model.composeTabs.first?.promptText, "Peer edit", "TARGET reselect \(label): \(labelSuffix) lost the peer edit")
+            }
+            let settled = await waitUntilProjectedLatest(observer, runtime: window.runtime, requireCatalogApplication: false)
+            XCTAssertTrue(settled, "SETUP reselect \(label): W's bridge never observed the final publication")
+            XCTAssertEqual(manager.workspace(withID: id)?.color, shownColour?.rawValue, "TARGET reselect \(label): W memory colour is not the reselected one")
+        }
+
+        /// Rename and colour saves are both parked at their first preparation; an unrelated peer save
+        /// is adopted. The rename is released and parked again at its recursive preparation, with its
+        /// re-applied copy shown but not committed; only then is the colour released. Both fields
+        /// and the peer edit must persist.
+        func testTwoPendingFieldSavesBothSurviveAdoptionAndStaggeredRelease() async throws {
+            let (window, _, observer) = try await makeBridgedAuthorityWindow(profile: "staggered-fields")
+            let manager = window.manager
+            let id = window.seeded.id
+            // Arrival 0: rename's first attempt; 1: colour's first attempt; 2: rename's retry.
+            let gate = installGate(on: manager, workspaceID: id, parkingArrivals: [0, 1, 2])
+            let retries = EvidenceLog()
+            manager.setWorkspaceSaveConflictHandlerForTesting { evidence in
+                retries.lines.append(evidence["source"] ?? "?")
+            }
+
+            try manager.renameWorkspace(XCTUnwrap(manager.workspace(withID: id), "SETUP staggered: W lacks the seed"), newName: "Renamed")
+            let renameParked = await waitUntil { await gate.parkedCount == 1 }
+            XCTAssertTrue(renameParked, "SETUP staggered: the rename never reached its first-attempt gate")
+            guard renameParked else { return }
+            try manager.setWorkspaceColor(XCTUnwrap(manager.workspace(withID: id), "SETUP staggered: W lost the workspace"), color: .teal)
+            let colourParked = await waitUntil { await gate.parkedCount == 2 }
+            XCTAssertTrue(colourParked, "SETUP staggered: the colour never reached its first-attempt gate")
+            guard colourParked else { return }
+
+            let generationBeforePeer = window.bridge?.projectionObservationStateForTesting.generation ?? 0
+            _ = try await peerSave(prompt: "Peer edit", workspaceID: id, runtime: window.runtime)
+            try await adoptPeerSave(in: window, generationBeforePeer: generationBeforePeer)
+            let adopted = try XCTUnwrap(manager.workspace(withID: id), "SETUP staggered: W lost the workspace")
+            XCTAssertEqual(adopted.composeTabs.first?.promptText, "Peer edit", "SETUP staggered: W did not adopt the peer save")
+            XCTAssertFalse(Field.rename.isApplied(to: adopted), "SETUP staggered: the adopted copy already has the rename")
+            XCTAssertNotEqual(adopted.color, WorkspaceColor.teal.rawValue, "SETUP staggered: the adopted copy already has the colour")
+
+            await gate.release(arrival: 0)
+            let renameRetryParked = await waitUntil { await gate.parkedCount == 3 }
+            XCTAssertTrue(renameRetryParked, "SETUP staggered: the rename never reached its recursive preparation")
+            guard renameRetryParked else { return }
+            let shown = try XCTUnwrap(manager.workspace(withID: id), "SETUP staggered: W lost the workspace")
+            XCTAssertEqual(shown.name, "Renamed", "SETUP staggered: the rename retry did not show its re-applied copy")
+            XCTAssertEqual(shown.composeTabs.first?.promptText, "Peer edit", "SETUP staggered: the rename retry dropped the peer edit")
+
+            await gate.release(arrival: 1)
+            let colourRetried = await waitUntil { retries.lines.count >= 2 }
+            XCTAssertTrue(colourRetried, "SETUP staggered: the colour save never re-entered the retry")
+            await gate.open()
+            let cleared = await waitUntil(timeout: .seconds(15)) {
+                !manager.hasPendingWorkspaceRenameIntentForTesting(workspaceID: id)
+                    && !manager.hasPendingWorkspaceColorIntentForTesting(workspaceID: id)
+            }
+            XCTAssertTrue(cleared, "TARGET staggered: a field save never finished")
+            let attempts = await gate.attempts
+            print("REPRO staggered: preparationAttempts=\(attempts) retryEntries=\(retries.lines)")
+
+            let persisted = try await readBack(id, runtime: window.runtime)
+            for (label, model) in [("canonical", persisted.canonical), ("disk", persisted.disk)] {
+                XCTAssertEqual(model.name, "Renamed", "TARGET staggered: \(label) lost the rename (\(Self.describe(model)))")
+                XCTAssertEqual(model.color, WorkspaceColor.teal.rawValue, "TARGET staggered: \(label) lost the colour (\(Self.describe(model)))")
+                XCTAssertEqual(model.composeTabs.first?.promptText, "Peer edit", "TARGET staggered: \(label) lost the peer edit")
+            }
+            let settled = await waitUntilProjectedLatest(observer, runtime: window.runtime, requireCatalogApplication: false)
+            XCTAssertTrue(settled, "SETUP staggered: W's bridge never observed the final publication")
+            let local = try XCTUnwrap(manager.workspace(withID: id), "TARGET staggered: W lost the workspace")
+            XCTAssertEqual(Self.describe(local), Self.describe(persisted.canonical), "TARGET staggered: W memory differs from canonical")
+        }
+
+        /// A parked rename's optimistic copy is replaced by the same canonical bytes (an unchanged
+        /// full catalog), which bumps the adoption generation at an unchanged revision and digest.
+        /// The field save must re-apply the rename onto the reinstalled copy and persist it.
+        func testFieldSurvivesSameDigestReinstallWhileParked() async throws {
+            let window = try await makeAuthorityWindow(adoption: .manualCatalogApply, profile: "same-digest-reinstall")
+            let manager = window.manager
+            let id = window.seeded.id
+            let gate = installGate(on: manager, workspaceID: id)
+            let retries = EvidenceLog()
+            manager.setWorkspaceSaveConflictHandlerForTesting { evidence in
+                let adoptionChanged = evidence["capturedAdoption"] != evidence["currentAdoption"]
+                let revisionSame = evidence["capturedWorking"] == evidence["currentWorking"]
+                    && evidence["capturedSaved"] == evidence["currentSaved"]
+                retries.lines.append(
+                    "adoptionChanged=\(adoptionChanged) revisionSame=\(revisionSame) "
+                        + "adoption=\(evidence["capturedAdoption"] ?? "?")->\(evidence["currentAdoption"] ?? "?")"
+                )
+            }
+            let beforeValue = await window.runtime.workspaceStore.canonicalWorkspaceSnapshot(id)
+            let before = try XCTUnwrap(beforeValue, "SETUP reinstall: seed missing from the authority")
+            let baselineBefore = manager.debugDomainAuthorityBaseline(for: id)
+
+            try manager.renameWorkspace(XCTUnwrap(manager.workspace(withID: id), "SETUP reinstall: W lacks the seed"), newName: "Renamed")
+            let parked = await waitUntil { await gate.parkedCount == 1 }
+            XCTAssertTrue(parked, "SETUP reinstall: the rename never reached the first-attempt gate")
+            guard parked else { return }
+            XCTAssertEqual(manager.workspace(withID: id)?.name, "Renamed", "SETUP reinstall: the optimistic rename is not in memory")
+
+            let result = try await applyFullCatalog(runtime: window.runtime, to: manager)
+            XCTAssertNil(result.rejection, "SETUP reinstall: the unchanged catalog apply was rejected")
+            let afterValue = await window.runtime.workspaceStore.canonicalWorkspaceSnapshot(id)
+            let after = try XCTUnwrap(afterValue, "SETUP reinstall: the workspace left the authority")
+            XCTAssertEqual(after.revisions, before.revisions, "SETUP reinstall: the authority revision changed")
+            XCTAssertEqual(after.document.contentDigest, before.document.contentDigest, "SETUP reinstall: the canonical digest changed")
+            let baselineAfter = manager.debugDomainAuthorityBaseline(for: id)
+            XCTAssertEqual(baselineAfter.digest, baselineBefore.digest, "SETUP reinstall: W's authority digest changed")
+            XCTAssertEqual(baselineAfter.revisions, baselineBefore.revisions, "SETUP reinstall: W's authority revisions changed")
+            XCTAssertEqual(
+                manager.workspace(withID: id)?.name, "Original",
+                "SETUP reinstall: the unchanged catalog did not reinstall canonical bytes over the parked proposal"
+            )
+
+            await gate.open()
+            let cleared = await waitUntil { !manager.hasPendingWorkspaceRenameIntentForTesting(workspaceID: id) }
+            XCTAssertTrue(cleared, "TARGET reinstall: the rename's pending intent never cleared")
+            let entry = try XCTUnwrap(retries.lines.first, "SETUP reinstall: the parked rename never re-entered the retry")
+            let attempts = await gate.attempts
+            print("REPRO reinstall: retry=\(retries.lines) preparationAttempts=\(attempts)")
+            XCTAssertTrue(
+                entry.hasPrefix("adoptionChanged=true revisionSame=true"),
+                "SETUP reinstall: the reinstall did not bump the adoption generation at an unchanged revision (\(entry))"
+            )
+
+            let persisted = try await readBack(id, runtime: window.runtime)
+            for (label, model) in [("canonical", persisted.canonical), ("disk", persisted.disk)] {
+                XCTAssertEqual(model.name, "Renamed", "TARGET reinstall: \(label) lost the rename (\(Self.describe(model)))")
+                XCTAssertEqual(model.composeTabs.first?.promptText, "Initial prompt", "TARGET reinstall: \(label) prompt changed")
+            }
+            XCTAssertEqual(manager.workspace(withID: id)?.name, "Renamed", "TARGET reinstall: W memory lost the rename")
+        }
+
+        // MARK: - Superseded choice committed after a same-digest reinstall
+
+        func testNewerChoiceSurvivesOlderDispatchedChoiceCommittingAfterReinstallForRename() async throws {
+            try await assertNewerChoiceSurvivesOlderDispatchedChoiceCommittingAfterReinstall(
+                label: "rename",
+                seedColor: nil,
+                chooseOlder: { manager, id in
+                    try manager.renameWorkspace(XCTUnwrap(manager.workspace(withID: id)), newName: "First")
+                },
+                chooseNewer: { manager, id in
+                    try manager.renameWorkspace(XCTUnwrap(manager.workspace(withID: id)), newName: "Second")
+                },
+                isPending: { $0.hasPendingWorkspaceRenameIntentForTesting(workspaceID: $1) },
+                shown: { $0.name },
+                original: "Original", older: "First", newer: "Second"
+            )
+        }
+
+        func testNewerChoiceSurvivesOlderDispatchedChoiceCommittingAfterReinstallForColour() async throws {
+            try await assertNewerChoiceSurvivesOlderDispatchedChoiceCommittingAfterReinstall(
+                label: "colour",
+                seedColor: WorkspaceColor.blue.rawValue,
+                chooseOlder: { manager, id in
+                    try manager.setWorkspaceColor(XCTUnwrap(manager.workspace(withID: id)), color: .red)
+                },
+                chooseNewer: { manager, id in
+                    try manager.setWorkspaceColor(XCTUnwrap(manager.workspace(withID: id)), color: .blue)
+                },
+                isPending: { $0.hasPendingWorkspaceColorIntentForTesting(workspaceID: $1) },
+                shown: { $0.color ?? "none" },
+                original: "blue", older: "red", newer: "blue"
+            )
+        }
+
+        /// The older choice's command is dispatched against revision R and parked. The same
+        /// canonical bytes are reinstalled, so W shows the original value; the newer choice is then
+        /// made and its command is also dispatched against R and parked. The older command commits
+        /// (R+1). The newer one then conflicts, its refresh adopts the older committed value, and
+        /// it must re-apply over that value: a superseded choice of this window is not a peer's.
+        private func assertNewerChoiceSurvivesOlderDispatchedChoiceCommittingAfterReinstall(
+            label: String,
+            seedColor: String?,
+            chooseOlder: @MainActor (WorkspaceManagerViewModel, UUID) throws -> Void,
+            chooseNewer: @MainActor (WorkspaceManagerViewModel, UUID) throws -> Void,
+            isPending: @MainActor (WorkspaceManagerViewModel, UUID) -> Bool,
+            shown: @escaping @MainActor (WorkspaceModel) -> String,
+            original: String,
+            older: String,
+            newer: String
+        ) async throws {
+            // Arrival 0: the older choice's command; 1: the newer choice's first command.
+            let commandGate = CommandGate(parkingArrivals: [0, 1])
+            commandGates.append(commandGate)
+            let (window, bridge, observer) = try await makeBridgedAuthorityWindow(
+                profile: "dispatched-\(label)", seedColor: seedColor
+            ) { client in
+                client.commandWillExecuteForTesting = { envelope in await commandGate.arrive(envelope) }
+            }
+            let manager = window.manager
+            let id = window.seeded.id
+            let completions = ListChangeRecorder()
+            let shownAtCatalogApplications = EvidenceLog()
+            let projectionToken = bridge.projectionObservationPublisherForTesting.sink { [weak manager] event in
+                guard case let .applied(checkpoint) = event, checkpoint.catalogReceipt != nil else { return }
+                MainActor.assumeIsolated {
+                    if let workspace = manager?.workspace(withID: id) {
+                        shownAtCatalogApplications.lines.append(shown(workspace))
+                    }
+                }
+            }
+            defer { projectionToken.cancel() }
+            let beforeValue = await window.runtime.workspaceStore.canonicalWorkspaceSnapshot(id)
+            let before = try XCTUnwrap(beforeValue, "SETUP dispatched \(label): seed missing from the authority")
+            let revisionR = before.revisions.workingRevision
+            let initial = try XCTUnwrap(manager.workspace(withID: id), "SETUP dispatched \(label): W lacks the seed")
+            XCTAssertEqual(shown(initial), original, "SETUP dispatched \(label): the seed value was not loaded")
+            await commandGate.arm(workspaceID: id)
+
+            try chooseOlder(manager, id)
+            let olderParked = await waitUntil { await commandGate.parkedCount == 1 }
+            XCTAssertTrue(olderParked, "SETUP dispatched \(label): the older choice's command never reached the store")
+            guard olderParked else { return }
+            XCTAssertEqual(try shown(XCTUnwrap(manager.workspace(withID: id))), older, "SETUP dispatched \(label): the older choice is not shown")
+
+            let reinstall = try await applyFullCatalog(runtime: window.runtime, to: manager)
+            XCTAssertNil(reinstall.rejection, "SETUP dispatched \(label): the unchanged catalog apply was rejected")
+            let afterReinstallValue = await window.runtime.workspaceStore.canonicalWorkspaceSnapshot(id)
+            let afterReinstall = try XCTUnwrap(afterReinstallValue, "SETUP dispatched \(label): the workspace left the authority")
+            XCTAssertEqual(afterReinstall.revisions, before.revisions, "SETUP dispatched \(label): the reinstall changed the authority revision")
+            XCTAssertEqual(afterReinstall.document.contentDigest, before.document.contentDigest, "SETUP dispatched \(label): the reinstall changed the digest")
+            XCTAssertEqual(
+                try shown(XCTUnwrap(manager.workspace(withID: id))), original,
+                "SETUP dispatched \(label): the reinstall did not bring back the original value"
+            )
+
+            try chooseNewer(manager, id)
+            XCTAssertTrue(isPending(manager, id), "SETUP dispatched \(label): the newer choice queued no save")
+            let newerParked = await waitUntil { await commandGate.parkedCount == 2 }
+            XCTAssertTrue(newerParked, "SETUP dispatched \(label): the newer choice's command never reached the store")
+            guard newerParked else { return }
+            let parkedRevisions = await commandGate.replaceRevisions
+            XCTAssertEqual(parkedRevisions, [revisionR, revisionR], "SETUP dispatched \(label): both commands must expect revision R")
+
+            await commandGate.release(arrival: 0)
+            let olderCommitted = await waitUntil { completions.managerIDs.count == 1 }
+            XCTAssertTrue(olderCommitted, "SETUP dispatched \(label): the older choice did not commit")
+            let committedValue = await window.runtime.workspaceStore.canonicalWorkspaceSnapshot(id)
+            let committed = try XCTUnwrap(committedValue, "SETUP dispatched \(label): the workspace left the authority")
+            XCTAssertGreaterThan(committed.revisions.workingRevision, revisionR, "SETUP dispatched \(label): the older commit did not advance the revision")
+            XCTAssertEqual(try shown(decodeWorkspace(committed.document.documentBytes)), older, "SETUP dispatched \(label): the older value is not canonical")
+
+            await commandGate.release(arrival: 1)
+            let cleared = await waitUntil(timeout: .seconds(15)) { !isPending(manager, id) }
+            XCTAssertTrue(cleared, "TARGET dispatched \(label): the newer choice's pending intent never cleared")
+            let commands = await commandGate.replaceRevisions
+            print("REPRO dispatched \(label): replaceWorkingDocument expectedRevisions=\(commands) shownAtCatalogApplications=\(shownAtCatalogApplications.lines)")
+            XCTAssertTrue(
+                shownAtCatalogApplications.lines.contains(older),
+                "SETUP dispatched \(label): W never showed the older committed value, so the re-apply rule was not exercised"
+            )
+            XCTAssertEqual(commands.count, 3, "TARGET dispatched \(label): the newer choice was not re-sent once after the conflict (\(commands))")
+            if commands.count == 3, let resent = commands[2] {
+                XCTAssertGreaterThan(resent, revisionR, "TARGET dispatched \(label): the re-sent command did not rebase onto the older commit")
+            }
+            XCTAssertEqual(completions.managerIDs.count, 2, "TARGET dispatched \(label): the newer choice did not report success")
+
+            let persisted = try await readBack(id, runtime: window.runtime)
+            for (labelSuffix, model) in [("canonical", persisted.canonical), ("disk", persisted.disk)] {
+                XCTAssertEqual(shown(model), newer, "TARGET dispatched \(label): \(labelSuffix) does not hold the newer choice")
+            }
+            let settled = await waitUntilProjectedLatest(observer, runtime: window.runtime, requireCatalogApplication: false)
+            XCTAssertTrue(settled, "SETUP dispatched \(label): W's bridge never observed the final publication")
+            XCTAssertEqual(try shown(XCTUnwrap(manager.workspace(withID: id))), newer, "TARGET dispatched \(label): W memory does not hold the newer choice")
+        }
+
+        // MARK: - Legacy (nil-client) control
+
+        /// Control for the legacy disk write policy: a stale copy strictly older than disk is not
+        /// written. Hide, not rename, because a legacy rename moves the workspace folder.
+        func testStaleLegacySaveOlderThanDiskLeavesDiskUnchanged() async throws {
+            let olderDate = Date(timeIntervalSinceNow: -3600)
+            let seeded = try seedWorkspace(name: "Legacy hide target", dateModified: olderDate)
+            try writeLegacyIndex([seeded])
+            let writerA = makeManager(windowID: -810)
+            let writerB = makeManager(windowID: -811)
+            await writerA.awaitInitialized()
+            await writerB.awaitInitialized()
+            let url = writerA.workspaceFileURL(for: seeded)
+            XCTAssertEqual(writerB.workspaceFileURL(for: seeded), url, "SETUP legacy: A and B resolve different files")
+            var stale = try XCTUnwrap(writerB.workspace(withID: seeded.id), "SETUP legacy: B did not load the seed")
+            XCTAssertFalse(stale.isHiddenInMenus, "SETUP legacy: B's copy is already hidden")
+
+            try writerA.setWorkspaceHidden(XCTUnwrap(writerA.workspace(withID: seeded.id), "SETUP legacy: A lacks the seed"), hidden: true)
+            XCTAssertTrue(writerA.hasPendingWorkspaceHiddenIntentForTesting(workspaceID: seeded.id), "SETUP legacy: hide queued no save")
+            let hideFinished = await waitUntil { !writerA.hasPendingWorkspaceHiddenIntentForTesting(workspaceID: seeded.id) }
+            XCTAssertTrue(hideFinished, "SETUP legacy: A's hide save did not finish")
+            await WorkspaceDiskWriterComposition.processWriter.flush(url: url)
+            let afterHide = try decodeWorkspace(Data(contentsOf: url))
+            XCTAssertTrue(afterHide.isHiddenInMenus, "SETUP legacy: A's hide did not reach disk")
+            XCTAssertGreaterThan(afterHide.dateModified, olderDate, "SETUP legacy: A's save did not advance dateModified")
+
+            XCTAssertFalse(stale.composeTabs.isEmpty, "SETUP legacy: B's copy has no compose tab")
+            stale.composeTabs[0].promptText = "B edit"
+            stale.dateModified = olderDate
+            _ = try await writerB.saveWorkspaceToFileAsync(stale)
+            await WorkspaceDiskWriterComposition.processWriter.flush(url: url)
+
+            let final = try decodeWorkspace(Data(contentsOf: url))
+            XCTAssertTrue(final.isHiddenInMenus, "TARGET legacy: an older stale save cleared A's hidden state")
+            XCTAssertEqual(final.composeTabs.first?.promptText, "Initial prompt", "TARGET legacy: an older stale save overwrote newer disk")
+        }
+
+        // MARK: - Scale
+
+        /// 35 windows, each with its own authority client and bridge, over five workspaces. For each
+        /// workspace one window renames, one hides, one colours and one saves a prompt edit, all at
+        /// once and ungated. Every field must reach the authority and every window must converge.
+        func testThirtyFiveWindowsConvergeOnConcurrentFieldChanges() async throws {
+            let clock = ContinuousClock()
+            let start = clock.now
+            let workspaceCount = 5
+            let windowsPerWorkspace = 7
+            let colours: [WorkspaceColor] = [.red, .orange, .green, .teal, .violet]
+            let seeded = try (0 ..< workspaceCount).map {
+                try seedWorkspace(name: "Scale \($0)", prompt: "Initial prompt \($0)")
+            }
+            try writeLegacyIndex(seeded)
+            let runtime = try await makeRuntime(profileIdentifier: "field-intent-scale")
+            var windows: [(manager: WorkspaceManagerViewModel, observer: DomainWorkspaceProjectionObserver)] = []
+            for index in 0 ..< workspaceCount * windowsPerWorkspace {
+                let windowID = -2000 - index
+                let client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: windowID)
+                let manager = makeManager(windowID: windowID, domainWorkspaceAuthorityClient: client)
+                await manager.awaitInitialized()
+                let (_, observer) = startBridge(for: manager, client: client)
+                windows.append((manager, observer))
+            }
+            let initialSequence = await runtime.workspaceStore.snapshot().publicationSequence
+            let seededIDs = Set(seeded.map(\.id))
+            for (index, window) in windows.enumerated() {
+                let checkpoint = await window.observer.waitForProjection(
+                    afterGeneration: 0, through: initialSequence, requireCatalogApplication: true, timeout: .seconds(20)
+                )
+                XCTAssertNotNil(checkpoint, "SETUP scale: window \(index) never projected the initial catalog")
+                XCTAssertTrue(
+                    seededIDs.isSubset(of: Set(window.manager.workspaces.map(\.id))),
+                    "SETUP scale: window \(index) is missing a seeded workspace"
+                )
+            }
+            let setupElapsed = clock.now - start
+            let retryEvidence = EvidenceLog()
+            for (index, window) in windows.enumerated() where index % windowsPerWorkspace < 4 {
+                window.manager.setWorkspaceSaveConflictHandlerForTesting { evidence in
+                    let fields = evidence.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }
+                    retryEvidence.lines.append("window \(index) \(fields.joined(separator: " "))")
+                }
+            }
+
+            var promptSaves: [(workspace: Int, task: Task<String?, Never>)] = []
+            var promptSaveSucceeded: [Int: Bool] = [:]
+            for (offset, workspace) in seeded.enumerated() {
+                let base = offset * windowsPerWorkspace
+                let renamer = windows[base].manager
+                let hider = windows[base + 1].manager
+                let colourer = windows[base + 2].manager
+                let prompter = windows[base + 3].manager
+                try renamer.renameWorkspace(XCTUnwrap(renamer.workspace(withID: workspace.id)), newName: "Scale \(offset) renamed")
+                try hider.setWorkspaceHidden(XCTUnwrap(hider.workspace(withID: workspace.id)), hidden: true)
+                try colourer.setWorkspaceColor(XCTUnwrap(colourer.workspace(withID: workspace.id)), color: colours[offset])
+                let index = try XCTUnwrap(prompter.workspaces.firstIndex { $0.id == workspace.id })
+                prompter.workspaces[index].composeTabs[0].promptText = "Prompt \(offset) from window"
+                prompter.markWorkspaceDirty(workspaceID: workspace.id)
+                let proposal = prompter.workspaces[index]
+                promptSaves.append((offset, Task { @MainActor in
+                    do {
+                        _ = try await prompter.saveWorkspaceToFileAsync(proposal)
+                        return nil
+                    } catch {
+                        return String(describing: error)
+                    }
+                }))
+            }
+            let editors = seeded.enumerated().map { offset, workspace in
+                (id: workspace.id, base: offset * windowsPerWorkspace)
+            }
+            let settersFinished = await waitUntil(timeout: .seconds(45)) {
+                editors.allSatisfy { editor in
+                    !windows[editor.base].manager.hasPendingWorkspaceRenameIntentForTesting(workspaceID: editor.id)
+                        && !windows[editor.base + 1].manager.hasPendingWorkspaceHiddenIntentForTesting(workspaceID: editor.id)
+                        && !windows[editor.base + 2].manager.hasPendingWorkspaceColorIntentForTesting(workspaceID: editor.id)
+                }
+            }
+            XCTAssertTrue(settersFinished, "SETUP scale: setter saves did not finish within 45s")
+            for promptSave in promptSaves {
+                let failure = await promptSave.task.value
+                promptSaveSucceeded[promptSave.workspace] = failure == nil
+                print("SCALE: workspace \(promptSave.workspace) prompt save \(failure.map { "failed: \($0)" } ?? "succeeded")")
+            }
+            let finalSequence = await runtime.workspaceStore.snapshot().publicationSequence
+            for (index, window) in windows.enumerated() {
+                let checkpoint = await window.observer.waitForProjection(
+                    afterGeneration: 0, through: finalSequence, timeout: .seconds(20)
+                )
+                XCTAssertNotNil(checkpoint, "SETUP scale: window \(index) never observed publication \(finalSequence)")
+            }
+
+            for line in retryEvidence.lines {
+                print("SCALE-RETRY: \(line)")
+            }
+            var divergent: [String] = []
+            for (offset, workspace) in seeded.enumerated() {
+                let snapshotValue = await runtime.workspaceStore.canonicalWorkspaceSnapshot(workspace.id)
+                let snapshot = try XCTUnwrap(snapshotValue, "SETUP scale: workspace \(offset) missing from the authority")
+                let canonical = try decodeWorkspace(snapshot.document.documentBytes)
+                print("SCALE: workspace \(offset) canonical \(Self.describe(canonical))")
+                XCTAssertEqual(canonical.name, "Scale \(offset) renamed", "TARGET scale: workspace \(offset) lost the rename")
+                XCTAssertTrue(canonical.isHiddenInMenus, "TARGET scale: workspace \(offset) lost the hide")
+                XCTAssertEqual(canonical.color, colours[offset].rawValue, "TARGET scale: workspace \(offset) lost the colour")
+                // A generic save has no field intent and fails closed on a lost revision check by
+                // design; its prompt must survive only when it reported success.
+                if promptSaveSucceeded[offset] == true {
+                    XCTAssertEqual(
+                        canonical.composeTabs.first?.promptText, "Prompt \(offset) from window",
+                        "TARGET scale: workspace \(offset) prompt save reported success but its prompt was lost"
+                    )
+                }
+                for (index, window) in windows.enumerated() {
+                    guard let local = window.manager.workspace(withID: workspace.id) else {
+                        divergent.append("window \(index) workspace \(offset): missing")
+                        continue
+                    }
+                    if Self.describe(local) != Self.describe(canonical) {
+                        divergent.append("window \(index) workspace \(offset): \(Self.describe(local))")
+                    }
+                }
+            }
+            XCTAssertEqual(divergent, [], "TARGET scale: in-memory copies diverge from canonical")
+
+            let elapsed = clock.now - start
+            let promptSuccesses = promptSaveSucceeded.values.filter(\.self).count
+            print("SCALE: elapsed=\(elapsed) setup=\(setupElapsed) edits+convergence=\(elapsed - setupElapsed) windows=\(windows.count) workspaces=\(workspaceCount) promptSavesSucceeded=\(promptSuccesses)/\(workspaceCount)")
+            XCTAssertLessThan(elapsed, .seconds(60), "TARGET scale: exceeded the 60s budget")
+        }
+
+        // MARK: - Shared scenario
+
+        @MainActor
+        private enum Field: CustomStringConvertible {
+            case rename, hide, colour
+
+            nonisolated var description: String {
+                switch self {
+                case .rename: "rename"
+                case .hide: "hide"
+                case .colour: "colour"
+                }
+            }
+
+            func request(on manager: WorkspaceManagerViewModel, _ workspace: WorkspaceModel) {
+                switch self {
+                case .rename: manager.renameWorkspace(workspace, newName: "Renamed")
+                case .hide: manager.setWorkspaceHidden(workspace, hidden: true)
+                case .colour: manager.setWorkspaceColor(workspace, color: .teal)
+                }
+            }
+
+            func isPending(in manager: WorkspaceManagerViewModel, workspaceID: UUID) -> Bool {
+                switch self {
+                case .rename: manager.hasPendingWorkspaceRenameIntentForTesting(workspaceID: workspaceID)
+                case .hide: manager.hasPendingWorkspaceHiddenIntentForTesting(workspaceID: workspaceID)
+                case .colour: manager.hasPendingWorkspaceColorIntentForTesting(workspaceID: workspaceID)
+                }
+            }
+
+            func isApplied(to workspace: WorkspaceModel) -> Bool {
+                switch self {
+                case .rename: workspace.name == "Renamed"
+                case .hide: workspace.isHiddenInMenus
+                case .colour: workspace.color == WorkspaceColor.teal.rawValue
+                }
+            }
+        }
+
+        private enum Adoption {
+            case manualCatalogApply
+            case presentationBridge
+        }
+
+        /// How a field change is requested: the UI setter's deferred save, or the awaited MCP
+        /// snapshot hide path (hide only).
+        private enum FieldRoute {
+            case setter
+            case snapshot
+
+            @MainActor
+            func name(_ field: Field) -> String {
+                switch self {
+                case .setter: "\(field)"
+                case .snapshot: "snapshot-\(field)"
+                }
+            }
+        }
+
+        /// Starts the request. The setter route queues the deferred save; the snapshot route returns
+        /// the task awaiting `setWorkspaceHiddenFromSnapshot`.
+        private func startRequest(
+            _ field: Field,
+            route: FieldRoute,
+            on manager: WorkspaceManagerViewModel,
+            _ workspace: WorkspaceModel,
+            name: String
+        ) -> Task<Result<WorkspaceModel, Error>, Never>? {
+            switch route {
+            case .setter:
+                field.request(on: manager, workspace)
+                XCTAssertTrue(field.isPending(in: manager, workspaceID: workspace.id), "SETUP \(name): the setter queued no save")
+                return nil
+            case .snapshot:
+                precondition(field == .hide, "only hide/show has a snapshot route")
+                return Task { @MainActor in
+                    do {
+                        return try await .success(manager.setWorkspaceHiddenFromSnapshot(workspace, hidden: true))
+                    } catch {
+                        return .failure(error)
+                    }
+                }
+            }
+        }
+
+        /// Waits for the request to finish: the setter's pending flag clears, or the snapshot call
+        /// returns its live model, which must carry the change and the adopted peer edit.
+        private func finishRequest(
+            _ snapshotSave: Task<Result<WorkspaceModel, Error>, Never>?,
+            _ field: Field,
+            on manager: WorkspaceManagerViewModel,
+            workspaceID: UUID,
+            name: String,
+            timeout: Duration = .seconds(10)
+        ) async {
+            guard let snapshotSave else {
+                let finished = await waitUntil(timeout: timeout) { !field.isPending(in: manager, workspaceID: workspaceID) }
+                XCTAssertTrue(finished, "SETUP \(name): the deferred save did not finish")
+                return
+            }
+            switch await snapshotSave.value {
+            case let .success(returned):
+                XCTAssertTrue(field.isApplied(to: returned), "TARGET \(name): the returned live model lacks the change (\(Self.describe(returned)))")
+                XCTAssertEqual(returned.composeTabs.first?.promptText, "Peer edit", "TARGET \(name): the returned live model lost the peer edit")
+            case let .failure(error):
+                XCTFail("TARGET \(name): the snapshot save threw \(error)")
+            }
+            XCTAssertFalse(field.isPending(in: manager, workspaceID: workspaceID), "TARGET \(name): the snapshot save left its hidden intent pending")
+        }
+
+        private struct AuthorityWindow {
+            let runtime: MCPDomainRuntime
+            let manager: WorkspaceManagerViewModel
+            let observer: DomainWorkspaceProjectionObserver?
+            let bridge: DomainWorkspacePresentationBridge?
+            let seeded: WorkspaceModel
+        }
+
+        /// Parks the setter's first attempt, commits a peer prompt edit, lets W2 adopt it, then
+        /// releases the save: its retry must carry both the field and the peer edit.
+        private func assertFieldSurvivesPeerSaveDuringRetry(
+            _ field: Field,
+            adoption: Adoption,
+            route: FieldRoute = .setter
+        ) async throws {
+            let name = route.name(field)
+            let window = try await makeAuthorityWindow(adoption: adoption, profile: "field-intent-\(name)")
+            let manager = window.manager
+            let workspaceID = window.seeded.id
+            let beforeValue = await window.runtime.workspaceStore.canonicalWorkspaceSnapshot(workspaceID)
+            let before = try XCTUnwrap(beforeValue, "SETUP \(name): seed missing from the authority")
+            let initial = try XCTUnwrap(manager.workspace(withID: workspaceID), "SETUP \(name): W2 did not load the seed")
+            XCTAssertFalse(field.isApplied(to: initial), "SETUP \(name): the seed already carries the change")
+
+            let gate = installGate(on: manager, workspaceID: workspaceID)
+            let snapshotSave = startRequest(field, route: route, on: manager, initial, name: name)
+            let parked = await waitUntil { await gate.parkedCount == 1 }
+            XCTAssertTrue(parked, "SETUP \(name): the setter's save never reached the first-attempt gate")
+            guard parked else { return }
+
+            let generationBeforePeer = window.bridge?.projectionObservationStateForTesting.generation ?? 0
+            let peerBase = try await peerSave(prompt: "Peer edit", workspaceID: workspaceID, runtime: window.runtime)
+            XCTAssertEqual(peerBase.revisions, before.revisions, "SETUP \(name): the authority advanced before the peer save")
+            try await adoptPeerSave(in: window, generationBeforePeer: generationBeforePeer)
+            let adopted = try XCTUnwrap(manager.workspace(withID: workspaceID), "SETUP \(name): W2 lost the workspace")
+            XCTAssertEqual(adopted.composeTabs.first?.promptText, "Peer edit", "SETUP \(name): W2 did not adopt the peer save")
+            XCTAssertFalse(field.isApplied(to: adopted), "SETUP \(name): the adopted copy already has the change; no retry exercised")
+
+            await gate.open()
+            await finishRequest(snapshotSave, field, on: manager, workspaceID: workspaceID, name: name)
+            let attempts = await gate.attempts
+            XCTAssertEqual(attempts, [1, 0], "TARGET \(name): expected the first attempt plus exactly one retry")
+
+            let persisted = try await readBack(workspaceID, runtime: window.runtime)
+            for (label, model) in [("canonical", persisted.canonical), ("disk", persisted.disk)] {
+                XCTAssertTrue(field.isApplied(to: model), "TARGET \(name): \(label) document lost the change (\(Self.describe(model)))")
+                XCTAssertEqual(model.composeTabs.first?.promptText, "Peer edit", "TARGET \(name): \(label) document lost the peer edit")
+            }
+            if let observer = window.observer {
+                let finalSequence = await window.runtime.workspaceStore.snapshot().publicationSequence
+                let settled = await observer.waitForProjection(afterGeneration: 0, through: finalSequence, timeout: .seconds(10))
+                XCTAssertNotNil(settled, "SETUP \(name): the bridge never observed its own final save")
+            }
+            let local = try XCTUnwrap(manager.workspace(withID: workspaceID), "TARGET \(name): W2 lost the workspace")
+            XCTAssertTrue(field.isApplied(to: local), "TARGET \(name): W2 memory lost the change (\(Self.describe(local)))")
+            XCTAssertEqual(local.composeTabs.first?.promptText, "Peer edit", "TARGET \(name): W2 memory lost the peer edit")
+        }
+
+        /// The setter's authority command is dispatched against the seed revision, then parked in
+        /// the client right before the store executes it. A peer save advances the revision, so the
+        /// released command fails the store's revision check after every local capture check passed.
+        /// Recovery must adopt the winning save and replay only the field over it.
+        private func assertFieldSurvivesPeerSaveThatWinsRevisionCheck(
+            _ field: Field,
+            route: FieldRoute = .setter
+        ) async throws {
+            let name = route.name(field)
+            let commandGate = CommandGate()
+            commandGates.append(commandGate)
+            let window = try await makeAuthorityWindow(adoption: .presentationBridge, profile: "field-conflict-\(name)") { client in
+                client.commandWillExecuteForTesting = { envelope in await commandGate.arrive(envelope) }
+            }
+            let manager = window.manager
+            let workspaceID = window.seeded.id
+            let beforeValue = await window.runtime.workspaceStore.canonicalWorkspaceSnapshot(workspaceID)
+            let before = try XCTUnwrap(beforeValue, "SETUP conflict \(name): seed missing from the authority")
+            let initial = try XCTUnwrap(manager.workspace(withID: workspaceID), "SETUP conflict \(name): W2 did not load the seed")
+            XCTAssertFalse(field.isApplied(to: initial), "SETUP conflict \(name): the seed already carries the change")
+            await commandGate.arm(workspaceID: workspaceID)
+
+            let snapshotSave = startRequest(field, route: route, on: manager, initial, name: "conflict \(name)")
+            let parked = await waitUntil { await commandGate.parkedCount == 1 }
+            XCTAssertTrue(parked, "SETUP conflict \(name): the setter's working-document command never reached the store")
+            guard parked else { return }
+            let parkedRevisions = await commandGate.replaceRevisions
+            XCTAssertEqual(
+                parkedRevisions, [before.revisions.workingRevision],
+                "SETUP conflict \(name): the parked command does not expect the seed revision"
+            )
+
+            let peerBase = try await peerSave(prompt: "Peer edit", workspaceID: workspaceID, runtime: window.runtime)
+            XCTAssertEqual(peerBase.revisions, before.revisions, "SETUP conflict \(name): the authority advanced before the peer save")
+            await commandGate.open()
+            await finishRequest(snapshotSave, field, on: manager, workspaceID: workspaceID, name: "conflict \(name)", timeout: .seconds(15))
+            let commands = await commandGate.replaceRevisions
+            print("REPRO conflict \(name): replaceWorkingDocument expectedRevisions=\(commands)")
+            XCTAssertGreaterThanOrEqual(commands.count, 2, "TARGET conflict \(name): the field was not replayed after the conflict")
+            if commands.count >= 2, let stale = commands.first ?? nil, let replay = commands.last ?? nil {
+                XCTAssertGreaterThan(replay, stale, "TARGET conflict \(name): the replay did not rebase onto the winning revision")
+            }
+
+            let persisted = try await readBack(workspaceID, runtime: window.runtime)
+            for (label, model) in [("canonical", persisted.canonical), ("disk", persisted.disk)] {
+                XCTAssertTrue(field.isApplied(to: model), "TARGET conflict \(name): \(label) document lost the change (\(Self.describe(model)))")
+                XCTAssertEqual(model.composeTabs.first?.promptText, "Peer edit", "TARGET conflict \(name): \(label) document lost the peer edit")
+            }
+            if let observer = window.observer {
+                let finalSequence = await window.runtime.workspaceStore.snapshot().publicationSequence
+                let settled = await observer.waitForProjection(afterGeneration: 0, through: finalSequence, timeout: .seconds(10))
+                XCTAssertNotNil(settled, "SETUP conflict \(name): the bridge never observed the final save")
+            }
+            let local = try XCTUnwrap(manager.workspace(withID: workspaceID), "TARGET conflict \(name): W2 lost the workspace")
+            XCTAssertEqual(Self.describe(local), Self.describe(persisted.canonical), "TARGET conflict \(name): W2 memory differs from canonical")
+        }
+
+        /// Seeds "Original" (not hidden, no colour, prompt "Initial prompt"), starts a runtime and W2
+        /// with an authority client, and performs W2's initial full catalog adoption.
+        private func makeAuthorityWindow(
+            adoption: Adoption,
+            profile: String,
+            seedColor: String? = nil,
+            configureClient: ((inout DomainWorkspaceAuthorityClient) -> Void)? = nil
+        ) async throws -> AuthorityWindow {
+            let seeded = try seedWorkspace(name: "Original", color: seedColor)
+            try writeLegacyIndex([seeded])
+            let runtime = try await makeRuntime(profileIdentifier: profile)
+            var client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -801)
+            configureClient?(&client)
+            let manager = makeManager(windowID: -801, domainWorkspaceAuthorityClient: client)
+            await manager.awaitInitialized()
+            switch adoption {
+            case .manualCatalogApply:
+                let result = try await applyFullCatalog(runtime: runtime, to: manager)
+                XCTAssertNil(result.rejection, "SETUP: W2's initial catalog apply was rejected")
+                return AuthorityWindow(runtime: runtime, manager: manager, observer: nil, bridge: nil, seeded: seeded)
+            case .presentationBridge:
+                let (bridge, observer) = startBridge(for: manager, client: client)
+                let catalog = await runtime.workspaceStore.snapshot()
+                let initial = await observer.waitForProjection(
+                    afterGeneration: 0, through: catalog.publicationSequence, requireCatalogApplication: true, timeout: .seconds(10)
+                )
+                XCTAssertNotNil(initial, "SETUP: W2's bridge never projected the initial catalog")
+                return AuthorityWindow(runtime: runtime, manager: manager, observer: observer, bridge: bridge, seeded: seeded)
+            }
+        }
+
+        /// Bridge-composed W2 plus its bridge and observer, non-optional.
+        private func makeBridgedAuthorityWindow(
+            profile: String,
+            seedColor: String? = nil,
+            configureClient: ((inout DomainWorkspaceAuthorityClient) -> Void)? = nil
+        ) async throws -> (window: AuthorityWindow, bridge: DomainWorkspacePresentationBridge, observer: DomainWorkspaceProjectionObserver) {
+            let window = try await makeAuthorityWindow(
+                adoption: .presentationBridge, profile: profile, seedColor: seedColor, configureClient: configureClient
+            )
+            switch (window.bridge, window.observer) {
+            case let (bridge?, observer?):
+                return (window, bridge, observer)
+            default:
+                throw XCTSkip("unreachable: a bridge-composed window always has a bridge")
+            }
+        }
+
+        /// Gives W2 the peer's committed save: an explicit full catalog apply, or the bridge's own
+        /// catalog application through the peer publication.
+        private func adoptPeerSave(in window: AuthorityWindow, generationBeforePeer: UInt64) async throws {
+            if let observer = window.observer {
+                let peerSequence = await window.runtime.workspaceStore.snapshot().publicationSequence
+                let applied = await observer.waitForProjection(
+                    afterGeneration: generationBeforePeer, through: peerSequence, requireCatalogApplication: true, timeout: .seconds(10)
+                )
+                XCTAssertNotNil(applied, "SETUP: the bridge did not apply the peer catalog while the save was parked")
+            } else {
+                let result = try await applyFullCatalog(runtime: window.runtime, to: window.manager)
+                XCTAssertNil(result.rejection, "SETUP: W2's post-peer catalog apply was rejected")
+            }
+        }
+
+        /// Another window's committed prompt edit, based on the latest canonical record. Returns that base.
+        @discardableResult
+        private func peerSave(prompt: String, workspaceID: UUID, runtime: MCPDomainRuntime) async throws -> DomainWorkspaceSnapshot {
+            let peer = try await peerCommit(workspaceID: workspaceID, runtime: runtime) { workspace in
+                XCTAssertFalse(workspace.composeTabs.isEmpty, "SETUP peer: canonical record has no compose tab")
+                guard !workspace.composeTabs.isEmpty else { return }
+                workspace.composeTabs[0].promptText = prompt
+            }
+            XCTAssertEqual(peer.outcome.saved?.disposition, .applied, "SETUP peer: the peer save was not applied")
+            return peer.base
+        }
+
+        /// Another window's fail-closed save of `edit` over the latest canonical record. Returns that
+        /// base and the authority outcome; callers decide whether a rejection is a setup failure.
+        private func peerCommit(
+            workspaceID: UUID,
+            runtime: MCPDomainRuntime,
+            edit: (inout WorkspaceModel) -> Void
+        ) async throws -> (base: DomainWorkspaceSnapshot, outcome: DomainWorkspaceFailClosedSaveOutcome) {
+            let baseValue = await runtime.workspaceStore.canonicalWorkspaceSnapshot(workspaceID)
+            let base = try XCTUnwrap(baseValue, "SETUP peer: no canonical record to edit")
+            var peer = try decodeWorkspace(base.document.documentBytes)
+            edit(&peer)
+            let document = try DomainWorkspaceAuthorityClient.document(for: peer, fileURL: base.document.fileURL)
+            let peerClient = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -802)
+            let outcome = try await peerClient.saveFailClosed(
+                document, expectedWorkspaceRevision: base.revisions.workingRevision,
+                expectedContentDigest: base.document.contentDigest
+            )
+            return (base, outcome)
+        }
+
+        /// Waits until `observer`'s bridge has projected the authority's latest publication.
+        /// `requireCatalogApplication` excludes self-echo baselines, so it proves a peer save was adopted.
+        private func waitUntilProjectedLatest(
+            _ observer: DomainWorkspaceProjectionObserver,
+            runtime: MCPDomainRuntime,
+            requireCatalogApplication: Bool
+        ) async -> Bool {
+            let sequence = await runtime.workspaceStore.snapshot().publicationSequence
+            return await observer.waitForProjection(
+                afterGeneration: 0, through: sequence, requireCatalogApplication: requireCatalogApplication, timeout: .seconds(10)
+            ) != nil
+        }
+
+        private struct BridgedWindow {
+            let manager: WorkspaceManagerViewModel
+            let bridge: DomainWorkspacePresentationBridge
+            let observer: DomainWorkspaceProjectionObserver
+        }
+
+        /// A production-composed window on an existing runtime, after its initial catalog projection.
+        private func makeBridgedWindow(
+            runtime: MCPDomainRuntime,
+            windowID: Int,
+            configureClient: ((inout DomainWorkspaceAuthorityClient) -> Void)? = nil
+        ) async -> BridgedWindow {
+            var client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: windowID)
+            configureClient?(&client)
+            let manager = makeManager(windowID: windowID, domainWorkspaceAuthorityClient: client)
+            await manager.awaitInitialized()
+            let (bridge, observer) = startBridge(for: manager, client: client)
+            let catalog = await runtime.workspaceStore.snapshot()
+            let initial = await observer.waitForProjection(
+                afterGeneration: 0, through: catalog.publicationSequence, requireCatalogApplication: true, timeout: .seconds(10)
+            )
+            XCTAssertNotNil(initial, "SETUP: window \(windowID)'s bridge never projected the initial catalog")
+            return BridgedWindow(manager: manager, bridge: bridge, observer: observer)
+        }
+
+        /// Composes and starts a window's bridge exactly as `WindowStateComposition` does, including the
+        /// catalog refresh wiring a field save awaits after losing a revision check.
+        private func startBridge(
+            for manager: WorkspaceManagerViewModel,
+            client: DomainWorkspaceAuthorityClient
+        ) -> (DomainWorkspacePresentationBridge, DomainWorkspaceProjectionObserver) {
+            let bridge = DomainWorkspacePresentationBridge(workspaceManager: manager, client: client)
+            bridges.append(bridge)
+            manager.installDomainCatalogRefresh(
+                request: { [weak bridge] isRetry in bridge?.requestCatalogRefresh(isRetry: isRetry) },
+                cancel: { [weak bridge] in bridge?.cancelCatalogRefresh() },
+                awaitRefresh: { [weak bridge] in await bridge?.refreshForAgentAdmission() ?? false }
+            )
+            bridge.start()
+            return (bridge, DomainWorkspaceProjectionObserver(bridge: bridge))
+        }
+
+        private func applyFullCatalog(
+            runtime: MCPDomainRuntime,
+            to manager: WorkspaceManagerViewModel
+        ) async throws -> DomainCatalogApplicationResult {
+            let catalog = await runtime.workspaceStore.snapshot()
+            let decoded = try catalog.workspaces.map { try manager.decodeDomainWorkspaceCatalogRecord($0) }
+            return manager.applyDomainWorkspaceCatalog(
+                catalog, projection: .full(decoded), preferredActiveWorkspaceID: nil, rootMapPolicy: .decodedModels
+            )
+        }
+
+        private func readBack(
+            _ workspaceID: UUID,
+            runtime: MCPDomainRuntime
+        ) async throws -> (canonical: WorkspaceModel, disk: WorkspaceModel) {
+            let snapshotValue = await runtime.workspaceStore.canonicalWorkspaceSnapshot(workspaceID)
+            let snapshot = try XCTUnwrap(snapshotValue, "TARGET: workspace missing from the authority")
+            await WorkspaceDiskWriterComposition.processWriter.flush(url: snapshot.document.fileURL)
+            return try (
+                decodeWorkspace(snapshot.document.documentBytes),
+                decodeWorkspace(Data(contentsOf: snapshot.document.fileURL))
+            )
+        }
+
+        private func installGate(
+            on manager: WorkspaceManagerViewModel,
+            workspaceID: UUID,
+            parkingArrivals: Set<Int> = [0]
+        ) -> SavePreparationGate {
+            let gate = SavePreparationGate(parkingArrivals: parkingArrivals)
+            gates.append(gate)
+            manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { id, _, remainingRetryCount in
+                guard id == workspaceID else { return }
+                await gate.arrive(remainingRetryCount: remainingRetryCount)
+            }
+            return gate
+        }
+
+        private func waitUntil(
+            timeout: Duration = .seconds(10),
+            _ condition: () async -> Bool
+        ) async -> Bool {
+            let clock = ContinuousClock()
+            let deadline = clock.now + timeout
+            while clock.now < deadline {
+                if await condition() {
+                    return true
+                }
+                try? await Task.sleep(for: .milliseconds(5))
+            }
+            return await condition()
+        }
+
+        private static func describe(_ workspace: WorkspaceModel) -> String {
+            "name=\(workspace.name) hidden=\(workspace.isHiddenInMenus) color=\(workspace.color ?? "nil") "
+                + "prompt=\(workspace.composeTabs.first?.promptText ?? "nil")"
+        }
+
+        private func decodeWorkspace(_ data: Data) throws -> WorkspaceModel {
+            try JSONDecoder().decode(WorkspaceModel.self, from: data)
+        }
+
+        // MARK: - Fixture (mirrors WorkspaceEphemeralPersistenceTests)
+
+        private func seedWorkspace(
+            name: String,
+            prompt: String = "Initial prompt",
+            dateModified: Date = Date(),
+            color: String? = nil
+        ) throws -> WorkspaceModel {
+            let tab = ComposeTabState(name: "Main", promptText: prompt)
+            let workspace = WorkspaceModel(
+                dateModified: dateModified, name: name, repoPaths: [], color: color,
+                composeTabs: [tab], activeComposeTabID: tab.id
+            )
+            try writeWorkspace(workspace)
+            seededWorkspaceIDs.append(workspace.id)
+            return workspace
+        }
+
+        private func pendingSetterIntents() -> [String] {
+            managers.enumerated().flatMap { index, manager in
+                seededWorkspaceIDs.compactMap { id -> String? in
+                    let kinds = [
+                        manager.hasPendingWorkspaceRenameIntentForTesting(workspaceID: id) ? "rename" : nil,
+                        manager.hasPendingWorkspaceHiddenIntentForTesting(workspaceID: id) ? "hide" : nil,
+                        manager.hasPendingWorkspaceColorIntentForTesting(workspaceID: id) ? "colour" : nil
+                    ].compactMap(\.self)
+                    return kinds.isEmpty ? nil : "manager \(index) \(id.uuidString.prefix(8)): \(kinds)"
+                }
+            }
+        }
+
+        private func makeRuntime(profileIdentifier: String) async throws -> MCPDomainRuntime {
+            let runtime = MCPDomainRuntime(configuration: .init(
+                mode: .app,
+                profileIdentifier: "\(profileIdentifier)-\(UUID().uuidString)",
+                storageDirectory: storageRoot.appendingPathComponent("runtime-state", isDirectory: true),
+                workspaceStorageDirectory: storageRoot,
+                eventDirectory: storageRoot.appendingPathComponent("events", isDirectory: true),
+                temporaryDirectory: storageRoot.appendingPathComponent("tmp", isDirectory: true),
+                externalReloadInterval: nil
+            ))
+            try await runtime.start()
+            runtimes.append(runtime)
+            return runtime
+        }
+
+        private func writeWorkspace(_ workspace: WorkspaceModel) throws {
+            let fileURL = storageRoot
+                .appendingPathComponent(
+                    DomainWorkspaceStoragePath.directoryName(name: workspace.name, id: workspace.id),
+                    isDirectory: true
+                )
+                .appendingPathComponent("workspace.json")
+            try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try JSONEncoder().encode(workspace).write(to: fileURL, options: .atomic)
+        }
+
+        private func writeLegacyIndex(_ workspaces: [WorkspaceModel]) throws {
+            let entries = workspaces.map {
+                WorkspaceIndexEntry(
+                    id: $0.id,
+                    name: $0.name,
+                    customStoragePath: $0.customStoragePath,
+                    isSystemWorkspace: $0.isSystemWorkspace,
+                    isHiddenInMenus: $0.isHiddenInMenus
+                )
+            }
+            try JSONEncoder().encode(entries).write(
+                to: storageRoot.appendingPathComponent("workspacesIndex.json"),
+                options: .atomic
+            )
+        }
+
+        private func makeManager(
+            windowID: Int,
+            domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient? = nil
+        ) -> WorkspaceManagerViewModel {
+            let keyManager = KeyManager(secureService: SecureKeysService(secureStorage: TestSecureStorageBackend()))
+            let aiQueriesService = AIQueriesService(keyManager: keyManager)
+            let fileManager = WorkspaceFilesViewModel()
+            let apiSettings = APISettingsViewModel(
+                aiQueriesService: aiQueriesService,
+                keyManager: keyManager,
+                loadStoredDataOnInit: false
+            )
+            let prompt = PromptViewModel(
+                fileManager: fileManager,
+                apiSettingsViewModel: apiSettings,
+                windowID: windowID,
+                settingsManager: WindowSettingsManager(windowID: windowID)
+            )
+            let manager = WorkspaceManagerViewModel(
+                fileManager: fileManager,
+                promptViewModel: prompt,
+                domainWorkspaceAuthorityClient: domainWorkspaceAuthorityClient,
+                workspaceActivityCoordinator: WindowStatesManager.shared.workspaceActivityCoordinator,
+                performInitialWorkspaceActivation: false
+            )
+            managers.append(manager)
+            return manager
+        }
+    }
+
+    /// Records every save-preparation attempt (its `remainingRetryCount`, in arrival order) and
+    /// parks only the chosen arrivals (by default the first), so other saves and retries never
+    /// deadlock on it. Parked arrivals are released one at a time or all at once.
+    private actor SavePreparationGate {
+        private(set) var attempts: [Int] = []
+        private(set) var parkedArrivals: [Int] = []
+        private let parkingArrivals: Set<Int>
+        private var isOpen = false
+        private var waiters: [Int: CheckedContinuation<Void, Never>] = [:]
+
+        var parkedCount: Int {
+            parkedArrivals.count
+        }
+
+        init(parkingArrivals: Set<Int> = [0]) {
+            self.parkingArrivals = parkingArrivals
+        }
+
+        func arrive(remainingRetryCount: Int) async {
+            let arrival = attempts.count
+            attempts.append(remainingRetryCount)
+            guard !isOpen, parkingArrivals.contains(arrival) else { return }
+            parkedArrivals.append(arrival)
+            await withCheckedContinuation { waiters[arrival] = $0 }
+        }
+
+        func release(arrival: Int) {
+            waiters.removeValue(forKey: arrival)?.resume()
+        }
+
+        func open() {
+            isOpen = true
+            let pending = waiters.values
+            waiters.removeAll()
+            pending.forEach { $0.resume() }
+        }
+    }
+
+    /// The colour of every working document this window submitted to the authority.
+    private actor SubmittedColourLog {
+        private(set) var colours: [String?] = []
+
+        func record(_ envelope: DomainWorkspaceCommandEnvelope) {
+            guard case let .replaceWorkingDocument(document) = envelope.command,
+                  let model = try? JSONDecoder().decode(WorkspaceModel.self, from: document.documentBytes)
+            else { return }
+            colours.append(model.color)
+        }
+    }
+
+    /// Records the expected revision of each `replaceWorkingDocument` command for the armed
+    /// workspace, in arrival order, and parks the chosen arrivals (by default the first) right
+    /// before the store executes them. Parked commands are released one at a time or all at once.
+    private actor CommandGate {
+        private(set) var replaceRevisions: [UInt64?] = []
+        private(set) var parkedArrivals: [Int] = []
+        private let parkingArrivals: Set<Int>
+        private var workspaceID: UUID?
+        private var isOpen = false
+        private var waiters: [Int: CheckedContinuation<Void, Never>] = [:]
+
+        var parkedCount: Int {
+            parkedArrivals.count
+        }
+
+        init(parkingArrivals: Set<Int> = [0]) {
+            self.parkingArrivals = parkingArrivals
+        }
+
+        func arm(workspaceID: UUID) {
+            self.workspaceID = workspaceID
+        }
+
+        func arrive(_ envelope: DomainWorkspaceCommandEnvelope) async {
+            guard let workspaceID,
+                  case let .replaceWorkingDocument(document) = envelope.command,
+                  document.workspaceID == workspaceID
+            else { return }
+            let arrival = replaceRevisions.count
+            replaceRevisions.append(envelope.expectedWorkspaceRevision)
+            guard !isOpen, parkingArrivals.contains(arrival) else { return }
+            parkedArrivals.append(arrival)
+            await withCheckedContinuation { waiters[arrival] = $0 }
+        }
+
+        func release(arrival: Int) {
+            waiters.removeValue(forKey: arrival)?.resume()
+        }
+
+        func open() {
+            isOpen = true
+            let pending = waiters.values
+            waiters.removeAll()
+            pending.forEach { $0.resume() }
+        }
+    }
+
+    /// Value-only evidence collected from main-actor test seams.
+    @MainActor
+    private final class EvidenceLog {
+        var lines: [String] = []
+    }
+
+    /// Setter completions: each successful rename/hide/colour save posts `.workspaceListDidChange`
+    /// with its manager's ID; catalog application does not post it.
+    @MainActor
+    private final class ListChangeRecorder {
+        private(set) var managerIDs: [UUID] = []
+        private var subscription: AnyCancellable?
+
+        init() {
+            subscription = NotificationCenter.default.publisher(for: .workspaceListDidChange).sink { [weak self] notification in
+                guard let managerID = notification.userInfo?["managerID"] as? UUID else { return }
+                MainActor.assumeIsolated { self?.managerIDs.append(managerID) }
+            }
         }
     }
 #endif

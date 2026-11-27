@@ -1984,6 +1984,13 @@ class WorkspaceManagerViewModel: ObservableObject {
     private var workspaceRenameIntentByID: [UUID: UUID] = [:]
     private var workspaceHiddenIntentByID: [UUID: UUID] = [:]
     private var workspaceColorIntentByID: [UUID: UUID] = [:]
+    /// For each field with a pending choice in this window: the values observed before each of
+    /// those choices, plus every choice's requested value. A newer choice re-applies only over one
+    /// of these values, so an earlier choice of this window, even one already sent to the authority
+    /// that commits later, does not stop it. These are values, not authorship: another window that
+    /// saves one of them is treated the same way.
+    private var workspaceRenamePriorNamesByID: [UUID: Set<String>] = [:]
+    private var workspaceColorPriorIDsByID: [UUID: Set<String?>] = [:]
     private var workspaceCreationTasksByID: [UUID: Task<Void, Never>] = [:]
     private var domainWorkspaceCatalogRevision: UInt64 = 0
     #if DEBUG
@@ -2489,6 +2496,14 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         func hasPendingWorkspaceColorIntentForTesting(workspaceID: UUID) -> Bool {
             workspaceColorIntentByID[workspaceID] != nil
+        }
+
+        func hasPendingWorkspaceRenameIntentForTesting(workspaceID: UUID) -> Bool {
+            workspaceRenameIntentByID[workspaceID] != nil
+        }
+
+        func hasPendingWorkspaceHiddenIntentForTesting(workspaceID: UUID) -> Bool {
+            workspaceHiddenIntentByID[workspaceID] != nil
         }
 
         func workspaceSaveDiagnosticsForTesting(workspaceID: UUID) -> (
@@ -15521,8 +15536,10 @@ class WorkspaceManagerViewModel: ObservableObject {
         domainWorkspaceFileURLsByID.removeValue(forKey: workspace.id)
         forgetWorkingPublicationTracking(workspaceID: workspace.id)
         workspaceRenameIntentByID.removeValue(forKey: workspace.id)
+        workspaceRenamePriorNamesByID.removeValue(forKey: workspace.id)
         workspaceHiddenIntentByID.removeValue(forKey: workspace.id)
         workspaceColorIntentByID.removeValue(forKey: workspace.id)
+        workspaceColorPriorIDsByID.removeValue(forKey: workspace.id)
         removeConsolidatedRestoreTracking(workspaceID: workspace.id)
         if activeWorkspaceID == workspace.id {
             activeWorkspaceID = nil
@@ -15572,7 +15589,18 @@ class WorkspaceManagerViewModel: ObservableObject {
         let workspaceID = workspace.id
         let intentID = UUID()
         let intentDateModified = workspaces[index].dateModified
+        let priorNames = (workspaceRenameIntentByID[workspaceID] == nil ? [] : workspaceRenamePriorNamesByID[workspaceID] ?? [])
+            .union([previousName])
         workspaceRenameIntentByID[workspaceID] = intentID
+        workspaceRenamePriorNamesByID[workspaceID] = priorNames.union([finalName])
+        let intent = WorkspaceSaveFieldIntent { [weak self] workspace in
+            guard self?.workspaceRenameIntentByID[workspaceID] == intentID,
+                  priorNames.contains(workspace.name) || workspace.name == finalName
+            else { return false }
+            workspace.name = finalName
+            workspace.dateModified = max(workspace.dateModified, intentDateModified)
+            return true
+        }
         Task { @MainActor [weak self] in
             guard let self,
                   workspaceRenameIntentByID[workspaceID] == intentID,
@@ -15581,16 +15609,18 @@ class WorkspaceManagerViewModel: ObservableObject {
             defer {
                 if workspaceRenameIntentByID[workspaceID] == intentID {
                     workspaceRenameIntentByID.removeValue(forKey: workspaceID)
+                    workspaceRenamePriorNamesByID.removeValue(forKey: workspaceID)
                 }
             }
-            workspaceToSave.name = finalName
-            workspaceToSave.dateModified = max(workspaceToSave.dateModified, intentDateModified)
+            guard intent.apply(&workspaceToSave) else { return }
             if let currentIndex = workspaces.firstIndex(where: { $0.id == workspaceID }) {
                 workspaces[currentIndex].name = workspaceToSave.name
                 workspaces[currentIndex].dateModified = workspaceToSave.dateModified
             }
             do {
-                let finalURL = try await saveWorkspaceToFileAsync(workspaceToSave, source: .renameWorkspace)
+                let finalURL = try await saveWorkspaceToFileAsync(
+                    workspaceToSave, source: .renameWorkspace, fieldIntent: intent
+                )
                 await workspaceDiskWriter.flush(url: finalURL)
 
                 await rebuildAndSaveIndexAsync()
@@ -15635,6 +15665,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     /// Preserves the predecessor optimistic hidden-state flow for ordinary UI mutations.
     private func setOrdinaryWorkspaceHidden(_ workspace: WorkspaceModel, hidden: Bool) {
         guard let index = workspaces.firstIndex(where: { $0.id == workspace.id }) else { return }
+        let lifecycle = workspaces[index].consolidatedIntoWorkspaceID
         workspaces[index].isHiddenInMenus = hidden
         workspaces[index].dateModified = Date()
 
@@ -15642,6 +15673,10 @@ class WorkspaceManagerViewModel: ObservableObject {
         let intentID = UUID()
         let intentDateModified = workspaces[index].dateModified
         workspaceHiddenIntentByID[workspaceID] = intentID
+        let intent = hiddenFieldIntent(
+            workspaceID: workspaceID, intentID: intentID, hidden: hidden,
+            lifecycle: lifecycle, intentDateModified: intentDateModified
+        )
         Task { @MainActor [weak self] in
             guard let self,
                   workspaceHiddenIntentByID[workspaceID] == intentID,
@@ -15652,14 +15687,15 @@ class WorkspaceManagerViewModel: ObservableObject {
                     workspaceHiddenIntentByID.removeValue(forKey: workspaceID)
                 }
             }
-            workspaceToSave.isHiddenInMenus = hidden
-            workspaceToSave.dateModified = max(workspaceToSave.dateModified, intentDateModified)
+            guard intent.apply(&workspaceToSave) else { return }
             if let currentIndex = workspaces.firstIndex(where: { $0.id == workspaceID }) {
                 workspaces[currentIndex].isHiddenInMenus = workspaceToSave.isHiddenInMenus
                 workspaces[currentIndex].dateModified = workspaceToSave.dateModified
             }
             do {
-                let finalURL = try await saveWorkspaceToFileAsync(workspaceToSave, source: .setWorkspaceHidden)
+                let finalURL = try await saveWorkspaceToFileAsync(
+                    workspaceToSave, source: .setWorkspaceHidden, fieldIntent: intent
+                )
                 await workspaceDiskWriter.flush(url: finalURL)
 
                 await rebuildAndSaveIndexAsync()
@@ -15689,36 +15725,57 @@ class WorkspaceManagerViewModel: ObservableObject {
               Self.acceptsWorkspaceColor(workspaces[index])
         else { return }
         let colorID = color?.rawValue
-        guard workspaces[index].color != colorID else { return }
+        let workspaceID = workspace.id
+        let previousColorID = workspaces[index].color
+        let hasPendingChoice = workspaceColorIntentByID[workspaceID] != nil
+        // Choosing the shown colour again still replaces a pending save of a different choice.
+        guard previousColorID != colorID || hasPendingChoice else { return }
         workspaces[index].color = colorID
         workspaces[index].dateModified = Date()
-        guard !workspaces[index].isEphemeral else { return }
+        guard !workspaces[index].isEphemeral else {
+            // A memory-only choice also replaces a pending save of an earlier choice.
+            workspaceColorIntentByID.removeValue(forKey: workspaceID)
+            workspaceColorPriorIDsByID.removeValue(forKey: workspaceID)
+            return
+        }
 
         // The intent token lets an authority projection replace the array element without losing
         // this request, while a newer colour choice supersedes the older task.
-        let workspaceID = workspace.id
         let intentID = UUID()
         let intentDateModified = workspaces[index].dateModified
+        let priorColorIDs = (hasPendingChoice ? workspaceColorPriorIDsByID[workspaceID] ?? [] : [])
+            .union([previousColorID])
         workspaceColorIntentByID[workspaceID] = intentID
+        workspaceColorPriorIDsByID[workspaceID] = priorColorIDs.union([colorID])
+        let intent = WorkspaceSaveFieldIntent { [weak self] workspace in
+            guard self?.workspaceColorIntentByID[workspaceID] == intentID,
+                  Self.acceptsWorkspaceColor(workspace),
+                  priorColorIDs.contains(workspace.color) || workspace.color == colorID
+            else { return false }
+            workspace.color = colorID
+            workspace.dateModified = max(workspace.dateModified, intentDateModified)
+            return true
+        }
         Task { @MainActor [weak self] in
             guard let self, workspaceColorIntentByID[workspaceID] == intentID else { return }
             defer {
                 if workspaceColorIntentByID[workspaceID] == intentID {
                     workspaceColorIntentByID.removeValue(forKey: workspaceID)
+                    workspaceColorPriorIDsByID.removeValue(forKey: workspaceID)
                 }
             }
             // The workspace may have been reclassified since admission; such a record is not saved.
             guard var workspaceToSave = workspaces.first(where: { $0.id == workspaceID }),
-                  Self.acceptsWorkspaceColor(workspaceToSave)
+                  intent.apply(&workspaceToSave)
             else { return }
-            workspaceToSave.color = colorID
-            workspaceToSave.dateModified = max(workspaceToSave.dateModified, intentDateModified)
             if let currentIndex = workspaces.firstIndex(where: { $0.id == workspaceID }) {
                 workspaces[currentIndex].color = workspaceToSave.color
                 workspaces[currentIndex].dateModified = workspaceToSave.dateModified
             }
             do {
-                let finalURL = try await saveWorkspaceToFileAsync(workspaceToSave, source: .setWorkspaceColor)
+                let finalURL = try await saveWorkspaceToFileAsync(
+                    workspaceToSave, source: .setWorkspaceColor, fieldIntent: intent
+                )
                 await workspaceDiskWriter.flush(url: finalURL)
                 NotificationCenter.default.post(
                     name: .workspaceListDidChange,
@@ -15764,6 +15821,28 @@ class WorkspaceManagerViewModel: ObservableObject {
         return !pendingConsolidatedRestoreIDs.contains(workspaceID)
     }
 
+    /// The hidden-state change of one request. Showing a recovery copy is a restore, which
+    /// `setWorkspaceHidden` routes elsewhere; a consolidation or restore since the request ends it.
+    private func hiddenFieldIntent(
+        workspaceID: UUID,
+        intentID: UUID,
+        hidden: Bool,
+        lifecycle: UUID?,
+        intentDateModified: Date
+    ) -> WorkspaceSaveFieldIntent {
+        WorkspaceSaveFieldIntent { [weak self] workspace in
+            guard self?.workspaceHiddenIntentByID[workspaceID] == intentID,
+                  workspace.consolidatedIntoWorkspaceID == lifecycle,
+                  hidden || workspace.consolidatedIntoWorkspaceID == nil
+            else { return false }
+            workspace.isHiddenInMenus = hidden
+            workspace.dateModified = max(workspace.dateModified, intentDateModified)
+            return true
+        }
+    }
+
+    /// On success, returns the latest in-memory workspace. Concurrent changes may be newer than the
+    /// document this call saved.
     func setWorkspaceHiddenFromSnapshot(_ workspace: WorkspaceModel, hidden: Bool) async throws -> WorkspaceModel {
         var current = self.workspace(withID: workspace.id)
         var isAuthorityIncompleteRestore = authorityIncompleteConsolidatedRestoreIDs.contains(workspace.id)
@@ -15857,9 +15936,21 @@ class WorkspaceManagerViewModel: ObservableObject {
                 workspaces.append(updated)
             }
 
+            // Same intent as the UI setter, so another window's save during this one keeps it.
+            let intentID = UUID()
+            workspaceHiddenIntentByID[updated.id] = intentID
+            defer {
+                if workspaceHiddenIntentByID[updated.id] == intentID {
+                    workspaceHiddenIntentByID.removeValue(forKey: updated.id)
+                }
+            }
             let finalURL = try await saveWorkspaceToFileAsync(
                 updated,
-                source: .setWorkspaceHiddenFromSnapshot
+                source: .setWorkspaceHiddenFromSnapshot,
+                fieldIntent: hiddenFieldIntent(
+                    workspaceID: updated.id, intentID: intentID, hidden: hidden,
+                    lifecycle: current.consolidatedIntoWorkspaceID, intentDateModified: updated.dateModified
+                )
             )
             await workspaceDiskWriter.flush(url: finalURL)
 
@@ -15871,7 +15962,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 object: nil,
                 userInfo: ["managerID": instanceID]
             )
-            return updated
+            return self.workspace(withID: updated.id) ?? updated
         }
 
         guard !activeConsolidatedRestoreIDs.contains(workspace.id) else {
@@ -17084,6 +17175,25 @@ class WorkspaceManagerViewModel: ObservableObject {
         let ownedPublicationGeneration: UInt64?
     }
 
+    /// The one field an optimistic setter (rename, hide/show, colour) is saving. Another window's
+    /// save can replace this window's copy while the save is suspended, or win the authority's
+    /// revision check first; the save then applies the change again to that window's adopted save
+    /// instead of saving the replacement as if it carried the change, or dropping it.
+    struct WorkspaceSaveFieldIntent {
+        /// Applies the change and returns true while the requesting setter still owns it and the
+        /// workspace still accepts it (including when it already holds the value). A rename or
+        /// colour also needs the field to hold a value observed before, or requested by, this
+        /// window's pending choices for it. Returns false, leaving the workspace alone, once a newer request in
+        /// this window owns the field, another window has saved a different value for that same
+        /// field (its saved choice stands), or the workspace no longer accepts the change.
+        let apply: @MainActor (inout WorkspaceModel) -> Bool
+    }
+
+    /// Extra attempts a field save may spend applying its change again to another window's save,
+    /// whether that save won the revision check or was reinstalled over the change in memory,
+    /// before the failure is returned to the setter. Other saves get none.
+    private static let fieldIntentRebaseLimit = 7
+
     /// The proposal may differ from the local model for an explicit direct save. Both it and
     /// the observed model must keep the revision under which the save began across suspensions.
     private struct DomainAuthoritySaveCapture {
@@ -17145,7 +17255,9 @@ class WorkspaceManagerViewModel: ObservableObject {
         issueClearance: DomainAuthorityIssueClearance,
         ownedPublicationGeneration: UInt64?,
         ownSaveFence: OwnSaveFence?,
-        recaptureActivationGeneration: UInt64?
+        recaptureActivationGeneration: UInt64?,
+        fieldIntent: WorkspaceSaveFieldIntent?,
+        remainingFieldIntentRebases: Int
     ) async throws -> DomainAuthoritySaveResult {
         try Task.checkCancellation()
         #if DEBUG
@@ -17192,10 +17304,12 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         let currentGeneration = fullDocumentAdoptionGenerations[proposal.id, default: 0]
         if currentGeneration != capture.adoptionGeneration,
-           domainWorkspaceDigestsByID[proposal.id] == capture.digest
+           domainWorkspaceDigestsByID[proposal.id] == capture.digest,
+           fieldIntent == nil
         {
             // Reinstalling the same canonical bytes can still discard a local proposal. It is
             // not the committed predecessor handoff for which this retry preserves descendants.
+            // A field save applies its change to the reinstalled bytes below, so it continues.
             throw WorkspacePersistenceFailure(category: .workspaceChanged)
         }
         // A joined own publisher may have committed while the newer local model was captured.
@@ -17208,15 +17322,30 @@ class WorkspaceManagerViewModel: ObservableObject {
            domainWorkspaceRevisionsByID[proposal.id]?.workingRevision != capture.revisions?.workingRevision
            || domainWorkspaceDigestsByID[proposal.id] != capture.digest
         {
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = .sortedKeys
-            let digest = try DomainContentDigest.sha256(encoder.encode(current))
-            guard digest == domainWorkspaceDigestsByID[proposal.id] else {
-                throw WorkspacePersistenceFailure(category: .workspaceChanged)
+            // A field save writes only its own field onto `current`, which may already carry this
+            // window's other field replays made since adoption. It needs proof that `current`
+            // descends from the adopted document, not that it equals it.
+            let descendsFromAdoptedDocument = fieldIntent != nil
+                && fullDocumentWriteBaseline(workspaceID: proposal.id) != nil
+            if !descendsFromAdoptedDocument {
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = .sortedKeys
+                let digest = try DomainContentDigest.sha256(encoder.encode(current))
+                guard digest == domainWorkspaceDigestsByID[proposal.id] else {
+                    throw WorkspacePersistenceFailure(category: .workspaceChanged)
+                }
             }
         }
-        guard remainingRetryCount > 0 else {
-            throw WorkspacePersistenceFailure(category: .localSavePreparationRetryExhausted)
+        // A field save re-applies its change below, so once its ordinary retry is spent it may
+        // keep rebasing on its own bounded allowance.
+        var nextRetryCount = remainingRetryCount - 1
+        var nextFieldIntentRebases = remainingFieldIntentRebases
+        if remainingRetryCount <= 0 {
+            guard fieldIntent != nil, remainingFieldIntentRebases > 0 else {
+                throw WorkspacePersistenceFailure(category: .localSavePreparationRetryExhausted)
+            }
+            nextRetryCount = 0
+            nextFieldIntentRebases -= 1
         }
         recordAgentAdmissionLocalRetry(
             workspaceID: proposal.id,
@@ -17240,18 +17369,62 @@ class WorkspaceManagerViewModel: ObservableObject {
             current = recaptured
             retryPublicationGeneration = generation
         }
+        if let fieldIntent {
+            // `current` may be another window's adopted save, which lacks this change. Apply it
+            // on top so that window's edits survive too, and show it here: this window's own
+            // committed save is not echoed back to it.
+            guard !isPreparingForWindowClose, fieldIntent.apply(&current) else {
+                throw WorkspacePersistenceFailure(category: .cancelled)
+            }
+            if let index = workspaces.firstIndex(where: { $0.id == proposal.id }), workspaces[index] != current {
+                workspaces[index] = current
+            }
+        }
         return try await persistWorkspaceThroughDomainAuthority(
             current,
             targetURL: targetURL,
             preserveDiskRepoPathsIfUnchangedSinceBaseline: preserveDiskRepoPathsIfUnchangedSinceBaseline,
             source: source,
-            remainingRetryCount: remainingRetryCount - 1,
+            remainingRetryCount: nextRetryCount,
             creationOperationID: creationOperationID,
             issueClearance: issueClearance,
             ownedPublicationGeneration: retryPublicationGeneration,
             ownSaveFence: ownSaveFence,
-            recaptureActivationGeneration: recaptureActivationGeneration
+            recaptureActivationGeneration: recaptureActivationGeneration,
+            fieldIntent: fieldIntent,
+            remainingFieldIntentRebases: nextFieldIntentRebases
         )
+    }
+
+    /// Waits, through the bridge's existing catalog refresh, until this window has adopted the save
+    /// that won the revision check, then applies `fieldIntent` to that adopted copy and shows it.
+    /// Returns nil when the change no longer applies or no adopted copy is writable after two
+    /// refreshes; the caller then returns the conflict.
+    private func workspaceRebasingFieldIntentAfterConflict(
+        workspaceID: UUID,
+        fileURL: URL,
+        fieldIntent: WorkspaceSaveFieldIntent,
+        ownSaveFence: OwnSaveFence?
+    ) async throws -> WorkspaceModel? {
+        guard let refresh = domainCatalogRefreshAwaiter else { return nil }
+        for _ in 0 ..< 2 {
+            // Stop if the refresh did not complete for the current bridge run; adoption itself is
+            // proven separately by the write baseline below.
+            guard await refresh() else { return nil }
+            try Task.checkCancellation()
+            guard !isPreparingForWindowClose,
+                  isOwnSaveFenceCurrent(ownSaveFence, workspaceID: workspaceID),
+                  var current = workspace(withID: workspaceID), !current.isEphemeral,
+                  workspaceFileURL(for: current) == fileURL
+            else { return nil }
+            guard fullDocumentWriteBaseline(workspaceID: workspaceID) != nil else { continue }
+            guard fieldIntent.apply(&current) else { return nil }
+            if let index = workspaces.firstIndex(where: { $0.id == workspaceID }), workspaces[index] != current {
+                workspaces[index] = current
+            }
+            return current
+        }
+        return nil
     }
 
     private func persistWorkspaceThroughDomainAuthority(
@@ -17264,7 +17437,9 @@ class WorkspaceManagerViewModel: ObservableObject {
         issueClearance: DomainAuthorityIssueClearance? = nil,
         ownedPublicationGeneration: UInt64? = nil,
         ownSaveFence: OwnSaveFence? = nil,
-        recaptureActivationGeneration: UInt64? = nil
+        recaptureActivationGeneration: UInt64? = nil,
+        fieldIntent: WorkspaceSaveFieldIntent? = nil,
+        remainingFieldIntentRebases: Int = 0
     ) async throws -> DomainAuthoritySaveResult {
         let issueClearance = issueClearance ?? DomainAuthorityIssueClearance(issueID: domainWorkspaceAuthorityIssue?.id)
         guard !workspace.isEphemeral else {
@@ -17315,7 +17490,8 @@ class WorkspaceManagerViewModel: ObservableObject {
                 source: source, remainingRetryCount: remainingRetryCount,
                 creationOperationID: creationOperationID, issueClearance: issueClearance,
                 ownedPublicationGeneration: ownedPublicationGeneration, ownSaveFence: ownSaveFence,
-                recaptureActivationGeneration: recaptureActivationGeneration
+                recaptureActivationGeneration: recaptureActivationGeneration, fieldIntent: fieldIntent,
+                remainingFieldIntentRebases: remainingFieldIntentRebases
             )
         }
 
@@ -17422,7 +17598,8 @@ class WorkspaceManagerViewModel: ObservableObject {
                 source: source, remainingRetryCount: remainingRetryCount,
                 creationOperationID: creationOperationID, issueClearance: issueClearance,
                 ownedPublicationGeneration: ownedPublicationGeneration, ownSaveFence: ownSaveFence,
-                recaptureActivationGeneration: recaptureActivationGeneration
+                recaptureActivationGeneration: recaptureActivationGeneration, fieldIntent: fieldIntent,
+                remainingFieldIntentRebases: remainingFieldIntentRebases
             )
         }
         guard isOwnSaveFenceCurrent(ownSaveFence, workspaceID: workspace.id) else {
@@ -17494,7 +17671,8 @@ class WorkspaceManagerViewModel: ObservableObject {
                     source: source, remainingRetryCount: remainingRetryCount,
                     creationOperationID: creationOperationID, issueClearance: issueClearance,
                     ownedPublicationGeneration: ownedPublicationGeneration, ownSaveFence: ownSaveFence,
-                    recaptureActivationGeneration: recaptureActivationGeneration
+                    recaptureActivationGeneration: recaptureActivationGeneration, fieldIntent: fieldIntent,
+                    remainingFieldIntentRebases: remainingFieldIntentRebases
                 )
             }
             // Last point before this save writes to the authority. A superseded own save bails
@@ -17599,9 +17777,33 @@ class WorkspaceManagerViewModel: ObservableObject {
         )
         guard Self.isSuccessfulDomainOutcome(outcome) else {
             await refreshCanonicalRootState(workspaceID: workspaceToSave.id)
-            throw DomainWorkspaceAuthorityOperationError(
+            let failure = DomainWorkspaceAuthorityOperationError(
                 outcome: outcome,
                 workingCommitted: workingCommitted
+            )
+            // Another window's save won the revision check. A field save rebases onto that save,
+            // once this window has adopted it, instead of dropping the change.
+            guard let fieldIntent, remainingFieldIntentRebases > 0, !requiresExactSnapshotAttempt,
+                  outcome.errorCode == .stateConflict, outcome.diagnostic == "workspace_revision_mismatch"
+            else { throw failure }
+            pendingOperationIDs.forEach { pendingFullDocumentWrites.removeValue(forKey: $0) }
+            pendingOperationIDs = []
+            guard let rebased = try await workspaceRebasingFieldIntentAfterConflict(
+                workspaceID: workspaceToSave.id, fileURL: targetURL,
+                fieldIntent: fieldIntent, ownSaveFence: ownSaveFence
+            ) else { throw failure }
+            return try await persistWorkspaceThroughDomainAuthority(
+                rebased,
+                targetURL: targetURL,
+                preserveDiskRepoPathsIfUnchangedSinceBaseline: preserveDiskRepoPathsIfUnchangedSinceBaseline,
+                source: source,
+                remainingRetryCount: 1,
+                issueClearance: issueClearance,
+                ownedPublicationGeneration: ownedPublicationGeneration,
+                ownSaveFence: ownSaveFence,
+                recaptureActivationGeneration: recaptureActivationGeneration,
+                fieldIntent: fieldIntent,
+                remainingFieldIntentRebases: remainingFieldIntentRebases - 1
             )
         }
 
@@ -17744,7 +17946,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         _ workspace: WorkspaceModel,
         preserveDiskRepoPathsIfUnchangedSinceBaseline: Bool = true,
         source: WorkspaceSaveSource = .directUnknown,
-        rootEditContext: RootEditSaveContext? = nil
+        rootEditContext: RootEditSaveContext? = nil,
+        fieldIntent: WorkspaceSaveFieldIntent? = nil
     ) async throws -> URL {
         let targetURL = workspaceFileURL(for: workspace)
         guard !isSessionRuntimeProjection else { throw WorkspaceDirectWriteError.domainAuthorityRequired }
@@ -17765,7 +17968,9 @@ class WorkspaceManagerViewModel: ObservableObject {
                 targetURL: targetURL,
                 preserveDiskRepoPathsIfUnchangedSinceBaseline: preserveDiskRepoPathsIfUnchangedSinceBaseline,
                 source: source,
-                remainingRetryCount: 1
+                remainingRetryCount: 1,
+                fieldIntent: fieldIntent,
+                remainingFieldIntentRebases: fieldIntent == nil ? 0 : Self.fieldIntentRebaseLimit
             )
             lastSavedVersionByWorkspaceID[workspace.id] = result.savedStateVersion
             return result.fileURL
