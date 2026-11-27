@@ -26,6 +26,8 @@ struct WorkspaceFileEditHost: FileEditHost {
     let selectCreatedFiles: Bool
     let mutationRootMappings: [DomainMutationPhysicalRootMapping]
     let writeReceipt: WriteReceipt?
+    /// Bounds only the Git-sync wait of the original-file read, which precedes every write.
+    let originalReadDeadline: MCPDomainAdmissionDeadline?
 
     init(
         store: WorkspaceFileContextStore,
@@ -35,7 +37,8 @@ struct WorkspaceFileEditHost: FileEditHost {
         createPathResolutionPolicy: WorkspaceFileCreatePathResolutionPolicy = .literalPreferredIfStronger,
         selectCreatedFiles: Bool = true,
         mutationRootMappings: [DomainMutationPhysicalRootMapping] = [],
-        writeReceipt: WriteReceipt? = nil
+        writeReceipt: WriteReceipt? = nil,
+        originalReadDeadline: MCPDomainAdmissionDeadline? = nil
     ) {
         mutationService = WorkspaceFileMutationService(store: store)
         self.target = target
@@ -45,6 +48,7 @@ struct WorkspaceFileEditHost: FileEditHost {
         self.selectCreatedFiles = selectCreatedFiles
         self.mutationRootMappings = mutationRootMappings
         self.writeReceipt = writeReceipt
+        self.originalReadDeadline = originalReadDeadline
     }
 
     func fileExists(path _: String) async -> Bool {
@@ -56,7 +60,10 @@ struct WorkspaceFileEditHost: FileEditHost {
         guard case let .existing(file) = target else {
             throw FileManagerError.fileSystemServiceNotFoundWithContext("Cannot read a missing file before creation.")
         }
-        guard let content = try await mutationService.readText(file: file) else {
+        let content = try await Self.timed(.originalRead) {
+            try await mutationService.readText(file: file, authorityDeadline: originalReadDeadline)
+        }
+        guard let content else {
             throw FileManagerError.fileSystemServiceNotFoundWithContext(
                 "The resolved file is no longer present or readable."
             )
@@ -69,15 +76,23 @@ struct WorkspaceFileEditHost: FileEditHost {
             throw FileManagerError.fileSystemServiceNotFoundWithContext("Approved writes require an existing file.")
         }
         try Task.checkCancellation()
-        try await mutationService.overwriteIfUnchanged(
-            file: file,
-            content: content,
-            expectedOriginalContent: expectedOriginalText,
-            mutationRootMappings: mutationRootMappings
-        )
+        try await Self.timed(.write) {
+            try await mutationService.overwriteIfUnchanged(
+                file: file,
+                content: content,
+                expectedOriginalContent: expectedOriginalText,
+                mutationRootMappings: mutationRootMappings
+            )
+        }
     }
 
-    func writeText(path _: String, content: String, overwrite: Bool) async throws {
+    func writeText(path: String, content: String, overwrite: Bool) async throws {
+        try await Self.timed(.write) {
+            try await writeTextUntimed(path: path, content: content, overwrite: overwrite)
+        }
+    }
+
+    private func writeTextUntimed(path _: String, content: String, overwrite: Bool) async throws {
         switch target {
         case let .existing(file):
             guard overwrite else {
@@ -110,6 +125,28 @@ struct WorkspaceFileEditHost: FileEditHost {
                     rootScope: lookupRootScope
                 )
             }
+        }
+    }
+
+    /// Records a stage of the current mutation call (log-only; no paths or contents).
+    private static func timed<T>(
+        _ stage: MCPDomainMutationCall.Stage,
+        _ body: () async throws -> T
+    ) async throws -> T {
+        guard let call = MCPDomainMutationCall.current else { return try await body() }
+        let span = call.begin(stage)
+        do {
+            let value = try await body()
+            call.end(span, .completed)
+            return value
+        } catch {
+            let outcome: MCPDomainMutationCall.Outcome = switch error {
+            case is CancellationError: .cancelled
+            case is WorkspaceSeededAuthorityWaitTimeout: .expired
+            default: .failed
+            }
+            call.end(span, outcome)
+            throw error
         }
     }
 
