@@ -1993,6 +1993,90 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
 
     // MARK: Managed-auth recovery replay
 
+    func testProviderSwitchAcceptedNativeStartIsNotReplayedAfterAuthFailure() async throws {
+        try await assertProviderSwitchAcceptedNativeStartIsNotReplayed(authBeforeReceipt: false)
+        try await assertProviderSwitchAcceptedNativeStartIsNotReplayed(authBeforeReceipt: true)
+        try await assertProviderSwitchAcceptedNativeStartIsNotReplayed(authBeforeReceipt: true, progressBeforeReceipt: true)
+    }
+
+    private func assertProviderSwitchAcceptedNativeStartIsNotReplayed(authBeforeReceipt: Bool, progressBeforeReceipt: Bool = false) async throws {
+        let fixture = try makeFixture()
+        await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
+        let session = fixture.session
+        let runtime = fixture.viewModel.linkExecutionRuntime
+        session.selectedModelRaw = fixture.viewModel.defaultModelRaw(for: .codexExec)
+        let prior = AgentChatItem.user("retained source history", sequenceIndex: 0)
+        let turn = AgentTranscriptTurn(request: .init(from: prior), responseSpans: [], conclusionActivityID: nil, terminalState: .completed, startedAt: prior.timestamp, completedAt: prior.timestamp)
+        let projection = try AgentProviderHandover.project(AgentTranscript(turns: [turn]))
+        let source = try AgentProviderHandover.Source(provider: "source", model: "source-model")
+        let carrier = AgentProviderHandover.render(AgentProviderHandover.history(projection, source: source, historyReference: nil))
+        session.pendingHandoff = .init(payload: carrier, createdAt: Date(), providerSwitchDelivery: .ready)
+        var acceptedSaves: [UUID] = []
+        let saveURL = FileManager.default.temporaryDirectory.appendingPathComponent("provider-switch-accepted-auth-fake.json")
+        fixture.viewModel.test_setAgentSessionSaver { saved, _, _ in
+            if let id = saved.providerSwitchAcceptedID { acceptedSaves.append(id) }
+            return saveURL
+        }
+        let input = AgentChatItem.user("destination input", sequenceIndex: session.nextSequenceIndex)
+        guard case let .success(.some(preparation)) = await runtime.providerSwitchSendAdmission(session: session, input: input.text) else {
+            return XCTFail("Expected ready carrier")
+        }
+        session.appendItem(input)
+        let messages = await runtime.prepareProviderSwitchHandoverForSend(
+            preparation.accepting(input.id, session: session), session: session, stopFence: .init(session: session)
+        )
+        let text = try XCTUnwrap(messages?.initial)
+        let failure = "external auth is active"
+        func emitFailure() async {
+            await fixture.coordinator.test_handleCodexNativeEvent(
+                .errorNotification(.init(message: failure, willRetry: false, threadID: nil, turnID: nil, itemID: nil)),
+                session: session, sourceController: fixture.controller
+            )
+        }
+        let gate = TestReleaseFence(name: "provider switch start receipt")
+        if authBeforeReceipt { fixture.controller.setSendGate(gate) }
+        defer { gate.release() }
+        let send = Task { @MainActor in
+            await fixture.coordinator.test_sendCodexNativeMessage(
+                session: session, ownership: session.beginRunAttempt(source: "test.providerSwitch.auth.accepted"),
+                text: text, attachments: []
+            )
+        }
+        if authBeforeReceipt {
+            guard await gate.waitUntilEntered(timeout: 3) else {
+                send.cancel()
+                return
+            }
+            await emitFailure()
+            let refreshedBeforeReceipt = await fixture.authRecovery.didRefresh
+            XCTAssertFalse(refreshedBeforeReceipt)
+            if progressBeforeReceipt {
+                await fixture.coordinator.test_handleCodexNativeEvent(
+                    .assistantDelta("progress before receipt"), session: session, sourceController: fixture.controller
+                )
+                XCTAssertNil(session.codexPendingAuthRetryTurn, "progress retires replayable text, not the outstanding receipt")
+            }
+            gate.release()
+        }
+        let outcome = await send.value
+        guard case .sent = outcome else { return XCTFail("Expected a positive start receipt, got \(outcome)") }
+        if !authBeforeReceipt {
+            let id = try XCTUnwrap(session.pendingHandoff.providerSwitchAcceptedID)
+            await runtime.drainPendingSendEffects(for: session)
+            XCTAssertTrue(acceptedSaves.contains(id))
+            await emitFailure()
+        }
+        await runtime.drainPendingSendEffects(for: session)
+        XCTAssertEqual(fixture.startedTurns.count(where: { $0.contains(carrier) }), 1)
+        let refreshed = await fixture.authRecovery.didRefresh
+        XCTAssertFalse(refreshed)
+        XCTAssertEqual(session.runState, .failed)
+        XCTAssertTrue(session.items.contains { $0.id == input.id && $0.text == input.text })
+        XCTAssertTrue(session.items.contains { $0.kind == .error && $0.text.contains(failure) })
+        let id = try XCTUnwrap(acceptedSaves.first)
+        XCTAssertEqual(session.items.count(where: { $0.id == id && $0.recoveryDiagnostic?.outcome == "sent" }), 1)
+    }
+
     func testProviderSwitchFirstStartAuthRejectionThenManagedReplayConfirmsExactlyOnce() async throws {
         let fixture = try makeFixture(rejectFirstNativeStartForAuth: true)
         await fixture.inventory.publishCodex(revision: 1, targetCount: 1)

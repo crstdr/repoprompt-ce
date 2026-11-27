@@ -4,6 +4,36 @@ import RepoPromptInstrumentation
 
 @MainActor
 extension AgentSessionLinkExecutionRuntime {
+    private struct ConfirmationTarget {
+        let sessionID: UUID
+        let workspaceID: UUID
+        let acceptedID: UUID
+
+        @MainActor
+        init?(session: TabSession, acceptedID: UUID) {
+            guard let binding = session.persistentSessionBindingIdentity,
+                  let workspaceID = binding.workspaceID
+            else { return nil }
+            sessionID = binding.sessionID
+            self.workspaceID = workspaceID
+            self.acceptedID = acceptedID
+        }
+
+        func matches(_ record: ProviderSwitchConfirmationRecord) -> Bool {
+            record.acceptedID == acceptedID
+                && record.binding?.bindingIdentity.sessionID == sessionID
+                && record.binding?.bindingIdentity.workspaceID == workspaceID
+        }
+    }
+
+    private func confirmationIsCurrent(_ session: TabSession, target: ConfirmationTarget) -> Bool {
+        sessions[session.tabID] === session
+            && session.activeAgentSessionID == target.sessionID
+            && session.persistentSessionBindingIdentity?.workspaceID == target.workspaceID
+            && session.pendingHandoff.providerSwitchAcceptedID == target.acceptedID
+            && session.pendingHandoff.providerSwitchDelivery == .sending
+    }
+
     /// Starts or coalesces the provider-free confirmation protocol. Triggers carry no evidence;
     /// the runtime record decides. Save A may run only for the originating writer, and Save B
     /// only for a durable marker whose carrying run is terminally resolved. Anything else leaves
@@ -13,8 +43,10 @@ extension AgentSessionLinkExecutionRuntime {
               scope.sessions[session.tabID] === session,
               let acceptedID = session.pendingHandoff.providerSwitchAcceptedID,
               session.pendingHandoff.providerSwitchDelivery == .sending,
-              let sessionID = session.activeAgentSessionID
+              let target = ConfirmationTarget(session: session, acceptedID: acceptedID),
+              confirmationIsCurrent(session, target: target)
         else { return }
+        let sessionID = target.sessionID
         let flightKey = ProviderSwitchConfirmationKey(sessionID: sessionID, acceptedID: acceptedID)
         if providerSwitchConfirmationFlights[flightKey] != nil {
             // Coalesce: the active flight reconciles once more when it ends.
@@ -22,8 +54,8 @@ extension AgentSessionLinkExecutionRuntime {
             return
         }
         // A trigger that cannot make progress must not reset an exposed save-failed state.
-        guard providerSwitchConfirmationCanProgress(session, sessionID: sessionID, acceptedID: acceptedID) else {
-            providerSwitchConfirmationExposeIfStranded(session, sessionID: sessionID, acceptedID: acceptedID)
+        guard providerSwitchConfirmationCanProgress(session, target: target) else {
+            providerSwitchConfirmationExposeIfStranded(session, target: target)
             return
         }
         let flightID = UUID()
@@ -39,46 +71,42 @@ extension AgentSessionLinkExecutionRuntime {
             }
             var lastFailure = false
             for attempt in 0 ..< 3 {
-                guard scope.sessions[session.tabID] === session,
-                      session.activeAgentSessionID == sessionID,
-                      session.pendingHandoff.providerSwitchAcceptedID == acceptedID,
-                      session.pendingHandoff.providerSwitchDelivery == .sending
-                else { return }
+                guard confirmationIsCurrent(session, target: target) else { return }
                 if attempt > 0 {
                     // Bounded and event-driven: the delay is only within this single flight and
                     // never parks a timer after persistent failure.
-                    try? await Task.sleep(nanoseconds: UInt64(attempt) * 100_000_000)
-                    if Task.isCancelled { return }
+                    await providerSwitchConfirmationRetryDelay(attempt)
+                    guard !Task.isCancelled, confirmationIsCurrent(session, target: target) else { return }
                 }
                 guard let writer = providerSwitchConfirmationWriter(for: session) else {
                     lastFailure = true
                     continue
                 }
                 guard let record = providerSwitchConfirmationRecords[sessionID],
-                      record.acceptedID == acceptedID
+                      target.matches(record)
                 else { return }
                 if !record.markerDurable {
                     // Only the originating writer may record a late provider acceptance. A
                     // successor waits for durable evidence instead of inferring acceptance.
                     guard let origin = record.originWriter, writer.identity == origin else {
                         if !providerSwitchConfirmationRerunRequested.contains(flightKey) {
-                            providerSwitchConfirmationExposeIfStranded(session, sessionID: sessionID, acceptedID: acceptedID)
+                            providerSwitchConfirmationExposeIfStranded(session, target: target)
                         }
                         return
                     }
                     let save = await scope.persistence.flushSaveRequired(writer: writer)
+                    guard !Task.isCancelled, confirmationIsCurrent(session, target: target) else { return }
                     guard case .success = save else {
                         lastFailure = true
                         continue
                     }
-                    if Task.isCancelled { return }
-                    providerSwitchNoteDurableMarker(sessionID: sessionID, acceptedID: acceptedID)
+                    providerSwitchNoteDurableMarker(target)
                 }
                 guard let settled = providerSwitchConfirmationRecords[sessionID],
-                      settled.acceptedID == acceptedID, settled.markerDurable, settled.terminalResolved
+                      target.matches(settled), settled.markerDurable, settled.terminalResolved
                 else { return }
                 guard let payload = providerSwitchConfirmationPayload(
-                    for: session, acceptedID: acceptedID
+                    for: session, acceptedID: acceptedID, expectedSessionID: target.sessionID, expectedWorkspaceID: target.workspaceID
                 ) else {
                     lastFailure = true
                     continue
@@ -87,12 +115,16 @@ extension AgentSessionLinkExecutionRuntime {
                     payload: payload,
                     writer: writer,
                     canonicalItemCount: payload.effectiveCanonicalItemCount,
-                    rebuildPayload: { self.providerSwitchConfirmationPayload(for: session, acceptedID: acceptedID) },
+                    rebuildPayload: {
+                        self.providerSwitchConfirmationPayload(
+                            for: session, acceptedID: acceptedID, expectedSessionID: target.sessionID, expectedWorkspaceID: target.workspaceID
+                        )
+                    },
                     apply: { [weak self, weak session] receipt in
                         guard let self, let session,
-                              scope.sessions[session.tabID] === session,
-                              session.activeAgentSessionID == sessionID,
-                              session.pendingHandoff.providerSwitchAcceptedID == acceptedID,
+                              confirmationIsCurrent(session, target: target),
+                              receipt.payload.id == target.sessionID,
+                              receipt.payload.workspaceID == target.workspaceID,
                               let transcript = receipt.payload.transcript
                         else { return false }
                         applyProviderSwitchConfirmationReceipt(receipt, to: session, transcript: transcript)
@@ -101,14 +133,12 @@ extension AgentSessionLinkExecutionRuntime {
                     }
                 )
                 if case .success = result { return }
-                if Task.isCancelled { return }
+                guard !Task.isCancelled, confirmationIsCurrent(session, target: target) else { return }
                 lastFailure = true
             }
             // A coalesced trigger gets its rerun first; only a flight with nothing pending may
             // expose save failure.
-            guard scope.sessions[session.tabID] === session,
-                  session.activeAgentSessionID == sessionID,
-                  session.pendingHandoff.providerSwitchAcceptedID == acceptedID,
+            guard confirmationIsCurrent(session, target: target),
                   lastFailure,
                   !providerSwitchConfirmationRerunRequested.contains(flightKey)
             else { return }
@@ -119,6 +149,16 @@ extension AgentSessionLinkExecutionRuntime {
         pendingSendEffects[flightID] = PendingSendEffect(
             sessionIdentity: ObjectIdentifier(session), task: task
         )
+    }
+
+    private func providerSwitchConfirmationRetryDelay(_ attempt: Int) async {
+        #if DEBUG
+            if let delay = test_providerSwitchConfirmationRetryDelay {
+                await delay()
+                return
+            }
+        #endif
+        try? await Task.sleep(nanoseconds: UInt64(attempt) * 100_000_000)
     }
 
     /// Releases a flight key and runs at most one reconciliation for triggers coalesced into it.
@@ -134,10 +174,10 @@ extension AgentSessionLinkExecutionRuntime {
 
     /// Whether a new flight could perform Save A or Save B from the current record evidence.
     private func providerSwitchConfirmationCanProgress(
-        _ session: TabSession, sessionID: UUID, acceptedID: UUID
+        _ session: TabSession, target: ConfirmationTarget
     ) -> Bool {
-        guard let record = providerSwitchConfirmationRecords[sessionID],
-              record.acceptedID == acceptedID
+        guard let record = providerSwitchConfirmationRecords[target.sessionID],
+              target.matches(record)
         else { return false }
         if record.markerDurable { return record.terminalResolved }
         guard let origin = record.originWriter else { return false }
@@ -149,23 +189,23 @@ extension AgentSessionLinkExecutionRuntime {
     /// Expose the existing save-failed state so the banner offers Discard rather than an endless
     /// progress state. Later durable evidence still wakes reconciliation and clears it.
     private func providerSwitchConfirmationExposeIfStranded(
-        _ session: TabSession, sessionID: UUID, acceptedID: UUID
+        _ session: TabSession, target: ConfirmationTarget
     ) {
-        guard let record = providerSwitchConfirmationRecords[sessionID],
-              record.acceptedID == acceptedID, record.terminalResolved, !record.markerDurable,
+        guard let record = providerSwitchConfirmationRecords[target.sessionID],
+              target.matches(record), record.terminalResolved, !record.markerDurable,
               !session.providerSwitchConfirmationSaveFailed
         else { return }
-        providerSwitchConfirmationSaveFailures.insert(sessionID)
+        providerSwitchConfirmationSaveFailures.insert(target.sessionID)
         session.providerSwitchConfirmationSaveFailed = true
         scope?.noteSettlementChanged()
     }
 
-    private func providerSwitchNoteDurableMarker(sessionID: UUID, acceptedID: UUID) {
-        guard var record = providerSwitchConfirmationRecords[sessionID],
-              record.acceptedID == acceptedID, !record.markerDurable
+    private func providerSwitchNoteDurableMarker(_ target: ConfirmationTarget) {
+        guard var record = providerSwitchConfirmationRecords[target.sessionID],
+              target.matches(record), !record.markerDurable
         else { return }
         record.markerDurable = true
-        providerSwitchConfirmationRecords[sessionID] = record
+        providerSwitchConfirmationRecords[target.sessionID] = record
     }
 
     /// Ordinary save settlement. A committed receipt whose payload carries the live accepted ID
@@ -177,11 +217,13 @@ extension AgentSessionLinkExecutionRuntime {
         guard let scope, scope.sessions[session.tabID] === session,
               session.activeAgentSessionID == sessionID,
               let acceptedID = session.pendingHandoff.providerSwitchAcceptedID,
-              session.pendingHandoff.providerSwitchDelivery == .sending
+              let target = ConfirmationTarget(session: session, acceptedID: acceptedID),
+              confirmationIsCurrent(session, target: target),
+              let record = providerSwitchConfirmationRecords[sessionID], target.matches(record)
         else { return }
-        let wasDurable = providerSwitchConfirmationRecords[sessionID]?.markerDurable == true
+        let wasDurable = record.markerDurable
         if committedAcceptedID == acceptedID {
-            providerSwitchNoteDurableMarker(sessionID: sessionID, acceptedID: acceptedID)
+            providerSwitchNoteDurableMarker(target)
         }
         let becameDurable = !wasDurable && providerSwitchConfirmationRecords[sessionID]?.markerDurable == true
         if becameDurable || session.providerSwitchConfirmationSaveFailed {
@@ -217,26 +259,36 @@ extension AgentSessionLinkExecutionRuntime {
               scope.sessions[session.tabID] === session,
               session.providerSwitchConfirmationSaveFailed,
               let acceptedID = session.pendingHandoff.providerSwitchAcceptedID,
-              let sessionID = session.activeAgentSessionID,
-              providerSwitchConfirmationFlights[ProviderSwitchConfirmationKey(sessionID: sessionID, acceptedID: acceptedID)] == nil,
-              providerSwitchConfirmationRecords[sessionID]?.terminalResolved != false,
+              let target = ConfirmationTarget(session: session, acceptedID: acceptedID),
+              confirmationIsCurrent(session, target: target),
+              providerSwitchConfirmationFlights[ProviderSwitchConfirmationKey(sessionID: target.sessionID, acceptedID: acceptedID)] == nil,
+              providerSwitchConfirmationRecords[target.sessionID].map({ target.matches($0) && $0.terminalResolved }) != false,
               let writer = providerSwitchConfirmationWriter(for: session),
-              let payload = providerSwitchConfirmationPayload(for: session, acceptedID: acceptedID, includeNotice: false),
+              let payload = providerSwitchConfirmationPayload(
+                  for: session, acceptedID: acceptedID,
+                  expectedSessionID: target.sessionID, expectedWorkspaceID: target.workspaceID, includeNotice: false
+              ),
               payload.transcript != nil
         else { return false }
         let discardFlightID = UUID()
-        let discardFlightKey = ProviderSwitchConfirmationKey(sessionID: sessionID, acceptedID: acceptedID)
+        let discardFlightKey = ProviderSwitchConfirmationKey(sessionID: target.sessionID, acceptedID: acceptedID)
         providerSwitchConfirmationFlights[discardFlightKey] = discardFlightID
         defer { providerSwitchConfirmationFlightEnded(discardFlightKey, flightID: discardFlightID, session: session) }
         let result = await scope.persistence.flushProviderSwitchProjectedSave(
             payload: payload,
             writer: writer,
             canonicalItemCount: payload.effectiveCanonicalItemCount,
-            rebuildPayload: { self.providerSwitchConfirmationPayload(for: session, acceptedID: acceptedID, includeNotice: false) },
+            rebuildPayload: {
+                self.providerSwitchConfirmationPayload(
+                    for: session, acceptedID: acceptedID,
+                    expectedSessionID: target.sessionID, expectedWorkspaceID: target.workspaceID, includeNotice: false
+                )
+            },
             apply: { [weak self, weak session] receipt in
                 guard let self, let session,
-                      scope.sessions[session.tabID] === session,
-                      session.pendingHandoff.providerSwitchAcceptedID == acceptedID,
+                      confirmationIsCurrent(session, target: target),
+                      receipt.payload.id == target.sessionID,
+                      receipt.payload.workspaceID == target.workspaceID,
                       let finalTranscript = receipt.payload.transcript
                 else { return false }
                 applyProviderSwitchConfirmationReceipt(receipt, to: session, transcript: finalTranscript)
@@ -263,18 +315,22 @@ extension AgentSessionLinkExecutionRuntime {
     func providerSwitchConfirmationPayload(
         for session: TabSession,
         acceptedID: UUID,
+        expectedSessionID: UUID,
+        expectedWorkspaceID: UUID,
         includeNotice: Bool = true
     ) -> AgentSession? {
         guard let scope,
-              let workspaceID = session.persistentSessionBindingIdentity?.workspaceID
+              let target = ConfirmationTarget(session: session, acceptedID: acceptedID),
+              target.sessionID == expectedSessionID, target.workspaceID == expectedWorkspaceID,
+              confirmationIsCurrent(session, target: target)
         else { return nil }
         let prepared = Self.providerSwitchConfirmationSnapshot(session)
         let composition = scope.persistence.composition
         func makePayload(_ snapshot: AgentPersistableTranscriptSnapshot) -> AgentSession {
             AgentSessionPayloadBuilder.makePayload(
                 session: session,
-                sessionID: session.activeAgentSessionID ?? session.tabID,
-                workspaceID: workspaceID,
+                sessionID: expectedSessionID,
+                workspaceID: expectedWorkspaceID,
                 name: composition?.displayName(session.tabID) ?? AgentSessionRestoreSupport.normalizedSessionTitle(nil),
                 snapshot: snapshot
             )
