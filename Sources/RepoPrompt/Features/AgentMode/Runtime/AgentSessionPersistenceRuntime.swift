@@ -620,16 +620,6 @@ final class AgentSessionPersistenceRuntime {
                 scope?.linkExecution?.providerSwitchReconcileConfirmation(for: session)
             }
         }
-        let projectedPayload: AgentSession
-        if let rebuildPayload {
-            guard let rebuilt = rebuildPayload() else {
-                return .failure(.init(operation: .save, tabID: session.tabID, message: "The provider-switch confirmation projection is stale."))
-            }
-            projectedPayload = rebuilt
-        } else {
-            projectedPayload = payload
-        }
-        let projectedItemCount = rebuildPayload == nil ? canonicalItemCount : projectedPayload.effectiveCanonicalItemCount
         session.saveDebounceTask?.cancel()
         session.saveDebounceTask = nil
         session.saveDebounceRequestID = nil
@@ -647,6 +637,19 @@ final class AgentSessionPersistenceRuntime {
         else {
             return .failure(.init(operation: .save, tabID: session.tabID, message: "The provider-switch confirmation workspace changed."))
         }
+        // Project after the last suspension, with no await before the commit token and prepared
+        // write capture the source revision: rows added during the workspace read are then part
+        // of the payload instead of being overwritten by its receipt.
+        let projectedPayload: AgentSession
+        if let rebuildPayload {
+            guard let rebuilt = rebuildPayload() else {
+                return .failure(.init(operation: .save, tabID: session.tabID, message: "The provider-switch confirmation projection is stale."))
+            }
+            projectedPayload = rebuilt
+        } else {
+            projectedPayload = payload
+        }
+        let projectedItemCount = rebuildPayload == nil ? canonicalItemCount : projectedPayload.effectiveCanonicalItemCount
         guard let token = makeSaveCommitToken(for: session, workspace: workspace),
               token.binding == writer.binding,
               token.matches(session)

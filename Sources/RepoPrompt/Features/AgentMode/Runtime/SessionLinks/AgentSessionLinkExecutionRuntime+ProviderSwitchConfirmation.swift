@@ -268,25 +268,30 @@ extension AgentSessionLinkExecutionRuntime {
         guard let scope,
               let workspaceID = session.persistentSessionBindingIdentity?.workspaceID
         else { return nil }
-        let snapshot = Self.providerSwitchConfirmationSnapshot(session)
+        let prepared = Self.providerSwitchConfirmationSnapshot(session)
         let composition = scope.persistence.composition
-        var payload = AgentSessionPayloadBuilder.makePayload(
-            session: session,
-            sessionID: session.activeAgentSessionID ?? session.tabID,
-            workspaceID: workspaceID,
-            name: composition?.displayName(session.tabID) ?? AgentSessionRestoreSupport.normalizedSessionTitle(nil),
-            snapshot: snapshot
-        )
-        let existingItems = payload.toLiveItems()
-        var items = existingItems
+        func makePayload(_ snapshot: AgentPersistableTranscriptSnapshot) -> AgentSession {
+            AgentSessionPayloadBuilder.makePayload(
+                session: session,
+                sessionID: session.activeAgentSessionID ?? session.tabID,
+                workspaceID: workspaceID,
+                name: composition?.displayName(session.tabID) ?? AgentSessionRestoreSupport.normalizedSessionTitle(nil),
+                snapshot: snapshot
+            )
+        }
+        var payload = makePayload(prepared)
         if includeNotice {
+            // Look the notice up in stored activities, not rendered rows: grouped history can hide
+            // a stored row from the rendered list. Nothing here is re-imported as a live row.
+            let storedActivities = prepared.transcript.turns.flatMap(\.allActivities)
+            let storedSequenceEnd = (storedActivities.map(\.sequenceIndex).max() ?? -1) + 1
             let noticeText = "Handover sent to \(session.selectedAgent.displayName) / \(commands.modelDisplayName(session))."
             let notice = AgentChatItem(
                 id: acceptedID,
                 timestamp: Date(),
                 kind: .system,
                 text: noticeText,
-                sequenceIndex: max((existingItems.map(\.sequenceIndex).max() ?? -1) + 1, session.nextSequenceIndex),
+                sequenceIndex: max(storedSequenceEnd, prepared.transcript.nextSequenceIndex, session.nextSequenceIndex),
                 recoveryDiagnostic: AgentTranscriptRecoveryDiagnostic(
                     id: acceptedID,
                     reason: "providerSwitch",
@@ -294,7 +299,7 @@ extension AgentSessionLinkExecutionRuntime {
                     text: noticeText
                 )
             )
-            if let existing = items.first(where: { $0.id == acceptedID }) {
+            if let existing = storedActivities.first(where: { $0.id == acceptedID }) {
                 guard existing.recoveryDiagnostic?.id == acceptedID,
                       existing.recoveryDiagnostic?.reason == "providerSwitch",
                       existing.recoveryDiagnostic?.outcome == "sent"
@@ -306,11 +311,10 @@ extension AgentSessionLinkExecutionRuntime {
                 if let summary = summaryIDs.first(where: { $0.id == acceptedID }) {
                     guard summary.reason == "providerSwitch", summary.outcome == "sent" else { return nil }
                 } else {
-                    items.append(notice)
+                    payload = makePayload(Self.providerSwitchConfirmationSnapshot(prepared, appending: notice, for: session))
                 }
             }
         }
-        payload = payload.withItems(items)
         payload.pendingHandoffProviderSwitchDelivery = nil
         payload.providerSwitchAcceptedID = nil
         payload.pendingHandoffPayload = nil
@@ -325,14 +329,40 @@ extension AgentSessionLinkExecutionRuntime {
         to session: TabSession,
         transcript: AgentTranscript
     ) {
-        let sourceItems = receipt.payload.toLiveItems()
-        session.setItemsSilently(sourceItems, reason: .persistedSessionHydration)
-        _ = AgentSessionTranscriptRefreshRuntime.applyTranscriptPresentation(
-            transcript, sourceItems: sourceItems, to: session
+        // Install only full-detail working rows, as hydration does. Archived rows installed as live
+        // sources would be re-imported as new turns on the next rebuild, duplicating history.
+        let previousNextSequenceIndex = session.nextSequenceIndex
+        session.setItemsSilently(
+            AgentTranscriptIO.workingSourceItems(from: transcript), reason: .persistedSessionHydration
         )
+        // Present the rows as installed: the setter may normalize them.
+        _ = AgentSessionTranscriptRefreshRuntime.applyTranscriptPresentation(
+            transcript, sourceItems: session.items, to: session
+        )
+        session.nextSequenceIndex = max(previousNextSequenceIndex, transcript.nextSequenceIndex)
         session.pendingHandoff.clearAfterSend()
         session.providerSwitchConfirmationSaveFailed = false
         session.isDirty = false
+    }
+
+    /// The prepared snapshot with the confirmation notice appended to its working tail, built the
+    /// way an ordinary save of "working rows + notice" would be: compacted turns and the
+    /// compaction frontier are preserved as they are.
+    private static func providerSwitchConfirmationSnapshot(
+        _ base: AgentPersistableTranscriptSnapshot,
+        appending notice: AgentChatItem,
+        for session: TabSession
+    ) -> AgentPersistableTranscriptSnapshot {
+        AgentSessionTranscriptRefreshRuntime.persistableTranscriptSnapshot(
+            for: session,
+            workingItems: AgentTranscriptIO.workingSourceItems(from: base.transcript) + [notice],
+            existingTranscript: base.transcript,
+            importPolicy: .liveSession(hidePendingQuestionToolCall: session.hasPendingQuestionUI),
+            projectionProtection: AgentSessionTranscriptRefreshRuntime.transcriptProjectionProtection(
+                for: session, transcript: base.transcript
+            ),
+            nextSequenceIndex: max(notice.sequenceIndex + 1, base.transcript.nextSequenceIndex, session.nextSequenceIndex)
+        )
     }
 
     private static func providerSwitchConfirmationSnapshot(

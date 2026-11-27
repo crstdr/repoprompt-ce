@@ -1692,6 +1692,254 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
             }
         }
 
+        /// Seeds the source with a compacted history (archived and summary turns behind a
+        /// compaction frontier) and a full-detail tail, installed the way hydration installs it.
+        private func seedCompactedHistory(
+            _ session: AgentModeViewModel.TabSession, turns: Int = 8, compactedTurns: Int = 5
+        ) throws -> AgentTranscript {
+            var history = AgentTranscript.empty
+            for index in stride(from: 0, to: turns * 2, by: 2) {
+                history.turns += AgentTranscriptIO.buildTranscript(
+                    from: [.user("history-user-\(index)", sequenceIndex: index), .assistant("history-answer-\(index + 1)", sequenceIndex: index + 1)],
+                    terminalState: .completed, nextSequenceIndex: index + 2,
+                    policy: .liveSession(hidePendingQuestionToolCall: false)
+                ).turns
+                history.nextSequenceIndex = index + 2
+            }
+            for index in 0 ..< compactedTurns {
+                history.turns[index].retentionTier = index < compactedTurns - 2 ? .archived : .summary
+            }
+            history = AgentTranscriptCompactor.compact(history, mode: .recomputeAll)
+            // A watermark well above every stored row: confirmation must never pull it back.
+            history.nextSequenceIndex += 100
+            session.setItemsSilently(AgentTranscriptIO.workingSourceItems(from: history), reason: .persistedSessionHydration)
+            _ = AgentSessionTranscriptRefreshRuntime.applyTranscriptPresentation(history, sourceItems: session.items, to: session)
+            session.nextSequenceIndex = history.nextSequenceIndex
+            let seeded = session.transcript
+            XCTAssertNotNil(seeded.compactionFrontier, "fixture must have a compaction frontier")
+            XCTAssertEqual(seeded.turns.count(where: { $0.retentionTier != .full }), compactedTurns, "fixture must keep compacted turns")
+            XCTAssertGreaterThan(seeded.turns.count(where: { $0.retentionTier == .full }), 0)
+            XCTAssertEqual(session.items.map(\.id), AgentTranscriptIO.workingSourceItems(from: seeded).map(\.id))
+            XCTAssertEqual(seeded.nextSequenceIndex, history.nextSequenceIndex)
+            XCTAssertGreaterThan(seeded.nextSequenceIndex, (seeded.allActivities.map(\.sequenceIndex).max() ?? 0) + 50)
+            return seeded
+        }
+
+        /// The provider-switch confirmation must leave history intact: no compacted turn may come
+        /// back as a live row, so the next ordinary rebuild and save cannot duplicate it.
+        func testSwitchConfirmationKeepsCompactedHistoryIntactThroughNextOrdinarySave() async throws {
+            enum Fault: Error { case clear }
+            // "large" mirrors an affected production chat: about 3,000 turns, nearly all compacted.
+            for route in ["saveB", "discard", "hydrated", "large"] {
+                try await withFixture { fixture in
+                    let vm = fixture.viewModel
+                    let runtime = vm.linkExecutionRuntime
+                    let session = fixture.sourceSession
+                    let started = ContinuousClock.now
+                    let baseline = route == "large"
+                        ? try seedCompactedHistory(session, turns: 3000, compactedTurns: 2995)
+                        : try seedCompactedHistory(session)
+                    var saves: [AgentSession] = []
+                    var failClear = route == "discard"
+                    vm.test_setAgentSessionSaver { saved, _, _ in
+                        saves.append(saved)
+                        if failClear, saved.pendingHandoffProviderSwitchDelivery == nil {
+                            throw Fault.clear
+                        }
+                        return fixture.rootURL.appendingPathComponent("switch-compacted.json")
+                    }
+                    func isClear(_ saved: AgentSession) -> Bool {
+                        saved.pendingHandoffProviderSwitchDelivery == nil && saved.providerSwitchAcceptedID == nil
+                    }
+                    let acceptedID: UUID
+                    if route == "hydrated" {
+                        // A restart after Save A: the durable accepted marker reconciles straight to Save B.
+                        session.pendingHandoff = try .init(
+                            payload: switchCarrier(), createdAt: Date(), sourceItemID: session.items.last?.id, providerSwitchDelivery: .sending
+                        )
+                        acceptedID = UUID()
+                        session.pendingHandoff.providerSwitchAcceptedID = acceptedID
+                        runtime.providerSwitchConfirmationHydrated(session, acceptedID: acceptedID)
+                    } else {
+                        try installSwitch(fixture)
+                        let preparation = try await switchPreparation(fixture)
+                        _ = await runtime.prepareProviderSwitchHandoverForSend(preparation, session: session, stopFence: .init(session: session))
+                        let runID = UUID()
+                        session.installRunID(runID)
+                        session.beginRunAttempt(source: "test.switch.compacted")
+                        let dispatch = AgentSessionLinkPromptDispatchID.headlessRun(runID: runID)
+                        XCTAssertTrue(runtime.providerSwitchAcquirePhysicalDispatch(session: session, dispatchID: dispatch))
+                        runtime.providerSwitchRecordPhysicalAcceptance(session: session, context: .init(session: session, dispatchID: dispatch))
+                        acceptedID = try XCTUnwrap(session.pendingHandoff.providerSwitchAcceptedID)
+                        try await AsyncTestWait.waitUntil("Save A persists the accepted marker") {
+                            saves.contains { $0.providerSwitchAcceptedID == acceptedID }
+                        }
+                        await runtime.drainPendingSendEffects(for: session)
+                        session.runState = .running
+                        await vm.runService.test_publishNaturalCompletion(session)
+                    }
+                    try await AsyncTestWait.waitUntil("\(route): confirmation settles") {
+                        failClear ? session.providerSwitchConfirmationSaveFailed : session.pendingHandoff.providerSwitchAcceptedID == nil
+                    }
+                    await runtime.drainPendingSendEffects(for: session)
+                    if route == "discard" {
+                        failClear = false
+                        let discarded = await runtime.providerSwitchDiscardAcceptedConfirmation(for: session)
+                        XCTAssertTrue(discarded, "safe Discard finishes once the clear can be saved")
+                        XCTAssertNil(session.pendingHandoff.providerSwitchAcceptedID)
+                    }
+                    session.saveDebounceTask?.cancel()
+                    session.saveDebounceTask = nil
+                    let expectedNotices = route == "discard" ? [] : [acceptedID]
+                    let clearSave = try XCTUnwrap(saves.last(where: isClear), route)
+                    assertHistoryIntact(clearSave.transcript, baseline: baseline, notices: expectedNotices, addedTurns: 1, route)
+                    assertHistoryIntact(session.transcript, baseline: baseline, notices: expectedNotices, addedTurns: 1, route)
+                    XCTAssertEqual(session.items.map(\.id), AgentTranscriptIO.workingSourceItems(from: session.transcript).map(\.id), "\(route): only working rows are live")
+                    let watermark = baseline.nextSequenceIndex
+                    let clearTranscript = try XCTUnwrap(clearSave.transcript)
+                    XCTAssertGreaterThanOrEqual(clearTranscript.nextSequenceIndex, watermark, "\(route): payload keeps the watermark")
+                    XCTAssertGreaterThanOrEqual(session.nextSequenceIndex, watermark, "\(route): live allocator keeps the watermark")
+                    if let notice = clearTranscript.allActivities.first(where: { $0.id == acceptedID }), route != "discard" {
+                        XCTAssertGreaterThan(clearTranscript.nextSequenceIndex, notice.sequenceIndex, route)
+                        XCTAssertGreaterThan(session.nextSequenceIndex, notice.sequenceIndex, route)
+                        XCTAssertGreaterThanOrEqual(notice.sequenceIndex, watermark, "\(route): the notice is ordered after history")
+                    }
+
+                    // The next message forces a full rebuild; the ordinary save must not duplicate history.
+                    session.appendItem(.user("after the switch", sequenceIndex: session.nextSequenceIndex))
+                    let writer = try XCTUnwrap(runtime.providerSwitchConfirmationWriter(for: session))
+                    guard case .success = await runtime.flushSaveRequired(writer: writer) else {
+                        return XCTFail("\(route): the ordinary save after the switch failed")
+                    }
+                    let ordinary = try XCTUnwrap(saves.last, route)
+                    XCTAssertTrue(ordinary.toLiveItems().contains { $0.text == "after the switch" }, route)
+                    assertHistoryIntact(ordinary.transcript, baseline: baseline, notices: expectedNotices, addedTurns: 2, route)
+                    assertHistoryIntact(session.transcript, baseline: baseline, notices: expectedNotices, addedTurns: 2, route)
+                    XCTAssertGreaterThanOrEqual(try XCTUnwrap(ordinary.transcript).nextSequenceIndex, watermark, route)
+                    XCTAssertGreaterThanOrEqual(session.nextSequenceIndex, watermark, route)
+                    XCTAssertLessThan(started.duration(to: .now), .seconds(60), "\(route): confirmation stays within its time budget")
+                }
+            }
+        }
+
+        /// A notice already stored in a full turn but hidden from rendered rows by grouped history
+        /// must be found, not appended a second time.
+        func testSwitchConfirmationDoesNotDuplicateNoticeHiddenInGroupedHistory() async throws {
+            try await withFixture { fixture in
+                let session = fixture.sourceSession
+                let runtime = fixture.viewModel.linkExecutionRuntime
+                let acceptedID = UUID()
+                var transcript = try seedCompactedHistory(session)
+                let start = transcript.nextSequenceIndex
+                var rows: [AgentChatItem] = [
+                    .user("Carry the handover", sequenceIndex: start),
+                    AgentChatItem(
+                        id: acceptedID, timestamp: Date(), kind: .system, text: "Handover already sent",
+                        sequenceIndex: start + 1,
+                        recoveryDiagnostic: .init(id: acceptedID, reason: "providerSwitch", outcome: "sent", text: "Handover already sent")
+                    )
+                ]
+                for index in 0 ..< 12 {
+                    let invocationID = UUID()
+                    rows.append(.toolCall(name: "Bash", invocationID: invocationID, argsJSON: "{}", sequenceIndex: start + 2 + index * 2))
+                    rows.append(.toolResult(name: "Bash", invocationID: invocationID, resultJSON: "{}", isError: false, sequenceIndex: start + 3 + index * 2))
+                }
+                transcript.nextSequenceIndex = start + rows.count
+                transcript.turns += AgentTranscriptIO.buildTranscript(
+                    from: rows, terminalState: .completed, nextSequenceIndex: transcript.nextSequenceIndex,
+                    policy: .liveSession(hidePendingQuestionToolCall: false)
+                ).turns
+                session.runState = .completed
+                session.setItemsSilently(AgentTranscriptIO.workingSourceItems(from: transcript), reason: .persistedSessionHydration)
+                session.nextSequenceIndex = transcript.nextSequenceIndex
+                _ = AgentSessionTranscriptRefreshRuntime.applyTranscriptPresentation(transcript, sourceItems: session.items, to: session)
+                // Precondition: the notice is stored once but grouped out of the rendered rows.
+                XCTAssertEqual(session.transcript.allActivities.count(where: { $0.id == acceptedID }), 1)
+                let rendered = AgentTranscriptProjectionBuilder.build(from: session.transcript)
+                XCTAssertFalse((rendered.archivedRows + rendered.workingRows).contains { $0.id == acceptedID }, "fixture must hide the stored notice")
+
+                let clear = try XCTUnwrap(runtime.providerSwitchConfirmationPayload(for: session, acceptedID: acceptedID))
+                let sent = try XCTUnwrap(clear.transcript).turns.flatMap(\.allActivities).filter {
+                    $0.recoveryDiagnostic?.reason == "providerSwitch" && $0.recoveryDiagnostic?.outcome == "sent"
+                }
+                XCTAssertEqual(sent.map(\.id), [acceptedID])
+            }
+        }
+
+        /// Rows that arrive while Save B reads its workspace belong to the written payload; the
+        /// receipt must not overwrite them with an older projection.
+        func testSwitchConfirmationKeepsRowsAddedDuringWorkspaceRead() async throws {
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let session = fixture.sourceSession
+                let baseline = try seedCompactedHistory(session)
+                let persistence = vm.persistenceRuntime
+                var composition = try XCTUnwrap(persistence.composition)
+                let original = composition
+                let workspace = fixture.workspace
+                var injected = false
+                var clearWrites: [AgentSession] = []
+                composition.canonicalStorage = .init(workspaceID: workspace.id) { _ in
+                    await MainActor.run {
+                        if !injected {
+                            injected = true
+                            session.appendItem(.user("successor request", sequenceIndex: session.nextSequenceIndex))
+                        }
+                        return workspace
+                    }
+                }
+                persistence.composition = composition
+                defer {
+                    persistence.composition = original
+                    session.saveDebounceTask?.cancel()
+                    session.saveDebounceTask = nil
+                }
+                vm.test_setAgentSessionSaver { payload, _, _ in
+                    if payload.providerSwitchAcceptedID == nil { clearWrites.append(payload) }
+                    return fixture.rootURL.appendingPathComponent("save-b-read-gap.json")
+                }
+                let acceptedID = UUID()
+                session.pendingHandoff = try .init(
+                    payload: switchCarrier(), createdAt: Date(), sourceItemID: session.items.last?.id, providerSwitchDelivery: .sending
+                )
+                session.pendingHandoff.providerSwitchAcceptedID = acceptedID
+                vm.linkExecutionRuntime.providerSwitchConfirmationHydrated(session, acceptedID: acceptedID)
+                try await AsyncTestWait.waitUntil("Save B settles") {
+                    session.pendingHandoff.providerSwitchAcceptedID == nil
+                }
+                await vm.linkExecutionRuntime.drainPendingSendEffects(for: session)
+                XCTAssertTrue(injected)
+                XCTAssertTrue(session.items.contains { $0.text == "successor request" }, "live row survives the receipt")
+                let clearWrite = try XCTUnwrap(clearWrites.last)
+                XCTAssertTrue(clearWrite.toLiveItems().contains { $0.text == "successor request" }, "the written payload includes the row")
+                XCTAssertEqual(Array(session.transcript.turns.prefix(5)), Array(baseline.turns.prefix(5)))
+            }
+        }
+
+        private func assertHistoryIntact(
+            _ transcript: AgentTranscript?,
+            baseline: AgentTranscript,
+            notices: [UUID],
+            addedTurns: Int,
+            _ route: String,
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) {
+            guard let transcript else { return XCTFail("\(route): no transcript", file: file, line: line) }
+            let ids = transcript.turns.map(\.id)
+            XCTAssertEqual(Set(ids).count, ids.count, "\(route): turn IDs must be unique", file: file, line: line)
+            XCTAssertLessThanOrEqual(ids.count, baseline.turns.count + addedTurns, "\(route): no duplicated turns", file: file, line: line)
+            XCTAssertEqual(Array(ids.prefix(baseline.turns.count)), baseline.turns.map(\.id), "\(route): history keeps its order", file: file, line: line)
+            let compacted = baseline.turns.filter { $0.retentionTier != .full }
+            XCTAssertEqual(Array(transcript.turns.prefix(compacted.count)), compacted, "\(route): compacted turns are untouched", file: file, line: line)
+            XCTAssertEqual(transcript.compactionFrontier, baseline.compactionFrontier, "\(route): compaction frontier unchanged", file: file, line: line)
+            let projection = AgentTranscriptProjectionBuilder.build(from: transcript)
+            let sent = (projection.archivedRows + projection.workingRows).filter {
+                $0.recoveryDiagnostic?.reason == "providerSwitch" && $0.recoveryDiagnostic?.outcome == "sent"
+            }
+            XCTAssertEqual(sent.map(\.id), notices, "\(route): exactly the expected Handover sent notices", file: file, line: line)
+        }
+
         func testSwitchAcceptedClearKeepsSuccessfulWriteDespitePostWriteDeferral() async throws {
             enum Fault: Error { case afterWrite }
             for drift in ["saveRequest", "transcript", "throwAfterWrite"] {
