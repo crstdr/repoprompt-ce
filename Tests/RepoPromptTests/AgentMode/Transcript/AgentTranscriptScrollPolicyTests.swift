@@ -1,6 +1,8 @@
+import AppKit
 import CoreGraphics
 import Foundation
 @testable import RepoPromptApp
+import SwiftUI
 import XCTest
 
 final class AgentTranscriptActivationRepaintRemountPolicyTests: XCTestCase {
@@ -853,3 +855,507 @@ final class TranscriptScrollAnchorModelTests: XCTestCase {
         }
     }
 #endif
+
+@MainActor
+final class AgentTranscriptBottomRevealTests: XCTestCase {
+    func testProgrammaticScrollDoesNotSettleUntilDeferredCompletion() async {
+        let gate = ProgrammaticScrollGate()
+        let ready = expectation(description: "Request admitted")
+        let settled = expectation(description: "Final action settled")
+        var complete: (() -> Void)?
+        gate.schedule(after: 0, settleAfter: 0, onSettled: { settled.fulfill() }, deferredAction: {
+            complete = $0
+            ready.fulfill()
+        })
+        await fulfillment(of: [ready], timeout: 1)
+        XCTAssertTrue(gate.isInFlight)
+        complete?()
+        complete?()
+        await fulfillment(of: [settled], timeout: 1)
+        XCTAssertFalse(gate.isInFlight)
+    }
+
+    func testCancelledCompletionCannotSettleReplacement() async {
+        let gate = ProgrammaticScrollGate()
+        let admitted = expectation(description: "First request admitted")
+        var stale: (() -> Void)?
+        var staleSettlements = 0
+        gate.schedule(after: 0, settleAfter: 0, onSettled: { staleSettlements += 1 }, deferredAction: {
+            stale = $0
+            admitted.fulfill()
+        })
+        await fulfillment(of: [admitted], timeout: 1)
+        gate.cancel()
+        XCTAssertFalse(gate.isInFlight)
+        stale?()
+        let replacement = expectation(description: "Replacement settled")
+        gate.schedule(after: 0, settleAfter: 0, onSettled: { replacement.fulfill() }, deferredAction: { finish in
+            stale?()
+            finish()
+        })
+        await fulfillment(of: [replacement], timeout: 1)
+        XCTAssertEqual(staleSettlements, 0)
+        XCTAssertFalse(gate.isInFlight)
+    }
+
+    func testBlockerDismissedRevealRejectsRevisionAdvanceBeforeEitherMove() {
+        let dismissed = AgentTranscriptScrollIntent.bottom(animated: false, reason: .blockerDismissed)
+        let fence = TranscriptBottomRevealRevisionFence(revision: 10, allowsRevisionMismatch: dismissed.allowsRevisionMismatch)
+        XCTAssertTrue(fence.permits(10))
+        XCTAssertFalse(fence.permits(11))
+
+        let streaming = AgentTranscriptScrollIntent.bottom(animated: false, reason: .transcriptChangeWhilePinned)
+        let followingFence = TranscriptBottomRevealRevisionFence(revision: 10, allowsRevisionMismatch: streaming.allowsRevisionMismatch)
+        XCTAssertTrue(followingFence.permits(11))
+    }
+
+    func testFrameMustIntersectCurrentViewport() {
+        let requestID = UUID()
+        let viewport = CGSize(width: 620, height: 470)
+        for frame in [CGRect.zero, CGRect(x: 0, y: 471, width: 100, height: 20), CGRect(x: 621, y: 0, width: 30, height: 20)] {
+            XCTAssertFalse(TranscriptBottomRevealFrame(requestID: requestID, presentationRevision: 0, frame: frame).isVisible(in: viewport))
+        }
+        XCTAssertTrue(TranscriptBottomRevealFrame(requestID: requestID, presentationRevision: 0, frame: CGRect(x: 0, y: 465, width: 90, height: 20)).isVisible(in: viewport))
+    }
+
+    func testHostedBottomRevealAndDetachedUpdatesAtBothSizes() async throws {
+        for count in [1200, 3000] {
+            try await checkHostedReveal(initialCount: count)
+        }
+    }
+
+    func testHeldFrameFallsBackAtDeadlineAndOnlySettlesOnce() async throws {
+        _ = NSApplication.shared
+        let feed = Feed(restoredEntries: [])
+        let pane = MountedPane(feed: feed)
+        defer { pane.close() }
+        feed.count = 1200
+        try await waitForLayout([pane]) { feed.visibleFrameCount > 0 }
+        feed.holdWitness = true
+        let started = ContinuousClock.now
+        feed.command = .bottom(UUID())
+        try await waitForLayout([pane]) { feed.heldWitness != nil }
+        XCTAssertTrue(feed.gate.isInFlight)
+        XCTAssertEqual(feed.completed, 0)
+        try await waitForLayout([pane]) { feed.settled == 1 }
+        XCTAssertGreaterThanOrEqual(started.duration(to: .now), Reveal.deadline)
+        try XCTUnwrap(feed.heldWitness)()
+        XCTAssertEqual(feed.completed, 1)
+        XCTAssertFalse(feed.gate.isInFlight)
+        XCTAssertNil(feed.requestID)
+        let scroll = try XCTUnwrap(Self.scrollView(in: pane.host))
+        let doc = try XCTUnwrap(scroll.documentView)
+        XCTAssertEqual(doc.frame.height - scroll.documentVisibleRect.maxY, 16, accuracy: 2)
+    }
+
+    func testRevealPolicyRejectsStaleScopeAndRetargetsWithoutRestartingDeadline() {
+        var reveal = Reveal(scope: 1, entryID: 10, revisionFence: .init(revision: 4, allowsRevisionMismatch: true))
+        let oldWitness = reveal.witnessID
+        let id = reveal.id
+        XCTAssertTrue(reveal.retarget(scope: 1, entryID: 11))
+        XCTAssertEqual(reveal.id, id)
+        XCTAssertEqual(reveal.action(for: .reveal(oldWitness), scope: 1, entryID: 11, revision: 5, canScroll: true), .ignore)
+        XCTAssertEqual(reveal.action(for: .deadline(id), scope: 2, entryID: 11, revision: 5, canScroll: true), .cancel)
+        XCTAssertEqual(reveal.action(for: .deadline(id), scope: 1, entryID: 11, revision: 5, canScroll: false), .cancel)
+        XCTAssertEqual(reveal.action(for: .deadline(id), scope: 1, entryID: 11, revision: 5, canScroll: true), .finish)
+        let tail = TranscriptBottomRevealFrame(requestID: reveal.witnessID, presentationRevision: 5, frame: CGRect(x: 0, y: -10, width: 20, height: 20))
+        XCTAssertEqual(reveal.action(for: .tail(tail), scope: 1, entryID: 11, revision: 5, canScroll: true), .finish)
+    }
+
+    func testScrollAwayCancelsHostedRevealBeforeLateWitness() async throws {
+        try await checkInterruptedReveal(remount: false)
+    }
+
+    func testRemountCancelsHostedRevealBeforeLateWitness() async throws {
+        try await checkInterruptedReveal(remount: true)
+    }
+
+    private func checkInterruptedReveal(remount: Bool) async throws {
+        _ = NSApplication.shared
+        let feed = Feed(restoredEntries: [])
+        let pane = MountedPane(feed: feed)
+        defer { pane.close() }
+        feed.count = 1200
+        try await waitForLayout([pane]) { feed.visibleFrameCount > 0 }
+        feed.holdWitness = true
+        feed.command = .bottom(UUID())
+        try await waitForLayout([pane]) { feed.heldWitness != nil }
+        XCTAssertTrue(feed.gate.isInFlight)
+        let late = try XCTUnwrap(feed.heldWitness)
+        feed.heldWitness = nil
+
+        let before = try XCTUnwrap(Self.scrollView(in: pane.host))
+        if remount {
+            feed.mount += 1
+        } else {
+            let clip = before.contentView
+            clip.scroll(to: CGPoint(x: clip.bounds.minX, y: clip.bounds.minY - 700))
+            before.reflectScrolledClipView(clip)
+            // An unordered AppKit host does not deliver a SwiftUI user scroll phase.
+            // Send the interruption at the same admission/cancellation seam.
+            feed.command = .idle
+        }
+        try await waitForLayout([pane]) {
+            !feed.gate.isInFlight && (!remount || Self.scrollView(in: pane.host) !== before)
+        }
+        let active = try XCTUnwrap(Self.scrollView(in: pane.host))
+        // The lazy stack can correct its estimated document extent after a native scroll.
+        // Sample the settled clip, not the provisional offset from the cancellation pass.
+        var stablePasses = 0
+        var origin = active.documentVisibleRect.minY
+        try await waitForLayout([pane]) {
+            let next = active.documentVisibleRect.minY
+            stablePasses = abs(next - origin) < 1 ? stablePasses + 1 : 0
+            origin = next
+            return stablePasses == 3
+        }
+        let document = try XCTUnwrap(active.documentView)
+        // The sentinel lands at the 16-point padding. Leave a clear gap to detect a jump,
+        // without assuming the estimated document's extent survives the native scroll.
+        XCTAssertGreaterThan(document.frame.height - active.documentVisibleRect.maxY, 32)
+        late()
+        for _ in 0 ..< 3 {
+            pane.host.layoutSubtreeIfNeeded()
+            try await Task.sleep(for: .milliseconds(12))
+        }
+        XCTAssertEqual(active.documentVisibleRect.minY, origin, accuracy: 1)
+        XCTAssertNil(feed.requestID)
+        XCTAssertFalse(feed.gate.isInFlight)
+        XCTAssertEqual(feed.completed, 0)
+        XCTAssertEqual(feed.settled, 0)
+    }
+
+    func testRestoredCompactedTranscriptWithResidentChatContexts() async throws {
+        let clock = ContinuousClock()
+        let started = clock.now
+        let items: [AgentChatItem] = (2940 ..< 3000).flatMap { turn in
+            [
+                .user("Request \(turn)", sequenceIndex: 2 * turn),
+                .assistant("Conclusion \(turn)", sequenceIndex: 2 * turn + 1)
+            ]
+        }
+        let archived = (0 ..< 2940).map { turn in
+            let time = Date(timeIntervalSince1970: Double(turn))
+            return AgentTranscriptTurn(
+                retentionTier: .archived,
+                summary: .init(
+                    requestText: "Request \(turn)", conclusionText: "Conclusion \(turn)",
+                    compactConclusionText: nil, middleSummaryText: nil, toolCount: 0,
+                    notableToolNames: [], keyPaths: [], compactedActivityCount: 1, hadWarning: false, hadError: false
+                ),
+                terminalState: .completed, startedAt: time, lastActivityAt: time, completedAt: time
+            )
+        }
+        // Restore a saved compacted prefix, rather than benchmarking initial compaction of 3,000 full turns.
+        var compacted = AgentTranscriptIO.buildTranscript(from: items, terminalState: .completed)
+        compacted.turns.insert(contentsOf: archived, at: 0)
+        compacted.compactionFrontier = try .init(frozenPrefixTurnCount: archived.count, lastFrozenTurnID: XCTUnwrap(archived.last?.id))
+        let restored = try JSONDecoder().decode(AgentTranscript.self, from: JSONEncoder().encode(compacted))
+        XCTAssertEqual(restored.turns.count, 3000)
+        XCTAssertTrue(restored.turns.contains { $0.retentionTier != .full })
+
+        _ = NSApplication.shared
+        // Retain 300 sessions while the selected transcript in each hidden window is laid out.
+        let contexts = (0 ..< 35).map { context in
+            stride(from: context, to: 300, by: 35).map { _ in AgentModeViewModel.TabSession(tabID: UUID()) }
+        }
+        XCTAssertEqual(contexts.flatMap(\.self).count, 300)
+        let built = AgentSessionTranscriptBuilder.buildTranscriptPresentation(
+            from: restored, sourceItems: AgentTranscriptIO.workingSourceItems(from: restored),
+            selectedAgent: .codexExec, previousPerformanceSnapshot: .empty,
+            isCompressedHistoryRevealed: true, isColdLoad: true
+        )
+        let entries = AgentTranscriptRenderEntries(blocks: built.projection.archivedBlocks + built.projection.workingBlocks).entries
+        XCTAssertFalse(entries.isEmpty)
+        let panes = contexts.indices.map { index in
+            MountedPane(feed: Feed(restoredEntries: index == 0 ? entries : []))
+        }
+        defer { panes.forEach { $0.close() } }
+        for (index, pane) in panes.enumerated() {
+            pane.feed.count = index == 0 ? entries.count : 10 + index
+        }
+        try await waitForLayout(panes) { panes.allSatisfy { $0.feed.visibleFrameCount > 0 } }
+        for pane in panes {
+            pane.feed.command = .bottom(UUID())
+        }
+        try await waitForLayout(panes) { panes.allSatisfy { $0.feed.settled == 1 } }
+        for pane in panes {
+            XCTAssertGreaterThan(pane.feed.visibleFrameCount, 0)
+            XCTAssertFalse(pane.feed.gate.isInFlight)
+            XCTAssertFalse(pane.window.isVisible)
+        }
+        let streamingStarted = clock.now
+        for wave in 1 ... 8 {
+            for pane in panes {
+                pane.feed.revision += 1
+                if wave.isMultiple(of: 2) { pane.feed.count += 1 }
+                pane.feed.command = .bottom(UUID())
+            }
+            try await waitForLayout(panes) { panes.allSatisfy { $0.feed.settled == wave + 1 } }
+        }
+        print("Transcript streaming host measurement: 280 requests in \(streamingStarted.duration(to: clock.now))")
+        withExtendedLifetime(contexts) {}
+        XCTAssertLessThan(started.duration(to: clock.now), .seconds(60))
+    }
+
+    private typealias Reveal = TranscriptBottomReveal<Int, Int>
+    private nonisolated static let viewport = CGSize(width: 620, height: 470)
+
+    private func checkHostedReveal(
+        initialCount: Int, restoredEntries: [AgentTranscriptRenderEntries.Entry] = [], checkDetached: Bool = true
+    ) async throws {
+        _ = NSApplication.shared
+        let feed = Feed(restoredEntries: restoredEntries)
+        let host = NSHostingView(rootView: Pane(feed: feed))
+        let window = NSWindow(contentRect: CGRect(origin: .zero, size: Self.viewport), styleMask: [.borderless], backing: .buffered, defer: true)
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+        defer {
+            window.contentView = nil
+            window.close()
+        }
+
+        func layout() async throws {
+            for _ in 0 ..< 6 {
+                host.layoutSubtreeIfNeeded()
+                try await Task.sleep(for: .milliseconds(12))
+            }
+        }
+
+        try await layout()
+        feed.count = initialCount
+        try await layout()
+        let scroll = try XCTUnwrap(Self.scrollView(in: host))
+        for step in 0 ..< 3 {
+            if step > 0 {
+                feed.command = .top
+                try await layout()
+                feed.count += 1
+            }
+            feed.revision = step + 1
+            feed.command = .bottom(UUID())
+            for _ in 0 ..< 4 {
+                try await layout()
+                if feed.completed == step + 1 { break }
+            }
+            XCTAssertEqual(feed.completed, step + 1, "Final row did not get a frame: \(initialCount), step \(step)")
+            let document = try XCTUnwrap(scroll.documentView)
+            XCTAssertEqual(document.frame.height - scroll.documentVisibleRect.maxY, 16, accuracy: 2)
+            XCTAssertGreaterThan(feed.visibleFrameCount, 0)
+        }
+
+        XCTAssertFalse(window.isVisible)
+        guard checkDetached else { return }
+        let clip = scroll.contentView
+        clip.scroll(to: CGPoint(x: clip.bounds.minX, y: clip.bounds.minY - 700))
+        scroll.reflectScrolledClipView(clip)
+        try await layout()
+        let viewport = CGRect(origin: .zero, size: Self.viewport)
+        let anchor = try XCTUnwrap(feed.frames.filter { $0.value.intersects(viewport) }.min { $0.value.minY < $1.value.minY })
+        for i in 0 ..< 8 {
+            feed.revision += 1
+            if i.isMultiple(of: 2) { feed.count += 1 }
+            try await layout()
+            let current = try XCTUnwrap(feed.frames[anchor.key])
+            XCTAssertEqual(current.minY, anchor.value.minY, accuracy: 1)
+        }
+        XCTAssertEqual(feed.completed, 3)
+        XCTAssertFalse(window.isVisible)
+    }
+
+    @MainActor
+    private final class MountedPane {
+        let feed: Feed
+        let host: NSHostingView<Pane>
+        let window: NSWindow
+
+        init(feed: Feed) {
+            self.feed = feed
+            host = NSHostingView(rootView: Pane(feed: feed))
+            window = NSWindow(contentRect: CGRect(origin: .zero, size: viewport), styleMask: [.borderless], backing: .buffered, defer: true)
+            window.isReleasedWhenClosed = false
+            window.contentView = host
+        }
+
+        func close() {
+            feed.cancelReveal()
+            feed.heldWitness = nil
+            window.contentView = nil
+            window.close()
+        }
+    }
+
+    private func waitForLayout(_ panes: [MountedPane], until ready: () -> Bool) async throws {
+        let deadline = ContinuousClock.now + .seconds(5)
+        repeat {
+            panes.forEach { $0.host.layoutSubtreeIfNeeded() }
+            if ready() { return }
+            try await Task.sleep(for: .milliseconds(12))
+        } while ContinuousClock.now < deadline
+        XCTFail("Hosted transcript did not reach the expected layout or request state")
+        throw CocoaError(.userCancelled)
+    }
+
+    private static func scrollView(in view: NSView) -> NSScrollView? {
+        if let scroll = view as? NSScrollView { return scroll }
+        return view.subviews.lazy.compactMap { scrollView(in: $0) }.first
+    }
+
+    private enum Command: Equatable {
+        case idle
+        case top
+        case bottom(UUID)
+    }
+
+    @MainActor
+    private final class Feed: ObservableObject {
+        let restoredEntries: [AgentTranscriptRenderEntries.Entry]
+
+        init(restoredEntries: [AgentTranscriptRenderEntries.Entry]) {
+            self.restoredEntries = restoredEntries
+        }
+
+        func mountedID(at index: Int) -> AnyHashable {
+            guard restoredEntries.indices.contains(index) else { return AnyHashable(index) }
+            let entry = restoredEntries[index]
+            return entry.isFirstInBlock ? AnyHashable(entry.block.id) : AnyHashable(entry.id)
+        }
+
+        func label(at index: Int) -> String {
+            guard restoredEntries.indices.contains(index) else { return String(index) }
+            let entry = restoredEntries[index]
+            return entry.item?.text ?? entry.block.id
+        }
+
+        @Published var count = 0
+        @Published var revision = 0
+        @Published var command = Command.idle
+        @Published var mount = 0
+        @Published var pending: Reveal?
+        var requestID: UUID? {
+            pending?.witnessID
+        }
+
+        let gate = ProgrammaticScrollGate()
+        var finish: (() -> Void)?
+        var holdWitness = false
+        var heldWitness: (() -> Void)?
+        var completed = 0
+        var settled = 0
+
+        func cancelReveal() {
+            gate.cancel()
+            pending = nil
+            finish = nil
+        }
+
+        var frames: [Int: CGRect] = [:]
+        var visibleFrameCount: Int {
+            frames.values.count(where: { $0.intersects(CGRect(origin: .zero, size: AgentTranscriptBottomRevealTests.viewport)) })
+        }
+    }
+
+    private enum FramesKey: PreferenceKey {
+        static var defaultValue: [Int: CGRect] {
+            [:]
+        }
+
+        static func reduce(value: inout [Int: CGRect], nextValue: () -> [Int: CGRect]) {
+            value.merge(nextValue(), uniquingKeysWith: { _, last in last })
+        }
+    }
+
+    private struct Pane: View {
+        @ObservedObject var feed: Feed
+
+        var body: some View {
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 12) {
+                        LazyVStack(alignment: .leading, spacing: 12) {
+                            Color.clear.frame(height: 1).id("top")
+                            ForEach(0 ..< feed.count, id: \.self) { index in
+                                Text(feed.label(at: index))
+                                    .frame(height: CGFloat(32 + ((index * 37 + (index >= feed.count - 3 ? feed.revision * 31 : 0)) % 170)))
+                                    .background {
+                                        GeometryReader { geometry in
+                                            Color.clear.preference(key: FramesKey.self, value: [index: geometry.frame(in: .named(TranscriptBottomRevealFrameKey.coordinateSpace))])
+                                        }
+                                    }
+                                    .modifier(TranscriptBottomRevealWitness(
+                                        requestID: index == feed.count - 1 ? feed.requestID : nil,
+                                        presentationRevision: index == feed.count - 1 ? feed.revision : 0
+                                    ))
+                                    .id(feed.mountedID(at: index))
+                            }
+                        }
+                        VStack(spacing: 12) {
+                            Text("Running")
+                            Color.clear.frame(height: 1).id(SwiftUITranscriptScrollDriver.bottomTargetID)
+                        }
+                    }
+                    .padding()
+                    .frame(maxWidth: .infinity, minHeight: AgentTranscriptBottomRevealTests.viewport.height, alignment: .topLeading)
+                }
+                .id(feed.mount)
+                .coordinateSpace(name: TranscriptBottomRevealFrameKey.coordinateSpace)
+                .onChange(of: feed.mount) { _, _ in feed.cancelReveal() }
+                .onPreferenceChange(FramesKey.self) { feed.frames = $0 }
+                .onPreferenceChange(TranscriptBottomRevealFrameKey.self) { frame in
+                    guard let frame, frame.requestID == feed.requestID, frame.isVisible(in: AgentTranscriptBottomRevealTests.viewport) else { return }
+                    let complete = { apply(.row(frame, viewport: AgentTranscriptBottomRevealTests.viewport), proxy: proxy) }
+                    if feed.holdWitness {
+                        feed.heldWitness = feed.heldWitness ?? complete
+                    } else {
+                        complete()
+                    }
+                }
+                .task(id: feed.pending?.witnessID) { [id = feed.pending?.witnessID] in
+                    guard let id else { return }
+                    do { try await Task.sleep(for: Reveal.revealDelay) } catch { return }
+                    apply(.reveal(id), proxy: proxy)
+                }
+                .task(id: feed.pending?.id) { [id = feed.pending?.id] in
+                    guard let id else { return }
+                    do { try await Task.sleep(for: Reveal.deadline) } catch { return }
+                    apply(.deadline(id), proxy: proxy)
+                }
+                .onChange(of: feed.command) { _, command in
+                    switch command {
+                    case .idle: feed.cancelReveal()
+                    case .top:
+                        feed.cancelReveal()
+                        proxy.scrollTo("top", anchor: .top)
+                    case let .bottom(id):
+                        feed.cancelReveal()
+                        feed.gate.schedule(after: 0, settleAfter: 0, onSettled: { feed.settled += 1 }, deferredAction: { finish in
+                            feed.finish = finish
+                            feed.pending = Reveal(
+                                id: id, scope: feed.mount, entryID: feed.count - 1,
+                                revisionFence: .init(revision: feed.revision, allowsRevisionMismatch: true)
+                            )
+                        })
+                    }
+                }
+            }
+            .frame(width: AgentTranscriptBottomRevealTests.viewport.width, height: AgentTranscriptBottomRevealTests.viewport.height)
+        }
+
+        private func apply(_ event: Reveal.Event, proxy: ScrollViewProxy) {
+            guard let pending = feed.pending else { return }
+            let driver = SwiftUITranscriptScrollDriver(proxy: proxy)
+            switch pending.action(for: event, scope: feed.mount, entryID: feed.count - 1, revision: feed.revision, canScroll: feed.gate.isInFlight) {
+            case .ignore: break
+            case .cancel: feed.cancelReveal()
+            case .reveal: driver.revealBottomEntry(id: feed.mountedID(at: pending.entryID))
+            case .finish:
+                feed.pending = nil
+                driver.scrollToBottom(animated: false)
+                feed.completed += 1
+                let finish = feed.finish
+                feed.finish = nil
+                finish?()
+            }
+        }
+    }
+}
