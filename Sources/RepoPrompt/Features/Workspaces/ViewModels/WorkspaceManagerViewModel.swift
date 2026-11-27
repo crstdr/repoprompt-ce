@@ -15841,6 +15841,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
     }
 
+    /// On success, returns the latest in-memory workspace. Concurrent changes may be newer than the
+    /// document this call saved.
     func setWorkspaceHiddenFromSnapshot(_ workspace: WorkspaceModel, hidden: Bool) async throws -> WorkspaceModel {
         var current = self.workspace(withID: workspace.id)
         var isAuthorityIncompleteRestore = authorityIncompleteConsolidatedRestoreIDs.contains(workspace.id)
