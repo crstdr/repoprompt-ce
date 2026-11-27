@@ -1858,7 +1858,13 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 let rendered = AgentTranscriptProjectionBuilder.build(from: session.transcript)
                 XCTAssertFalse((rendered.archivedRows + rendered.workingRows).contains { $0.id == acceptedID }, "fixture must hide the stored notice")
 
-                let clear = try XCTUnwrap(runtime.providerSwitchConfirmationPayload(for: session, acceptedID: acceptedID))
+                session.pendingHandoff.providerSwitchDelivery = .sending
+                session.pendingHandoff.providerSwitchAcceptedID = acceptedID
+                let binding = try XCTUnwrap(session.persistentSessionBindingIdentity)
+                let clear = try XCTUnwrap(try runtime.providerSwitchConfirmationPayload(
+                    for: session, acceptedID: acceptedID,
+                    expectedSessionID: binding.sessionID, expectedWorkspaceID: XCTUnwrap(binding.workspaceID)
+                ))
                 let sent = try XCTUnwrap(clear.transcript).turns.flatMap(\.allActivities).filter {
                     $0.recoveryDiagnostic?.reason == "providerSwitch" && $0.recoveryDiagnostic?.outcome == "sent"
                 }
@@ -1913,6 +1919,55 @@ final class AgentSessionLinkHandoffInheritanceTests: XCTestCase {
                 let clearWrite = try XCTUnwrap(clearWrites.last)
                 XCTAssertTrue(clearWrite.toLiveItems().contains { $0.text == "successor request" }, "the written payload includes the row")
                 XCTAssertEqual(Array(session.transcript.turns.prefix(5)), Array(baseline.turns.prefix(5)))
+            }
+        }
+
+        func testSwitchRetryCannotClearReboundSession() async throws {
+            enum Fault: Error { case firstClear }
+            try await withFixture { fixture in
+                let vm = fixture.viewModel
+                let runtime = vm.linkExecutionRuntime
+                let session = fixture.sourceSession
+                let retry = SwitchGate()
+                let a = try XCTUnwrap(session.activeAgentSessionID)
+                let b = UUID()
+                let acceptedID = UUID()
+                let carrier = try switchCarrier()
+                let workspace = fixture.workspace
+                let originalComposition = try XCTUnwrap(vm.persistenceRuntime.composition)
+                var composition = originalComposition
+                composition.canonicalStorage = .init(workspaceID: workspace.id) { _ in workspace }
+                vm.persistenceRuntime.composition = composition
+                vm.test_setSuppressesAgentSessionPersistence(false)
+                runtime.test_providerSwitchConfirmationRetryDelay = { await retry.wait() }
+                defer {
+                    retry.open()
+                    runtime.test_providerSwitchConfirmationRetryDelay = nil
+                    vm.persistenceRuntime.composition = originalComposition
+                    vm.test_setSuppressesAgentSessionPersistence(nil)
+                }
+                var writes: [UUID] = []
+                vm.test_setAgentSessionSaver { payload, _, _ in
+                    writes.append(payload.id)
+                    if writes.count == 1 { throw Fault.firstClear }
+                    return fixture.rootURL.appendingPathComponent("rebound-confirmation.json")
+                }
+                session.pendingHandoff = .init(payload: carrier, createdAt: Date(), providerSwitchDelivery: .sending)
+                session.pendingHandoff.providerSwitchAcceptedID = acceptedID
+                runtime.providerSwitchConfirmationHydrated(session, acceptedID: acceptedID)
+                try await AsyncTestWait.waitUntil("Save B enters retry delay") { retry.entered }
+                XCTAssertNotNil(vm.test_installPersistentSessionBinding(sessionID: b, on: session, compareAndSetInWorkspaceID: workspace.id))
+                session.markCurrentBindingHydrated()
+                session.recordRestorationAuthoritative(.persistedPayloadApplied)
+                XCTAssertTrue(session.permitsBoundOperationAndSave)
+                XCTAssertNotNil(runtime.providerSwitchConfirmationWriter(for: session))
+                session.pendingHandoff = .init(payload: carrier, createdAt: Date(), providerSwitchDelivery: .ready)
+                let reboundHandoff = session.pendingHandoff
+                retry.open()
+                await runtime.drainPendingSendEffects(for: session)
+                XCTAssertEqual(writes, [a])
+                XCTAssertEqual(session.pendingHandoff, reboundHandoff)
+                XCTAssertFalse(session.items.contains { $0.id == acceptedID })
             }
         }
 

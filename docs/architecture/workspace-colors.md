@@ -19,22 +19,22 @@ The order below is the menu order. Light values are for light appearances and da
 
 | id | Display name | Light hex | Dark hex |
 |---|---|---|---|
-| `red` | Red | `#DC2626` | `#F87171` |
-| `orange` | Orange | `#EA580C` | `#FB923C` |
-| `yellow` | Yellow | `#CA8A04` | `#FACC15` |
-| `lime` | Lime | `#65A30D` | `#A3E635` |
-| `green` | Green | `#16A34A` | `#4ADE80` |
-| `teal` | Teal | `#0D9488` | `#2DD4BF` |
-| `aqua` | Aqua | `#0891B2` | `#22D3EE` |
-| `blue` | Blue | `#2563EB` | `#60A5FA` |
-| `indigo` | Indigo | `#4F46E5` | `#818CF8` |
-| `violet` | Violet | `#7C3AED` | `#A78BFA` |
-| `magenta` | Magenta | `#C026D3` | `#E879F9` |
-| `pink` | Pink | `#DB2777` | `#F472B6` |
-| `brown` | Brown | `#92633A` | `#C8A27C` |
-| `grey` | Gray | `#6B7280` | `#9CA3AF` |
+| `red` | Red | `#B83A3A` | `#E06C6C` |
+| `orange` | Orange | `#C8612C` | `#E38C5A` |
+| `yellow` | Amber | `#AE7D16` | `#DCB750` |
+| `lime` | Lime | `#708D28` | `#A6C564` |
+| `green` | Green | `#2C7D46` | `#62B678` |
+| `teal` | Teal | `#177A7A` | `#49B5B0` |
+| `aqua` | Sky | `#2582B8` | `#63BCE8` |
+| `blue` | Blue | `#305FBD` | `#6893E6` |
+| `indigo` | Indigo | `#4343A2` | `#6F76CC` |
+| `violet` | Violet | `#6E49B8` | `#A485E4` |
+| `magenta` | Plum | `#983A84` | `#D076BA` |
+| `pink` | Rose | `#C74A6E` | `#E8839E` |
+| `brown` | Brown | `#8A6246` | `#BA9476` |
+| `grey` | Gray | `#70757D` | `#9A9FA8` |
 
-The id `grey` keeps its British spelling for compatibility with existing readers; the UI shows "Gray".
+For compatibility with existing readers, the saved ids stay the same: `yellow`, `aqua`, `magenta`, `pink`, and `grey` are shown as Amber, Sky, Plum, Rose, and Gray.
 
 ## Where it shows
 
