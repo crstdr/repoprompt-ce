@@ -924,6 +924,44 @@ final class AgentTranscriptBottomRevealTests: XCTestCase {
         }
     }
 
+    func testHeldFrameFallsBackAtDeadlineAndOnlySettlesOnce() async throws {
+        _ = NSApplication.shared
+        let feed = Feed(restoredEntries: [])
+        let pane = MountedPane(feed: feed)
+        defer { pane.close() }
+        feed.count = 1200
+        try await waitForLayout([pane]) { feed.visibleFrameCount > 0 }
+        feed.holdWitness = true
+        let started = ContinuousClock.now
+        feed.command = .bottom(UUID())
+        try await waitForLayout([pane]) { feed.heldWitness != nil }
+        XCTAssertTrue(feed.gate.isInFlight)
+        XCTAssertEqual(feed.completed, 0)
+        try await waitForLayout([pane]) { feed.settled == 1 }
+        XCTAssertGreaterThanOrEqual(started.duration(to: .now), Reveal.deadline)
+        try XCTUnwrap(feed.heldWitness)()
+        XCTAssertEqual(feed.completed, 1)
+        XCTAssertFalse(feed.gate.isInFlight)
+        XCTAssertNil(feed.requestID)
+        let scroll = try XCTUnwrap(Self.scrollView(in: pane.host))
+        let doc = try XCTUnwrap(scroll.documentView)
+        XCTAssertEqual(doc.frame.height - scroll.documentVisibleRect.maxY, 16, accuracy: 2)
+    }
+
+    func testRevealPolicyRejectsStaleScopeAndRetargetsWithoutRestartingDeadline() {
+        var reveal = Reveal(scope: 1, entryID: 10, revisionFence: .init(revision: 4, allowsRevisionMismatch: true))
+        let oldWitness = reveal.witnessID
+        let id = reveal.id
+        XCTAssertTrue(reveal.retarget(scope: 1, entryID: 11))
+        XCTAssertEqual(reveal.id, id)
+        XCTAssertEqual(reveal.action(for: .reveal(oldWitness), scope: 1, entryID: 11, revision: 5, canScroll: true), .ignore)
+        XCTAssertEqual(reveal.action(for: .deadline(id), scope: 2, entryID: 11, revision: 5, canScroll: true), .cancel)
+        XCTAssertEqual(reveal.action(for: .deadline(id), scope: 1, entryID: 11, revision: 5, canScroll: false), .cancel)
+        XCTAssertEqual(reveal.action(for: .deadline(id), scope: 1, entryID: 11, revision: 5, canScroll: true), .finish)
+        let tail = TranscriptBottomRevealFrame(requestID: reveal.witnessID, presentationRevision: 5, frame: CGRect(x: 0, y: -10, width: 20, height: 20))
+        XCTAssertEqual(reveal.action(for: .tail(tail), scope: 1, entryID: 11, revision: 5, canScroll: true), .finish)
+    }
+
     func testScrollAwayCancelsHostedRevealBeforeLateWitness() async throws {
         try await checkInterruptedReveal(remount: false)
     }
@@ -1046,10 +1084,21 @@ final class AgentTranscriptBottomRevealTests: XCTestCase {
             XCTAssertFalse(pane.feed.gate.isInFlight)
             XCTAssertFalse(pane.window.isVisible)
         }
+        let streamingStarted = clock.now
+        for wave in 1 ... 8 {
+            for pane in panes {
+                pane.feed.revision += 1
+                if wave.isMultiple(of: 2) { pane.feed.count += 1 }
+                pane.feed.command = .bottom(UUID())
+            }
+            try await waitForLayout(panes) { panes.allSatisfy { $0.feed.settled == wave + 1 } }
+        }
+        print("Transcript streaming host measurement: 280 requests in \(streamingStarted.duration(to: clock.now))")
         withExtendedLifetime(contexts) {}
         XCTAssertLessThan(started.duration(to: clock.now), .seconds(60))
     }
 
+    private typealias Reveal = TranscriptBottomReveal<Int, Int>
     private nonisolated static let viewport = CGSize(width: 620, height: 470)
 
     private func checkHostedReveal(
@@ -1182,7 +1231,11 @@ final class AgentTranscriptBottomRevealTests: XCTestCase {
         @Published var revision = 0
         @Published var command = Command.idle
         @Published var mount = 0
-        @Published var requestID: UUID?
+        @Published var pending: Reveal?
+        var requestID: UUID? {
+            pending?.witnessID
+        }
+
         let gate = ProgrammaticScrollGate()
         var finish: (() -> Void)?
         var holdWitness = false
@@ -1192,7 +1245,7 @@ final class AgentTranscriptBottomRevealTests: XCTestCase {
 
         func cancelReveal() {
             gate.cancel()
-            requestID = nil
+            pending = nil
             finish = nil
         }
 
@@ -1229,7 +1282,10 @@ final class AgentTranscriptBottomRevealTests: XCTestCase {
                                             Color.clear.preference(key: FramesKey.self, value: [index: geometry.frame(in: .named(TranscriptBottomRevealFrameKey.coordinateSpace))])
                                         }
                                     }
-                                    .modifier(TranscriptBottomRevealWitness(requestID: index == feed.count - 1 ? feed.requestID : nil))
+                                    .modifier(TranscriptBottomRevealWitness(
+                                        requestID: index == feed.count - 1 ? feed.requestID : nil,
+                                        presentationRevision: index == feed.count - 1 ? feed.revision : 0
+                                    ))
                                     .id(feed.mountedID(at: index))
                             }
                         }
@@ -1247,20 +1303,22 @@ final class AgentTranscriptBottomRevealTests: XCTestCase {
                 .onPreferenceChange(FramesKey.self) { feed.frames = $0 }
                 .onPreferenceChange(TranscriptBottomRevealFrameKey.self) { frame in
                     guard let frame, frame.requestID == feed.requestID, frame.isVisible(in: AgentTranscriptBottomRevealTests.viewport) else { return }
-                    let complete = {
-                        guard frame.requestID == feed.requestID, feed.gate.isInFlight else { return }
-                        feed.requestID = nil
-                        SwiftUITranscriptScrollDriver(proxy: proxy).scrollToBottom(animated: false)
-                        feed.completed += 1
-                        let finish = feed.finish
-                        feed.finish = nil
-                        finish?()
-                    }
+                    let complete = { apply(.row(frame, viewport: AgentTranscriptBottomRevealTests.viewport), proxy: proxy) }
                     if feed.holdWitness {
                         feed.heldWitness = feed.heldWitness ?? complete
                     } else {
                         complete()
                     }
+                }
+                .task(id: feed.pending?.witnessID) { [id = feed.pending?.witnessID] in
+                    guard let id else { return }
+                    do { try await Task.sleep(for: Reveal.revealDelay) } catch { return }
+                    apply(.reveal(id), proxy: proxy)
+                }
+                .task(id: feed.pending?.id) { [id = feed.pending?.id] in
+                    guard let id else { return }
+                    do { try await Task.sleep(for: Reveal.deadline) } catch { return }
+                    apply(.deadline(id), proxy: proxy)
                 }
                 .onChange(of: feed.command) { _, command in
                     switch command {
@@ -1272,13 +1330,32 @@ final class AgentTranscriptBottomRevealTests: XCTestCase {
                         feed.cancelReveal()
                         feed.gate.schedule(after: 0, settleAfter: 0, onSettled: { feed.settled += 1 }, deferredAction: { finish in
                             feed.finish = finish
-                            feed.requestID = id
-                            SwiftUITranscriptScrollDriver(proxy: proxy).revealBottomEntry(id: feed.mountedID(at: feed.count - 1))
+                            feed.pending = Reveal(
+                                id: id, scope: feed.mount, entryID: feed.count - 1,
+                                revisionFence: .init(revision: feed.revision, allowsRevisionMismatch: true)
+                            )
                         })
                     }
                 }
             }
             .frame(width: AgentTranscriptBottomRevealTests.viewport.width, height: AgentTranscriptBottomRevealTests.viewport.height)
+        }
+
+        private func apply(_ event: Reveal.Event, proxy: ScrollViewProxy) {
+            guard let pending = feed.pending else { return }
+            let driver = SwiftUITranscriptScrollDriver(proxy: proxy)
+            switch pending.action(for: event, scope: feed.mount, entryID: feed.count - 1, revision: feed.revision, canScroll: feed.gate.isInFlight) {
+            case .ignore: break
+            case .cancel: feed.cancelReveal()
+            case .reveal: driver.revealBottomEntry(id: feed.mountedID(at: pending.entryID))
+            case .finish:
+                feed.pending = nil
+                driver.scrollToBottom(animated: false)
+                feed.completed += 1
+                let finish = feed.finish
+                feed.finish = nil
+                finish?()
+            }
         }
     }
 }

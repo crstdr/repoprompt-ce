@@ -1827,14 +1827,10 @@ struct AgentModeChatDetailView: View {
                 ZStack(alignment: .bottomTrailing) {
                     versionedScrollableContent(proxy: proxy, viewportHeight: geometry.size.height)
                         .onPreferenceChange(TranscriptBottomRevealFrameKey.self) { witness in
-                            if let witness, witness.isVisible(in: geometry.size) {
-                                completeBottomReveal(witness)
-                            }
+                            if let witness { applyBottomReveal(.row(witness, viewport: geometry.size)) }
                         }
                         .onPreferenceChange(BottomRevealTailStartKey.self) { witness in
-                            if let witness, witness.frame.minY <= 0 {
-                                completeBottomReveal(witness)
-                            }
+                            if let witness { applyBottomReveal(.tail(witness)) }
                         }
                         .onChange(of: bottomRevealScope) { _, scope in
                             if let pendingBottomReveal, pendingBottomReveal.scope != scope {
@@ -1847,23 +1843,13 @@ struct AgentModeChatDetailView: View {
                         .task(id: pendingBottomReveal?.witnessID) { [witnessID = pendingBottomReveal?.witnessID] in
                             guard let witnessID else { return }
                             // Give an already mounted row a layout pass without moving the viewport.
-                            do { try await Task.sleep(for: .milliseconds(24)) } catch { return }
-                            guard let reveal = pendingBottomReveal, reveal.witnessID == witnessID,
-                                  reveal.scope == bottomRevealScope, currentTabID == agentModeVM.currentTabID,
-                                  !isUserInteractingWithScroll, programmaticScrollGate.isInFlight,
-                                  let entry = transcriptSnapshot.renderEntries?.entries.last, entry.id == reveal.entryID
-                            else { return }
-                            guard reveal.revisionFence.permits(currentTranscriptPresentationRevision) else {
-                                cancelBottomRevealIfNeeded()
-                                return
-                            }
-                            reveal.move(bottomRevealScrollID(for: entry))
+                            do { try await Task.sleep(for: BottomReveal.revealDelay) } catch { return }
+                            applyBottomReveal(.reveal(witnessID))
                         }
                         .task(id: pendingBottomReveal?.id) { [id = pendingBottomReveal?.id] in
                             guard let id else { return }
-                            do { try await Task.sleep(for: .milliseconds(300)) } catch { return }
-                            guard pendingBottomReveal?.id == id else { return }
-                            cancelBottomRevealIfNeeded()
+                            do { try await Task.sleep(for: BottomReveal.deadline) } catch { return }
+                            applyBottomReveal(.deadline(id))
                         }
 
                     #if DEBUG
@@ -2256,12 +2242,26 @@ struct AgentModeChatDetailView: View {
         let target: AgentTranscriptPaneTarget
     }
 
+    private typealias BottomReveal = TranscriptBottomReveal<BottomRevealScope, AgentTranscriptRenderEntries.Entry.ID>
+
     private struct PendingBottomReveal {
-        let id: UUID
-        var witnessID = UUID()
-        let scope: BottomRevealScope
-        var entryID: AgentTranscriptRenderEntries.Entry.ID
-        let revisionFence: TranscriptBottomRevealRevisionFence
+        var request: BottomReveal
+        var id: UUID {
+            request.id
+        }
+
+        var witnessID: UUID {
+            request.witnessID
+        }
+
+        var scope: BottomRevealScope {
+            request.scope
+        }
+
+        var entryID: AgentTranscriptRenderEntries.Entry.ID {
+            request.entryID
+        }
+
         let restoreToken: UInt64?
         let move: (AnyHashable) -> Void
         let complete: () -> Void
@@ -2288,36 +2288,32 @@ struct AgentModeChatDetailView: View {
         }
     }
 
-    private func completeBottomReveal(_ witness: TranscriptBottomRevealFrame) {
-        guard let reveal = pendingBottomReveal, witness.requestID == reveal.witnessID,
-              witness.presentationRevision == currentTranscriptPresentationRevision,
-              reveal.entryID == transcriptSnapshot.renderEntries?.entries.last?.id
-        else { return }
-        guard reveal.scope == bottomRevealScope, currentTabID == agentModeVM.currentTabID,
-              !isUserInteractingWithScroll,
-              reveal.revisionFence.permits(currentTranscriptPresentationRevision),
-              programmaticScrollGate.isInFlight
-        else {
-            cancelBottomRevealIfNeeded()
-            return
+    private func applyBottomReveal(_ event: BottomReveal.Event) {
+        guard let reveal = pendingBottomReveal else { return }
+        let entry = transcriptSnapshot.renderEntries?.entries.last
+        let action = reveal.request.action(
+            for: event, scope: bottomRevealScope, entryID: entry?.id, revision: currentTranscriptPresentationRevision,
+            canScroll: currentTabID == agentModeVM.currentTabID && !isUserInteractingWithScroll && programmaticScrollGate.isInFlight
+        )
+        switch action {
+        case .ignore: break
+        case .cancel: cancelBottomRevealIfNeeded()
+        case .reveal:
+            if let entry { reveal.move(bottomRevealScrollID(for: entry)) }
+        case .finish:
+            pendingBottomReveal = nil
+            reveal.complete()
         }
-        pendingBottomReveal = nil
-        reveal.complete()
     }
 
     private func retargetBottomRevealIfNeeded() {
         guard var reveal = pendingBottomReveal else { return }
-        guard reveal.scope == bottomRevealScope, reveal.revisionFence.allowsRevisionMismatch,
-              let entry = transcriptSnapshot.renderEntries?.entries.last
-        else {
+        let previousWitness = reveal.witnessID
+        guard reveal.request.retarget(scope: bottomRevealScope, entryID: transcriptSnapshot.renderEntries?.entries.last?.id) else {
             cancelBottomRevealIfNeeded()
             return
         }
-        if reveal.entryID != entry.id {
-            reveal.entryID = entry.id
-            reveal.witnessID = UUID()
-            pendingBottomReveal = reveal
-        }
+        if reveal.witnessID != previousWitness { pendingBottomReveal = reveal }
     }
 
     private func cancelBottomRevealIfNeeded() {
@@ -3734,8 +3730,10 @@ struct AgentModeChatDetailView: View {
                let entry = transcriptSnapshot.renderEntries?.entries.last
             {
                 pendingBottomReveal = PendingBottomReveal(
-                    id: UUID(), scope: capturedScope, entryID: entry.id,
-                    revisionFence: .init(revision: capturedPresentationRevision, allowsRevisionMismatch: intent.allowsRevisionMismatch),
+                    request: .init(
+                        scope: capturedScope, entryID: entry.id,
+                        revisionFence: .init(revision: capturedPresentationRevision, allowsRevisionMismatch: intent.allowsRevisionMismatch)
+                    ),
                     restoreToken: restoreToken,
                     move: { driver.revealBottomEntry(id: $0, animated: intent.isAnimated) }, complete: complete
                 )
