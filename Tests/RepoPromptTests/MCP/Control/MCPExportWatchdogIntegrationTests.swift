@@ -1697,6 +1697,12 @@ import XCTest
             }
         }
 
+        @MainActor
+        private final class CompactAccountingProbe {
+            var inputs = 0
+            var outputs = 0
+        }
+
         func testAntigravityCompactEventsAccountOnlyTheTargetOrTheRefusedWrapper() async throws {
             try await withReadyCompactSocket { manager, admitted, _ in
                 let vm = admitted.context.window.agentModeViewModel
@@ -1704,9 +1710,26 @@ import XCTest
                 _ = session.beginRunAttempt(source: "compact-event-fixture")
                 let attemptID = try XCTUnwrap(session.activeRunAttemptID)
                 let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
+                let accounting = CompactAccountingProbe()
+                let hooks = vm.runtimeSessionStore.stream.makeToolTrackingHooks()
                 let runner = ACPIntegratedAgentModeRunner(
                     hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier(),
-                    toolTrackingHooks: vm.runtimeSessionStore.stream.makeToolTrackingHooks()
+                    toolTrackingHooks: .init(
+                        flushPendingAssistantDelta: hooks.flushPendingAssistantDelta,
+                        endActiveAssistantSegment: hooks.endActiveAssistantSegment,
+                        endActiveReasoningSegment: hooks.endActiveReasoningSegment,
+                        sealAssistantBoundary: hooks.sealAssistantBoundary,
+                        requestUIRefresh: hooks.requestUIRefresh,
+                        scheduleSave: hooks.scheduleSave,
+                        addToolInputTokens: { payload, session in
+                            accounting.inputs += 1
+                            hooks.addToolInputTokens(payload, session)
+                        },
+                        addToolOutputTokens: { payload, session in
+                            accounting.outputs += 1
+                            hooks.addToolOutputTokens(payload, session)
+                        }
+                    )
                 )
                 let observer = await manager.registerToolEventObserver(for: admitted.runID, observer: .init(onCalled: { id, tool, args in
                     await MainActor.run {
@@ -1743,10 +1766,8 @@ import XCTest
                     let response = try await admitted.endpoint.callTool(name: "call_tool", arguments: args)
                     let result = try XCTUnwrap(Self.responseObject(from: response)["result"] as? [String: Any])
                     XCTAssertEqual(result["isError"] as? Bool ?? false, scenario.error)
-                    let input = try XCTUnwrap(session.activeNonCodexTurnTokenAccumulator?.estimatedToolInputTokens)
-                    let output = try XCTUnwrap(session.activeNonCodexTurnTokenAccumulator?.estimatedToolOutputTokens)
-                    XCTAssertGreaterThan(input, 0)
-                    XCTAssertGreaterThan(output, 0)
+                    XCTAssertEqual(accounting.inputs, index + 1)
+                    XCTAssertEqual(accounting.outputs, index + 1)
                     // Antigravity's terminal update can omit the wrapper title.
                     await deliver([
                         "sessionUpdate": "tool_call_update", "toolCallId": providerID,
@@ -1755,8 +1776,10 @@ import XCTest
                     let rows = session.items.dropFirst(before).filter { $0.toolName != nil }
                     XCTAssertEqual(rows.compactMap(\.toolName), [scenario.row])
                     XCTAssertEqual(rows.first?.toolIsError, scenario.error)
-                    XCTAssertEqual(session.activeNonCodexTurnTokenAccumulator?.estimatedToolInputTokens, input)
-                    XCTAssertEqual(session.activeNonCodexTurnTokenAccumulator?.estimatedToolOutputTokens, output)
+                    XCTAssertEqual(accounting.inputs, index + 1)
+                    XCTAssertEqual(accounting.outputs, index + 1)
+                    XCTAssertEqual(session.activeNonCodexTurnTokenAccumulator?.estimatedToolInputTokens, 0)
+                    XCTAssertEqual(session.activeNonCodexTurnTokenAccumulator?.estimatedToolOutputTokens, 0)
                 }
                 await manager.unregisterToolEventObserver(for: admitted.runID, token: observer)
             }

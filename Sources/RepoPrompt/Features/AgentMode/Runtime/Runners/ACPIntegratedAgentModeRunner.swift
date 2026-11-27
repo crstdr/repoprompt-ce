@@ -2943,7 +2943,7 @@ final class ACPIntegratedAgentModeRunner {
 
     private func isCompactWrapperEcho(name: String, invocationID: UUID?, session: AgentTabSession) -> Bool {
         guard session.selectedAgent == .antigravity else { return false }
-        if name == MCPCompactToolEnvelope.call {
+        if name == ACPDefaultSessionUpdateNormalizer.antigravityCompactDispatchEchoName {
             if let invocationID { compactWrapperInvocationIDsByTabID[session.tabID, default: []].insert(invocationID) }
             return true
         }

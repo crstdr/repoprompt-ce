@@ -215,9 +215,11 @@ package enum ACPDefaultSessionUpdateNormalizer {
         }
     }
 
+    package static let antigravityCompactDispatchEchoName = "mcp_\(RepoPromptMCPServerConfiguration.defaultServerName)_call_tool"
+
     private static func isAntigravityCompactDispatch(_ payload: [String: Any], providerID: ACPProviderID) -> Bool {
         guard providerID == .antigravity else { return false }
-        let name = "mcp_\(RepoPromptMCPServerConfiguration.defaultServerName)_call_tool"
+        let name = antigravityCompactDispatchEchoName
         let title = payload["title"] as? String
         return title == "Run \(name)" || title == name || payload["toolName"] as? String == name
     }
@@ -226,7 +228,7 @@ package enum ACPDefaultSessionUpdateNormalizer {
         _ payload: [String: Any], toolNames: ACPToolNameResolution, compactWrapper: Bool
     ) -> [NormalizedAgentRuntimeEvent] {
         let toolCallID = ACPRuntimeEventParsing.firstString(in: payload, keys: ["toolCallId"]) ?? UUID().uuidString
-        let toolName = compactWrapper ? "call_tool" : ACPRuntimeEventParsing.normalizedToolName(from: payload, toolNames: toolNames)
+        let toolName = compactWrapper ? antigravityCompactDispatchEchoName : ACPRuntimeEventParsing.normalizedToolName(from: payload, toolNames: toolNames)
         let argsJSON = ACPRuntimeEventParsing.serializeJSON(payload["rawInput"])
         return [
             .stream(
@@ -246,7 +248,7 @@ package enum ACPDefaultSessionUpdateNormalizer {
         _ payload: [String: Any], toolNames: ACPToolNameResolution, compactWrapper: Bool
     ) -> [NormalizedAgentRuntimeEvent] {
         let toolCallID = ACPRuntimeEventParsing.firstString(in: payload, keys: ["toolCallId"]) ?? UUID().uuidString
-        let toolName = compactWrapper ? "call_tool" : ACPRuntimeEventParsing.normalizedToolName(from: payload, toolNames: toolNames)
+        let toolName = compactWrapper ? antigravityCompactDispatchEchoName : ACPRuntimeEventParsing.normalizedToolName(from: payload, toolNames: toolNames)
         let invocationID = ACPRuntimeEventParsing.stableInvocationUUID(rawValue: toolCallID)
         let status = ACPRuntimeEventParsing.firstString(in: payload, keys: ["status"])?.lowercased()
         let argsJSON = ACPRuntimeEventParsing.serializeJSON(payload["rawInput"])
