@@ -1275,20 +1275,20 @@ final class WorkspaceColorPaletteTests: XCTestCase {
 
     /// The documented contract table (`docs/architecture/workspace-colors.md`), in menu order.
     private let contract: [Row] = [
-        Row(id: "red", name: "Red", light: 0xDC2626, dark: 0xF87171),
-        Row(id: "orange", name: "Orange", light: 0xEA580C, dark: 0xFB923C),
-        Row(id: "yellow", name: "Yellow", light: 0xCA8A04, dark: 0xFACC15),
-        Row(id: "lime", name: "Lime", light: 0x65A30D, dark: 0xA3E635),
-        Row(id: "green", name: "Green", light: 0x16A34A, dark: 0x4ADE80),
-        Row(id: "teal", name: "Teal", light: 0x0D9488, dark: 0x2DD4BF),
-        Row(id: "aqua", name: "Aqua", light: 0x0891B2, dark: 0x22D3EE),
-        Row(id: "blue", name: "Blue", light: 0x2563EB, dark: 0x60A5FA),
-        Row(id: "indigo", name: "Indigo", light: 0x4F46E5, dark: 0x818CF8),
-        Row(id: "violet", name: "Violet", light: 0x7C3AED, dark: 0xA78BFA),
-        Row(id: "magenta", name: "Magenta", light: 0xC026D3, dark: 0xE879F9),
-        Row(id: "pink", name: "Pink", light: 0xDB2777, dark: 0xF472B6),
-        Row(id: "brown", name: "Brown", light: 0x92633A, dark: 0xC8A27C),
-        Row(id: "grey", name: "Gray", light: 0x6B7280, dark: 0x9CA3AF)
+        Row(id: "red", name: "Red", light: 0xB83A3A, dark: 0xE06C6C),
+        Row(id: "orange", name: "Orange", light: 0xC8612C, dark: 0xE38C5A),
+        Row(id: "yellow", name: "Amber", light: 0xAE7D16, dark: 0xDCB750),
+        Row(id: "lime", name: "Lime", light: 0x708D28, dark: 0xA6C564),
+        Row(id: "green", name: "Green", light: 0x2C7D46, dark: 0x62B678),
+        Row(id: "teal", name: "Teal", light: 0x177A7A, dark: 0x49B5B0),
+        Row(id: "aqua", name: "Sky", light: 0x2582B8, dark: 0x63BCE8),
+        Row(id: "blue", name: "Blue", light: 0x305FBD, dark: 0x6893E6),
+        Row(id: "indigo", name: "Indigo", light: 0x4343A2, dark: 0x6F76CC),
+        Row(id: "violet", name: "Violet", light: 0x6E49B8, dark: 0xA485E4),
+        Row(id: "magenta", name: "Plum", light: 0x983A84, dark: 0xD076BA),
+        Row(id: "pink", name: "Rose", light: 0xC74A6E, dark: 0xE8839E),
+        Row(id: "brown", name: "Brown", light: 0x8A6246, dark: 0xBA9476),
+        Row(id: "grey", name: "Gray", light: 0x70757D, dark: 0x9A9FA8)
     ]
 
     func testPaletteMatchesDocumentedIdsNamesAndOrder() {
