@@ -6670,7 +6670,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 session: session,
                 expectedController: activeController,
                 source: "idle-controller-reconnect",
-                preserveRunID: startupRouting != nil
+                preserveRunID: preserveExistingRunID || startupRouting != nil
             ) {
                 await ensureCodexNativeSession(
                     session: session,
@@ -6678,6 +6678,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                     deferPublicationUntilRouting: deferPublicationUntilRouting,
                     allowMissingRolloutFallback: allowMissingRolloutFallback,
                     forIdleNativeCompact: forIdleNativeCompact,
+                    preserveExistingRunID: preserveExistingRunID,
                     skipResumeWhenNoPriorCodexHistory: false,
                     semanticRunState: semanticRunState,
                     startupClaimToken: claimToken,
@@ -7098,7 +7099,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 session: session,
                 expectedController: expectedController,
                 source: "missing-live-route",
-                preserveRunID: startupRouting != nil
+                preserveRunID: preserveExistingRunID || startupRouting != nil
             )
             await ensureCodexNativeSession(
                 session: session,
@@ -7106,6 +7107,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 deferPublicationUntilRouting: deferPublicationUntilRouting,
                 allowMissingRolloutFallback: allowMissingRolloutFallback,
                 forIdleNativeCompact: forIdleNativeCompact,
+                preserveExistingRunID: preserveExistingRunID,
                 skipResumeWhenNoPriorCodexHistory: skipResumeWhenNoPriorCodexHistory,
                 semanticRunState: semanticRunState,
                 startupClaimToken: claimToken,
@@ -7218,6 +7220,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 deferPublicationUntilRouting: true,
                 allowMissingRolloutFallback: allowMissingRolloutFallback,
                 forIdleNativeCompact: forIdleNativeCompact,
+                preserveExistingRunID: preserveExistingRunID,
                 skipResumeWhenNoPriorCodexHistory: skipResumeWhenNoPriorCodexHistory,
                 semanticRunState: semanticRunState,
                 startupClaimToken: claimToken,

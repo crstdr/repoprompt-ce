@@ -1993,6 +1993,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         let fixture = makeFixture(restored: true, [[.timeout], [.timeout], [.discoveryFailure]], authRecovery: MonitorStubCodexAuthRecovery())
         var notifications: [String?] = []
         var reasons: [DomainAgentRunSnapshot.FailureReason?] = []
+        var terminalRunIDs: [UUID?] = []
         fixture.session.appendItem(.user("continue the task"))
         let barrier = AgentRunTerminalCommitBarrier()
         let makeBinding: (AgentTabSession) -> AgentRunTerminalSessionBinding = { owned in
@@ -2006,6 +2007,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
                     notifyAgentTurnComplete: {}, notifyAgentTurnFailed: { notifications.append($0) }, scheduleSave: {},
                     publishTerminalCommit: { revision, _ in
                         reasons.append(revision.failureReason)
+                        terminalRunIDs.append(revision.expectedRunID)
                         return .accepted(successorEpoch: nil)
                     }, startFollowUpRun: { _ in }
                 ),
@@ -2064,7 +2066,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         // A successful auth refresh followed by a resume timeout must not add login guidance.
         fixture.session.runState = .running
         fixture.session.beginRunAttempt(source: "auth-recovery-timeout")
-        _ = AgentModeProcessRunIdentity.startFreshProcessRun(for: fixture.session)
+        let authRunID = AgentModeProcessRunIdentity.startFreshProcessRun(for: fixture.session)
         fixture.session.appendItem(.user("recover auth", sequenceIndex: fixture.session.nextSequenceIndex))
         fixture.session.codexPendingAuthRetryTurn = .init(
             text: "recover auth", attachments: [], model: nil, reasoningEffort: nil, serviceTier: nil,
@@ -2078,6 +2080,10 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         XCTAssertFalse(authMessage?.contains(CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage) == true)
         XCTAssertEqual(notifications, [message, authMessage])
         XCTAssertEqual(reasons, [.resumeTimedOut, .resumeTimedOut])
+        XCTAssertEqual(terminalRunIDs.count, 2)
+        XCTAssertEqual(terminalRunIDs.last ?? nil, authRunID)
+        XCTAssertEqual(fixture.session.runState, .failed)
+        XCTAssertNil(fixture.session.activeRunOwnership)
         XCTAssertNil(fixture.session.codexNativeStartupDisposition)
 
         // A later, different startup failure must not inherit the timeout classification.
