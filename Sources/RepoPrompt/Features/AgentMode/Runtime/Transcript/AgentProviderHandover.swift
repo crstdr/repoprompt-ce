@@ -18,6 +18,22 @@ enum AgentProviderHandover {
         return codexMaximumInputScalars - composedInput.unicodeScalars.count - "\n\n".count - note - late
     }
 
+    /// agy ACP 1.5.17 truncates the model-facing prompt text after 192,000 UTF-8 bytes.
+    static let antigravityMaximumPromptBytes = 192_000
+
+    static func antigravityCarrierAllowance(composedInput: String, instructions: [String]) -> Int {
+        // The final instruction slot is the current oversight supplement. Reserve its maximum
+        // instead because the ACP runner builds the actual supplement just before dispatch.
+        let prefixBytes = instructions.dropLast().reduce(0) { $0 + $1.utf8.count + "\n\n".utf8.count }
+        let linkBytes = AgentSessionLinkPrompts.maximumRenderedBytes
+            + AgentSessionLinkPrompts.maximumLocalInputDeltaBytes
+            + AgentSessionLinkMessageEnvelope.escaped(AgentSessionLinkPrompts.localInputGuidance).utf8.count + 1
+        let separatorBytes = "\n\n".utf8.count
+        // The Oracle status uses only ASCII, so its scalar ceiling is also its byte ceiling.
+        let lateBytes = linkBytes + separatorBytes + OracleBackgroundAwareness.maximumTextScalars + separatorBytes
+        return antigravityMaximumPromptBytes - composedInput.utf8.count - separatorBytes - prefixBytes - lateBytes
+    }
+
     enum Mode: String {
         case history
         case newestTurns = "newest_turns"
@@ -97,6 +113,7 @@ enum AgentProviderHandover {
         let instructionTokens: Double
         let inputTokens: Double
         let codexCarrierScalars: Int?
+        let antigravityCarrierBytes: Int?
         var marginTokens: Double {
             Double(window) * 0.1
         }
@@ -107,13 +124,17 @@ enum AgentProviderHandover {
 
         /// Only catalog/configured window metadata belongs here, never source occupancy/native usage.
         /// Instructions are existing RP-composed strings; hidden harness/tool overhead uses the margin.
-        init(catalogWindow: Int?, instructions: [String], composedInput: String, isPreview: Bool, codexCarrierScalars: Int? = nil) {
+        init(
+            catalogWindow: Int?, instructions: [String], composedInput: String, isPreview: Bool,
+            codexCarrierScalars: Int? = nil, antigravityCarrierBytes: Int? = nil
+        ) {
             let known = catalogWindow.flatMap { $0 > 0 ? $0 : nil }
             window = known ?? 128_000
             windowSource = known == nil ? .assumed : .catalog
             instructionTokens = instructions.reduce(0) { $0 + estimate($1) }
             inputTokens = isPreview ? max(2048, estimate(composedInput)) : estimate(composedInput)
             self.codexCarrierScalars = codexCarrierScalars
+            self.antigravityCarrierBytes = antigravityCarrierBytes
         }
 
         func fits(_ carrier: Carrier) -> Bool {
@@ -128,11 +149,13 @@ enum AgentProviderHandover {
             bytes <= maximumBytes && (mode != .summary || bytes <= maximumSummaryBytes)
                 && estimate(bytes: bytes) <= remainingCarrierTokens
                 && (codexCarrierScalars.map { scalars <= $0 } ?? true)
+                && (antigravityCarrierBytes.map { bytes <= $0 } ?? true)
         }
 
         fileprivate var summaryByteAllowance: Int {
             let bytes = max(0, remainingCarrierTokens / 1.05 * 4)
-            return Int(min(Double(maximumSummaryBytes), bytes).rounded(.down))
+            let providerBytes = max(0, antigravityCarrierBytes ?? maximumSummaryBytes)
+            return Int(min(Double(maximumSummaryBytes), Double(providerBytes), bytes).rounded(.down))
         }
     }
 

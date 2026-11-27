@@ -653,7 +653,8 @@ final class AgentSessionLinkCapturingACPProvider: ACPAgentProvider, @unchecked S
         lock.lock()
         captured.append(message)
         lock.unlock()
-        return [["type": "text", "text": message.userMessage]]
+        let padding = Int(environment["ACP_TEST_PROMPT_PADDING"] ?? "") ?? 0
+        return [["type": "text", "text": String(repeating: "x", count: padding) + message.userMessage]]
     }
 
     func normalizeSessionUpdate(
@@ -834,7 +835,10 @@ enum AgentSessionLinkACPServerScript {
                 respond_error(request.get("id"), "injected startup failure")
                 continue
             if method == "initialize":
-                respond(request.get("id"), {"agentCapabilities": {"loadSession": True}, "authMethods": []})
+                capabilities = {"loadSession": True}
+                if os.environ.get("ACP_TEST_IMAGE_INPUT") == "1":
+                    capabilities["promptCapabilities"] = {"image": True}
+                respond(request.get("id"), {"agentCapabilities": capabilities, "authMethods": []})
             elif method == "session/load" and os.environ.get("ACP_FAIL_LOAD"):
                 respond_error(request.get("id"), "session not found: invalid params")
             elif method == "session/load":

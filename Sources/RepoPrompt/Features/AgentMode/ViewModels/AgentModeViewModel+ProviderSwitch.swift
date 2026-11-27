@@ -691,7 +691,10 @@ extension AgentModeViewModel {
                 session: session, ignoresPendingHandoff: true, shouldPublishCatalog: live
             )
             guard live() else { return nil as String? }
-            return await self.buildInitialThreadMessageIfNeeded(tabID: session.tabID, session: session, initialMessage: initial, assumeFreshProvider: preview.destination == .codexExec)
+            return await self.buildInitialThreadMessageIfNeeded(
+                tabID: session.tabID, session: session, initialMessage: initial,
+                assumeFreshProvider: preview.destination == .codexExec || preview.destination == .antigravity
+            )
         }
         guard live() else { return }
         guard let composed = stage ?? nil else {
@@ -707,7 +710,9 @@ extension AgentModeViewModel {
             catalogWindow: linkExecutionRuntime.providerSwitchCatalogWindow(agent: preview.destination, model: preview.model),
             instructions: preview.instructions, composedInput: "\n\n" + composed, isPreview: true,
             codexCarrierScalars: preview.destination == .codexExec
-                ? AgentProviderHandover.codexCarrierAllowance(composedInput: composed, parkedNote: session.selfCompactState.parkedNote?.frame) : nil
+                ? AgentProviderHandover.codexCarrierAllowance(composedInput: composed, parkedNote: session.selfCompactState.parkedNote?.frame) : nil,
+            antigravityCarrierBytes: preview.destination == .antigravity
+                ? AgentProviderHandover.antigravityCarrierAllowance(composedInput: composed, instructions: preview.instructions) : nil
         )
         let server = preview.destination == .grokBuild ? RepoPromptMCPServerConfiguration.grokBuildRuntimeServerName : MCPIntegrationHelper.repoPromptMCPServerName
         let reference = try? session.activeAgentSessionID.flatMap {
