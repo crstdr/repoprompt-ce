@@ -3,6 +3,7 @@ import MCP
 import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptMCPServer
 import RepoPromptShared
 import XCTest
 
@@ -484,5 +485,57 @@ final class AgentWorktreePlacementPolicyTests: XCTestCase {
             XCTAssertTrue(plan.path.path.hasPrefix(container + "/"))
             XCTAssertFalse(plan.createRequest.allowExternalPath)
         }
+    }
+}
+
+final class MCPCompactToolCatalogTests: XCTestCase {
+    func testFullCatalogPreservesSerializedDefinitions() throws {
+        let tools = [MCP.Tool(name: "read_file", description: "Read a file.", inputSchema: .object([:]))]
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let full = MCPCompactToolCatalog.project(tools, compact: false, enabled: true)
+        XCTAssertEqual(try encoder.encode(full), try encoder.encode(tools))
+    }
+
+    func testCompactProjectionKeepsOnlyEligibleNativeToolsAndExactWrappers() {
+        let offered = ["read_file", "set_status", "self_compact"].map {
+            MCP.Tool(name: $0, description: "Describe \($0).", inputSchema: .object([:]))
+        }
+        let compact = MCPCompactToolCatalog.project(offered, compact: true, enabled: true)
+        XCTAssertEqual(compact.map(\.name), ["describe_tool", "call_tool", "set_status", "self_compact"])
+        XCTAssertTrue(MCPCompactToolCatalog.hasExactWrapperPair(compact))
+        XCTAssertFalse(MCPCompactToolCatalog.hasExactWrapperPair(Array(compact.dropFirst())))
+        XCTAssertFalse(MCPCompactToolCatalog.hasExactWrapperPair(compact + [compact[0]]))
+        XCTAssertTrue(MCPCompactToolCatalog.project(offered, compact: true, enabled: false).isEmpty)
+        XCTAssertTrue(MCPCompactToolCatalog.directory(offered).contains("set_status [native]: Describe set_status."))
+        XCTAssertFalse(MCPCompactToolCatalog.directory(offered).contains("self_noop"))
+    }
+
+    func testSerializedEagerDefinitionsStaySmall() throws {
+        let native = try ["self_compact", "self_noop", "set_status"].map { name in
+            let tool = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: name))
+            return MCP.Tool(name: tool.name, description: tool.description, inputSchema: tool.inputSchema, annotations: tool.annotations.mcpAnnotations)
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        let projection = MCPCompactToolCatalog.project(native, compact: true, enabled: true)
+        let data = try encoder.encode(projection)
+        XCTAssertEqual(projection.count, 5)
+        // Check the actual production encoder output. The sanitized fixture is also
+        // captured in the test log for the o200k_base comparison in the release gate.
+        XCTAssertLessThan(data.count, 2271)
+        print("Compact eager fixture: \(String(decoding: data, as: UTF8.self))")
+    }
+
+    func testForwardSyntaxRejectsMalformedObjectsAndUnexpectedRouting() {
+        func resolve(_ arguments: [String: Value]) -> String? {
+            MCPCompactToolEnvelope.forwardedTarget(arguments, string: { $0.stringValue }, object: { $0.objectValue })?.name
+        }
+        XCTAssertEqual(resolve(["name": .string("read_file"), "arguments": .object([:])]), "read_file")
+        XCTAssertNil(resolve(["name": .string("read_file"), "arguments": .string("{}")]))
+        XCTAssertNil(resolve(["name": .string("read_file"), "arguments": .object([:]), "_windowID": .int(1)]))
+        XCTAssertNil(resolve(["name": .string(""), "arguments": .object([:])]))
+        XCTAssertTrue(MCPCompactToolEnvelope.isWrapper("call_tool"))
+        XCTAssertTrue(MCPCompactToolEnvelope.isWrapper("describe_tool"))
     }
 }

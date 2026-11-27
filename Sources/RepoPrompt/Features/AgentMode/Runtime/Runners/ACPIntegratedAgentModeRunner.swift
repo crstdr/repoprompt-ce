@@ -3,6 +3,7 @@ import MCP
 import RepoPromptACPProviders
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
+import RepoPromptMCPServer
 import RepoPromptSettingsCore
 
 @MainActor
@@ -79,6 +80,7 @@ final class ACPIntegratedAgentModeRunner {
     private enum ToolObservationSource: Equatable { case tracker, provider }
     private var acpTrackerInvocationIDsByTabID: [UUID: Set<UUID>] = [:]
     private var acpProviderInvocationIDsByTabID: [UUID: Set<UUID>] = [:]
+    private var compactWrapperInvocationIDsByTabID: [UUID: Set<UUID>] = [:]
     private var acpProviderInvocationByTrackerInvocationIDByTabID: [UUID: [UUID: UUID]] = [:]
     private var acpProviderPlaceholderInvocationIDsByTabID: [UUID: Set<UUID>] = [:]
 
@@ -2407,7 +2409,8 @@ final class ACPIntegratedAgentModeRunner {
         args: [String: Value]?,
         session: AgentTabSession
     ) {
-        guard AgentToolTrackingSupport.isRepoPromptTool(toolName) else { return }
+        guard AgentToolTrackingSupport.isRepoPromptTool(toolName)
+            || (session.selectedAgent == .antigravity && toolName == MCPCompactToolEnvelope.call) else { return }
         guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else { return }
         #if DEBUG
             if MCPIntegrationHelper.normalizedRepoPromptToolName(toolName) == "agent_run" {
@@ -2469,7 +2472,8 @@ final class ACPIntegratedAgentModeRunner {
         isError: Bool,
         session: AgentTabSession
     ) {
-        guard AgentToolTrackingSupport.isRepoPromptTool(toolName) else { return }
+        guard AgentToolTrackingSupport.isRepoPromptTool(toolName)
+            || (session.selectedAgent == .antigravity && toolName == MCPCompactToolEnvelope.call) else { return }
         guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else { return }
         #if DEBUG
             if MCPIntegrationHelper.normalizedRepoPromptToolName(toolName) == "agent_run" {
@@ -2752,6 +2756,7 @@ final class ACPIntegratedAgentModeRunner {
         acpProviderPlaceholderInvocationIDsByTabID[tabID] = nil
         acpTrackerInvocationIDsByTabID[tabID] = nil
         acpProviderInvocationIDsByTabID[tabID] = nil
+        compactWrapperInvocationIDsByTabID[tabID] = nil
     }
 
     private func toolInvocationSignature(toolName: String?, argsJSON: String?) -> String {
@@ -2936,6 +2941,15 @@ final class ACPIntegratedAgentModeRunner {
         return false
     }
 
+    private func isCompactWrapperEcho(name: String, invocationID: UUID?, session: AgentTabSession) -> Bool {
+        guard session.selectedAgent == .antigravity else { return false }
+        if name == ACPDefaultSessionUpdateNormalizer.antigravityCompactDispatchEchoName {
+            if let invocationID { compactWrapperInvocationIDsByTabID[session.tabID, default: []].insert(invocationID) }
+            return true
+        }
+        return invocationID.map { compactWrapperInvocationIDsByTabID[session.tabID]?.contains($0) == true } ?? false
+    }
+
     @discardableResult
     func handleToolStreamEvent(
         _ event: AgentToolStreamEvent,
@@ -2946,6 +2960,7 @@ final class ACPIntegratedAgentModeRunner {
         // RepoPrompt tool cards here so AgentModeViewModel can remain provider-neutral.
         switch event {
         case let .toolCall(call):
+            if isCompactWrapperEcho(name: call.toolName, invocationID: call.invocationID, session: session) { return true }
             guard AgentToolTrackingSupport.isRepoPromptTool(call.toolName) else { return false }
             guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(call.toolName) else { return true }
             #if DEBUG
@@ -3004,6 +3019,7 @@ final class ACPIntegratedAgentModeRunner {
             return true
 
         case let .toolResult(result):
+            if isCompactWrapperEcho(name: result.toolName, invocationID: result.invocationID, session: session) { return true }
             // ACP terminal updates can omit title/name. Only an exact invocation
             // already owned by RepoPrompt can supply that missing identity.
             let knownToolName = result.invocationID.flatMap { id in
