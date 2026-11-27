@@ -1798,6 +1798,44 @@ import XCTest
             }
         }
 
+        @MainActor
+        private final class CompactRefusalTrace {
+            var started: [UUID] = []
+            var completed: [UUID] = []
+            var refusal: String?
+        }
+
+        func testAntigravityCompactRefusalSurvivesRebindBeforeRecording() async throws {
+            try await withReadyCompactSocket { manager, admitted, _ in
+                let connectionID = admitted.endpoint.connectionID
+                let successor = UUID()
+                let trace = CompactRefusalTrace()
+                let observer = await manager.registerToolEventObserver(for: admitted.runID, observer: .init(onCalled: { id, name, _ in
+                    guard name == "call_tool" else { return }
+                    await MainActor.run { trace.started.append(id) }
+                }, onCompleted: { id, name, _, output, isError in
+                    guard name == "call_tool", isError else { return }
+                    await MainActor.run {
+                        trace.completed.append(id)
+                        trace.refusal = output
+                    }
+                }))
+                await manager.debugSetBeforeCompactRefusalRecordingForTesting {
+                    await manager.debugSeedConnectionRunRouting(connectionID: connectionID, runID: successor, purpose: .agentModeRun)
+                }
+                let reply = try await admitted.endpoint.callTool(name: "call_tool", arguments: ["name": MCPWindowToolName.agentManage, "arguments": [:]])
+                await manager.debugSeedConnectionRunRouting(connectionID: connectionID, runID: admitted.runID, purpose: .agentModeRun)
+                await manager.unregisterToolEventObserver(for: admitted.runID, token: observer)
+                let result = try XCTUnwrap(Self.responseObject(from: reply)["result"] as? [String: Any])
+                XCTAssertEqual(result["isError"] as? Bool, true)
+                XCTAssertEqual(trace.started.count, 1)
+                XCTAssertEqual(trace.completed, trace.started)
+                let recorded = try XCTUnwrap(trace.refusal)
+                let decoded = try JSONSerialization.jsonObject(with: Data(recorded.utf8)) as? NSArray
+                XCTAssertEqual(decoded, result["content"] as? NSArray)
+            }
+        }
+
         func testExpiredClientEnvelopeRejectsBeforeProviderAndJournalForBothPublicTools() async throws {
             for toolName in ["prompt", "workspace_context"] {
                 try await MCPSharedServerTestLease.shared.withLease { lease in

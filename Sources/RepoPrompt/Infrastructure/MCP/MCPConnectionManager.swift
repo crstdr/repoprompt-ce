@@ -1369,6 +1369,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         private var debugOutboundSessionLinkEndpointsForTesting: Set<DomainAgentSessionLinkEndpointIdentity>?
         private var debugCompactConsentExpiryForTesting: Date?
         private var debugBeforeCompactReadinessPublicationForTesting: (@Sendable () async -> Void)?
+        private var debugBeforeCompactRefusalRecordingForTesting: (@Sendable () async -> Void)?
     #endif
 
     /// Invalidates queued internal-management admission only for this connection.
@@ -3336,6 +3337,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
 
     private final class CompactDispatchObservation: @unchecked Sendable {
         let runID: UUID
+        let refusalInvocationID = UUID()
         private let lock = NSLock()
         private var targetStarted = false
 
@@ -3352,14 +3354,26 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         }
     }
 
+    private func beginCompactDispatchObservation(connectionID: UUID) -> CompactDispatchObservation? {
+        guard !connectionsBeingRemoved.contains(connectionID), wantsCompactToolCatalog(connectionID),
+              let runID = runIDByConnectionID[connectionID] else { return nil }
+        return CompactDispatchObservation(runID: runID)
+    }
+
     private func recordCompactDispatchRefusal(
-        connectionID: UUID, runID: UUID, args: [String: Value]?, result: CallTool.Result
+        observation: CompactDispatchObservation, args: [String: Value]?, result: CallTool.Result
     ) async {
-        guard runIDByConnectionID[connectionID] == runID, wantsCompactToolCatalog(connectionID),
-              !connectionsBeingRemoved.contains(connectionID),
-              let data = try? JSONEncoder().encode(result.content) else { return }
+        #if DEBUG
+            if let beforeRecording = debugBeforeCompactRefusalRecordingForTesting {
+                debugBeforeCompactRefusalRecordingForTesting = nil
+                await beforeRecording()
+            }
+        #endif
+        // Both events belong to the admitted request, not the connection's current binding.
+        guard let data = try? JSONEncoder().encode(result.content) else { return }
+        let runID = observation.runID
         let name = MCPCompactToolEnvelope.call
-        let id = UUID()
+        let id = observation.refusalInvocationID
         let arguments = args?.filter { $0.key != MCPExportResponseDeliveryDeadlineRegistry.requestIdentityArgumentKey }
         await fireToolCalledObservers(runID: runID, invocationID: id, toolName: name, args: arguments)
         // Complete the row on its call-time run, even if delivery overlapped a rebind.
@@ -12237,6 +12251,10 @@ actor ServerNetworkManager: MCPServerConnectionHost {
             debugCompactConsentExpiryForTesting = compactConsentExpiry
         }
 
+        func debugSetBeforeCompactRefusalRecordingForTesting(_ hook: (@Sendable () async -> Void)?) {
+            debugBeforeCompactRefusalRecordingForTesting = hook
+        }
+
         func debugSetBeforeCompactReadinessPublicationForTesting(_ hook: (@Sendable () async -> Void)?) {
             debugBeforeCompactReadinessPublicationForTesting = hook
         }
@@ -15768,18 +15786,12 @@ actor ServerNetworkManager: MCPServerConnectionHost {
             return await finalizeToolResult(result)
         }
         await server.withMethodHandler(CallTool.self) { [weak self] params in
-            let observation: CompactDispatchObservation? = if let self, params.name == MCPCompactToolEnvelope.call,
-                                                              await wantsCompactToolCatalog(connectionID),
-                                                              let runID = await runIDByConnectionID[connectionID]
-            {
-                CompactDispatchObservation(runID: runID)
-            } else {
-                nil
-            }
+            let observation = params.name == MCPCompactToolEnvelope.call
+                ? await self?.beginCompactDispatchObservation(connectionID: connectionID) : nil
             let result = await dispatchToolCall(params, observation)
             if let observation, !observation.hasStartedTarget, result.isError == true {
                 await self?.recordCompactDispatchRefusal(
-                    connectionID: connectionID, runID: observation.runID, args: params.arguments, result: result
+                    observation: observation, args: params.arguments, result: result
                 )
             }
             return result
