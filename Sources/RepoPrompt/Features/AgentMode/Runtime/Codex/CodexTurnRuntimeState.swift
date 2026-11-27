@@ -10,7 +10,24 @@ import RepoPromptCodexProvider
 /// task is launched here and no provider, view model, or presentation is retained.
 @MainActor
 final class CodexTurnRuntimeState {
+    struct CarrierStart: Equatable {
+        let submissionID: UUID
+        let context: AgentSessionLinkDispatchContext
+        let controllerID: ObjectIdentifier
+        let runID: UUID
+        let runAttemptID: UUID?
+        let binding: AgentSessionRestorationBindingToken?
+        var acceptedTurnID: String?
+        var deferredAuthFailures: [String?: DeferredAuthFailure] = [:]
+    }
+
+    struct DeferredAuthFailure: Equatable {
+        let message: String
+        let issue: CodexNativeSessionController.ServerRequestIssue?
+    }
+
     struct PendingAuthRetryTurn: Equatable {
+        let submissionID = UUID()
         /// Undecorated provider text, exactly as every other Codex buffer stores it.
         var text: String
         var attachments: [AgentFileAttachment]
@@ -202,7 +219,17 @@ final class CodexTurnRuntimeState {
     }
 
     var pendingTurnKind: TurnKind?
-    var pendingAuthRetryTurn: PendingAuthRetryTurn?
+    var authSubmissionID: UUID?
+    var carrierStart: CarrierStart?
+    var pendingAuthRetryTurn: PendingAuthRetryTurn? {
+        didSet {
+            if let id = pendingAuthRetryTurn?.submissionID, id != authSubmissionID {
+                authSubmissionID = id
+                carrierStart = nil
+            }
+        }
+    }
+
     var authoritativeActiveTurn: AuthoritativeTurnIdentity?
     var anonymousActiveTurn: AnonymousTurnLiveness?
     var routingObservedTurnID: String?

@@ -5180,7 +5180,30 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                     ) else {
                         return .skipped
                     }
-                    if let failure = pendingFailure {
+                    let carrier = session.codexTurnState.carrierStart
+                    let awaitingCarrierReceipt = carrier?.runID == expectedRunID
+                        && carrier?.runAttemptID == expectedRunAttemptID
+                        && carrier?.controllerID == ObjectIdentifier(probeController)
+                        && carrier?.binding == session.currentRestorationBindingToken
+                        && carrier?.acceptedTurnID == nil
+                    if awaitingCarrierReceipt,
+                       let deferred = carrier?.deferredAuthFailures[activeTurnID] ?? carrier?.deferredAuthFailures[nil]
+                    {
+                        // An idle probe can precede the start receipt. Use the existing
+                        // recovery deadline and repeat probe before settling an unknown result.
+                        if ambiguousCodexProbeShouldDefer(
+                            fingerprint: fingerprint, kind: "no-active-turn",
+                            session: session, referenceDate: referenceDate
+                        ) {
+                            return .skipped
+                        }
+                        await finalizeCodexRun(
+                            session, turnStatus: .failed, reason: "stall-watchdog-explicit-error", errorMessage: deferred.message,
+                            notifyOnCompleted: false, deleteDeferredFilesWhenFailureHasNoInFlight: true
+                        )
+                        return .skipped
+                    }
+                    if let failure = pendingFailure, !awaitingCarrierReceipt {
                         let recovered = await attemptManagedCodexAuthRecovery(
                             for: session,
                             issue: nil,
@@ -5524,25 +5547,129 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         updateCodexStallWatchdogState(for: session)
     }
 
+    private enum CodexAuthReplayStop: Error {
+        case carrierAwaitingReceipt
+        case acceptedCarrier
+        case supersededSubmission
+    }
+
+    private struct CodexRejectedCarrierStart: LocalizedError {
+        let error: any Error
+        let deferred: CodexTurnRuntimeState.DeferredAuthFailure
+        var errorDescription: String? {
+            error.localizedDescription
+        }
+    }
+
+    /// Tag the physical carrier before calling the controller; the saved handoff can be
+    /// cleared by acceptance, and unrelated later input must keep its own auth recovery.
+    private func startCodexAuthTrackedTurn(
+        session: AgentTabSession, controller: any CodexSessionControlling,
+        dispatchID: AgentSessionLinkPromptDispatchID, submissionID: UUID?,
+        start: () async throws -> CodexTurnStartReceipt
+    ) async throws -> CodexTurnStartReceipt {
+        guard let runtime = linkExecutionRuntime,
+              let submissionID, session.codexTurnState.authSubmissionID == submissionID,
+              session.pendingHandoff.providerSwitchDelivery == .sending,
+              session.pendingHandoff.isStagedForSend,
+              let proof = session.pendingHandoff.providerSwitchDispatch,
+              let ownership = proof.runOwnership, let runID = proof.runID,
+              proof.binding == session.currentRestorationBindingToken,
+              session.isCurrentRunAttempt(ownership, expectedRunID: runID),
+              proof.dispatchID == runtime.agentSessionLinkEffectiveDispatchID(for: session, dispatchID: dispatchID),
+              let effectiveID = proof.dispatchID
+        else { return try await start() }
+        let context = AgentSessionLinkDispatchContext(session: session, dispatchID: effectiveID)
+        let attemptID = session.activeRunAttemptID
+        session.codexTurnState.carrierStart = .init(
+            submissionID: submissionID, context: context, controllerID: ObjectIdentifier(controller), runID: runID,
+            runAttemptID: attemptID, binding: proof.binding
+        )
+        do {
+            let receipt = try await start()
+            if let current = session.codexTurnState.carrierStart, current.submissionID == submissionID,
+               current.context == context,
+               Self.capturedSendIsCurrent(session: session, sendRunID: runID, sendRunAttemptID: attemptID, controller: controller),
+               session.currentRestorationBindingToken == proof.binding
+            {
+                session.codexTurnState.carrierStart?.acceptedTurnID = receipt.provisionalSubmissionID
+            }
+            // Record carrier acceptance ahead of terminal settlement without advancing the
+            // separate oversight/claim acknowledgment that the outer send still owns.
+            runtime.providerSwitchRecordPhysicalAcceptance(session: session, context: context)
+            return receipt
+        } catch {
+            if let current = session.codexTurnState.carrierStart, current.submissionID == submissionID,
+               current.context == context,
+               Self.capturedSendIsCurrent(session: session, sendRunID: runID, sendRunAttemptID: attemptID, controller: controller),
+               session.currentRestorationBindingToken == proof.binding
+            {
+                let deferred = current.deferredAuthFailures[nil]
+                session.codexTurnState.carrierStart = nil
+                if let deferred, case .requestFailed? = error as? CodexAppServerClient.ClientError {
+                    throw CodexRejectedCarrierStart(error: error, deferred: deferred)
+                }
+            }
+            throw error
+        }
+    }
+
+    private func finishDeferredCodexCarrierAuthFailure(
+        session: AgentTabSession, controller: any CodexSessionControlling, submissionID: UUID?
+    ) async {
+        guard let submissionID, let start = session.codexTurnState.carrierStart,
+              start.submissionID == submissionID, let acceptedTurnID = start.acceptedTurnID,
+              let failure = start.deferredAuthFailures[acceptedTurnID] ?? start.deferredAuthFailures[nil],
+              Self.capturedSendIsCurrent(session: session, sendRunID: start.runID, sendRunAttemptID: start.runAttemptID, controller: controller),
+              session.currentRestorationBindingToken == start.binding, session.runState.isActive
+        else { return }
+        session.codexTurnState.carrierStart?.deferredAuthFailures.removeAll()
+        await finalizeCodexRun(
+            session, turnStatus: .failed, reason: "error", errorMessage: failure.message,
+            notifyOnCompleted: false, deleteDeferredFilesWhenFailureHasNoInFlight: true
+        )
+    }
+
     @discardableResult
     private func attemptManagedCodexAuthRecovery(
         for session: AgentTabSession,
         issue: CodexNativeSessionController.ServerRequestIssue?,
         message: String,
         sourceController: (any CodexSessionControlling)?,
-        cancelEventTask: Bool = true
+        cancelEventTask: Bool = true,
+        failedTurnID: String? = nil,
+        onReplayAccepted: () -> Void = {}
     ) async -> Bool {
         guard session.selectedAgent == .codexExec, session.runState.isActive else { return false }
+        let recoverable = if let issue {
+            CodexManagedAuthRecoveryClassifier.isRecoverable(issue: issue)
+        } else {
+            CodexManagedAuthRecoveryClassifier.isRecoverable(message: message)
+        }
+        func rememberCarrierAuthFailure() {
+            guard session.codexTurnState.carrierStart?.deferredAuthFailures[failedTurnID] == nil else { return }
+            session.codexTurnState.carrierStart?.deferredAuthFailures[failedTurnID] = .init(message: message, issue: issue)
+        }
+        if recoverable, let start = session.codexTurnState.carrierStart,
+           let sourceController,
+           start.controllerID == ObjectIdentifier(sourceController),
+           Self.capturedSendIsCurrent(session: session, sendRunID: start.runID, sendRunAttemptID: start.runAttemptID, controller: sourceController),
+           session.currentRestorationBindingToken == start.binding
+        {
+            if let acceptedTurnID = start.acceptedTurnID {
+                // A keyed callback from a different provider turn is not ours to settle.
+                return failedTurnID != nil && failedTurnID != acceptedTurnID
+            }
+            rememberCarrierAuthFailure()
+            return true
+        }
         // The in-flight startup owns its provider response and any auth failure until readiness settles.
         if hasCodexStartupClaim(for: session) { return true }
         guard session.pendingApproval == nil, session.runState != .waitingForApproval else { return false }
-        if let issue {
-            guard CodexManagedAuthRecoveryClassifier.isRecoverable(issue: issue) else { return false }
-        } else {
-            guard CodexManagedAuthRecoveryClassifier.isRecoverable(message: message) else { return false }
-        }
+        guard recoverable else { return false }
         guard let runID = session.runID,
               var pendingTurn = session.codexPendingAuthRetryTurn,
+              session.codexTurnState.carrierStart == nil,
               !pendingTurn.retryAttempted,
               codexAuthRecoveryAttemptedRunIDs.insert(runID).inserted
         else {
@@ -5552,12 +5679,47 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         let computerUseActivationID = session.pendingCodexComputerUseActivation?.id
         let computerUseRecoveryAttemptID = session.activeRunAttemptID
         let computerUseRecoveryStopFence = AgentRunStartStopFence(session: session)
+        let submissionID = pendingTurn.submissionID
+        let binding = session.currentRestorationBindingToken
+        func isCurrentSubmission() -> Bool {
+            session.runState.isActive
+                && session.runID == runID && session.activeRunAttemptID == computerUseRecoveryAttemptID
+                && session.currentRestorationBindingToken == binding
+                && session.codexTurnState.authSubmissionID == submissionID
+                && computerUseRecoveryStopFence.permitsStart(of: session)
+        }
+        func requireReplayableSubmission() throws {
+            guard isCurrentSubmission() else { throw CodexAuthReplayStop.supersededSubmission }
+            if let start = session.codexTurnState.carrierStart {
+                guard start.acceptedTurnID != nil else { throw CodexAuthReplayStop.carrierAwaitingReceipt }
+                throw CodexAuthReplayStop.acceptedCarrier
+            }
+            guard session.codexPendingAuthRetryTurn?.submissionID == submissionID else { throw CodexAuthReplayStop.supersededSubmission }
+        }
+        func finishAcceptedCarrierFailure() async {
+            guard isCurrentSubmission() else { return }
+            await finalizeCodexRun(
+                session, turnStatus: .failed, reason: "error", errorMessage: message,
+                notifyOnCompleted: false, deleteDeferredFilesWhenFailureHasNoInFlight: true
+            )
+        }
         pendingTurn.retryAttempted = true
         session.codexPendingAuthRetryTurn = pendingTurn
         setRunningStatus("Refreshing Codex authentication…", source: .reconnect, session: session, urgent: true)
         presentationRuntime.requestUIRefresh(for: session, urgent: true)
 
-        switch await authRecovery.refreshManagedAccount() {
+        let refresh = await authRecovery.refreshManagedAccount()
+        guard isCurrentSubmission() else { return true }
+        if let start = session.codexTurnState.carrierStart {
+            if start.acceptedTurnID == nil {
+                rememberCarrierAuthFailure()
+            } else {
+                await finishAcceptedCarrierFailure()
+            }
+            return true
+        }
+        guard session.codexPendingAuthRetryTurn?.submissionID == submissionID else { return true }
+        switch refresh {
         case let .requiresUserLogin(guidance):
             _ = markCodexReconnectNeeded(for: session, source: "managed-auth-recovery-required")
             await finalizeCodexRun(
@@ -5588,21 +5750,29 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                   session.runID == runID,
                   session.activeRunAttemptID == computerUseRecoveryAttemptID else { return true }
         }
-        _ = invalidateCodexControllerForReconnect(
+        guard invalidateCodexControllerForReconnect(
             session: session,
             expectedController: sourceController,
             source: "managed-auth-recovery",
             cancelEventTask: cancelEventTask,
             preserveRunID: true
-        )
+        ) else { return true }
         await ensureCodexNativeSession(
             session: session,
             policyAlreadyInstalled: false,
             allowMissingRolloutFallback: false,
             preserveExistingRunID: true
         )
-        guard session.runState.isActive,
-              let controller = session.codexController,
+        guard isCurrentSubmission() else { return true }
+        if let start = session.codexTurnState.carrierStart {
+            if start.acceptedTurnID == nil {
+                rememberCarrierAuthFailure()
+            } else {
+                await finishAcceptedCarrierFailure()
+            }
+            return true
+        }
+        guard let controller = session.codexController,
               controller.hasActiveThread,
               let replayTurn = session.codexPendingAuthRetryTurn
         else {
@@ -5626,6 +5796,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 return false
             }
             let routeReadiness = await linkExecutionRuntime?.qualifyProviderInputRoute(for: session) ?? .unavailable
+            try requireReplayableSubmission()
             guard routeReadiness.allowsDispatch else {
                 linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchNotAttempted(
                     for: session,
@@ -5665,6 +5836,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             } else {
                 routeReadiness
             }
+            try requireReplayableSubmission()
             let inputRouteIsCurrent = linkExecutionRuntime?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: finalReadiness) == true
             guard session.runState.isActive,
                   session.runID == runID,
@@ -5767,6 +5939,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             if let replayClaim, !replayClaim.managedMetadataRequirements.isEmpty {
                 guard let linkExecutionRuntime else { return false }
                 replayProof = await linkExecutionRuntime.agentSessionLinkProveProviderInput(for: session, claim: replayClaim)
+                try requireReplayableSubmission()
                 guard !Task.isCancelled, session.runState.isActive,
                       computerUseRecoveryStopFence.permitsStart(of: session), session.runID == runID,
                       session.activeRunAttemptID == computerUseRecoveryAttemptID,
@@ -5802,6 +5975,10 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                     persistenceRuntime?.scheduleSave(for: session)
                 }
                 guard await validateCodexComputerUseScope(session: session, controller: controller, activationID: computerUseActivationID) else { throw CancellationError() }
+                try requireReplayableSubmission()
+                guard session.codexController.map({ Self.sameCodexControllerInstance($0, controller) }) == true else {
+                    throw CodexAuthReplayStop.supersededSubmission
+                }
                 if computerUseActivationID != nil {
                     guard !Task.isCancelled,
                           session.runState.isActive, computerUseRecoveryStopFence.permitsStart(of: session),
@@ -5821,13 +5998,17 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 }
                 let oracle = session.oracleBackgroundAwareness.reserve(session: session, providerID: ObjectIdentifier(controller))
                 defer { session.oracleBackgroundAwareness.release(oracle) }
-                let receipt = try await controller.startUserTurn(
-                    text: oracle?.decorating(finalReplayText) ?? finalReplayText,
-                    attachments: replayTurn.attachments,
-                    model: replayTurn.model,
-                    reasoningEffort: replayTurn.reasoningEffort,
-                    serviceTier: replayTurn.serviceTier
-                )
+                let receipt = try await startCodexAuthTrackedTurn(
+                    session: session, controller: controller, dispatchID: replayDispatchID, submissionID: submissionID
+                ) {
+                    try await controller.startUserTurn(
+                        text: oracle?.decorating(finalReplayText) ?? finalReplayText,
+                        attachments: replayTurn.attachments,
+                        model: replayTurn.model,
+                        reasoningEffort: replayTurn.reasoningEffort,
+                        serviceTier: replayTurn.serviceTier
+                    )
+                }
                 session.oracleBackgroundAwareness.accept(oracle)
                 if let auditTurnID = replayTurn.auditTurnID {
                     session.updateAutomationAudit(turnID: auditTurnID) {
@@ -5841,7 +6022,9 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 return receipt
             }
             dispatched = true
+            onReplayAccepted()
             linkExecutionRuntime?.acceptAgentSessionLinkDispatch(session: session, context: monitoring?.dispatchContext ?? replayDispatchContext, claim: nil)
+            guard isCurrentSubmission() else { return true }
             await applySuccessfulCodexNativeSend(
                 for: session,
                 runID: runID,
@@ -5849,8 +6032,18 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 attachmentReservationID: replayTurn.attachmentReservationID
             )
             presentationRuntime.requestUIRefresh(for: session, urgent: true)
+            await finishDeferredCodexCarrierAuthFailure(session: session, controller: controller, submissionID: submissionID)
+            return true
+        } catch CodexAuthReplayStop.supersededSubmission {
+            return true
+        } catch CodexAuthReplayStop.carrierAwaitingReceipt {
+            rememberCarrierAuthFailure()
+            return true
+        } catch CodexAuthReplayStop.acceptedCarrier {
+            await finishAcceptedCarrierFailure()
             return true
         } catch {
+            guard isCurrentSubmission() else { return true }
             if acquiredAgentSessionLinkPhysicalDispatch {
                 linkExecutionRuntime?.agentSessionLinkRecordPhysicalDispatchFailure(
                     for: session,
@@ -7711,6 +7904,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             autoEffortApplied: initialSelection.isAuto
         ) }
 
+        let authSubmissionID = isSelfNote ? nil : session.codexPendingAuthRetryTurn?.submissionID
         await ensureCodexNativeSession(
             session: session,
             policyAlreadyInstalled: policyAlreadyInstalled,
@@ -8061,7 +8255,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 return .cancelled
             }
             if let monitoringDispatchID = candidate?.dispatchContext?.dispatchID,
-               var pendingAuthTurn = session.codexPendingAuthRetryTurn
+               var pendingAuthTurn = session.codexPendingAuthRetryTurn, pendingAuthTurn.submissionID == authSubmissionID
             {
                 pendingAuthTurn.monitoringDispatchID = monitoringDispatchID
                 pendingAuthTurn.monitoringDispatchContext = candidate?.dispatchContext
@@ -8151,7 +8345,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                         let physicalSelection = autoEffortSelection == nil
                             ? (model: selection.model, reasoningEffort: selection.reasoningEffort, serviceTier: selection.serviceTier, isAuto: false)
                             : turnSelection()
-                        if var pendingTurn = session.codexPendingAuthRetryTurn {
+                        if var pendingTurn = session.codexPendingAuthRetryTurn, pendingTurn.submissionID == authSubmissionID {
                             pendingTurn.model = physicalSelection.model
                             pendingTurn.reasoningEffort = physicalSelection.reasoningEffort
                             pendingTurn.serviceTier = physicalSelection.serviceTier
@@ -8212,13 +8406,17 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                             let dispatchText = parkedNote.map { $0.frame + "\n\n" + baseText } ?? baseText
                             oracleAwareness = isSelfNote ? nil : session.oracleBackgroundAwareness.reserve(session: session, providerID: ObjectIdentifier(controller))
                             attemptedPhysicalSend = true
-                            receipt = try await controller.startUserTurn(
-                                text: oracleAwareness?.decorating(dispatchText) ?? dispatchText,
-                                attachments: attachments,
-                                model: physicalSelection.model,
-                                reasoningEffort: physicalSelection.reasoningEffort,
-                                serviceTier: physicalSelection.serviceTier
-                            )
+                            receipt = try await startCodexAuthTrackedTurn(
+                                session: session, controller: controller, dispatchID: promptDispatchID, submissionID: authSubmissionID
+                            ) {
+                                try await controller.startUserTurn(
+                                    text: oracleAwareness?.decorating(dispatchText) ?? dispatchText,
+                                    attachments: attachments,
+                                    model: physicalSelection.model,
+                                    reasoningEffort: physicalSelection.reasoningEffort,
+                                    serviceTier: physicalSelection.serviceTier
+                                )
+                            }
                             session.oracleBackgroundAwareness.accept(oracleAwareness)
                         } catch {
                             if let noteDispatchID {
@@ -8425,11 +8623,11 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             // before the staleness guard below, because a dispatch the provider accepted after the
             // local run changed still delivered the supplement exactly once.
             linkExecutionRuntime?.acceptAgentSessionLinkDispatch(session: session, context: monitoring?.dispatchContext, claim: releasedMonitoringClaim)
-            // Managed-auth recovery can still replay this exact turn after acceptance. Hand it the
-            // acknowledged claim so the replay can re-attach the identical fragment instead of
+            // Ordinary managed-auth replay still needs the acknowledged claim so it can
+            // re-attach the identical fragment instead of
             // shipping the bare stored text and silently dropping the revision forever.
             if let acceptedClaim = releasedMonitoringClaim,
-               var pendingAuthTurn = session.codexPendingAuthRetryTurn
+               var pendingAuthTurn = session.codexPendingAuthRetryTurn, pendingAuthTurn.submissionID == authSubmissionID
             {
                 pendingAuthTurn.monitoringDispatchID = pendingAuthTurn.monitoringDispatchID
                     ?? acceptedClaim.dispatchID
@@ -8470,6 +8668,7 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                 attachmentReservationID: attachmentReservationID
             )
             await acknowledgeAcceptedDispatch()
+            await finishDeferredCodexCarrierAuthFailure(session: session, controller: controller, submissionID: authSubmissionID)
             return .sent
         } catch let steerError as CodexTurnSteerError {
             guard writerReceipt.disposition(for: session) != .claimLost else {
@@ -8589,13 +8788,16 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             }
             session.codexPendingTurnKind = nil
             logCodex("[AgentModeVM] sendCodexNativeMessage: error - \(error)")
+            let deferredAuth = (error as? CodexRejectedCarrierStart)?.deferred
+            var replayAccepted = false
             if await attemptManagedCodexAuthRecovery(
                 for: session,
-                issue: nil,
-                message: error.localizedDescription,
-                sourceController: controller
+                issue: deferredAuth?.issue,
+                message: deferredAuth?.message ?? error.localizedDescription,
+                sourceController: controller,
+                onReplayAccepted: { replayAccepted = true }
             ) {
-                return session.runState.isActive
+                return replayAccepted
                     ? .sent
                     : .failed(message: "Codex native send failed after managed authentication recovery.")
             }
@@ -9454,6 +9656,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
         )
         clearCodexAuthRecoveryAttempt(for: session.runID)
         clearCodexPendingAuthRetryTurn(session)
+        session.codexTurnState.authSubmissionID = nil
+        session.codexTurnState.carrierStart = nil
         cancelCodexTransportClosedFallback(for: session.tabID)
         resetTrackedCodexTurns(session)
         // Terminalizing without a correlated completion — a server request issue, a watchdog
@@ -10125,7 +10329,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
                    issue: nil,
                    message: failureMessage,
                    sourceController: sourceController,
-                   cancelEventTask: !dispatchedOnEventTask
+                   cancelEventTask: !dispatchedOnEventTask,
+                   failedTurnID: turnID
                )
             {
                 return
@@ -10276,7 +10481,8 @@ final class CodexAgentModeCoordinator: AgentRunInteractionStateObserving {
             issue: nil,
             message: message,
             sourceController: sourceController,
-            cancelEventTask: cancelEventTask
+            cancelEventTask: cancelEventTask,
+            failedTurnID: notificationTurnID
         ) {
             return
         }
