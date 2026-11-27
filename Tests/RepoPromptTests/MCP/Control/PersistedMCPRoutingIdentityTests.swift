@@ -135,11 +135,20 @@ import RepoPromptSettingsCore
 
         @MainActor
         func testOwnedAntigravityReconnectCommitsReplacementRouteAfterOneShotConsumption() async throws {
+            try await assertOwnedReconnect(clientName: "antigravity-client")
+        }
+
+        @MainActor
+        func testOwnedClaudeReconnectCommitsReplacementRouteAfterOneShotConsumption() async throws {
+            try await assertOwnedReconnect(clientName: AgentProviderKind.claudeMCPClientID)
+        }
+
+        @MainActor
+        private func assertOwnedReconnect(clientName: String) async throws {
             let runtime = AppDomainRuntimeComposition.shared.runtime
             let manager = ServerNetworkManager(domainHost: runtime.domainHost)
             let route = MCPHostRouteResources(identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: nil, runtime: runtime)
             addTeardownBlock { await route.close() }
-            let clientName = "antigravity-client"
             let runID = UUID()
             let tabID = UUID()
             let windowID = route.identity.routeID

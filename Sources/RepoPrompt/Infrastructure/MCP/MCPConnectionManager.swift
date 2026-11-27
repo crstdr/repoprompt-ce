@@ -1268,6 +1268,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
     private var physicalWarmTransports: [UUID: PhysicalWarmTransport] = [:]
     private var lastPhysicalWarmGeneration: UInt64 = 0
     private var physicalWarmCleanupCounts: [UUID: Int] = [:]
+    private var physicalWarmCleanupWaiters: [UUID: [CheckedContinuation<Void, Never>]] = [:]
 
     /// One initialize handoff only; never a standing connection/name grant.
     private var automaticAgentAdmissions: [UUID: AutomaticAgentAdmission] = [:]
@@ -1376,6 +1377,8 @@ actor ServerNetworkManager: MCPServerConnectionHost {
     #if DEBUG
         private var debugBeforeToolEventObserverDeliveryForTesting: (@Sendable () async -> Void)?
         private var debugAfterLegacyCleanupWaiterCapture: (@Sendable (UUID) async -> Void)?
+        private var debugBeforeWarmEndpointLookup: (@Sendable () async -> Void)?
+        private var debugBeforeWarmMappingCleanup: (@Sendable () async -> Void)?
         private var debugAnyActiveSessionLinkEndpointsForTesting: Set<DomainAgentSessionLinkEndpointIdentity>?
         private var debugOutboundSessionLinkEndpointsForTesting: Set<DomainAgentSessionLinkEndpointIdentity>?
         private var debugCompactConsentExpiryForTesting: Date?
@@ -5561,12 +5564,22 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         guard originalRegistration?.routeOwner == nil else { return }
         let tracksWarmCleanup = physicalWarmTransports.values.contains { $0.route.runID == runID }
         if tracksWarmCleanup { physicalWarmCleanupCounts[runID, default: 0] += 1 }
-        defer {
-            if tracksWarmCleanup {
-                let remaining = physicalWarmCleanupCounts[runID, default: 1] - 1
-                physicalWarmCleanupCounts[runID] = remaining > 0 ? remaining : nil
-            }
+        await cleanupLegacyRunRouting(
+            runID: runID, windowID: windowID, includingObserversAndWaiter: includingObserversAndWaiter,
+            originalRegistration: originalRegistration, originalAuthorityGeneration: originalAuthorityGeneration
+        )
+        guard tracksWarmCleanup else { return }
+        let remaining = physicalWarmCleanupCounts[runID, default: 1] - 1
+        physicalWarmCleanupCounts[runID] = remaining > 0 ? remaining : nil
+        if remaining == 0 {
+            physicalWarmCleanupWaiters.removeValue(forKey: runID)?.forEach { $0.resume() }
         }
+    }
+
+    private func cleanupLegacyRunRouting(
+        runID: UUID, windowID: Int?, includingObserversAndWaiter: Bool,
+        originalRegistration: MCPRunRoutingCleanupReceipt?, originalAuthorityGeneration: UInt64?
+    ) async {
         let observerCleanup = includingObserversAndWaiter ? prepareToolObserverUnregistration(for: runID) : nil
         func stillOwnsOriginalRegistration() -> Bool {
             runPolicyStateByRunID[runID]?.cleanupReceipt == originalRegistration
@@ -5603,6 +5616,9 @@ actor ServerNetworkManager: MCPServerConnectionHost {
             setConnectionRunID(nil, for: connectionID)
         }
 
+        #if DEBUG
+            if physicalWarmCleanupCounts[runID] != nil { await debugBeforeWarmMappingCleanup?() }
+        #endif
         await MainActor.run {
             let windows = WindowStatesManager.shared.allWindows.filter { window in
                 guard let windowID else { return true }
@@ -9951,12 +9967,12 @@ actor ServerNetworkManager: MCPServerConnectionHost {
         #endif
         if armed, registration == nil, Self.clientStorageKey(clientName) == "antigravity-client",
            let entry = oldestPendingPolicyEntry(for: clientName, where: {
-               $0.runID == runID && $0.windowID == windowID && $0.reservationConnectionID == nil
+               $0.runID == runID && (windowID == nil || $0.windowID == windowID) && $0.reservationConnectionID == nil
                    && $0.purpose == .agentModeRun && $0.oneShot && $0.requiresExpectedAgentPID
                    && $0.cleanupReceipt?.routeOwner == nil
            })
         {
-            await rebindWarmPhysicalTransport(entry, clientName: clientName)
+            await rebindWarmPhysicalTransport(policyID: entry.policy.id, clientName: clientName)
         }
         return armed
     }
@@ -9978,39 +9994,71 @@ actor ServerNetworkManager: MCPServerConnectionHost {
             && canConsumePendingPolicy(policy, clientName: clientName, clientPid: Int(transport.peer.pid))
     }
 
-    private func rebindWarmPhysicalTransport(
-        _ entry: (key: String, index: Int, policy: ClientConnectionPolicy), clientName: String
-    ) async {
-        guard let runID = entry.policy.runID, !admittedPolicyRunIDs.contains(runID),
-              pendingPolicyApplicationIDByRunID[runID] == nil
-        else { return }
+    private func rebindWarmPhysicalTransport(policyID: UUID, clientName: String) async {
+        func currentEntry() -> (key: String, index: Int, policy: ClientConnectionPolicy)? {
+            pruneExpiredPolicies(for: clientName)
+            return oldestPendingPolicyEntry(for: clientName, where: {
+                $0.id == policyID && $0.reservationConnectionID == nil && $0.cleanupReceipt.map(ownsRunRegistration) == true
+            })
+        }
+        guard !Task.isCancelled, let entry = currentEntry(), let runID = entry.policy.runID else { return }
+        if physicalWarmCleanupCounts[runID] != nil {
+            // Keep the successor lease in arming until the retiring turn is done.
+            // Re-evaluate the exact policy and transport rather than retaining queue state.
+            await withCheckedContinuation { physicalWarmCleanupWaiters[runID, default: []].append($0) }
+            await rebindWarmPhysicalTransport(policyID: policyID, clientName: clientName)
+            return
+        }
+        guard !admittedPolicyRunIDs.contains(runID), pendingPolicyApplicationIDByRunID[runID] == nil else { return }
         let transports = physicalWarmTransports.values.filter {
             warmPhysicalTransportIsCurrent($0, policy: entry.policy, clientName: clientName)
         }
         guard transports.count == 1, let transport = transports.first else { return }
         let route = transport.route
         let connectionID = route.connectionID
+        #if DEBUG
+            await debugBeforeWarmEndpointLookup?()
+        #endif
         let currentEndpoint = await MainActor.run {
             WindowStatesManager.shared.window(withID: entry.policy.windowID)?.agentModeViewModel.linkExecutionRuntime
                 .agentSessionLinkObserverEndpoint(tabID: route.observerEndpoint.tabID)
         }
-        guard currentEndpoint == route.observerEndpoint,
-              warmPhysicalTransportIsCurrent(transport, policy: entry.policy, clientName: clientName),
+        guard !Task.isCancelled, currentEndpoint == route.observerEndpoint, let current = currentEntry() else { return }
+        if physicalWarmCleanupCounts[runID] != nil {
+            // Keep the successor lease in arming until the retiring turn is done.
+            // Re-evaluate the exact policy and transport rather than retaining queue state.
+            await withCheckedContinuation { physicalWarmCleanupWaiters[runID, default: []].append($0) }
+            await rebindWarmPhysicalTransport(policyID: policyID, clientName: clientName)
+            return
+        }
+        guard warmPhysicalTransportIsCurrent(transport, policy: current.policy, clientName: clientName),
               !admittedPolicyRunIDs.contains(runID), pendingPolicyApplicationIDByRunID[runID] == nil,
               pendingPolicyApplicationIDByConnectionID[connectionID] == nil,
               runIDByConnectionID[connectionID] == nil,
-              let policy = reserveOneShotPendingPolicy(entry, for: connectionID)
+              let policy = reserveOneShotPendingPolicy(current, for: connectionID)
         else { return }
-        let remaining = max(0, (pendingPoliciesByClient[entry.key]?.count ?? 1) - 1)
+        let remaining = max(0, (pendingPoliciesByClient[current.key]?.count ?? 1) - 1)
         _ = await applyConnectionPolicy(
             policy, clientName: clientName, connectionID: connectionID,
             clientPid: Int(transport.peer.pid), bootstrapClientName: clientName,
             requireRunRouting: true, expectedLifecycleGeneration: route.connectionLifecycleGeneration,
-            queue: (entry.key, remaining, remaining), warmTransport: transport
+            queue: (current.key, remaining, remaining), warmTransport: transport
         )
     }
 
     #if DEBUG
+        func debugHasWarmCleanupWaiter(runID: UUID) -> Bool {
+            physicalWarmCleanupWaiters[runID]?.isEmpty == false
+        }
+
+        func debugSetWarmTurnRaces(
+            beforeEndpoint: (@Sendable () async -> Void)? = nil,
+            beforeCleanup: (@Sendable () async -> Void)? = nil
+        ) {
+            debugBeforeWarmEndpointLookup = beforeEndpoint
+            debugBeforeWarmMappingCleanup = beforeCleanup
+        }
+
         func debugSuspendNextPendingPolicyObservation() {
             debugShouldSuspendNextPendingPolicyObservation = true
         }

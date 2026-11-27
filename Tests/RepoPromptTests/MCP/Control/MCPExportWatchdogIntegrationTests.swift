@@ -1700,7 +1700,7 @@ import XCTest
                     tabID: tabID, runID: agent.runID, additionalTools: [], purpose: .agentModeRun,
                     allowsAgentExternalControlTools: true, requiresExpectedAgentPID: true
                 )
-                let armed = await manager.requireExpectedAgentPIDForPendingPolicy(for: socket.clientName, runID: agent.runID, windowID: window.windowID)
+                let armed = await manager.requireExpectedAgentPIDForPendingPolicy(for: socket.clientName, runID: agent.runID)
                 XCTAssertTrue(armed)
                 let next = await manager.authoritativeRunCatalogRouteToken(runID: agent.runID, windowID: window.windowID, tabID: tabID)
                 let second = try await socket.callTool(name: "self_noop", arguments: [:])
@@ -1718,6 +1718,66 @@ import XCTest
                     XCTAssertEqual(queue.count, 1)
                     XCTAssertEqual(secondResult["isError"] as? Bool, true)
                 }
+            }
+        }
+
+        func testAntigravityWarmTurnReservesPolicyAfterQueueMoves() async throws {
+            try await assertWarmTurnRace(cleanupOverlap: false)
+        }
+
+        func testAntigravityWarmTurnRetriesAfterOverlappingCleanup() async throws {
+            try await assertWarmTurnRace(cleanupOverlap: true)
+        }
+
+        private func assertWarmTurnRace(cleanupOverlap: Bool) async throws {
+            try await withReadyCompactSocket(verifyHelper: true) { manager, agent, _ in
+                let client = agent.endpoint.clientName
+                let window = agent.context.window.windowID
+                let run = agent.runID
+                let tab = agent.context.tabID
+                let gate = TestReleaseFence(name: "Warm Antigravity turn interleaving")
+                defer { gate.release() }
+                if cleanupOverlap {
+                    await manager.debugSetWarmTurnRaces(beforeCleanup: { await gate.enterAndWait() })
+                }
+                let cleanup = Task { await manager.revokeClientConnectionPolicy(for: client, windowID: window, runID: run) }
+                if cleanupOverlap { await gate.waitUntilEntered() } else { await cleanup.value }
+
+                let earlierRun = UUID()
+                if !cleanupOverlap {
+                    await manager.installClientConnectionPolicy(
+                        for: client, windowID: window + 1, restrictedTools: [], runID: earlierRun,
+                        purpose: .agentModeRun, requiresExpectedAgentPID: true
+                    )
+                    await manager.debugSetWarmTurnRaces(beforeEndpoint: { await gate.enterAndWait() })
+                }
+                await manager.installClientConnectionPolicy(
+                    for: client, windowID: window, restrictedTools: [MCPWindowToolName.agentManage],
+                    tabID: tab, runID: run, additionalTools: [], purpose: .agentModeRun,
+                    allowsAgentExternalControlTools: true, requiresExpectedAgentPID: true
+                )
+                let arming = Task { await manager.requireExpectedAgentPIDForPendingPolicy(for: client, runID: run, windowID: window) }
+                if cleanupOverlap {
+                    do {
+                        try await AsyncTestWait.waitUntil("warm arming waits for old cleanup", timeout: 5) {
+                            await manager.debugHasWarmCleanupWaiter(runID: run)
+                        }
+                    } catch { XCTFail(error.localizedDescription) }
+                } else {
+                    await gate.waitUntilEntered()
+                    await manager.clearClientConnectionPolicy(for: client, windowID: window + 1, runID: earlierRun)
+                    await manager.cleanupRunRoutingState(for: earlierRun, windowID: window + 1)
+                }
+                gate.release()
+                let armed = await arming.value
+                XCTAssertTrue(armed)
+                await cleanup.value
+                await manager.debugSetWarmTurnRaces()
+                let route = await manager.authoritativeRunCatalogRouteToken(runID: run, windowID: window, tabID: tab)
+                XCTAssertEqual(route?.connectionID, agent.endpoint.connectionID)
+                let response = try await agent.endpoint.callTool(name: "self_noop", arguments: [:])
+                let result = try XCTUnwrap(Self.responseObject(from: response)["result"] as? [String: Any])
+                XCTAssertNotEqual(result["isError"] as? Bool, true)
             }
         }
 
