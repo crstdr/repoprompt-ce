@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptShared
 import RepoPromptWorkspaceContext
 
 struct MCPMutationRetryableFailure: Error, Equatable {
@@ -35,6 +36,18 @@ struct MCPMutationRetryableFailure: Error, Equatable {
             retryable: true,
             retryAfterMilliseconds: retryDelayMilliseconds,
             suggestion: "Retry after the suggested delay. This failure occurred before mutation, so replay is safe."
+        )
+    }
+
+    /// A window-exclusive call stayed queued behind its window's lease holder until the pre-write
+    /// wait budget ran out. It never reached its provider; the holder keeps its lease.
+    static func admissionTimeout() -> MCPMutationRetryableFailure {
+        MCPMutationRetryableFailure(
+            errorCode: "tool_execution_admission_timeout",
+            errorMessage: "This call waited longer than the \(MCPTimeoutPolicy.mutationPreWriteWaitBudgetSeconds) s admission limit for an earlier tool call in its window or on its connection to finish, so it was not started. No edits or other changes were applied.",
+            retryable: true,
+            retryAfterMilliseconds: retryDelayMilliseconds,
+            suggestion: "Retry after the suggested delay. This call never started, so replay is safe."
         )
     }
 

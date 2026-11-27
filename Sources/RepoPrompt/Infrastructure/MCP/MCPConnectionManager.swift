@@ -14363,6 +14363,39 @@ actor ServerNetworkManager: MCPServerConnectionHost {
             // enforced below by explicit window/app/repository resource ownership.
             let admissionClass = preAdmissionDecision.admissionClass
             let callLane = admissionClass.connectionLane
+            // Window-exclusive mutations serialize behind one lease per window. Each gets stage
+            // timings and one pre-write wait deadline; prompt exports keep their own envelope.
+            let mutationCall: MCPDomainMutationCall? = admissionClass == .exclusive
+                && !MCPGlobalToolName.orderedToolNames.contains(toolName)
+                && !isPromptExport
+                ? MCPDomainMutationCall(
+                    invocationID: invocationID,
+                    toolName: toolName,
+                    watchdogEnvironment: executionWatchdogEnvironment
+                )
+                : nil
+            // One absolute deadline bounds both queue waits (connection lane, then window lease).
+            let admissionDeadline = promptExportExecutionEnvelope?.admissionDeadline ?? mutationCall?.preWriteWaitDeadline
+            func mutationAdmissionTimeoutResult() -> CallTool.Result {
+                let failure = MCPMutationRetryableFailure.admissionTimeout()
+                var metadata: [String: Value] = [
+                    "retryable": .bool(failure.retryable),
+                    "retry_after_ms": .int(failure.retryAfterMilliseconds),
+                    "mutation_state": .string("not_applied"),
+                    "settlement": .string("admission_timeout"),
+                    "tool": .string(toolName),
+                    "suggestion": .string(failure.suggestion)
+                ]
+                if toolName == MCPWindowToolName.applyEdits {
+                    metadata["edits_applied"] = .int(0)
+                }
+                return Self.executionContractToolErrorResult(
+                    rawJSON: capturedRawJSON,
+                    code: failure.errorCode,
+                    message: failure.errorMessage,
+                    metadata: metadata
+                )
+            }
             connectionLog("tools/call \(toolName): acquiring limiter lane=\(callLane.rawValue)")
             if let admissionTimeout = promptExportAdmissionTimeoutResultIfExpired() {
                 return await finishRequestProgress(admissionTimeout)
@@ -14431,15 +14464,23 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                     EditFlowPerf.Dimensions(toolName: toolName)
                 )
                 defer { EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.limiterWait, limiterWaitState) }
+                let laneQueueSpan = mutationCall?.begin(.connectionLaneQueue)
+                @Sendable func endLaneQueue(_ outcome: MCPDomainMutationCall.Outcome) {
+                    if let mutationCall, let laneQueueSpan { mutationCall.end(laneQueueSpan, outcome) }
+                }
                 return await self.withConnectionCallPermit(
                     connectionID: connectionID,
                     lane: callLane,
                     resolution: limiterResolution,
                     toolName: toolName,
                     lifecycleCorrelation: lifecycleCorrelation,
-                    admissionDeadline: promptExportExecutionEnvelope?.admissionDeadline,
+                    admissionDeadline: admissionDeadline,
                     admissionTimeoutResult: {
-                        promptExportAdmissionTimeoutResultIfExpired()
+                        endLaneQueue(.expired)
+                        if mutationCall != nil {
+                            return mutationAdmissionTimeoutResult()
+                        }
+                        return promptExportAdmissionTimeoutResultIfExpired()
                             ?? Self.executionContractToolErrorResult(
                                 rawJSON: capturedRawJSON,
                                 code: "tool_execution_admission_timeout",
@@ -14447,6 +14488,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                             )
                     },
                     cancellationResult: {
+                        endLaneQueue(.cancelled)
                         MCPToolConcurrencyEvidenceRecorder.shared.recordLaneWaitAbandoned(classKey: evidenceClass)
                         MCPToolConcurrencyEvidenceRecorder.shared.recordRejection(
                             classKey: evidenceClass,
@@ -14460,6 +14502,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                         )
                     }
                 ) {
+                    endLaneQueue(.completed)
                     if let admissionTimeout = promptExportAdmissionTimeoutResultIfExpired() {
                         return admissionTimeout
                     }
@@ -14741,25 +14784,41 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                                 if let admissionTimeout = promptExportAdmissionTimeoutResultIfExpired() {
                                     return admissionTimeout
                                 }
+                                mutationCall?.setWindowID(chosenID)
+                                let leaseQueueSpan = mutationCall?.begin(.windowLeaseQueue)
                                 let resourceAdmissionLease: MCPDomainToolResourceAdmissionController.Lease?
+                                let leaseHoldSpan: MCPDomainMutationCall.Span?
                                 switch await MCPServerResourceAdmission.acquire(
                                     host: self.domainHost,
                                     toolName: toolName,
                                     admissionClass: admissionClass,
                                     windowID: chosenID,
-                                    deadline: promptExportExecutionEnvelope?.admissionDeadline,
+                                    deadline: admissionDeadline,
                                     evidenceClass: evidenceClass,
                                     operationIdentity: evidenceOperationIdentity
                                 ) {
                                 case let .admitted(lease):
                                     resourceAdmissionLease = lease
+                                    if let mutationCall, let leaseQueueSpan { mutationCall.end(leaseQueueSpan, .completed) }
+                                    leaseHoldSpan = lease == nil ? nil : mutationCall?.begin(.lease)
                                 case let .rejected(code, message, deadlineExpired):
+                                    if let mutationCall, let leaseQueueSpan {
+                                        mutationCall.end(leaseQueueSpan, deadlineExpired ? .expired : .failed)
+                                    }
                                     if deadlineExpired, let result = promptExportAdmissionTimeoutResultIfExpired() {
                                         return result
                                     }
+                                    if deadlineExpired, mutationCall != nil {
+                                        return mutationAdmissionTimeoutResult()
+                                    }
                                     return Self.executionContractToolErrorResult(rawJSON: capturedRawJSON, code: code, message: message)
                                 }
-                                defer { resourceAdmissionLease?.release() }
+                                @Sendable func endLeaseHold() {
+                                    if let mutationCall, let leaseHoldSpan { mutationCall.end(leaseHoldSpan, .completed) }
+                                }
+                                defer {
+                                    if resourceAdmissionLease?.release() == true { endLeaseHold() }
+                                }
 
                                 let resourceAdmissionWindowID = chosenID
                                 let resourceAdmissionOwner = MCPGlobalToolName.orderedToolNames.contains(toolName)
@@ -14767,6 +14826,7 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                                     : resourceAdmissionWindowID.map { "window:\($0)" }
                                 @Sendable func releaseResourceAdmissionLeases(outcome: String) {
                                     guard resourceAdmissionLease?.release() == true else { return }
+                                    endLeaseHold()
                                     EditFlowPerf.lifecycleEvent(
                                         EditFlowPerf.Lifecycle.MCPToolCall.resourceAdmissionReleased,
                                         correlation: lifecycleCorrelation,
@@ -15181,18 +15241,20 @@ actor ServerNetworkManager: MCPServerConnectionHost {
                                     )
                                     let resolvedOperation: @Sendable (PromptExportProviderEntryBridge?, ToolInvocationContext) async throws -> Value = { providerEntryBridge, invocationContext in
                                         let diagnosticAdapter = MCPInvocationDiagnosticAdapter()
-                                        return try await resolvedInvocation.invoke(
-                                            context: invocationContext,
-                                            providerEntry: providerEntryBridge,
-                                            diagnosticSink: { diagnosticAdapter.report($0) },
-                                            testOperation: {
-                                                #if DEBUG
-                                                    await self.debugResolvedToolOperationOverrides[toolName]
-                                                #else
-                                                    nil
-                                                #endif
-                                            }
-                                        )
+                                        return try await MCPDomainMutationCall.$current.withValue(mutationCall) {
+                                            try await resolvedInvocation.invoke(
+                                                context: invocationContext,
+                                                providerEntry: providerEntryBridge,
+                                                diagnosticSink: { diagnosticAdapter.report($0) },
+                                                testOperation: {
+                                                    #if DEBUG
+                                                        await self.debugResolvedToolOperationOverrides[toolName]
+                                                    #else
+                                                        nil
+                                                    #endif
+                                                }
+                                            )
+                                        }
                                     }
 
                                     let completionPublisher = MCPToolCompletionPublisher(

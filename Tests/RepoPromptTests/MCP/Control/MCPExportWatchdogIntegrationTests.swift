@@ -2540,6 +2540,118 @@ import XCTest
             }
         }
 
+        /// A window-exclusive call queued behind a stalled holder gives up at the pre-write wait
+        /// budget, both in the connection lane (same connection) and on the window lease (sibling
+        /// connection bound to the same window). Neither starts; the holder keeps its lease.
+        func testQueuedWindowMutationsTimeOutBehindStalledHolderWithoutStartingOrDisturbingIt() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(
+                    lease: lease,
+                    domainRuntime: AppDomainRuntimeComposition.shared.runtime
+                )
+                let manager = fixture.networkManager
+                let endpoint = try fixture.endpointA()
+                let clock = MCPExportWatchdogManualClock()
+                let holderGate = MCPExecutionIgnoringCancellationGate()
+                let providerEntries = MCPProviderEntryCounter()
+                var sibling: PersistentMCPTestEndpoint?
+                var pending: [Task<PersistentMCPTestRPCResponse, Error>] = []
+                let arguments: [String: Any] = [
+                    "path": fixture.contextA.fileURL.path,
+                    "search": "queued-mutation-probe",
+                    "replace": "unused",
+                    "_rawJSON": true
+                ]
+
+                func cleanUp() async {
+                    await holderGate.release()
+                    for task in pending {
+                        task.cancel()
+                        _ = try? await task.value
+                    }
+                    await manager.debugSetResolvedToolOperationOverride(
+                        toolName: MCPWindowToolName.applyEdits,
+                        operation: nil
+                    )
+                    for connectionID in [endpoint.connectionID] + [sibling?.connectionID].compactMap(\.self) {
+                        await manager.debugSetDomainPeerIdentityForTesting(connectionID: connectionID, identity: nil)
+                    }
+                    if let sibling { await Self.cleanupEndpoint(sibling, manager: manager) }
+                    await manager.debugResetToolExecutionWatchdogEnvironment()
+                    await fixture.cleanup()
+                }
+
+                await manager.debugSetToolExecutionWatchdogEnvironment(clock.environment)
+                await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.applyEdits) {
+                    if providerEntries.increment() == 1 {
+                        await holderGate.enterAndWait()
+                    }
+                    return .object(["status": .string("success")])
+                }
+                do {
+                    try await Self.prepareProtectedExportFixture(fixture, endpoint: endpoint)
+                    let createdSibling = try await PersistentMCPTestEndpoint.make(
+                        label: "window-lease-follower",
+                        networkManager: manager,
+                        requiredToolNames: [MCPWindowToolName.applyEdits, "bind_context"]
+                    )
+                    sibling = createdSibling
+                    try await Self.prepareProtectedExportFixture(fixture, endpoint: createdSibling)
+
+                    let holder = Task { try await endpoint.callTool(name: MCPWindowToolName.applyEdits, arguments: arguments) }
+                    pending.append(holder)
+                    try await holderGate.waitUntilEntered(count: 1)
+
+                    // Same connection: queues in the connection lane behind the holder.
+                    let laneFollower = Task {
+                        try await endpoint.callTool(name: MCPWindowToolName.applyEdits, arguments: arguments)
+                    }
+                    pending.append(laneFollower)
+                    try await clock.waitForSleeperCount(1)
+                    // Sibling connection, same window: passes its own lane, queues on the window lease.
+                    let leaseFollower = Task {
+                        try await createdSibling.callTool(name: MCPWindowToolName.applyEdits, arguments: arguments)
+                    }
+                    pending.append(leaseFollower)
+                    let domainHost = AppDomainRuntimeComposition.shared.runtime.domainHost
+                    let leaseWaiterQueued = await Self.waitUntil {
+                        await domainHost.snapshot().resourceAdmissionWaiterCount == 1
+                    }
+                    XCTAssertTrue(leaseWaiterQueued)
+                    try await clock.waitForSleeperCount(2)
+                    try await clock.advanceSleeper(expected: MCPTimeoutPolicy.mutationPreWriteWaitBudget)
+                    try await clock.advanceSleeper(expected: MCPTimeoutPolicy.mutationPreWriteWaitBudget)
+
+                    for follower in [laneFollower, leaseFollower] {
+                        let object = try await Self.toolResultObject(follower.value)
+                        XCTAssertEqual(object["code"] as? String, "tool_execution_admission_timeout")
+                        XCTAssertEqual(object["error"] as? String, MCPMutationRetryableFailure.admissionTimeout().errorMessage)
+                        XCTAssertEqual(object["retryable"] as? Bool, true)
+                        XCTAssertEqual((object["retry_after_ms"] as? NSNumber)?.intValue, 1000)
+                        XCTAssertEqual(object["mutation_state"] as? String, "not_applied")
+                        XCTAssertEqual(object["settlement"] as? String, "admission_timeout")
+                        XCTAssertEqual((object["edits_applied"] as? NSNumber)?.intValue, 0)
+                        XCTAssertEqual(object["tool"] as? String, MCPWindowToolName.applyEdits)
+                    }
+                    XCTAssertEqual(providerEntries.value, 1, "queued calls never reach the provider")
+
+                    await holderGate.release()
+                    let holderText = try await Self.toolResultText(holder.value)
+                    XCTAssertFalse(holderText.contains("admission_timeout"), holderText)
+
+                    let next = try await createdSibling.callTool(name: MCPWindowToolName.applyEdits, arguments: arguments)
+                    XCTAssertFalse(try Self.toolResultText(next).contains("admission_timeout"))
+                    XCTAssertEqual(providerEntries.value, 2, "the window lease is free again once the holder settles")
+                    pending.removeAll()
+                    await cleanUp()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    await cleanUp()
+                    throw error
+                }
+            }
+        }
+
         func testRealManageSelectionDrainTimeoutSettlesDuringGraceAndKeepsQueuedCallUsable() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease)
@@ -5100,6 +5212,22 @@ import XCTest
 
     private enum MCPQueuedPolicyFixtureError: Error {
         case admissionNotReached
+    }
+
+    final class MCPProviderEntryCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+
+        func increment() -> Int {
+            lock.withLock {
+                count += 1
+                return count
+            }
+        }
+
+        var value: Int {
+            lock.withLock { count }
+        }
     }
 
     actor MCPExecutionIgnoringCancellationGate {
