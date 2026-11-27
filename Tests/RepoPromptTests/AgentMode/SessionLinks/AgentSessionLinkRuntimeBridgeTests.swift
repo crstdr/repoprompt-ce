@@ -8631,6 +8631,46 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertTrue(inbound.items.isEmpty)
     }
 
+    func testLaneAdmitsExactAdvertisedAntigravityModelOnlyWhenDestinationIsAvailable() async throws {
+        let fixture = makeFixture()
+        try installLaneIntentStore(fixture)
+        guard case .added = await addLink(fixture) else { return XCTFail("seed link failed") }
+        _ = prepareCreatedLane(fixture)
+        let windowID = fixture.observer.windowID
+        let availability = AgentModelCatalog.AvailabilityContext.none.assumingAvailable(.antigravity)
+        let catalog = AgentModelCatalogRuntime.shared
+        let model = "fixture-gemini-low"
+        XCTAssertTrue(catalog.record([
+            AgentModelOption(rawValue: model, displayName: "Fixture Gemini", description: nil, isDefault: true)
+        ], for: .antigravity, generation: catalog.productionGeneration(for: .antigravity)))
+        defer { catalog.invalidate(.antigravity) }
+        XCTAssertEqual(try catalog.selection("antigravity:\(model)", availability: availability).storedModelRaw, model)
+
+        for (key, modelID, destinationAvailability) in [
+            ("unadvertised", "antigravity:fixture-gemini-high", availability),
+            ("unavailable", "antigravity:\(model)", .none),
+            ("available", "antigravity:\(model)", availability)
+        ] {
+            fixture.host.modelAvailabilityByWindow[windowID] = destinationAvailability
+            let receipt = await createLane(
+                fixture, observerEndpoint: fixture.observer.domainEndpoint,
+                request: .init(idempotencyKey: key, role: nil, modelID: modelID, sessionName: nil, message: nil, workflowReference: nil)
+            )
+            if key == "available" {
+                XCTAssertEqual(receipt.result, .created, "Unexpected refusal: \(receipt.reason as Any)")
+                XCTAssertTrue(receipt.linked)
+                XCTAssertEqual(fixture.host.laneCreationCount, 1)
+                XCTAssertEqual(fixture.host.lastLaneSelection?.agentRaw, "antigravity")
+                XCTAssertEqual(fixture.host.lastLaneSelection?.modelRaw, model)
+                XCTAssertNil(fixture.host.lastLaneSelection?.reasoningEffortRaw)
+                XCTAssertTrue(fixture.host.sendRequests.isEmpty)
+            } else {
+                XCTAssertEqual(receipt.reason, .modelUnavailable, key)
+                XCTAssertEqual(fixture.host.laneCreationCount, 0, key)
+            }
+        }
+    }
+
     func testLaneCreationWritesIntentInDormantPersistenceMode() async throws {
         let fixture = makeFixture()
         let directory = try installLaneIntentStore(fixture, mode: .dormant)

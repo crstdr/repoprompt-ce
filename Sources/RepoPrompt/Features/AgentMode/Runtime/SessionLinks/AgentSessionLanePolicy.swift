@@ -23,7 +23,7 @@ enum AgentSessionLanePolicy {
         availability: AgentModelCatalog.AvailabilityContext
     ) throws -> RoleSelection {
         let selection = try AgentModelCatalogRuntime.shared.selection(modelID, availability: availability)
-        guard AgentModelCatalog.AgentSelectionSurface.headless.allows(selection.agent) else {
+        guard AgentModelCatalog.AgentSelectionSurface.general.allows(selection.agent) else {
             throw AgentModelCatalogRuntime.AdmissionError.unavailable
         }
         // Default selection label only: lane creation consumes the model fields and creates
@@ -70,7 +70,7 @@ enum AgentSessionLanePolicy {
             effective = storedSelection.selection
             modelParameters = storedSelection.modelParameters
         }
-        guard AgentModelCatalog.AgentSelectionSurface.headless.allows(effective.agent),
+        guard AgentModelCatalog.AgentSelectionSurface.general.allows(effective.agent),
               AgentModelCatalog.isValid(
                   rawModel: effective.modelRaw,
                   for: effective.agent,
@@ -79,10 +79,13 @@ enum AgentSessionLanePolicy {
         else {
             throw RoleResolutionError.roleUnavailable
         }
-        // Devin encodes thinking in its model ID, not in the native reasoning-effort field.
-        let effort = effective.agent == .devin
-            ? (model: effective.modelRaw, effort: nil)
-            : AgentExternalMCPRunStarter.extractReasoningEffort(from: effective.modelRaw)
+        let effort: (model: String?, effort: String?) = switch effective.agent {
+        case .antigravity, .devin:
+            // These providers encode effort in the model ID, not in a separate session field.
+            (effective.modelRaw, nil)
+        default:
+            AgentExternalMCPRunStarter.extractReasoningEffort(from: effective.modelRaw)
+        }
         return RoleSelection(
             role: role,
             agentRaw: effective.agent.rawValue,

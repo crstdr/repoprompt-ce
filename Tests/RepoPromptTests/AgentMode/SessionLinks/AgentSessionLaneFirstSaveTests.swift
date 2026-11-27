@@ -1587,6 +1587,34 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
         }
     }
 
+    func testAntigravityRolePinPersistsFullModelIDOnFirstSave() async throws {
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+        try await withFixture(ephemeral: false) { fixture in
+            let model = "fixture-gemini-low"
+            let registry = AgentModelCatalogRuntime.shared.acpRegistry
+            registry.test_reset(providerID: .antigravity)
+            defer { registry.test_reset(providerID: .antigravity) }
+            XCTAssertTrue(registry.updateDiscoveredModels(.init(
+                options: [.init(rawValue: model, displayName: "Fixture Gemini", description: nil, isDefault: true)],
+                currentModelRaw: model
+            ), for: .antigravity))
+            let settings = AgentModelsProfileRoleDefaultsStore(overrides: ["explore": "antigravity:\(model)"])
+            let selection = try AgentSessionLanePolicy.resolveRole(
+                "explore", availability: .none.assumingAvailable(.antigravity), workspaceID: fixture.workspaceID, settingsStore: settings
+            )
+            let outcome = try await WindowStatesManager.shared.agentSessionLinkCreateLane(
+                destinationWindowID: fixture.window.windowID, workspaceID: fixture.workspaceID,
+                creatorSessionID: UUID(), sessionName: "Antigravity lane", selection: selection
+            )
+            guard case let .created(sessionID, _, _) = outcome else { return XCTFail("Lane did not complete its first save") }
+            let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+            let loaded = try await AgentSessionDataService.shared.loadAgentSession(id: sessionID, for: workspace)
+            let saved = try XCTUnwrap(loaded)
+            XCTAssertEqual(saved.agentKind, "antigravity")
+            XCTAssertEqual(saved.agentModel, model)
+        }
+    }
+
     func testPersistedDevinRoleLanesSaveLinkAndDispatchFirstTask() async throws {
         GlobalSettingsStore.installApplicationModelIdentityPolicy()
         let registry = AgentModelCatalogRuntime.shared.acpRegistry
