@@ -20,6 +20,7 @@ final class ACPIntegratedAgentModeRunner {
         /// like `.failed`, but the live controller it was addressed to is left in place: nothing about
         /// that session changed, so tearing it down would only discard the target's warm session.
         case refusedBeforeSend(errorText: String)
+        case unwrittenProviderSwitch(errorText: String)
         case superseded
 
         var debugDescription: String {
@@ -34,6 +35,8 @@ final class ACPIntegratedAgentModeRunner {
                 "state=failed error=\(errorText ?? "nil")"
             case let .refusedBeforeSend(errorText):
                 "state=refusedBeforeSend error=\(errorText)"
+            case let .unwrittenProviderSwitch(errorText):
+                "state=unwrittenProviderSwitch error=\(errorText)"
             case .superseded:
                 "state=superseded error=nil"
             }
@@ -44,6 +47,7 @@ final class ACPIntegratedAgentModeRunner {
         let report: DomainAgentRunExecutionReport
         let errorText: String?
         var retainsController = false
+        var attachmentDisposition: DomainAgentRunAttachmentTurnDisposition = .deleteFiles
     }
 
     /// Set when a provider control command's run ends without anything reaching the provider and
@@ -135,6 +139,7 @@ final class ACPIntegratedAgentModeRunner {
     ) async -> TransientExecutionClassification {
         var explicitFailureText: String??
         var refusedBeforeSend = false
+        var attachmentDisposition: DomainAgentRunAttachmentTurnDisposition = .deleteFiles
         let report = await DomainAgentRunExecutionCore.execute(
             failureText: { error in
                 if let failure = error as? ExplicitTerminalFailure {
@@ -158,6 +163,10 @@ final class ACPIntegratedAgentModeRunner {
                 refusedBeforeSend = true
                 explicitFailureText = .some(errorText)
                 throw ExplicitTerminalFailure(errorText: errorText)
+            case let .unwrittenProviderSwitch(errorText):
+                attachmentDisposition = .keepFiles
+                explicitFailureText = .some(errorText)
+                throw ExplicitTerminalFailure(errorText: errorText)
             case .superseded:
                 return .superseded
             }
@@ -173,7 +182,8 @@ final class ACPIntegratedAgentModeRunner {
         return TransientExecutionClassification(
             report: report,
             errorText: errorText,
-            retainsController: refusedBeforeSend
+            retainsController: refusedBeforeSend,
+            attachmentDisposition: attachmentDisposition
         )
     }
 
@@ -343,10 +353,12 @@ final class ACPIntegratedAgentModeRunner {
                     providerControlCommand: nil,
                     receipt: receipt, providerLaunchInput: providerLaunchInput,
                     makeLease: makeLease,
+                    startOutcome: startOutcome,
                     localComposerCandidate: localComposerCandidate
                 )
                 candidateTransferred = true
                 handedToRunTask = true
+                if startOutcome?.recoverUnwrittenProviderSwitch != nil { startOutcome?.recordAccepted() }
                 return nil
             }
 
@@ -497,6 +509,7 @@ final class ACPIntegratedAgentModeRunner {
                                         lease: lease,
                                         receipt: receipt, providerLaunchInput: providerLaunchInput,
                                         attachmentReservationID: attachmentReservationID,
+                                        startOutcome: startOutcome,
                                         localComposerCandidate: localComposerCandidate
                                     )
                                 }
@@ -568,6 +581,7 @@ final class ACPIntegratedAgentModeRunner {
         receipt: AgentSessionRuntimeStore.WriterReceipt,
         providerLaunchInput: AgentProviderLaunchInput?,
         makeLease: @escaping (_ runID: UUID) -> MCPBootstrapLease,
+        startOutcome: AgentRunStartOutcomeRecorder? = nil,
         localComposerCandidate: UUID? = nil
     ) {
         let runAttemptID = ownership.attemptID
@@ -614,6 +628,7 @@ final class ACPIntegratedAgentModeRunner {
                 attachmentReservationID: attachmentReservationID,
                 providerControlCommand: providerControlCommand,
                 leaseDisposition: leaseDisposition,
+                startOutcome: startOutcome,
                 localComposerCandidate: localComposerCandidate
             )
         }
@@ -1072,6 +1087,7 @@ final class ACPIntegratedAgentModeRunner {
         receipt: AgentSessionRuntimeStore.WriterReceipt,
         providerLaunchInput: AgentProviderLaunchInput?,
         attachmentReservationID: UUID?,
+        startOutcome: AgentRunStartOutcomeRecorder? = nil,
         localComposerCandidate: UUID? = nil
     ) async {
         let isPeriodic = session.oversight.pendingAutoWake?.isPeriodic == true
@@ -1205,6 +1221,9 @@ final class ACPIntegratedAgentModeRunner {
                     runRequest: runRequest,
                     attachmentReservationID: attachmentReservationID,
                     events: events, receipt: receipt, providerLaunchInput: providerLaunchInput, retainsControllerOnRefusal: false, phase: &phase,
+                    freshSessionID: runRequest.resumeSessionID == nil || bootstrap.didFallbackToNewSessionAfterLoadFailure
+                        ? (bootstrap.providerSessionIdentity.loadSessionID ?? bootstrap.providerSessionIdentity.runtimeSessionID) : nil,
+                    startOutcome: startOutcome,
                     localComposerCandidate: localComposerCandidate
                 )
             } catch is CancellationError {
@@ -1270,6 +1289,7 @@ final class ACPIntegratedAgentModeRunner {
         attachmentReservationID: UUID?,
         providerControlCommand: AgentProviderControlCommand? = nil,
         leaseDisposition: ProviderControlLeaseDisposition? = nil,
+        startOutcome: AgentRunStartOutcomeRecorder? = nil,
         localComposerCandidate: UUID? = nil
     ) async {
         var phase = PromptPhase.setup
@@ -1386,6 +1406,7 @@ final class ACPIntegratedAgentModeRunner {
                     attachmentReservationID: attachmentReservationID,
                     events: events, receipt: receipt, providerLaunchInput: providerLaunchInput, retainsControllerOnRefusal: true, phase: &phase,
                     dedicatedNoteID: dedicatedNoteID,
+                    startOutcome: startOutcome,
                     localComposerCandidate: localComposerCandidate
                 )
             } catch is CancellationError {
@@ -1436,6 +1457,8 @@ final class ACPIntegratedAgentModeRunner {
         retainsControllerOnRefusal: Bool,
         phase: inout PromptPhase,
         dedicatedNoteID: AgentSelfCompactionDispatchID? = nil,
+        freshSessionID: String? = nil,
+        startOutcome: AgentRunStartOutcomeRecorder? = nil,
         localComposerCandidate: UUID? = nil
     ) async -> TransientOperationResult {
         // Canonical resource IO precedes decoration/proof. The original writer, controller,
@@ -1566,8 +1589,12 @@ final class ACPIntegratedAgentModeRunner {
             let oracle = carry.exactNote ? nil : session.oracleBackgroundAwareness.reserve(session: session, providerID: ObjectIdentifier(controller))
             defer { session.oracleBackgroundAwareness.release(oracle) }
             let outbound = released?.message(agentMessage) ?? agentMessage
+            let carriesSwitchHandover = session.pendingHandoff.providerSwitchDelivery == .sending
+                && session.pendingHandoff.isStagedForSend && session.pendingHandoff.providerSwitchAcceptedID == nil
+            let maximumTextBytes = runRequest.agentKind == .antigravity && carriesSwitchHandover
+                ? AgentProviderHandover.antigravityMaximumPromptBytes : nil
             phase = .providerDispatch
-            try await controller.prompt(oracle?.decorating(outbound) ?? outbound, request: runRequest)
+            try await controller.prompt(oracle?.decorating(outbound) ?? outbound, request: runRequest, maximumTextBytes: maximumTextBytes)
             session.oracleBackgroundAwareness.accept(oracle)
             // A non-throwing `controller.prompt` return is ACP's acceptance signal.
             session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained)
@@ -1575,6 +1602,30 @@ final class ACPIntegratedAgentModeRunner {
             let identity = await controller.currentProviderSessionIdentity()
             applyProviderSessionIdentity(identity, session: session)
             log("controller.prompt returned; awaiting event consumer", runID: runID)
+        } catch is ACPAgentSessionController.PromptTextBudgetExceeded {
+            consumeTask.cancel()
+            // An empty session loaded on retry would omit Antigravity's inline first-turn instructions.
+            // Clear only the identity installed by this exact fresh attempt, before saving ready.
+            if let freshSessionID, session.providerSessionID == freshSessionID,
+               session.selectedAgent == .antigravity, session.acpController === controller,
+               isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID),
+               receipt.disposition(for: session) == .current
+            {
+                session.providerSessionID = nil
+                session.providerCleanupHandle = nil
+                session.isDirty = true
+                hooks.persistence.scheduleSave(session)
+                hooks.bindingObservation.updateBindings(session)
+            }
+            hooks.providerInput.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, oversightDispatch)
+            let recover = startOutcome?.recoverUnwrittenProviderSwitch
+            startOutcome?.recoverUnwrittenProviderSwitch = nil
+            if let recover {
+                await recover(oversightDispatch)
+            } else {
+                await hooks.providerInput.recoverUnwrittenProviderSwitch(session, oversightDispatch)
+            }
+            return .unwrittenProviderSwitch(errorText: "Too long to send with the handover.")
         } catch {
             await recordPromptFailure(session: session, controller: controller, carry: carry, oversightDispatch: oversightDispatch)
             let normalizedError = await controller.normalizeError(error)
@@ -2149,7 +2200,8 @@ final class ACPIntegratedAgentModeRunner {
             errorText: classification.errorText,
             notifyTurnComplete: terminalState == .completed,
             shouldShutdownController: terminalState != .completed && !classification.retainsController,
-            retainsController: classification.retainsController
+            retainsController: classification.retainsController,
+            attachmentDisposition: classification.attachmentDisposition
         )
     }
 
@@ -2163,7 +2215,8 @@ final class ACPIntegratedAgentModeRunner {
         errorText: String?,
         notifyTurnComplete: Bool,
         shouldShutdownController: Bool,
-        retainsController: Bool = false
+        retainsController: Bool = false,
+        attachmentDisposition: DomainAgentRunAttachmentTurnDisposition = .deleteFiles
     ) async {
         let finalizeErrorDescription = errorText ?? "nil"
         log("finalize requested state=\(terminalState.rawValue) error=\(finalizeErrorDescription)", runID: runID)
@@ -2182,7 +2235,7 @@ final class ACPIntegratedAgentModeRunner {
             source: "acp.finalize",
             errorText: errorText,
             attachmentReservationID: attachmentReservationID,
-            attachmentDisposition: .deleteFiles,
+            attachmentDisposition: attachmentDisposition,
             finalizeNonCodexUsage: true,
             supportsFollowUp: supportsSessionResume,
             notifyTurnComplete: notifyTurnComplete,

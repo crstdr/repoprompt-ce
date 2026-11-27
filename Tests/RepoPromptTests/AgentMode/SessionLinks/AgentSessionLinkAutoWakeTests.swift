@@ -651,6 +651,22 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
         tools.endAgentRunWaitScope(unrelatedWait.token, completion: completion)
     }
 
+    func testAntigravityUnwrittenWakeRetainsDispatchIdentityWithoutAmbiguity() throws {
+        let f = try fixture()
+        let wakeID = UUID()
+        f.session.oversight.pendingAutoWake = .init(
+            wakeID: wakeID, observerEndpoint: f.endpoint, queueEpoch: nil, queueRevision: 0,
+            wakeFingerprint: nil, admissionBasis: .manual, attemptedFingerprint: nil,
+            physicalOutcome: .ambiguous, phase: .dispatching, task: nil
+        )
+        f.runtime.agentSessionLinkMarkAcquiredWakeUnwritten(session: f.session, effectiveID: .autoWake(wakeID: UUID()))
+        XCTAssertEqual(f.session.oversight.pendingAutoWake?.physicalOutcome, .ambiguous)
+        f.runtime.agentSessionLinkMarkAcquiredWakeUnwritten(session: f.session, effectiveID: .autoWake(wakeID: wakeID))
+        XCTAssertEqual(f.session.oversight.pendingAutoWake?.physicalOutcome, .notAttempted)
+        XCTAssertEqual(f.session.oversight.pendingAutoWake?.wakeID, wakeID)
+        XCTAssertEqual(f.session.oversight.pendingAutoWake?.phase, .dispatching)
+    }
+
     func testCanonicalComposerPublicationRefusalUsesPrepublicationCleanupOnly() async throws {
         for change in ["claim", "claim-existing-draft", "membership", "draft", "workflow", "reused-row"] {
             let (host, f, _, provider, _, _, _) = try await hostStartupFixture(
@@ -720,6 +736,122 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             submissions.release(claim)
             XCTAssertTrue(claim.cancellation.isFinalized, change)
         }
+    }
+
+    func testAntigravityLateNoWriteRestoresCanonicalDraftWithoutDuplicateRow() async throws {
+        try await assertAntigravityLateRefusal(newerDraft: nil)
+    }
+
+    func testAntigravityLateNoWritePreservesNewerDraft() async throws {
+        try await assertAntigravityLateRefusal(newerDraft: "Newer draft while ACP starts")
+    }
+
+    private func assertAntigravityLateRefusal(newerDraft: String?) async throws {
+        let (host, f, _, provider, _, _, _) = try await hostStartupFixture(
+            canonicalWorkspace: true, boundCanonicalCarrier: true, canonicalInput: true, providerID: .antigravity
+        )
+        let session = f.session
+        session.selectedAgent = .antigravity
+        session.selectedModelRaw = "model-a"
+        let draft = "Original switch draft"
+        session.draftText = draft
+        let source = try AgentProviderHandover.Source(provider: "source", model: "model")
+        let projection = try AgentProviderHandover.project(AgentTranscript())
+        let carrier = AgentProviderHandover.render(AgentProviderHandover.history(projection, source: source, historyReference: nil))
+        session.pendingHandoff = .init(payload: carrier, createdAt: Date(), sourceItemID: session.items.last?.id, providerSwitchDelivery: .ready)
+        let trace = URL(fileURLWithPath: provider.commandPath).deletingLastPathComponent().appendingPathComponent("antigravity-rpc.jsonl")
+        provider.environment["ACP_TEST_PROMPT_PADDING"] = "192000"
+        provider.environment["ACP_RPC_LOG"] = trace.path
+        provider.environment["ACP_TEST_IMAGE_INPUT"] = "1"
+        provider.environment["ACP_TEST_ANTIGRAVITY_PROMPT"] = "1"
+        let gate = try AgentSessionLinkACPResponseGate(directory: trace.deletingLastPathComponent())
+        defer { gate.release() }
+        provider.environment["ACP_HOLD_METHOD"] = "session/new"
+        provider.environment["ACP_RESPONSE_GATE"] = gate.path
+        let attachmentDirectory = trace.deletingLastPathComponent().appendingPathComponent("agent_attachments", isDirectory: true)
+        try FileManager.default.createDirectory(at: attachmentDirectory, withIntermediateDirectories: true)
+        let attachmentURL = attachmentDirectory.appendingPathComponent("unsent.png")
+        try Data([1, 2, 3]).write(to: attachmentURL)
+        let attachment = AgentFileAttachment(source: .localFile(path: attachmentURL.path))
+
+        let submissions = host.scope.submissions
+        let command = try host.scope.admit(session: session)
+        let target = try XCTUnwrap(submissions.programmaticTarget(command))
+        let attempt = AgentComposerSubmitAttempt(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: draft)
+        guard case let .claimed(claim) = submissions.claim(attempt, command: command) else { return XCTFail("Expected canonical composer claim") }
+        var releasedClaim = false
+        defer { if !releasedClaim { submissions.release(claim) } }
+        guard case let .success(.some(preparation)) = await f.runtime.providerSwitchSendAdmission(session: session, input: draft, attachments: [attachment]) else {
+            return XCTFail("Small input should pass the early budget")
+        }
+        let item = AgentChatItem.user(draft, attachments: [attachment], sequenceIndex: session.nextSequenceIndex)
+        let publication = try XCTUnwrap(submissions.captureCanonicalPublication(claim: claim, host: host, item: item))
+        let accepted = preparation.accepting(item.id, session: session)
+        let anchor = host.scope.turnTiming.recordAgentTurnUserAnchor(for: session, userItem: item)
+        session.appendItem(item)
+        let localOrigin = session.registerLocalComposerCandidate(itemID: item.id, at: session.items.count - 1)
+        let stop = try XCTUnwrap(claim.cancellation.pendingStartFence(for: session))
+        let turn = AgentSessionComposerSubmitRuntime.PreparedTurn(
+            publication: publication, message: draft, attachments: [attachment], taggedFiles: [], providerTaggedFiles: [],
+            userItemID: item.id, draftText: draft, workflow: nil, workflowMutationGeneration: nil,
+            anchorRollback: anchor, autoEffortSelection: nil,
+            options: .init(stopFence: stop, localComposerCandidate: localOrigin, initialUserItemID: item.id),
+            providerSwitchPreparation: accepted
+        )
+        guard case let .queued(producer) = submissions.submitCanonicalTurn(turn, claim: claim, host: host) else {
+            return XCTFail("Expected canonical producer")
+        }
+        XCTAssertTrue(submissions.clearSubmittedDraft(claim))
+        submissions.release(claim)
+        releasedClaim = true
+        _ = await producer.value
+        try await gate.waitUntilEntered()
+        if let newerDraft { session.draftText = newerDraft }
+        gate.release()
+        await session.agentTask?.value
+        XCTAssertEqual(provider.promptedMessages.count, 1, "The refusal must occur after assembling the final prompt")
+        let requests = try String(contentsOf: trace, encoding: .utf8)
+        XCTAssertFalse(requests.contains("session/prompt"))
+        XCTAssertEqual(session.draftText, newerDraft ?? draft)
+        XCTAssertEqual(session.items.count(where: { $0.id == item.id }), newerDraft == nil ? 0 : 1)
+        XCTAssertEqual(session.pendingHandoff.providerSwitchDelivery, .ready)
+        XCTAssertEqual(session.pendingHandoff.payload, carrier)
+        XCTAssertEqual(AgentSessionLinkExecutionRuntime.providerSwitchNeedsReview(session), newerDraft != nil)
+        XCTAssertNil(session.providerSessionID, "An unwritten first turn must not leave a resumable identity")
+        XCTAssertNil(session.providerCleanupHandle)
+        if newerDraft == nil { XCTAssertTrue(session.pendingFileAttachments.contains(attachment)) }
+        XCTAssertEqual(try Data(contentsOf: attachmentURL), Data([1, 2, 3]))
+        guard newerDraft == nil else { return }
+
+        provider.environment.removeValue(forKey: "ACP_TEST_PROMPT_PADDING")
+        provider.environment.removeValue(forKey: "ACP_HOLD_METHOD")
+        guard case let .success(.some(retry)) = await f.runtime.providerSwitchSendAdmission(session: session, input: draft) else {
+            return XCTFail("The recovered handover should admit a retry")
+        }
+        _ = await host.startCanonicalRequest(
+            command: retry.command, message: draft, options: .init(), outcome: nil, providerSwitchPreparation: retry
+        )
+        await session.agentTask?.value
+        XCTAssertEqual(provider.promptedMessages.count, 2)
+        let retryMessage = try XCTUnwrap(provider.promptedMessages.last)
+        let instructions = retryMessage.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        XCTAssertFalse(instructions.isEmpty)
+        let traceLines = try String(contentsOf: trace, encoding: .utf8).split(separator: "\n")
+        let rpcRequests = try traceLines.compactMap { line -> [String: Any]? in
+            let trace = try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+            guard trace?["direction"] as? String == "request" else { return nil }
+            return trace?["payload"] as? [String: Any]
+        }
+        XCTAssertFalse(rpcRequests.contains { $0["method"] as? String == "session/load" })
+        XCTAssertEqual(rpcRequests.count { $0["method"] as? String == "session/new" }, 2)
+        let writes = rpcRequests.filter { $0["method"] as? String == "session/prompt" }
+        XCTAssertEqual(writes.count, 1)
+        let params = try XCTUnwrap(writes.first?["params"] as? [String: Any])
+        let blocks = try XCTUnwrap(params["prompt"] as? [[String: Any]])
+        let sent = try XCTUnwrap(blocks.first?["text"] as? String)
+        XCTAssertTrue(sent.hasPrefix(instructions + "\n\n"))
+        XCTAssertEqual(sent.components(separatedBy: instructions).count, 2)
+        XCTAssertTrue(sent.contains(draft))
     }
 
     func testCanonicalComposerProducerRetainsOriginalHostAndWriterAcrossScheduling() async throws {
@@ -1507,7 +1639,8 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
     /// the external provider is scripted; startup is never intercepted or delegated to a VM.
     private func hostStartupFixture(
         canonicalWorkspace: Bool = false, boundCanonicalCarrier: Bool = false, canonicalInput: Bool = false,
-        registersProviderRoute: Bool = false, commandWillExecute: (@Sendable (DomainWorkspaceCommandEnvelope) async -> Void)? = nil
+        registersProviderRoute: Bool = false, providerID: ACPProviderID = .openCode,
+        commandWillExecute: (@Sendable (DomainWorkspaceCommandEnvelope) async -> Void)? = nil
     ) async throws -> (
         AgentSessionRuntimeHost, Fixture, AgentSessionHostStartupResources,
         AgentSessionLinkCapturingACPProvider, AgentWorkspaceSessionIndexStore, @MainActor () async throws -> Void,
@@ -1525,7 +1658,7 @@ final class AgentSessionLinkExecutionRuntimeTests: XCTestCase {
             try? FileManager.default.removeItem(at: directory)
         }
         let script = try AgentSessionLinkACPServerScript.write(to: directory)
-        let provider = AgentSessionLinkCapturingACPProvider(providerID: .openCode, commandPath: script.path)
+        let provider = AgentSessionLinkCapturingACPProvider(providerID: providerID, commandPath: script.path)
         let routeIdentity = MCPRouteIdentityAllocator.allocateHost()
         let route = if registersProviderRoute {
             MCPHostRouteResources(identity: routeIdentity, coordinator: domain.routingCoordinator, runtime: domain)

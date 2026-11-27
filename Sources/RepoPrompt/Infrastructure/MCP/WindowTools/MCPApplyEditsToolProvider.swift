@@ -2,6 +2,7 @@ import Foundation
 import JSONSchema
 import MCP
 import Ontology
+import RepoPromptDomainRuntime
 import RepoPromptFileSystem
 import RepoPromptShared
 import RepoPromptWorkspaceContext
@@ -209,7 +210,8 @@ final class MCPApplyEditsToolProvider: MCPAppToolProviding {
                 createPathResolutionPolicy: .canonicalAliasFirst,
                 selectCreatedFiles: false,
                 mutationRootMappings: mutationRootMappings,
-                writeReceipt: writeReceipt
+                writeReceipt: writeReceipt,
+                originalReadDeadline: MCPDomainMutationCall.current?.preWriteWaitDeadline
             )
             let service = ApplyEditsService(engine: .default, host: host)
 
@@ -262,7 +264,12 @@ final class MCPApplyEditsToolProvider: MCPAppToolProviding {
                     mode: request.mode,
                     verbose: true
                 )
-                let preview = try await service.preview(previewRequest)
+                let preview: (exists: Bool, originalText: String?, result: ApplyEditsResult)
+                do {
+                    preview = try await service.preview(previewRequest)
+                } catch is WorkspaceSeededAuthorityWaitTimeout {
+                    return Self.retryableFailureSummary(request: request, failure: .workspaceFreshnessUnavailable())
+                }
                 let previewResult = preview.result
                 if previewResult.editsApplied == 0 {
                     return editSummary(from: previewResult, path: displayPath)
@@ -364,7 +371,13 @@ final class MCPApplyEditsToolProvider: MCPAppToolProviding {
 
             let effectiveRequest = ApplyEditsRequest(path: effectivePath, mode: request.mode, verbose: request.verbose)
             try Task.checkCancellation()
-            let result = try await service.run(effectiveRequest)
+            let result: ApplyEditsResult
+            do {
+                result = try await service.run(effectiveRequest)
+            } catch is WorkspaceSeededAuthorityWaitTimeout {
+                // Thrown only by the original-file read, before the write in `run`.
+                return Self.retryableFailureSummary(request: request, failure: .workspaceFreshnessUnavailable())
+            }
             let selectionWarning = result.fileCreated
                 ? await dependencies.selection.selectCreatedFile(writeReceipt.file, resolvedContext, metadata, lookupContext)
                 : nil

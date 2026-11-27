@@ -2376,6 +2376,10 @@ package actor WorkspaceFileContextStore {
             publishedSeededAuthorityIsQueryable(rootID: rootID)
         }
 
+        func publishedSeededAuthorityRepositoryKeyForTesting(rootID: UUID) -> GitWorkspaceAuthorityRepositoryKey? {
+            publishedSeededAuthorityFencesByRootID[rootID]?.repositoryKey
+        }
+
         func waitForPublishedSeededAuthorityReconciliationForTesting(rootID: UUID) async {
             while let task = seededAuthorityReconciliationTasksByRootID[rootID] {
                 await task.value
@@ -5571,6 +5575,50 @@ package actor WorkspaceFileContextStore {
               !state.reconciliationFailed
         else { return false }
         return workspaceStateAuthority.pendingInitializationAuthorityFenceIsSynchronouslyCurrent(fence)
+    }
+
+    /// An edit's original-file read passes its pre-write deadline: the Git-sync wait then gives up
+    /// at that deadline instead of parking indefinitely. Expiry only removes this waiter through
+    /// the cancellation path; the root stays blocked and reconciliation keeps its schedule.
+    private func requirePublishedSeededAuthorityFresh(
+        rootID: UUID,
+        editDeadline: MCPDomainAdmissionDeadline?,
+        phase: String
+    ) async throws {
+        let call = MCPDomainMutationCall.current
+        guard editDeadline != nil || call != nil,
+              publishedSeededAuthorityFencesByRootID[rootID] != nil,
+              !publishedSeededAuthorityIsQueryable(rootID: rootID)
+        else {
+            try await requirePublishedSeededAuthorityFresh(rootID: rootID)
+            return
+        }
+        let span = call?.begin(.gitSyncWait, detail: phase)
+        func finish(_ outcome: MCPDomainMutationCall.Outcome) {
+            if let call, let span { call.end(span, outcome) }
+        }
+        do {
+            if let editDeadline {
+                try await withThrowingTaskGroup(of: Void.self) { group in
+                    group.addTask { try await self.requirePublishedSeededAuthorityFresh(rootID: rootID) }
+                    group.addTask { try await editDeadline.waitUntilExpired() }
+                    try await group.next()
+                    group.cancelAll()
+                }
+            } else {
+                try await requirePublishedSeededAuthorityFresh(rootID: rootID)
+            }
+            finish(.completed)
+        } catch is MCPDomainAdmissionDeadline.Expired {
+            finish(.expired)
+            throw WorkspaceSeededAuthorityWaitTimeout()
+        } catch is CancellationError {
+            finish(.cancelled)
+            throw CancellationError()
+        } catch {
+            finish(.failed)
+            throw error
+        }
     }
 
     private func requirePublishedSeededAuthorityFresh(rootID: UUID) async throws {
@@ -13395,12 +13443,20 @@ package actor WorkspaceFileContextStore {
         return result
     }
 
+    /// - Parameter authorityDeadline: An edit's pre-write deadline for its original-file read. When
+    ///   the root's Git-sync check is still pending at that deadline, the read throws
+    ///   `WorkspaceSeededAuthorityWaitTimeout` before any mutation could have started.
     package func readContent(
         rootID: UUID,
         relativePath: String,
-        workloadClass: ContentReadWorkloadClass = .unspecified
+        workloadClass: ContentReadWorkloadClass = .unspecified,
+        authorityDeadline: MCPDomainAdmissionDeadline? = nil
     ) async throws -> String? {
-        try await requirePublishedSeededAuthorityFresh(rootID: rootID)
+        try await requirePublishedSeededAuthorityFresh(
+            rootID: rootID,
+            editDeadline: authorityDeadline,
+            phase: "before_read"
+        )
         let state = try state(for: rootID)
         let lifecycleCorrelation = EditFlowPerf.currentLifecycleCorrelation
         EditFlowPerf.lifecycleEvent(
@@ -13420,7 +13476,11 @@ package actor WorkspaceFileContextStore {
                 ofRelativePath: StandardizedPath.relative(relativePath),
                 workloadClass: workloadClass
             )
-            try await requirePublishedSeededAuthorityFresh(rootID: rootID)
+            try await requirePublishedSeededAuthorityFresh(
+                rootID: rootID,
+                editDeadline: authorityDeadline,
+                phase: "after_read"
+            )
             EditFlowPerf.end(
                 EditFlowPerf.Stage.ReadFile.storeReadContentForwardAwait,
                 forwardState,
@@ -24156,6 +24216,12 @@ package actor WorkspaceFileContextStore {
 
 package enum WorkspaceAppliedIngressWaitError: Error, Equatable {
     case timedOut
+}
+
+/// An edit's original-file read reached its pre-write deadline while the root's Git-sync check
+/// was still pending. Thrown only from that read, so no mutation can have started.
+package struct WorkspaceSeededAuthorityWaitTimeout: Error, Equatable {
+    package init() {}
 }
 
 extension WorkspaceAppliedIngressWaitError: LocalizedError {

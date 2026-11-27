@@ -136,6 +136,23 @@ public enum MCPTimeoutPolicy {
 
     public static let codexServerActiveTimeoutSeconds = 10000
 
+    /// Antigravity's MCP client abandons a tool call 180 s after sending it; progress
+    /// notifications do not extend that (measured 27 Nov 2026). It is the shortest known
+    /// client allowance, below `cliDefaultToolCallTimeoutSeconds` and the Codex stall
+    /// watchdog's 300 s recovery threshold.
+    public static let antigravityToolCallAbortSeconds = 180
+
+    /// Longest a window-exclusive mutation may wait before it starts writing: queued behind
+    /// another call in its window, or blocked on the workspace's Git-sync check before reading
+    /// the original file. It is the shortest client allowance less the response-delivery
+    /// allowance and the cancellation cleanup grace, so the retryable "not applied" answer
+    /// still reaches the caller before it gives up (180 - 30 - 5 = 145 s).
+    public static let mutationPreWriteWaitBudgetSeconds =
+        min(antigravityToolCallAbortSeconds, Int(cliDefaultToolCallTimeoutSeconds))
+            - responseSendDeadlineSeconds
+            - boundedToolCancellationCleanupGraceSeconds
+    public static let mutationPreWriteWaitBudget: Duration = .seconds(mutationPreWriteWaitBudgetSeconds)
+
     /// Default CLI-side deadline for ordinary tool responses.
     public static let cliDefaultToolCallTimeoutSeconds: TimeInterval = 300
     /// Long-running tools whose provider/run cancellation contract is authoritative.

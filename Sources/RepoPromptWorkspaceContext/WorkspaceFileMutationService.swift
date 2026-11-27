@@ -105,8 +105,15 @@ package struct WorkspaceFileMutationService {
         }
     }
 
-    package func readText(file: WorkspaceFileRecord) async throws -> String? {
-        try await store.readContent(rootID: file.rootID, relativePath: file.standardizedRelativePath)
+    package func readText(
+        file: WorkspaceFileRecord,
+        authorityDeadline: MCPDomainAdmissionDeadline? = nil
+    ) async throws -> String? {
+        try await store.readContent(
+            rootID: file.rootID,
+            relativePath: file.standardizedRelativePath,
+            authorityDeadline: authorityDeadline
+        )
     }
 
     @discardableResult

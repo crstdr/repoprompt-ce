@@ -132,20 +132,37 @@ extension AgentSessionComposerSubmitRuntime {
         claim.cancellation.retainProducer()
         return .queued(Task { [self, host] in
             defer { claim.cancellation.releaseProducer() }
-            defer { session.settleLocalComposerOrigin(turn.options.localComposerCandidate, disposition: .retained) }
+            let startupOutcome: AgentRunStartOutcomeRecorder? = if agent == .antigravity, turn.providerSwitchPreparation != nil {
+                AgentRunStartOutcomeRecorder()
+            } else { nil }
+            defer {
+                if startupOutcome?.outcome.didStart != true {
+                    session.settleLocalComposerOrigin(turn.options.localComposerCandidate, disposition: .retained)
+                }
+            }
             if let ticket {
                 guard await session.codexDispatchSerialGate.awaitTurn(ticket) else { return .cancelled }
             }
             defer { if let ticket { session.codexDispatchSerialGate.finish(ticket) } }
             var options = turn.options
             options.stopFence = stop
+            startupOutcome?.recoverUnwrittenProviderSwitch = { dispatch in
+                await owner.linkExecution?.providerSwitchRecoverUnwrittenDispatch(
+                    session: session, dispatchID: dispatch, inputID: turn.userItemID
+                ) {
+                    let message = "Too long to send with the handover."
+                    guard self.rollbackCanonicalPublication(turn, claim: claim, message: message) else { return }
+                    session.settleLocalComposerOrigin(turn.options.localComposerCandidate, disposition: .rolledBack)
+                    rejectedPresentation?(message)
+                }
+            }
             let result: CodexAgentModeCoordinator.NativeSendOutcome? = if command.isCurrent, isCurrent(claim), session.selectedAgent == agent,
                                                                           stop.permitsStart(of: session), !Task.isCancelled
             {
                 await host.startCanonicalRequest(
                     command: command, message: turn.message, attachments: turn.attachments,
                     taggedFileAttachments: turn.providerTaggedFiles, codexFallbackContext: fallback,
-                    autoEffortSelection: turn.autoEffortSelection, options: options, outcome: nil,
+                    autoEffortSelection: turn.autoEffortSelection, options: options, outcome: startupOutcome,
                     providerSwitchPreparation: turn.providerSwitchPreparation
                 )
             } else {

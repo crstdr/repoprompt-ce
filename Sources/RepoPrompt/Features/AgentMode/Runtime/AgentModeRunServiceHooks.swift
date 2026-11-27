@@ -155,6 +155,8 @@ extension AgentModeRunService {
         /// respective owners settle them behind this one runner-neutral call.
         let acceptAgentSessionLinkPrompt: (AgentTabSession, AgentSessionLinkDispatchContext?, AgentSessionLinkOutboundPromptClaim?) -> Void
 
+        var recoverUnwrittenProviderSwitch: @MainActor (AgentTabSession, AgentSessionLinkPromptDispatchID) async -> Void = { _, _ in }
+
         var proveAgentSessionLinkProviderInput: @MainActor (AgentTabSession, AgentSessionLinkOutboundPromptClaim?) async -> AgentSessionLinkProviderInputRelease.Proof = { _, claim in
             await AgentSessionLinkProviderInputRelease.prove(claim) { _ in false }
         }

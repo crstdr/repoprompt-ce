@@ -1,7 +1,9 @@
 import Darwin
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
+import RepoPromptShared
 import RepoPromptVCS
 @testable import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
@@ -285,111 +287,6 @@ import XCTest
             }
         }
 
-        private func makeSeededWorktreePreparation(
-            store: WorkspaceFileContextStore,
-            git: GitService,
-            source: URL
-        ) async throws -> (ownerID: UUID, preparation: WorkspaceSessionWorktreeOwnershipPreparation) {
-            let ownerID = UUID()
-            let startupContext = WorktreeStartupContext(
-                agentSessionID: ownerID,
-                flags: WorktreeStartupFeatureFlags(
-                    observeDiffSeededWorktreeStartup: true,
-                    serveDiffSeededWorktreeStartup: true
-                )
-            )
-            let expectedGeneration = await store.nextSessionWorktreeOwnershipGeneration(ownerID: ownerID)
-            let plan = try GitWorktreeDefaultPathPlanner.plan(
-                GitWorktreeDefaultPathPlanner.Request(
-                    mainWorktreeRoot: source,
-                    existingWorktreeRoots: [source],
-                    detach: true,
-                    purpose: .agentStart(sessionID: ownerID.uuidString)
-                )
-            )
-            // Receipt witnessing requires an existing, stable app-managed parent before
-            // Git creates the destination. The destination itself must remain absent.
-            try FileManager.default.createDirectory(
-                at: plan.appManagedContainer,
-                withIntermediateDirectories: true
-            )
-            var watchRootIsDirectory = ObjCBool(false)
-            guard FileManager.default.fileExists(
-                atPath: plan.appManagedContainer.path,
-                isDirectory: &watchRootIsDirectory
-            ), watchRootIsDirectory.boolValue else {
-                throw testFailure("The receipt witness root was not a directory: \(plan.appManagedContainer.path).")
-            }
-            let targetExists = FileManager.default.fileExists(atPath: plan.path.path)
-            guard !targetExists else {
-                throw testFailure("The planned worktree destination already exists: \(plan.path.path).")
-            }
-            let initializationContext = try GitWorktreeInitializationContext(
-                agentSessionID: ownerID,
-                correlationID: startupContext.correlationID,
-                logicalRootPath: source.path,
-                expectedOwnerBindingGeneration: expectedGeneration,
-                repositoryRelativeRootPrefix: GitRepositoryRelativeRootPrefix(""),
-                observeReceipt: true
-            )
-            var sourceIsDirectory = ObjCBool(false)
-            guard FileManager.default.fileExists(atPath: source.path, isDirectory: &sourceIsDirectory),
-                  sourceIsDirectory.boolValue
-            else {
-                throw testFailure("The source repository disappeared before real worktree creation: \(source.path).")
-            }
-            let creation: GitWorktreeCreateResult
-            do {
-                creation = try await git.createWorktreeWithResult(
-                    request: plan.createRequest,
-                    at: source,
-                    initializationContext: initializationContext
-                )
-            } catch {
-                throw testFailure(
-                    "Real worktree creation failed for source=\(source.path), target=\(plan.path.path), sourceIsDirectory=\(sourceIsDirectory.boolValue): \(error)."
-                )
-            }
-            let receipt = try XCTUnwrap(
-                creation.initializationReceipt,
-                "The helper requires a real worktree creation receipt to exercise seeded publication."
-            )
-            let targetPath = (creation.descriptor.path as NSString).standardizingPath
-            if let fallback = receipt.fallbackReason() {
-                let decisions = WorktreeStartupInstrumentation.receiptDecisions(
-                    correlationID: startupContext.correlationID
-                )
-                throw testFailure(
-                    "The real creation receipt is ineligible before Store preparation: fallback=\(fallback), creationFallback=\(String(describing: creation.initializationFallbackReason)), witness=\(receipt.witnessCoverage), decisions=\(decisions)."
-                )
-            }
-            let hint = WorkspaceRootMaterializationHint(
-                bindingID: "seeded-publication-\(ownerID.uuidString)",
-                standardizedTargetPath: targetPath,
-                creationReceipt: receipt,
-                correlationID: startupContext.correlationID
-            )
-            let preparation = try await store.prepareSessionWorktreeOwnership(
-                ownerID: ownerID,
-                bindingFingerprint: "seeded-publication-\(ownerID.uuidString)",
-                physicalRootPaths: [targetPath],
-                startupContext: startupContext,
-                initializationHintsByPhysicalRootPath: [targetPath: hint]
-            )
-            guard preparation.pendingSeededRootPreparations.count == 1 else {
-                let observation = preparation.materializationHintObservationsByPhysicalRootPath[
-                    targetPath
-                ]
-                let receiptDecisions = WorktreeStartupInstrumentation.receiptDecisions(
-                    correlationID: startupContext.correlationID
-                )
-                throw testFailure(
-                    "The helper did not reach the real pending seeded-root commit path for \(source.path): observation=\(String(describing: observation)), creationFallback=\(String(describing: creation.initializationFallbackReason)), receiptDecisions=\(receiptDecisions)."
-                )
-            }
-            return (ownerID, preparation)
-        }
-
         private func requiredMarkerURL(_ key: String) throws -> URL {
             guard let path = ProcessInfo.processInfo.environment[key], !path.isEmpty else {
                 throw NSError(
@@ -473,6 +370,383 @@ import XCTest
                 code: 6,
                 userInfo: [NSLocalizedDescriptionKey: description]
             )
+        }
+    }
+
+    /// Real seeded-worktree preparation shared by tests that need a published seeded root:
+    /// creates an app-managed Git worktree with a creation receipt and prepares its ownership.
+    fileprivate extension XCTestCase {
+        func makeSeededWorktreePreparation(
+            store: WorkspaceFileContextStore,
+            git: GitService,
+            source: URL
+        ) async throws -> (ownerID: UUID, preparation: WorkspaceSessionWorktreeOwnershipPreparation) {
+            let ownerID = UUID()
+            let startupContext = WorktreeStartupContext(
+                agentSessionID: ownerID,
+                flags: WorktreeStartupFeatureFlags(
+                    observeDiffSeededWorktreeStartup: true,
+                    serveDiffSeededWorktreeStartup: true
+                )
+            )
+            let expectedGeneration = await store.nextSessionWorktreeOwnershipGeneration(ownerID: ownerID)
+            let plan = try GitWorktreeDefaultPathPlanner.plan(
+                GitWorktreeDefaultPathPlanner.Request(
+                    mainWorktreeRoot: source,
+                    existingWorktreeRoots: [source],
+                    detach: true,
+                    purpose: .agentStart(sessionID: ownerID.uuidString)
+                )
+            )
+            // Receipt witnessing requires an existing, stable app-managed parent before
+            // Git creates the destination. The destination itself must remain absent.
+            try FileManager.default.createDirectory(
+                at: plan.appManagedContainer,
+                withIntermediateDirectories: true
+            )
+            var watchRootIsDirectory = ObjCBool(false)
+            guard FileManager.default.fileExists(
+                atPath: plan.appManagedContainer.path,
+                isDirectory: &watchRootIsDirectory
+            ), watchRootIsDirectory.boolValue else {
+                throw seededAuthorityFixtureFailure("The receipt witness root was not a directory: \(plan.appManagedContainer.path).")
+            }
+            let targetExists = FileManager.default.fileExists(atPath: plan.path.path)
+            guard !targetExists else {
+                throw seededAuthorityFixtureFailure("The planned worktree destination already exists: \(plan.path.path).")
+            }
+            let initializationContext = try GitWorktreeInitializationContext(
+                agentSessionID: ownerID,
+                correlationID: startupContext.correlationID,
+                logicalRootPath: source.path,
+                expectedOwnerBindingGeneration: expectedGeneration,
+                repositoryRelativeRootPrefix: GitRepositoryRelativeRootPrefix(""),
+                observeReceipt: true
+            )
+            var sourceIsDirectory = ObjCBool(false)
+            guard FileManager.default.fileExists(atPath: source.path, isDirectory: &sourceIsDirectory),
+                  sourceIsDirectory.boolValue
+            else {
+                throw seededAuthorityFixtureFailure("The source repository disappeared before real worktree creation: \(source.path).")
+            }
+            let creation: GitWorktreeCreateResult
+            do {
+                creation = try await git.createWorktreeWithResult(
+                    request: plan.createRequest,
+                    at: source,
+                    initializationContext: initializationContext
+                )
+            } catch {
+                throw seededAuthorityFixtureFailure(
+                    "Real worktree creation failed for source=\(source.path), target=\(plan.path.path), sourceIsDirectory=\(sourceIsDirectory.boolValue): \(error)."
+                )
+            }
+            // A plain throw (not XCTUnwrap) so callers that retry setup do not record a failure.
+            guard let receipt = creation.initializationReceipt else {
+                throw seededAuthorityFixtureFailure(
+                    "The helper requires a real worktree creation receipt to exercise seeded publication."
+                )
+            }
+            let targetPath = (creation.descriptor.path as NSString).standardizingPath
+            if let fallback = receipt.fallbackReason() {
+                let decisions = WorktreeStartupInstrumentation.receiptDecisions(
+                    correlationID: startupContext.correlationID
+                )
+                throw seededAuthorityFixtureFailure(
+                    "The real creation receipt is ineligible before Store preparation: fallback=\(fallback), creationFallback=\(String(describing: creation.initializationFallbackReason)), witness=\(receipt.witnessCoverage), decisions=\(decisions)."
+                )
+            }
+            let hint = WorkspaceRootMaterializationHint(
+                bindingID: "seeded-publication-\(ownerID.uuidString)",
+                standardizedTargetPath: targetPath,
+                creationReceipt: receipt,
+                correlationID: startupContext.correlationID
+            )
+            let preparation = try await store.prepareSessionWorktreeOwnership(
+                ownerID: ownerID,
+                bindingFingerprint: "seeded-publication-\(ownerID.uuidString)",
+                physicalRootPaths: [targetPath],
+                startupContext: startupContext,
+                initializationHintsByPhysicalRootPath: [targetPath: hint]
+            )
+            guard preparation.pendingSeededRootPreparations.count == 1 else {
+                let observation = preparation.materializationHintObservationsByPhysicalRootPath[
+                    targetPath
+                ]
+                let receiptDecisions = WorktreeStartupInstrumentation.receiptDecisions(
+                    correlationID: startupContext.correlationID
+                )
+                throw seededAuthorityFixtureFailure(
+                    "The helper did not reach the real pending seeded-root commit path for \(source.path): observation=\(String(describing: observation)), creationFallback=\(String(describing: creation.initializationFallbackReason)), receiptDecisions=\(receiptDecisions)."
+                )
+            }
+            return (ownerID, preparation)
+        }
+
+        private func seededAuthorityFixtureFailure(_ description: String) -> NSError {
+            NSError(
+                domain: "WorkspaceSeededAuthorityFixture",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: description]
+            )
+        }
+    }
+
+    /// An edit's original-file read on a published seeded root parks in the Git-sync wait while a
+    /// Git mutation is in flight. These tests block a real seeded root with authority events and
+    /// check that the read gives up at the edit's pre-write deadline without writing anything.
+    final class ApplyEditsGitSyncDeadlineTests: XCTestCase {
+        private static let relativePath = "Sources/Alpha.swift"
+        private static let originalText = "struct Alpha {}\n"
+
+        private struct SeededRoot {
+            let store: WorkspaceFileContextStore
+            let rootID: UUID
+            let file: WorkspaceFileRecord
+            let fileURL: URL
+            let repositoryKey: GitWorkspaceAuthorityRepositoryKey
+        }
+
+        private final class LineRecorder: @unchecked Sendable {
+            private let lock = NSLock()
+            private var storage: [String] = []
+            func append(_ line: String) {
+                lock.withLock { storage.append(line) }
+            }
+
+            var lines: [String] {
+                lock.withLock { storage }
+            }
+        }
+
+        func testPreWriteWaitBudgetDerivesFromShortestClientAllowance() {
+            XCTAssertEqual(MCPTimeoutPolicy.antigravityToolCallAbortSeconds, 180)
+            XCTAssertEqual(
+                MCPTimeoutPolicy.mutationPreWriteWaitBudgetSeconds,
+                MCPTimeoutPolicy.antigravityToolCallAbortSeconds
+                    - MCPTimeoutPolicy.responseSendDeadlineSeconds
+                    - MCPTimeoutPolicy.boundedToolCancellationCleanupGraceSeconds
+            )
+            XCTAssertEqual(MCPTimeoutPolicy.mutationPreWriteWaitBudget, .seconds(145))
+            XCTAssertEqual(MCPTimeoutPolicy.workspaceFreshnessWaitTimeoutSeconds, 30, "the ingress freshness check is unchanged")
+        }
+
+        func testOriginalReadGivesUpAtDeadlineWhileGitSyncIsPendingAndWritesNothing() async throws {
+            let recorder = LineRecorder()
+            MCPDomainMutationCall.setDebugObserverForTesting { recorder.append($0) }
+            defer { MCPDomainMutationCall.setDebugObserverForTesting(nil) }
+
+            try await withBlockableSeededRoot { seeded in
+                await self.beginGitMutation(seeded, generation: 1)
+                let blockedValue = await seeded.store.publishedSeededAuthoritySnapshotForTesting(rootID: seeded.rootID)
+                let blocked = try XCTUnwrap(blockedValue)
+                XCTAssertTrue(blocked.isBlocked)
+                XCTAssertEqual(blocked.activeMutationDepth, 1)
+
+                let call = MCPDomainMutationCall(
+                    invocationID: UUID(),
+                    toolName: "apply_edits",
+                    watchdogEnvironment: .continuous()
+                )
+                let service = self.service(seeded, deadline: Self.deadline(after: .milliseconds(300)))
+                do {
+                    _ = try await MCPDomainMutationCall.$current.withValue(call) {
+                        try await service.run(self.rewriteRequest(seeded))
+                    }
+                    XCTFail("the read must give up while the Git-sync check is pending")
+                } catch is WorkspaceSeededAuthorityWaitTimeout {}
+
+                XCTAssertEqual(try String(contentsOf: seeded.fileURL, encoding: .utf8), Self.originalText, "nothing was written")
+                let afterTimeoutValue = await seeded.store.publishedSeededAuthoritySnapshotForTesting(rootID: seeded.rootID)
+                let afterTimeout = try XCTUnwrap(afterTimeoutValue)
+                XCTAssertTrue(afterTimeout.isBlocked, "timing out leaves the root blocked for reconciliation")
+                XCTAssertEqual(afterTimeout.activeMutationDepth, 1)
+                XCTAssertEqual(afterTimeout.waiterCount, 0, "the timed-out waiter is removed")
+
+                let lines = recorder.lines.filter { $0.contains("call=\(call.invocationID.uuidString)") }
+                XCTAssertTrue(lines.contains { $0.contains("event=end stage=git_sync_wait") && $0.contains("phase=before_read") && $0.contains("outcome=expired") }, "\(lines)")
+                XCTAssertTrue(lines.contains { $0.contains("event=end stage=original_read") && $0.contains("outcome=expired") }, "\(lines)")
+                XCTAssertFalse(lines.contains { $0.contains("stage=write") }, "\(lines)")
+                XCTAssertFalse(lines.contains { $0.contains(seeded.fileURL.path) || $0.contains("Alpha") }, "timings carry no paths or contents")
+
+                await self.finishGitMutation(seeded, generation: 2)
+                await seeded.store.waitForPublishedSeededAuthorityReconciliationForTesting(rootID: seeded.rootID)
+                let current = await seeded.store.publishedSeededAuthorityIsCurrentForTesting(rootID: seeded.rootID)
+                XCTAssertTrue(current, "reconciliation still completes after the timeout")
+                let retried = try await self.service(seeded, deadline: Self.deadline(after: .seconds(30)))
+                    .run(self.rewriteRequest(seeded))
+                XCTAssertEqual(retried.editsApplied, 1)
+                XCTAssertEqual(try String(contentsOf: seeded.fileURL, encoding: .utf8), "struct Beta {}\n")
+            }
+        }
+
+        func testCurrentRootEditIsUnaffectedAndRecordsReadAndWriteTimings() async throws {
+            let recorder = LineRecorder()
+            MCPDomainMutationCall.setDebugObserverForTesting { recorder.append($0) }
+            defer { MCPDomainMutationCall.setDebugObserverForTesting(nil) }
+
+            try await withBlockableSeededRoot { seeded in
+                let call = MCPDomainMutationCall(
+                    invocationID: UUID(),
+                    toolName: "apply_edits",
+                    watchdogEnvironment: .continuous()
+                )
+                let result = try await MCPDomainMutationCall.$current.withValue(call) {
+                    try await self.service(seeded, deadline: Self.deadline(after: .seconds(30)))
+                        .run(self.rewriteRequest(seeded))
+                }
+                XCTAssertEqual(result.editsApplied, 1)
+                XCTAssertEqual(try String(contentsOf: seeded.fileURL, encoding: .utf8), "struct Beta {}\n")
+
+                let lines = recorder.lines.filter { $0.contains("call=\(call.invocationID.uuidString)") }
+                let readAndWrite = lines.compactMap { line -> String? in
+                    let fields = line.split(separator: " ").map(String.init)
+                    guard let stage = fields.first(where: { $0.hasPrefix("stage=") }),
+                          stage == "stage=original_read" || stage == "stage=write",
+                          let event = fields.first(where: { $0.hasPrefix("event=") })
+                    else { return nil }
+                    let outcome = fields.first(where: { $0.hasPrefix("outcome=") })
+                    return ([event, stage] + (outcome.map { [$0] } ?? [])).joined(separator: " ")
+                }
+                XCTAssertEqual(readAndWrite, [
+                    "event=begin stage=original_read",
+                    "event=end stage=original_read outcome=completed",
+                    "event=begin stage=write",
+                    "event=end stage=write outcome=completed"
+                ])
+                XCTAssertTrue(lines.allSatisfy { !$0.contains("event=end") || $0.contains("duration_ms=") }, "\(lines)")
+                XCTAssertFalse(lines.contains { $0.contains(seeded.fileURL.path) || $0.contains("Alpha") }, "timings carry no paths or contents")
+            }
+        }
+
+        func testCancelledReadWhileParkedReportsCancellationAndRemovesWaiter() async throws {
+            try await withBlockableSeededRoot { seeded in
+                await self.beginGitMutation(seeded, generation: 1)
+                let service = self.service(seeded, deadline: Self.deadline(after: .seconds(60)))
+                let request = self.rewriteRequest(seeded)
+                let read = Task { try await service.run(request) }
+                await seeded.store.waitForPublishedSeededAuthorityWaiterForTesting(rootID: seeded.rootID)
+                read.cancel()
+                do {
+                    _ = try await read.value
+                    XCTFail("cancelled read must not succeed")
+                } catch is CancellationError {
+                } catch {
+                    XCTFail("caller cancellation stays cancellation, got \(error)")
+                }
+                let snapshotValue = await seeded.store.publishedSeededAuthoritySnapshotForTesting(rootID: seeded.rootID)
+                let snapshot = try XCTUnwrap(snapshotValue)
+                XCTAssertEqual(snapshot.waiterCount, 0)
+                XCTAssertEqual(try String(contentsOf: seeded.fileURL, encoding: .utf8), Self.originalText)
+                await self.finishGitMutation(seeded, generation: 2)
+                await seeded.store.waitForPublishedSeededAuthorityReconciliationForTesting(rootID: seeded.rootID)
+            }
+        }
+
+        // MARK: - Helpers
+
+        private static func deadline(after duration: Duration) -> MCPDomainAdmissionDeadline {
+            let clock = ContinuousClock()
+            let origin = clock.now
+            return MCPDomainAdmissionDeadline(
+                instant: duration,
+                now: { origin.duration(to: clock.now) },
+                sleep: { try await Task.sleep(for: $0) }
+            )
+        }
+
+        private func service(_ seeded: SeededRoot, deadline: MCPDomainAdmissionDeadline) -> ApplyEditsService {
+            ApplyEditsService(
+                engine: .default,
+                host: WorkspaceFileEditHost(
+                    store: seeded.store,
+                    target: .existing(seeded.file),
+                    originalReadDeadline: deadline
+                )
+            )
+        }
+
+        private func rewriteRequest(_ seeded: SeededRoot) -> ApplyEditsRequest {
+            ApplyEditsRequest(
+                path: seeded.file.standardizedFullPath,
+                mode: .single(search: "Alpha", replace: "Beta", replaceAll: false),
+                verbose: false
+            )
+        }
+
+        private func beginGitMutation(_ seeded: SeededRoot, generation: UInt64) async {
+            await seeded.store.handleSeededAuthorityInvalidationForTesting(GitWorkspaceAuthorityInvalidationEvent(
+                repositoryKey: seeded.repositoryKey,
+                invalidationGeneration: generation,
+                acceptedMetadataWatermark: 0,
+                kind: .mutationBegan(.other)
+            ))
+        }
+
+        private func finishGitMutation(_ seeded: SeededRoot, generation: UInt64) async {
+            await seeded.store.handleSeededAuthorityInvalidationForTesting(GitWorkspaceAuthorityInvalidationEvent(
+                repositoryKey: seeded.repositoryKey,
+                invalidationGeneration: generation,
+                acceptedMetadataWatermark: 0,
+                kind: .mutationCompleted(.other, .succeeded)
+            ))
+        }
+
+        private func withBlockableSeededRoot(_ body: (SeededRoot) async throws -> Void) async throws {
+            let fixture = try ReviewGitRepositoryFixture(name: "ApplyEditsGitSyncDeadline")
+            defer { fixture.cleanup() }
+            let source = try fixture.makeRepository(named: "source", files: [Self.relativePath: Self.originalText])
+            WorkspaceContextStartupInstrumentation.install(AppWorkspaceStartupEventRecorder())
+            WorkspaceExternalReadWorkHooks.install(AppWorkspaceExternalReadWorkRecorder())
+            let store = WorkspaceFileContextStore(startupFeatureFlags: .standaloneOperationalDefault())
+            let loaded = try await store.loadRoot(path: source.path, kind: .primaryWorkspace)
+            // A freshly created repository can still deliver Git metadata events, which makes
+            // seeded admission fall back as "authority unstable". Retry setup until it settles.
+            var prepared: (ownerID: UUID, preparation: WorkspaceSessionWorktreeOwnershipPreparation)?
+            var setupFailures: [String] = []
+            for _ in 0 ..< 5 where prepared == nil {
+                do {
+                    let admission = try await store.admitReusableSnapshotForLoadedRoot(
+                        rootID: loaded.id,
+                        expectedStandardizedPath: loaded.standardizedFullPath
+                    )
+                    guard case .admitted = admission else {
+                        setupFailures.append("admission: \(admission)")
+                        try await Task.sleep(for: .milliseconds(500))
+                        continue
+                    }
+                    prepared = try await makeSeededWorktreePreparation(store: store, git: GitService(), source: source)
+                } catch {
+                    setupFailures.append("preparation: \(error.localizedDescription)")
+                    try await Task.sleep(for: .milliseconds(500))
+                }
+            }
+            guard let prepared else {
+                await store.unloadRoots(ids: [loaded.id])
+                XCTFail("seeded root setup did not settle: \(setupFailures)")
+                return
+            }
+            do {
+                let roots = try await store.commitSessionWorktreeOwnership(prepared.preparation)
+                let root = try XCTUnwrap(roots.first, "seeded publication installs one root")
+                let fileValue = await store.file(rootID: root.rootID, relativePath: Self.relativePath)
+                let file = try XCTUnwrap(fileValue)
+                let keyValue = await store.publishedSeededAuthorityRepositoryKeyForTesting(rootID: root.rootID)
+                let key = try XCTUnwrap(keyValue)
+                try await body(SeededRoot(
+                    store: store,
+                    rootID: root.rootID,
+                    file: file,
+                    fileURL: URL(fileURLWithPath: file.standardizedFullPath),
+                    repositoryKey: key
+                ))
+            } catch {
+                await store.releaseSessionWorktreeOwnership(ownerID: prepared.ownerID)
+                await store.unloadRoots(ids: [loaded.id])
+                throw error
+            }
+            await store.releaseSessionWorktreeOwnership(ownerID: prepared.ownerID)
+            await store.unloadRoots(ids: [loaded.id])
         }
     }
 #endif
