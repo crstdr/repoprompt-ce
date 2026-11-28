@@ -1981,6 +1981,14 @@ class WorkspaceManagerViewModel: ObservableObject {
     private var fullDocumentWriteBaselines: [UUID: FullDocumentWriteBaseline] = [:]
     private var fullDocumentAdoptionGenerations: [UUID: UInt64] = [:]
     private var pendingFullDocumentWrites: [UUID: PendingFullDocumentWrite] = [:]
+    private struct MetadataSaveDrain {
+        var count = 0
+        var waiters: [CheckedContinuation<Void, Never>] = []
+    }
+
+    // Track accepted saves independently of field ownership: even a superseded task may still
+    // be processing a committed write. Snapshot hides use the same drain without a child task.
+    private var metadataSaveDrains: [UUID: MetadataSaveDrain] = [:]
     private var workspaceRenameIntentByID: [UUID: UUID] = [:]
     private var workspaceHiddenIntentByID: [UUID: UUID] = [:]
     private var workspaceColorIntentByID: [UUID: UUID] = [:]
@@ -5369,10 +5377,35 @@ class WorkspaceManagerViewModel: ObservableObject {
         return pollTimerSaveTask
     }
 
+    private func beginMetadataSave(workspaceID: UUID) {
+        metadataSaveDrains[workspaceID, default: MetadataSaveDrain()].count += 1
+    }
+
+    private func finishMetadataSave(workspaceID: UUID) {
+        guard let drain = metadataSaveDrains[workspaceID] else { return }
+        if drain.count > 1 {
+            metadataSaveDrains[workspaceID]?.count -= 1
+        } else {
+            metadataSaveDrains.removeValue(forKey: workspaceID)
+            drain.waiters.forEach { $0.resume() }
+        }
+    }
+
+    private func awaitMetadataSaves(workspaceID: UUID) async {
+        while metadataSaveDrains[workspaceID] != nil {
+            await withCheckedContinuation { continuation in
+                metadataSaveDrains[workspaceID]?.waiters.append(continuation)
+            }
+        }
+    }
+
     /// Window close: let this window's own saves (including the final `onDisappear` capture)
     /// finish instead of abandoning them mid-write. Bounded: saves scheduled while awaiting are
     /// picked up for at most a few passes; nothing new is scheduled once teardown runs.
     func awaitOwnSavesForWindowClose() async {
+        while let workspaceID = metadataSaveDrains.keys.first {
+            await awaitMetadataSaves(workspaceID: workspaceID)
+        }
         for _ in 0 ..< 3 {
             var tasks = scheduledWorkspaceSaveTasks.values.flatMap(\.values)
             if pollTimerSaveTaskID != nil, let pollTimerSaveTask {
@@ -15566,10 +15599,11 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     func renameWorkspace(_ workspace: WorkspaceModel, newName: String) {
-        guard let index = workspaces.firstIndex(where: { $0.id == workspace.id }) else { return }
+        guard !isPreparingForWindowClose, let index = workspaces.firstIndex(where: { $0.id == workspace.id }) else { return }
         let finalName = newName.trimmingCharacters(in: .whitespaces)
         guard !finalName.isEmpty else { return }
 
+        beginMetadataSave(workspaceID: workspace.id)
         let previousName = workspaces[index].name
         workspaces[index].name = finalName
         workspaces[index].dateModified = Date()
@@ -15602,17 +15636,18 @@ class WorkspaceManagerViewModel: ObservableObject {
             return true
         }
         Task { @MainActor [weak self] in
-            guard let self,
-                  workspaceRenameIntentByID[workspaceID] == intentID,
-                  var workspaceToSave = workspaces.first(where: { $0.id == workspaceID })
-            else { return }
+            guard let self else { return }
             defer {
+                finishMetadataSave(workspaceID: workspaceID)
                 if workspaceRenameIntentByID[workspaceID] == intentID {
                     workspaceRenameIntentByID.removeValue(forKey: workspaceID)
                     workspaceRenamePriorNamesByID.removeValue(forKey: workspaceID)
                 }
             }
-            guard intent.apply(&workspaceToSave) else { return }
+            guard workspaceRenameIntentByID[workspaceID] == intentID,
+                  var workspaceToSave = workspaces.first(where: { $0.id == workspaceID }),
+                  intent.apply(&workspaceToSave)
+            else { return }
             if let currentIndex = workspaces.firstIndex(where: { $0.id == workspaceID }) {
                 workspaces[currentIndex].name = workspaceToSave.name
                 workspaces[currentIndex].dateModified = workspaceToSave.dateModified
@@ -15664,7 +15699,8 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     /// Preserves the predecessor optimistic hidden-state flow for ordinary UI mutations.
     private func setOrdinaryWorkspaceHidden(_ workspace: WorkspaceModel, hidden: Bool) {
-        guard let index = workspaces.firstIndex(where: { $0.id == workspace.id }) else { return }
+        guard !isPreparingForWindowClose, let index = workspaces.firstIndex(where: { $0.id == workspace.id }) else { return }
+        beginMetadataSave(workspaceID: workspace.id)
         let lifecycle = workspaces[index].consolidatedIntoWorkspaceID
         workspaces[index].isHiddenInMenus = hidden
         workspaces[index].dateModified = Date()
@@ -15678,16 +15714,17 @@ class WorkspaceManagerViewModel: ObservableObject {
             lifecycle: lifecycle, intentDateModified: intentDateModified
         )
         Task { @MainActor [weak self] in
-            guard let self,
-                  workspaceHiddenIntentByID[workspaceID] == intentID,
-                  var workspaceToSave = workspaces.first(where: { $0.id == workspaceID })
-            else { return }
+            guard let self else { return }
             defer {
+                finishMetadataSave(workspaceID: workspaceID)
                 if workspaceHiddenIntentByID[workspaceID] == intentID {
                     workspaceHiddenIntentByID.removeValue(forKey: workspaceID)
                 }
             }
-            guard intent.apply(&workspaceToSave) else { return }
+            guard workspaceHiddenIntentByID[workspaceID] == intentID,
+                  var workspaceToSave = workspaces.first(where: { $0.id == workspaceID }),
+                  intent.apply(&workspaceToSave)
+            else { return }
             if let currentIndex = workspaces.firstIndex(where: { $0.id == workspaceID }) {
                 workspaces[currentIndex].isHiddenInMenus = workspaceToSave.isHiddenInMenus
                 workspaces[currentIndex].dateModified = workspaceToSave.dateModified
@@ -15721,7 +15758,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     /// judged from the current record, not the caller's copy, so a retained row action cannot colour
     /// a workspace that has since become a recovery copy.
     func setWorkspaceColor(_ workspace: WorkspaceModel, color: WorkspaceColor?) {
-        guard let index = workspaces.firstIndex(where: { $0.id == workspace.id }),
+        guard !isPreparingForWindowClose, let index = workspaces.firstIndex(where: { $0.id == workspace.id }),
               Self.acceptsWorkspaceColor(workspaces[index])
         else { return }
         let colorID = color?.rawValue
@@ -15739,6 +15776,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             return
         }
 
+        beginMetadataSave(workspaceID: workspaceID)
         // The intent token lets an authority projection replace the array element without losing
         // this request, while a newer colour choice supersedes the older task.
         let intentID = UUID()
@@ -15757,15 +15795,17 @@ class WorkspaceManagerViewModel: ObservableObject {
             return true
         }
         Task { @MainActor [weak self] in
-            guard let self, workspaceColorIntentByID[workspaceID] == intentID else { return }
+            guard let self else { return }
             defer {
+                finishMetadataSave(workspaceID: workspaceID)
                 if workspaceColorIntentByID[workspaceID] == intentID {
                     workspaceColorIntentByID.removeValue(forKey: workspaceID)
                     workspaceColorPriorIDsByID.removeValue(forKey: workspaceID)
                 }
             }
             // The workspace may have been reclassified since admission; such a record is not saved.
-            guard var workspaceToSave = workspaces.first(where: { $0.id == workspaceID }),
+            guard workspaceColorIntentByID[workspaceID] == intentID,
+                  var workspaceToSave = workspaces.first(where: { $0.id == workspaceID }),
                   intent.apply(&workspaceToSave)
             else { return }
             if let currentIndex = workspaces.firstIndex(where: { $0.id == workspaceID }) {
@@ -15925,6 +15965,9 @@ class WorkspaceManagerViewModel: ObservableObject {
                 return current
             }
             try validateConsolidationLifecycle(workspace)
+            guard !isPreparingForWindowClose else { throw WorkspacePersistenceFailure(category: .cancelled) }
+            beginMetadataSave(workspaceID: workspace.id)
+            defer { finishMetadataSave(workspaceID: workspace.id) }
             var updated = current
             updated.isHiddenInMenus = hidden
             updated.dateModified = Date()
@@ -17144,6 +17187,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         // following a still-running tab-creation save).
         // An in-flight poll save of this workspace is a predecessor too.
         let predecessors = ownTrackedSaveTasks(workspaceID: workspaceID)
+        let isCloseSave = isPreparingForWindowClose
         let task = Task { @MainActor [weak self] in
             defer {
                 self?.scheduledWorkspaceSaveTasks[workspaceID]?.removeValue(forKey: taskID)
@@ -17153,6 +17197,9 @@ class WorkspaceManagerViewModel: ObservableObject {
             }
             for predecessor in predecessors {
                 await predecessor.value
+            }
+            if isCloseSave {
+                await self?.awaitMetadataSaves(workspaceID: workspaceID)
             }
             await self?.saveWorkspaceAsync(
                 workspaceID: workspaceID,
@@ -17373,7 +17420,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             // `current` may be another window's adopted save, which lacks this change. Apply it
             // on top so that window's edits survive too, and show it here: this window's own
             // committed save is not echoed back to it.
-            guard !isPreparingForWindowClose, fieldIntent.apply(&current) else {
+            guard fieldIntent.apply(&current) else {
                 throw WorkspacePersistenceFailure(category: .cancelled)
             }
             if let index = workspaces.firstIndex(where: { $0.id == proposal.id }), workspaces[index] != current {
