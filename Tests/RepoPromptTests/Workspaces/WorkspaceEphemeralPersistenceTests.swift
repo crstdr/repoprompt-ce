@@ -2520,6 +2520,186 @@ import XCTest
             }
         }
 
+        func testQuitFenceRejectsParkedWorkingPublication() async throws {
+            try await withProjectionSaveFixture { fixture in
+                let manager = fixture.manager
+                let index = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == fixture.workspace.id })
+                let snapshot = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(fixture.workspace.id)
+                let before = try XCTUnwrap(snapshot)
+                manager.workspaces[index].composeTabs[0].promptText = "Unpublished quit draft"
+                let proposal = manager.workspaces[index]
+                let captured = self.expectation(description: "working publication captured")
+                let gate = WorkspaceDeleteSuspensionGate()
+                manager.workingPublicationDidCaptureForTesting = { id in
+                    guard id == proposal.id else { return }
+                    captured.fulfill()
+                    await gate.wait()
+                }
+                defer { manager.workingPublicationDidCaptureForTesting = nil }
+                let publish = Task { await manager.debugPublishWorkingDocumentToDomainAuthority(proposal) }
+                do {
+                    try await self.awaitSaveCheckpoint(captured)
+                } catch {
+                    await gate.open()
+                    await publish.value
+                    throw error
+                }
+                manager.beginWorkspaceSaveShutdown(deadline: .now)
+                await gate.open()
+                await publish.value
+                try await self.assertCanonicalAndDiskRemain(before, in: fixture)
+            }
+        }
+
+        func testMetadataCloseDeadlineReleasesStalledSaveAndFencesItsWrite() async throws {
+            try await assertMetadataDrainFencesParkedSave(cancelClose: false)
+        }
+
+        func testCancellingMetadataCloseDrainFencesParkedSave() async throws {
+            try await assertMetadataDrainFencesParkedSave(cancelClose: true)
+        }
+
+        private func assertMetadataDrainFencesParkedSave(cancelClose: Bool) async throws {
+            try await withProjectionSaveFixture { fixture in
+                let manager = fixture.manager
+                let initial = try XCTUnwrap(manager.workspace(withID: fixture.workspace.id))
+                let snapshot = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(initial.id)
+                let before = try XCTUnwrap(snapshot)
+                let prepared = self.expectation(description: "metadata preparation parked")
+                let done = self.expectation(description: "close stopped waiting")
+                let gate = WorkspaceDeleteSuspensionGate()
+                manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { id, _, _ in
+                    guard id == initial.id else { return }
+                    prepared.fulfill()
+                    await gate.wait()
+                }
+                defer { manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil) }
+                let hide = Task { try await manager.setWorkspaceHiddenFromSnapshot(initial, hidden: true) }
+                do {
+                    try await self.awaitSaveCheckpoint(prepared)
+                } catch {
+                    await gate.open()
+                    _ = await hide.result
+                    throw error
+                }
+                if !cancelClose {
+                    manager.beginWorkspaceSaveShutdown(deadline: .now.advanced(by: .milliseconds(100)))
+                }
+                manager.prepareForWindowClose()
+                let close = Task {
+                    await manager.awaitOwnSavesForWindowClose()
+                    done.fulfill()
+                }
+                if cancelClose { close.cancel() }
+                let reached = await XCTWaiter.fulfillment(of: [done], timeout: 2)
+                XCTAssertEqual(reached, .completed)
+                await gate.open()
+                await close.value
+                if case .success = await hide.result { XCTFail("An expired save submitted new bytes") }
+                try await self.assertCanonicalAndDiskRemain(before, in: fixture)
+            }
+        }
+
+        func testClosingSnapshotHideReplaysAfterPeerWinsRevisionCheck() async throws {
+            let entered = expectation(description: "visibility command parked at authority ingress")
+            let gate = WorkspaceDeleteSuspensionGate()
+            let counter = WorkspaceSavePreparationCounter()
+            try await withProjectionSaveFixture(configureClient: { client in
+                client.commandWillExecuteForTesting = { envelope in
+                    guard case .replaceWorkingDocument = envelope.command, await counter.increment() == 1 else { return }
+                    entered.fulfill()
+                    await gate.wait()
+                }
+            }) { fixture in
+                let manager = fixture.manager
+                let initial = try XCTUnwrap(manager.workspace(withID: fixture.workspace.id))
+                let hide = Task { try await manager.setWorkspaceHiddenFromSnapshot(initial, hidden: true) }
+                let peer: DomainWorkspaceSnapshot
+                do {
+                    try await self.awaitSaveCheckpoint(entered)
+                    manager.prepareForWindowClose()
+                    peer = try await self.restoreArchivedTabRemotely(in: fixture)
+                    XCTAssertFalse(try XCTUnwrap(manager.workspace(withID: initial.id)).composeTabs.contains { $0.id == fixture.restoredTab.id })
+                } catch {
+                    await gate.open()
+                    _ = await hide.result
+                    throw error
+                }
+                await gate.open()
+                await manager.awaitOwnSavesForWindowClose()
+                let returned = try await hide.value
+                XCTAssertTrue(returned.isHiddenInMenus)
+                let snapshot = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(initial.id)
+                let final = try XCTUnwrap(snapshot)
+                XCTAssertNil(final.revisions.dirtyRevision)
+                var expected = try JSONDecoder().decode(WorkspaceModel.self, from: peer.document.documentBytes)
+                let canonical = try JSONDecoder().decode(WorkspaceModel.self, from: final.document.documentBytes)
+                expected.isHiddenInMenus = true
+                expected.dateModified = canonical.dateModified
+                XCTAssertEqual(canonical, expected)
+                let commands = await counter.value
+                XCTAssertEqual(commands, 2)
+                try await self.assertCanonicalAndDiskRemain(final, in: fixture)
+            }
+        }
+
+        func testWindowCloseDrainsInactiveWorkspaceMetadataSave() async throws {
+            for rename in [true, false] {
+                let tab = ComposeTabState(name: "Active tab")
+                let other = WorkspaceModel(name: "Active workspace", repoPaths: [], composeTabs: [tab], activeComposeTabID: tab.id)
+                try await withProjectionSaveFixture(additionalWorkspaces: [other]) { fixture in
+                    let manager = fixture.manager
+                    let initial = try XCTUnwrap(manager.workspace(withID: fixture.workspace.id))
+                    manager.activeWorkspace = try XCTUnwrap(manager.workspace(withID: other.id))
+                    XCTAssertEqual(manager.activeWorkspaceID, other.id)
+                    let prepared = self.expectation(description: "inactive metadata save prepared")
+                    let gate = WorkspaceDeleteSuspensionGate()
+                    let counter = WorkspaceSavePreparationCounter()
+                    manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { id, _, _ in
+                        guard id == initial.id, await counter.increment() == 1 else { return }
+                        prepared.fulfill()
+                        await gate.wait()
+                    }
+                    defer { manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil) }
+                    if rename {
+                        manager.renameWorkspace(initial, newName: "Renamed before close")
+                    } else {
+                        manager.setWorkspaceHidden(initial, hidden: true)
+                    }
+                    do {
+                        try await self.awaitSaveCheckpoint(prepared)
+                        let catalog = await fixture.runtime.workspaceStore.snapshot()
+                        let decoded = try catalog.workspaces.map {
+                            try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(
+                                documentBytes: $0.document.documentBytes, fileURL: $0.document.fileURL
+                            )
+                        }
+                        let receipt = manager.applyDomainWorkspaceCatalog(
+                            catalog, projection: .full(decoded), preferredActiveWorkspaceID: other.id, rootMapPolicy: .snapshotMetadata
+                        ).receipt
+                        XCTAssertEqual(try XCTUnwrap(receipt).kind, .full)
+                        XCTAssertEqual(manager.workspace(withID: initial.id), initial)
+                        XCTAssertEqual(manager.activeWorkspaceID, other.id)
+                    } catch {
+                        await gate.open()
+                        await manager.awaitOwnSavesForWindowClose()
+                        throw error
+                    }
+                    manager.prepareForWindowClose()
+                    manager.pollAndSaveState()
+                    await gate.open()
+                    await manager.awaitOwnSavesForWindowClose()
+                    let snapshot = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(initial.id)
+                    let saved = try XCTUnwrap(snapshot)
+                    XCTAssertNil(saved.revisions.dirtyRevision)
+                    let canonical = try JSONDecoder().decode(WorkspaceModel.self, from: saved.document.documentBytes)
+                    XCTAssertEqual(canonical.name, rename ? "Renamed before close" : initial.name)
+                    XCTAssertEqual(canonical.isHiddenInMenus, !rename)
+                    try await self.assertCanonicalAndDiskRemain(saved, in: fixture)
+                }
+            }
+        }
+
         func testWorkspaceMetadataSaveRebasesAfterPeerProjection() async throws {
             for rename in [true, false] {
                 try await withProjectionSaveFixture { fixture in
@@ -2787,6 +2967,7 @@ import XCTest
         }
 
         private func withProjectionSaveFixture(
+            additionalWorkspaces: [WorkspaceModel] = [],
             configureClient: (@MainActor (inout DomainWorkspaceAuthorityClient) -> Void)? = nil,
             _ body: @MainActor (ProjectionSaveFixture) async throws -> Void
         ) async throws {
@@ -2798,7 +2979,10 @@ import XCTest
             )
             workspace.stashedTabs = [StashedTab(tab: restoredTab)]
             try writeWorkspace(workspace)
-            try writeLegacyIndex([workspace])
+            for additional in additionalWorkspaces {
+                try writeWorkspace(additional)
+            }
+            try writeLegacyIndex([workspace] + additionalWorkspaces)
             let runtime = try await makeRuntime(profileIdentifier: "workspace-projection-save")
             var client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -759)
             configureClient?(&client)
@@ -3297,7 +3481,6 @@ import XCTest
         private var runtimes: [MCPDomainRuntime] = []
         private var gates: [SavePreparationGate] = []
         private var commandGates: [CommandGate] = []
-        private var seededWorkspaceIDs: [UUID] = []
 
         override func setUp() async throws {
             try await super.setUp()
@@ -3322,22 +3505,23 @@ import XCTest
                 await gate.open()
             }
             commandGates.removeAll()
-            // Let released setter tasks settle (they may still await a bridge refresh) before the
-            // bridges stop and the shared storage and settings reset.
-            let settled = await waitUntil(timeout: .seconds(10)) { pendingSetterIntents().isEmpty }
-            if !settled {
-                XCTFail("TEARDOWN: setter saves still pending after 10s: \(pendingSetterIntents())")
-            }
-            seededWorkspaceIDs.removeAll()
-            for bridge in bridges {
-                await bridge.stopAndJoinForTesting()
-            }
-            bridges.removeAll()
             for manager in managers {
                 manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil)
                 manager.prepareForWindowClose()
             }
+            // Retire refresh work before joining saves; storage stays alive until both drain.
+            for bridge in bridges {
+                bridge.stop()
+            }
+            for manager in managers {
+                try? await manager.debugDrainMetadataSaves()
+                await manager.debugDrainScheduledSaves()
+            }
             managers.removeAll()
+            for bridge in bridges {
+                await bridge.stopAndJoinForTesting()
+            }
+            bridges.removeAll()
             for runtime in runtimes {
                 _ = await runtime.shutdown()
             }
@@ -4724,21 +4908,7 @@ import XCTest
                 composeTabs: [tab], activeComposeTabID: tab.id
             )
             try writeWorkspace(workspace)
-            seededWorkspaceIDs.append(workspace.id)
             return workspace
-        }
-
-        private func pendingSetterIntents() -> [String] {
-            managers.enumerated().flatMap { index, manager in
-                seededWorkspaceIDs.compactMap { id -> String? in
-                    let kinds = [
-                        manager.hasPendingWorkspaceRenameIntentForTesting(workspaceID: id) ? "rename" : nil,
-                        manager.hasPendingWorkspaceHiddenIntentForTesting(workspaceID: id) ? "hide" : nil,
-                        manager.hasPendingWorkspaceColorIntentForTesting(workspaceID: id) ? "colour" : nil
-                    ].compactMap(\.self)
-                    return kinds.isEmpty ? nil : "manager \(index) \(id.uuidString.prefix(8)): \(kinds)"
-                }
-            }
         }
 
         private func makeRuntime(profileIdentifier: String) async throws -> MCPDomainRuntime {
