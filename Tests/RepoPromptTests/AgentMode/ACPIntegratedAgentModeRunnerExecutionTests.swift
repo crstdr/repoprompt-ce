@@ -314,10 +314,89 @@ final class ACPToolObservationCorrelationTests: XCTestCase {
         XCTAssertTrue(session.items.allSatisfy { AgentTranscriptToolNormalizer.toolExecution(for: $0)?.status == .success })
     }
 
-    private func fixture(toolTrackingHooks: AgentToolTrackingHooks = .noOp) -> (AgentSessionLinkRunnerHarness, AgentTabSession, ACPIntegratedAgentModeRunner) {
+    func testAntigravityNativeObservationsShareOneRowAndOneResultAccounting() throws {
+        for trackerFirst in [false, true] {
+            accountedOutputs = []
+            let noOp = AgentToolTrackingHooks.noOp
+            let hooks = AgentToolTrackingHooks(
+                flushPendingAssistantDelta: noOp.flushPendingAssistantDelta,
+                endActiveAssistantSegment: noOp.endActiveAssistantSegment,
+                endActiveReasoningSegment: noOp.endActiveReasoningSegment,
+                sealAssistantBoundary: noOp.sealAssistantBoundary,
+                requestUIRefresh: noOp.requestUIRefresh,
+                scheduleSave: noOp.scheduleSave,
+                addToolInputTokens: noOp.addToolInputTokens,
+                addToolOutputTokens: { [weak self] payload, _ in self?.accountedOutputs.append(payload) }
+            )
+            let (harness, session, runner) = fixture(toolTrackingHooks: hooks, agent: .antigravity)
+            let tracker = UUID()
+            let output = #"{"accepted":true}"#
+            func deliverTracker() {
+                runner.testHandleTrackerToolCall(invocationID: tracker, toolName: "self_noop", args: [:], session: session)
+                runner.testHandleTrackerToolResult(invocationID: tracker, toolName: "self_noop", args: [:], resultJSON: output, isError: false, session: session)
+            }
+            if trackerFirst { deliverTracker() }
+            try deliverAntigravity("native", status: "pending", name: "mcp_RepoPromptCE_self_noop", runner: runner, session: session)
+            let rowID = try XCTUnwrap(session.items.first?.id)
+            try deliverAntigravity("native", status: "in_progress", name: "mcp_RepoPromptCE_self_noop", runner: runner, session: session)
+            if !trackerFirst { deliverTracker() }
+            try deliverAntigravity("native", status: "completed", runner: runner, session: session)
+            XCTAssertEqual(session.items.map(\.id), [rowID])
+            XCTAssertEqual(session.items.map(\.toolName), ["self_noop"])
+            XCTAssertEqual(session.items.first?.toolResultJSON, output)
+            XCTAssertEqual(accountedOutputs.count, 1)
+            withExtendedLifetime(harness) {}
+        }
+    }
+
+    func testAntigravityNativeProviderFailureRemainsVisibleWithoutTracker() throws {
+        let (harness, session, runner) = fixture(agent: .antigravity)
+        defer { withExtendedLifetime(harness) {} }
+        try deliverAntigravity("failed-native", status: "pending", name: "mcp_RepoPromptCE_self_noop", runner: runner, session: session)
+        try deliverAntigravity("failed-native", status: "failed", runner: runner, session: session)
+        XCTAssertEqual(session.items.map(\.toolName), ["self_noop"])
+        XCTAssertEqual(session.items.first?.toolIsError, true)
+    }
+
+    func testAntigravityLookalikeServerNameDoesNotCorrelateWithRepoPrompt() throws {
+        let (harness, session, runner) = fixture(agent: .antigravity)
+        defer { withExtendedLifetime(harness) {} }
+        let name = "mcp_RepoPromptCE_other_self_noop"
+        let event = try antigravityEvent("lookalike", status: "pending", name: name)
+        guard case let .toolCall(call) = event else { return XCTFail("Expected a tool call") }
+        XCTAssertEqual(call.toolName, name)
+        XCTAssertFalse(runner.handleToolStreamEvent(event, session: session))
+        let tracker = UUID()
+        runner.testHandleTrackerToolCall(invocationID: tracker, toolName: "self_noop", args: [:], session: session)
+        XCTAssertEqual(session.items.map(\.toolInvocationID), [tracker])
+    }
+
+    private func deliverAntigravity(
+        _ id: String, status: String, name: String? = nil, runner: ACPIntegratedAgentModeRunner, session: AgentTabSession
+    ) throws {
+        let event = try antigravityEvent(id, status: status, name: name)
+        XCTAssertTrue(runner.handleToolStreamEvent(event, session: session))
+    }
+
+    private func antigravityEvent(_ id: String, status: String, name: String?) throws -> AgentToolStreamEvent {
+        var payload: [String: Any] = ["sessionUpdate": status == "pending" ? "tool_call" : "tool_call_update", "toolCallId": id, "status": status]
+        if let name {
+            payload["toolName"] = name
+            payload["title"] = "Run \(name)"
+            payload["kind"] = "other"
+            payload["rawInput"] = [String: Any]()
+        }
+        let events = ACPDefaultSessionUpdateNormalizer.normalize(payload, providerID: .antigravity)
+        return try XCTUnwrap(events.compactMap { event in
+            guard case let .stream(result) = event else { return nil }
+            return AgentToolStreamEvent.from(result)
+        }.first)
+    }
+
+    private func fixture(toolTrackingHooks: AgentToolTrackingHooks = .noOp, agent: AgentProviderKind = .devin) -> (AgentSessionLinkRunnerHarness, AgentTabSession, ACPIntegratedAgentModeRunner) {
         let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
         let runner = ACPIntegratedAgentModeRunner(hooks: harness.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier(), toolTrackingHooks: toolTrackingHooks)
-        return (harness, harness.makeSession(agent: .devin), runner)
+        return (harness, harness.makeSession(agent: agent), runner)
     }
 
     private func deliver(_ id: String, status: String, input: [String: Any]? = nil, output: Any? = nil, title: String? = nil, runner: ACPIntegratedAgentModeRunner, session: AgentTabSession) throws {
