@@ -134,6 +134,90 @@ import RepoPromptSettingsCore
         }
 
         @MainActor
+        func testOwnedAntigravityReconnectCommitsReplacementRouteAfterOneShotConsumption() async throws {
+            try await assertOwnedReconnect(clientName: "antigravity-client")
+        }
+
+        @MainActor
+        func testOwnedClaudeReconnectCommitsReplacementRouteAfterOneShotConsumption() async throws {
+            try await assertOwnedReconnect(clientName: AgentProviderKind.claudeMCPClientID)
+        }
+
+        @MainActor
+        private func assertOwnedReconnect(clientName: String) async throws {
+            let runtime = AppDomainRuntimeComposition.shared.runtime
+            let manager = ServerNetworkManager(domainHost: runtime.domainHost)
+            let route = MCPHostRouteResources(identity: MCPRouteIdentityAllocator.allocateHost(), coordinator: nil, runtime: runtime)
+            addTeardownBlock { await route.close() }
+            let runID = UUID()
+            let tabID = UUID()
+            let windowID = route.identity.routeID
+            let token = "owned-reconnect-\(runID)"
+            let snapshot = MCPTabContextSnapshot(
+                tabID: tabID, windowID: windowID, workspaceID: UUID(), promptText: "",
+                selection: .init(), selectedMetaPromptIDs: [], tabName: "Reconnect",
+                runID: runID, explicitlyBound: true
+            )
+            let issued = await manager.installClientConnectionPolicy(
+                for: clientName, windowID: windowID, restrictedTools: ["apply_edits"], oneShot: true,
+                ttl: 60, tabID: tabID, runID: runID, purpose: .agentModeRun,
+                requiresExpectedAgentPID: true, routingOwner: route,
+                originatingContextSource: { _, _ in
+                    { .init(snapshot: snapshot, isCurrent: { true }, validateCarrier: { true }) }
+                }
+            )
+            let registration = try XCTUnwrap(issued)
+            addTeardownBlock { await manager.cleanupRunRoutingState(ownedBy: registration) }
+            await manager.registerExpectedAgentPID(getppid(), for: clientName, runID: runID, registration: registration)
+
+            let original = try await makeProductionMCPConnection(
+                networkManager: manager, clientName: clientName, sessionToken: token,
+                requireAppManagedAdmission: true
+            )
+            addTeardownBlock { await original.cleanup() }
+            let originalCompleted = await manager.debugCompleteApprovedAgentInitialization(
+                clientName: clientName, connectionID: original.connectionID,
+                sessionToken: token, clientPid: Int(getpid())
+            )
+            guard originalCompleted else { return XCTFail("Initial owned policy must commit") }
+            let pendingPolicies = await manager.debugPendingPolicySnapshot(for: clientName)
+            XCTAssertTrue(pendingPolicies.isEmpty)
+            XCTAssertEqual(route.runRouteBindings.connectionID(forRunID: runID), original.connectionID)
+
+            do {
+                let denied = try await makeProductionMCPConnection(
+                    networkManager: manager, clientName: clientName, sessionToken: token,
+                    requireAppManagedAdmission: true, verifiedBundledHelperPID: Int(getppid()),
+                    stopManagerOnFailure: false
+                )
+                addTeardownBlock { await denied.cleanup() }
+                XCTFail("Initialization must reject an observed-PID verification mismatch")
+            } catch {
+                XCTAssertEqual(route.runRouteBindings.connectionID(forRunID: runID), original.connectionID)
+            }
+
+            let controller = ServerController(networkManager: manager, installNetworkCallbacks: false)
+            let replacement = try await makeProductionMCPConnection(
+                networkManager: manager, clientName: clientName, sessionToken: token,
+                requireAppManagedAdmission: true, globalAutoApprovalController: controller
+            )
+            addTeardownBlock { await replacement.cleanup() }
+            let replacementCompleted = await manager.debugCompleteApprovedAgentInitialization(
+                clientName: clientName, connectionID: replacement.connectionID,
+                sessionToken: token, clientPid: Int(getpid())
+            )
+            XCTAssertTrue(replacementCompleted)
+            XCTAssertEqual(route.runRouteBindings.connectionID(forRunID: runID), replacement.connectionID)
+            let committed = await manager.isRunRouteAuthoritativelyCommitted(
+                runID: runID, windowID: windowID, tabID: tabID,
+                registration: registration, expectedConnectionID: replacement.connectionID
+            )
+            XCTAssertTrue(committed)
+            let pendingAfterReplacement = await manager.debugPendingPolicySnapshot(for: clientName)
+            XCTAssertTrue(pendingAfterReplacement.isEmpty)
+        }
+
+        @MainActor
         func testExpectedPIDAloneDoesNotJoinEstablishedRunButTokenAndPendingPolicyDo() async {
             let manager = ServerNetworkManager(domainHost: AppDomainRuntimeComposition.shared.runtime.domainHost)
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
@@ -1220,7 +1304,10 @@ import RepoPromptSettingsCore
             networkManager: ServerNetworkManager,
             clientName: String,
             sessionToken: String,
-            requireAppManagedAdmission: Bool = false
+            requireAppManagedAdmission: Bool = false,
+            verifiedBundledHelperPID: Int = Int(getpid()),
+            stopManagerOnFailure: Bool = true,
+            globalAutoApprovalController: ServerController? = nil
         ) async throws -> Issue862ProductionMCPConnection {
             var descriptors = [Int32](repeating: -1, count: 2)
             guard Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors) == 0 else {
@@ -1263,9 +1350,15 @@ import RepoPromptSettingsCore
             do {
                 try await connectionManager.start { info in
                     guard info.name == clientName else { return false }
+                    if let globalAutoApprovalController {
+                        return await globalAutoApprovalController.test_authorizeConnection(
+                            connectionID: connectionID, clientName: info.name,
+                            approvalOverride: (true, verifiedBundledHelperPID)
+                        )
+                    }
                     guard requireAppManagedAdmission else { return true }
                     return await networkManager.authorizeAutomaticAppManagedAgentAdmission(
-                        connectionID: connectionID, clientName: info.name, verifiedBundledHelperPID: Int(getpid())
+                        connectionID: connectionID, clientName: info.name, verifiedBundledHelperPID: verifiedBundledHelperPID
                     )
                 }
                 let client = Client(name: clientName, version: "1.0")
@@ -1281,7 +1374,7 @@ import RepoPromptSettingsCore
                 await clientTransport.disconnect()
                 await connectionManager.stop()
                 await networkManager.debugRemoveConnection(connectionID)
-                if !wasNetworkManagerRunning {
+                if stopManagerOnFailure, !wasNetworkManagerRunning {
                     await networkManager.stop()
                 }
                 throw error

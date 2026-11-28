@@ -1450,7 +1450,8 @@ import XCTest
         }
 
         private static func prepareQueuedSessionAdminAgent(
-            _ fixture: PersistentMCPTestFixture, context: PersistentMCPTestContext, antigravity: Bool = false
+            _ fixture: PersistentMCPTestFixture, context: PersistentMCPTestContext, antigravity: Bool = false,
+            verifyHelper: Bool = false
         ) async throws -> QueuedSessionAdminAgent {
             try await fixture.registerDomainWorkspace(context)
             let window = context.window
@@ -1501,6 +1502,7 @@ import XCTest
             let endpoint = try await PersistentMCPTestEndpoint.make(
                 label: "queued-policy", networkManager: fixture.networkManager, clientName: clientName,
                 useProductionAgentAdmission: antigravity,
+                verifyHelper: verifyHelper,
                 requiredToolNames: antigravity ? ["describe_tool", "call_tool"] : [MCPWindowToolName.sessionAdmin, MCPWindowToolName.readFile]
             )
             XCTAssertEqual(window.mcpServer.runRouteBindings.connectionIDByRunID[runID], endpoint.connectionID)
@@ -1624,6 +1626,7 @@ import XCTest
         }
 
         private func withReadyCompactSocket(
+            verifyHelper: Bool = false,
             _ body: @MainActor (ServerNetworkManager, QueuedSessionAdminAgent, AgentSessionLinkRunCatalogRouteToken) async throws -> Void
         ) async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
@@ -1632,7 +1635,9 @@ import XCTest
                 var agent: QueuedSessionAdminAgent?
                 var failure: Error?
                 do {
-                    let admitted = try await Self.prepareQueuedSessionAdminAgent(fixture, context: fixture.contextA, antigravity: true)
+                    let admitted = try await Self.prepareQueuedSessionAdminAgent(
+                        fixture, context: fixture.contextA, antigravity: true, verifyHelper: verifyHelper
+                    )
                     agent = admitted
                     let routeCandidate = await manager.authoritativeRunCatalogRouteToken(
                         runID: admitted.runID, windowID: admitted.context.window.windowID, tabID: admitted.context.tabID
@@ -1658,6 +1663,121 @@ import XCTest
                 if let agent { try await AgentSessionDataService.shared.deleteAgentSessionFile(agent.fileURL) }
                 try await fixture.assertCleanedUp()
                 if let failure { throw failure }
+            }
+        }
+
+        func testAntigravityWarmTurnRebindsSamePhysicalWindowSocketAfterCleanup() async throws {
+            try await assertAntigravityWarmTurn(verifyHelper: true)
+        }
+
+        func testAntigravityWarmTurnDoesNotRebindAnUnverifiedSocket() async throws {
+            try await assertAntigravityWarmTurn(verifyHelper: false)
+        }
+
+        private func assertAntigravityWarmTurn(verifyHelper: Bool) async throws {
+            try await withReadyCompactSocket(verifyHelper: verifyHelper) { manager, agent, original in
+                let socket = agent.endpoint
+                let window = agent.context.window
+                let tabID = agent.context.tabID
+                let first = try await socket.callTool(name: "self_noop", arguments: [:])
+                let firstResult = try XCTUnwrap(Self.responseObject(from: first)["result"] as? [String: Any])
+                guard firstResult["isError"] as? Bool != true else {
+                    return XCTFail("The physical-window baseline must execute self_noop: \(firstResult)")
+                }
+                XCTAssertEqual(original.connectionID, socket.connectionID)
+                XCTAssertEqual(original.observerEndpoint.windowID, window.windowID)
+
+                await manager.revokeClientConnectionPolicy(for: socket.clientName, windowID: window.windowID, runID: agent.runID)
+                let retired = await manager.authoritativeRunCatalogRouteToken(runID: agent.runID, windowID: window.windowID, tabID: tabID)
+                XCTAssertNil(retired, "Settling the first turn must withdraw its route")
+                let between = try await socket.callTool(name: "self_noop", arguments: [:])
+                let betweenResult = try XCTUnwrap(Self.responseObject(from: between)["result"] as? [String: Any])
+                XCTAssertEqual(betweenResult["isError"] as? Bool, true, "A dormant socket has no turn authority")
+
+                await manager.installClientConnectionPolicy(
+                    for: socket.clientName, windowID: window.windowID,
+                    restrictedTools: [MCPWindowToolName.agentManage], reason: "Warm turn replay", ttl: 60,
+                    tabID: tabID, runID: agent.runID, additionalTools: [], purpose: .agentModeRun,
+                    allowsAgentExternalControlTools: true, requiresExpectedAgentPID: true
+                )
+                let armed = await manager.requireExpectedAgentPIDForPendingPolicy(for: socket.clientName, runID: agent.runID)
+                XCTAssertTrue(armed)
+                let next = await manager.authoritativeRunCatalogRouteToken(runID: agent.runID, windowID: window.windowID, tabID: tabID)
+                let second = try await socket.callTool(name: "self_noop", arguments: [:])
+                let secondResult = try XCTUnwrap(Self.responseObject(from: second)["result"] as? [String: Any])
+                let queue = await manager.debugPendingPolicySnapshot(for: socket.clientName)
+                if verifyHelper {
+                    XCTAssertEqual(next?.connectionID, socket.connectionID, "The next turn must commit the same socket without initialize")
+                    XCTAssertEqual(next?.observerEndpoint.windowID, window.windowID)
+                    XCTAssertNotEqual(next?.routingAuthorityGeneration, original.routingAuthorityGeneration)
+                    XCTAssertTrue(queue.isEmpty)
+                    XCTAssertNotEqual(secondResult["isError"] as? Bool, true, "The next turn must execute self_noop: \(secondResult)")
+                } else {
+                    XCTAssertNil(next)
+                    XCTAssertNil(window.mcpServer.runRouteBindings.connectionID(forRunID: agent.runID))
+                    XCTAssertEqual(queue.count, 1)
+                    XCTAssertEqual(secondResult["isError"] as? Bool, true)
+                }
+            }
+        }
+
+        func testAntigravityWarmTurnReservesPolicyAfterQueueMoves() async throws {
+            try await assertWarmTurnRace(cleanupOverlap: false)
+        }
+
+        func testAntigravityWarmTurnRetriesAfterOverlappingCleanup() async throws {
+            try await assertWarmTurnRace(cleanupOverlap: true)
+        }
+
+        private func assertWarmTurnRace(cleanupOverlap: Bool) async throws {
+            try await withReadyCompactSocket(verifyHelper: true) { manager, agent, _ in
+                let client = agent.endpoint.clientName
+                let window = agent.context.window.windowID
+                let run = agent.runID
+                let tab = agent.context.tabID
+                let gate = TestReleaseFence(name: "Warm Antigravity turn interleaving")
+                defer { gate.release() }
+                if cleanupOverlap {
+                    await manager.debugSetWarmTurnRaces(beforeCleanup: { await gate.enterAndWait() })
+                }
+                let cleanup = Task { await manager.revokeClientConnectionPolicy(for: client, windowID: window, runID: run) }
+                if cleanupOverlap { await gate.waitUntilEntered() } else { await cleanup.value }
+
+                let earlierRun = UUID()
+                if !cleanupOverlap {
+                    await manager.installClientConnectionPolicy(
+                        for: client, windowID: window + 1, restrictedTools: [], runID: earlierRun,
+                        purpose: .agentModeRun, requiresExpectedAgentPID: true
+                    )
+                    await manager.debugSetWarmTurnRaces(beforeEndpoint: { await gate.enterAndWait() })
+                }
+                await manager.installClientConnectionPolicy(
+                    for: client, windowID: window, restrictedTools: [MCPWindowToolName.agentManage],
+                    tabID: tab, runID: run, additionalTools: [], purpose: .agentModeRun,
+                    allowsAgentExternalControlTools: true, requiresExpectedAgentPID: true
+                )
+                let arming = Task { await manager.requireExpectedAgentPIDForPendingPolicy(for: client, runID: run, windowID: window) }
+                if cleanupOverlap {
+                    do {
+                        try await AsyncTestWait.waitUntil("warm arming waits for old cleanup", timeout: 5) {
+                            await manager.debugHasWarmCleanupWaiter(runID: run)
+                        }
+                    } catch { XCTFail(error.localizedDescription) }
+                } else {
+                    await gate.waitUntilEntered()
+                    await manager.clearClientConnectionPolicy(for: client, windowID: window + 1, runID: earlierRun)
+                    await manager.cleanupRunRoutingState(for: earlierRun, windowID: window + 1)
+                }
+                gate.release()
+                let armed = await arming.value
+                XCTAssertTrue(armed)
+                await cleanup.value
+                await manager.debugSetWarmTurnRaces()
+                let route = await manager.authoritativeRunCatalogRouteToken(runID: run, windowID: window, tabID: tab)
+                XCTAssertEqual(route?.connectionID, agent.endpoint.connectionID)
+                let response = try await agent.endpoint.callTool(name: "self_noop", arguments: [:])
+                let result = try XCTUnwrap(Self.responseObject(from: response)["result"] as? [String: Any])
+                XCTAssertNotEqual(result["isError"] as? Bool, true)
             }
         }
 
@@ -6089,6 +6209,7 @@ import XCTest
             networkManager: ServerNetworkManager,
             clientName overrideClientName: String? = nil,
             useProductionAgentAdmission: Bool = false,
+            verifyHelper: Bool = false,
             sessionToken overrideSessionToken: String? = nil,
             requiredToolNames: Set<String> = [
                 MCPWindowToolName.readFile,
@@ -6157,6 +6278,12 @@ import XCTest
                 try await manager.start { clientInfo in
                     guard clientInfo.name == clientName else { return false }
                     if useProductionAgentAdmission {
+                        if verifyHelper {
+                            guard await networkManager.authorizeAutomaticAppManagedAgentAdmission(
+                                connectionID: connectionID, clientName: clientName, verifiedBundledHelperPID: Int(getpid()),
+                                verifiedPeer: MCPApprovalProcessIdentity.read(pid: getpid())
+                            ) else { return false }
+                        }
                         // Substitute only the human socket approval. Readiness, lifecycle,
                         // run-policy admission and route installation are production-owned.
                         return await networkManager.debugCompleteApprovedAgentInitialization(
