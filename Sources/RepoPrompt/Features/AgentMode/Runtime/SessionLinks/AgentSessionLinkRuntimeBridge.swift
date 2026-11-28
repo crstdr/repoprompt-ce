@@ -8765,6 +8765,14 @@ final class AgentSessionLinkRuntimeBridge {
                     workspaceID: destination.workspaceID
                 )
             }
+        } catch let error as AgentModelCatalogRuntime.AdmissionError {
+            if let modelID = request.modelID {
+                let provider = AgentModelSelectionID.parse(modelID).flatMap { AgentProviderKind(rawValue: $0.agentRaw) }
+                AgentSessionLaneModelRefusalDiagnostic.record(
+                    stage: .initialResolution, reason: .admission(error), provider: provider, windowID: destination.windowID
+                )
+            }
+            return .refused(request.modelID == nil ? .roleUnavailable : .modelUnavailable)
         } catch { return .refused(request.modelID == nil ? .roleUnavailable : .modelUnavailable) }
         guard await laneCreationCallerIsCurrent(observerEndpoint, basis: callerBasis) else { return .refused(.denied) }
         // Admission is creator-scoped and counts active lanes plus pending allocations. The final
@@ -8839,13 +8847,24 @@ final class AgentSessionLinkRuntimeBridge {
         }
         guard !isFrozenForTermination, !Task.isCancelled else { return .refused(.shuttingDown) }
         let creation: AgentSessionLaneHostCreationOutcome
-        do {
-            if let modelID = request.modelID {
+        if let modelID = request.modelID {
+            let provider = AgentProviderKind(rawValue: selection.agentRaw)
+            do {
                 guard try AgentSessionLanePolicy.resolveModel(
                     modelID, availability: host.agentSessionLinkModelAvailability(windowID: destinationWindowID)
-                ) == selection else { return .refused(.modelUnavailable) }
-            }
-        } catch { return .refused(.modelUnavailable) }
+                ) == selection else {
+                    AgentSessionLaneModelRefusalDiagnostic.record(
+                        stage: .preAllocationRevalidation, reason: .selectionChanged, provider: provider, windowID: destinationWindowID
+                    )
+                    return .refused(.modelUnavailable)
+                }
+            } catch let error as AgentModelCatalogRuntime.AdmissionError {
+                AgentSessionLaneModelRefusalDiagnostic.record(
+                    stage: .preAllocationRevalidation, reason: .admission(error), provider: provider, windowID: destinationWindowID
+                )
+                return .refused(.modelUnavailable)
+            } catch { return .refused(.modelUnavailable) }
+        }
         do {
             creation = try await host.agentSessionLinkCreateLane(
                 destinationWindowID: destinationWindowID,

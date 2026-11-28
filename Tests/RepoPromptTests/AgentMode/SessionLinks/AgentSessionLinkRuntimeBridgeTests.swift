@@ -7,6 +7,7 @@ import RepoPromptAIContracts
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 @testable import RepoPromptPersistence
+import RepoPromptSecureStorage
 import RepoPromptSettingsCore
 import XCTest
 
@@ -8669,6 +8670,110 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
                 XCTAssertEqual(fixture.host.laneCreationCount, 0, key)
             }
         }
+    }
+
+    func testLaneModelRefusalDiagnosticEmitsOnlyFixedFields() {
+        typealias Diagnostic = AgentSessionLaneModelRefusalDiagnostic
+        let cases: [(Diagnostic.Stage, Diagnostic.Reason, AgentProviderKind?, String)] = [
+            (
+                .initialResolution,
+                .admission(.invalidID),
+                nil,
+                "stage=initial_resolution reason=model_id_invalid provider=unknown"
+            ),
+            (
+                .initialResolution,
+                .admission(.unavailable),
+                .antigravity,
+                "stage=initial_resolution reason=model_agent_unavailable provider=antigravity"
+            ),
+            (
+                .initialResolution,
+                .admission(.catalogueUnavailable),
+                .antigravity,
+                "stage=initial_resolution reason=model_catalog_unavailable provider=antigravity"
+            ),
+            (
+                .preAllocationRevalidation,
+                .admission(.unadvertised),
+                .antigravity,
+                "stage=pre_allocation_revalidation reason=model_not_advertised provider=antigravity"
+            ),
+            (
+                .preAllocationRevalidation,
+                .selectionChanged,
+                .antigravity,
+                "stage=pre_allocation_revalidation reason=model_selection_changed provider=antigravity"
+            )
+        ]
+        for (stage, reason, provider, expected) in cases {
+            var lines: [String] = []
+            Diagnostic.record(stage: stage, reason: reason, provider: provider, windowID: 42) { lines.append($0) }
+            XCTAssertEqual(lines, ["Lane model refused \(expected) destination_window=42"])
+        }
+    }
+
+    func testCrossWindowAntigravityLaneRequiresCurrentAdvertisedIndex() async throws {
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+        let fixture = makeFixture()
+        try installLaneIntentStore(fixture)
+        guard case .added = await addLink(fixture) else { return XCTFail("seed link failed") }
+        let lane = prepareCreatedLane(fixture)
+        XCTAssertNotEqual(lane.windowID, fixture.observer.windowID)
+
+        let keys = KeyManager(secureService: SecureKeysService(secureStorage: TestSecureStorageBackend()))
+        let listing = APISettingsViewModel(
+            aiQueriesService: AIQueriesService(keyManager: keys), keyManager: keys, loadStoredDataOnInit: false,
+            antigravityRuntimeInstalledProvider: { true }, devinRuntimeInstalledProvider: { false }
+        )
+        let destination = APISettingsViewModel(
+            aiQueriesService: AIQueriesService(keyManager: keys), keyManager: keys, loadStoredDataOnInit: false,
+            antigravityRuntimeInstalledProvider: { true }, devinRuntimeInstalledProvider: { false }
+        )
+        fixture.host.modelAvailabilityByWindow[fixture.observer.windowID] = .some(.none)
+        fixture.host.modelAvailabilityByWindow[lane.windowID] = destination.agentAvailability
+        let catalog = AgentModelCatalogRuntime.shared
+        let registry = catalog.acpRegistry
+        registry.test_reset(providerID: .antigravity)
+        defer { registry.test_reset(providerID: .antigravity) }
+        let raw = "gemini-3.8-flash-low"
+        let id = "antigravity:\(raw)"
+        let option = AgentModelOption(rawValue: raw, displayName: "Fixture Flash", description: nil, isDefault: true)
+        XCTAssertTrue(registry.updateDiscoveredModels(.init(options: [option], currentModelRaw: raw), for: .antigravity))
+
+        func listModels() {
+            let entry = AgentModelCatalog.discoveryAgents(availability: listing.agentModeAvailabilityContext).first { $0.agent == .antigravity }
+            XCTAssertTrue(entry?.models.contains { $0.modelID == id } == true)
+        }
+        func create(_ key: String) async -> AgentSessionLaneCreateReceipt {
+            await fixture.bridge.createLane(observerEndpoint: fixture.observer.domainEndpoint, request: .init(
+                idempotencyKey: key, role: nil, modelID: id, sessionName: nil, message: nil, workflowReference: nil
+            )) {
+                .available(.init(windowID: lane.windowID, workspaceID: lane.workspaceID, workspaceName: "Destination"))
+            }
+        }
+
+        listModels()
+        catalog.invalidate(.antigravity)
+        XCTAssertThrowsError(try catalog.selection(id, availability: destination.agentAvailability)) {
+            XCTAssertEqual($0 as? AgentModelCatalogRuntime.AdmissionError, .catalogueUnavailable)
+        }
+        let refused = await create("invalidated")
+        XCTAssertEqual(refused.reason, .modelUnavailable)
+        XCTAssertEqual(fixture.host.laneCreationCount, 0)
+
+        listModels()
+        fixture.bridge.test_afterLaneCapInventoryBeforeRevision = { catalog.invalidate(.antigravity) }
+        let revalidationRefusal = await create("invalidated-during-admission")
+        fixture.bridge.test_afterLaneCapInventoryBeforeRevision = nil
+        XCTAssertEqual(revalidationRefusal.reason, .modelUnavailable)
+        XCTAssertEqual(fixture.host.laneCreationCount, 0)
+
+        listModels()
+        let accepted = await create("republished")
+        XCTAssertEqual(accepted.result, .created)
+        XCTAssertEqual(fixture.host.laneCreationCount, 1)
+        XCTAssertEqual(fixture.host.lastLaneSelection?.modelRaw, raw)
     }
 
     func testLaneCreationWritesIntentInDormantPersistenceMode() async throws {
