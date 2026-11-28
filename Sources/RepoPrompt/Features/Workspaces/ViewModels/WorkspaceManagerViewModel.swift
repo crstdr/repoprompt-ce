@@ -17373,7 +17373,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             // `current` may be another window's adopted save, which lacks this change. Apply it
             // on top so that window's edits survive too, and show it here: this window's own
             // committed save is not echoed back to it.
-            guard !isPreparingForWindowClose, fieldIntent.apply(&current) else {
+            guard fieldIntent.apply(&current) else {
                 throw WorkspacePersistenceFailure(category: .cancelled)
             }
             if let index = workspaces.firstIndex(where: { $0.id == proposal.id }), workspaces[index] != current {

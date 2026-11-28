@@ -2576,6 +2576,78 @@ import XCTest
             }
         }
 
+        func testCloseWithPendingInactiveMetadataWithoutReinstall() async throws {
+            try await assertCloseWithPendingInactiveMetadata(reinstall: false)
+        }
+
+        func testCloseWithPendingInactiveMetadataAfterSameBytesReinstall() async throws {
+            try await assertCloseWithPendingInactiveMetadata(reinstall: true)
+        }
+
+        private func assertCloseWithPendingInactiveMetadata(reinstall: Bool) async throws {
+            for rename in [true, false] {
+                let tab = ComposeTabState(name: "Active tab")
+                let other = WorkspaceModel(name: "Active workspace", repoPaths: [], composeTabs: [tab], activeComposeTabID: tab.id)
+                try await withProjectionSaveFixture(additionalWorkspaces: [other]) { fixture in
+                    let manager = fixture.manager
+                    let initial = try XCTUnwrap(manager.workspace(withID: fixture.workspace.id))
+                    manager.activeWorkspace = try XCTUnwrap(manager.workspace(withID: other.id))
+                    XCTAssertEqual(manager.activeWorkspaceID, other.id)
+                    let prepared = self.expectation(description: "inactive metadata save prepared")
+                    let gate = WorkspaceDeleteSuspensionGate()
+                    let counter = WorkspaceSavePreparationCounter()
+                    manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { id, _, _ in
+                        guard id == initial.id, await counter.increment() == 1 else { return }
+                        prepared.fulfill()
+                        await gate.wait()
+                    }
+                    defer { manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil) }
+                    if rename {
+                        manager.renameWorkspace(initial, newName: "Renamed before close")
+                    } else {
+                        manager.setWorkspaceHidden(initial, hidden: true)
+                    }
+                    do {
+                        try await self.awaitSaveCheckpoint(prepared)
+                        if reinstall {
+                            let catalog = await fixture.runtime.workspaceStore.snapshot()
+                            let decoded = try catalog.workspaces.map {
+                                try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(
+                                    documentBytes: $0.document.documentBytes, fileURL: $0.document.fileURL
+                                )
+                            }
+                            let receipt = manager.applyDomainWorkspaceCatalog(
+                                catalog, projection: .full(decoded), preferredActiveWorkspaceID: other.id, rootMapPolicy: .snapshotMetadata
+                            ).receipt
+                            XCTAssertEqual(try XCTUnwrap(receipt).kind, .full)
+                            XCTAssertEqual(manager.workspace(withID: initial.id), initial)
+                        }
+                        XCTAssertEqual(manager.activeWorkspaceID, other.id)
+                    } catch {
+                        await gate.open()
+                        throw error
+                    }
+                    manager.prepareForWindowClose()
+                    await gate.open()
+                    let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+                    var snapshot = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(initial.id)
+                    while let current = snapshot, ContinuousClock.now < deadline {
+                        let model = try JSONDecoder().decode(WorkspaceModel.self, from: current.document.documentBytes)
+                        if current.revisions.dirtyRevision == nil,
+                           rename ? model.name == "Renamed before close" : model.isHiddenInMenus { break }
+                        try await Task.sleep(for: .milliseconds(10))
+                        snapshot = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(initial.id)
+                    }
+                    let saved = try XCTUnwrap(snapshot)
+                    XCTAssertNil(saved.revisions.dirtyRevision)
+                    let canonical = try JSONDecoder().decode(WorkspaceModel.self, from: saved.document.documentBytes)
+                    XCTAssertEqual(canonical.name, rename ? "Renamed before close" : initial.name)
+                    XCTAssertEqual(canonical.isHiddenInMenus, !rename)
+                    try await self.assertCanonicalAndDiskRemain(saved, in: fixture)
+                }
+            }
+        }
+
         func testPreparationDriftRecapturesOnceAndPersistsTheLatestModel() async throws {
             try await assertPreparationDrift(changeCount: 1)
         }
@@ -2643,6 +2715,7 @@ import XCTest
         }
 
         private func withProjectionSaveFixture(
+            additionalWorkspaces: [WorkspaceModel] = [],
             configureClient: (@MainActor (inout DomainWorkspaceAuthorityClient) -> Void)? = nil,
             _ body: @MainActor (ProjectionSaveFixture) async throws -> Void
         ) async throws {
@@ -2654,7 +2727,10 @@ import XCTest
             )
             workspace.stashedTabs = [StashedTab(tab: restoredTab)]
             try writeWorkspace(workspace)
-            try writeLegacyIndex([workspace])
+            for additional in additionalWorkspaces {
+                try writeWorkspace(additional)
+            }
+            try writeLegacyIndex([workspace] + additionalWorkspaces)
             let runtime = try await makeRuntime(profileIdentifier: "workspace-projection-save")
             var client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -759)
             configureClient?(&client)
