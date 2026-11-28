@@ -2576,6 +2576,105 @@ import XCTest
             }
         }
 
+        private func awaitColorSaveCompletion(_ manager: WorkspaceManagerViewModel, workspaceID: UUID) async throws {
+            let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+            while manager.hasPendingWorkspaceColorIntentForTesting(workspaceID: workspaceID), ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(1))
+            }
+            XCTAssertFalse(manager.hasPendingWorkspaceColorIntentForTesting(workspaceID: workspaceID))
+        }
+
+        func testWorkspaceColorJoinsPendingAuthorityCreation() async throws {
+            try await withProjectionSaveFixture { fixture in
+                let manager = fixture.manager
+                let bridge = fixture.bridge
+                await bridge.stopAndJoinForTesting()
+                manager.installDomainCatalogRefresh(
+                    request: { _ in }, cancel: {},
+                    awaitRefresh: {
+                        bridge.start()
+                        return await bridge.refreshForAgentAdmission()
+                    }
+                )
+                let entered = expectation(description: "authority creation parked before writing")
+                let gate = WorkspaceDeleteSuspensionGate()
+                manager.persistentWorkspaceCreationWillExecuteHandlerForTesting = { _, _ in
+                    entered.fulfill()
+                    await gate.wait()
+                }
+                defer { manager.persistentWorkspaceCreationWillExecuteHandlerForTesting = nil }
+                let target = manager.createWorkspace(name: "New colored workspace", repoPaths: [])
+                do {
+                    try await self.awaitSaveCheckpoint(entered)
+                    manager.setWorkspaceColor(target, color: .teal)
+                } catch {
+                    await gate.open()
+                    throw error
+                }
+                await gate.open()
+                try await awaitColorSaveCompletion(manager, workspaceID: target.id)
+                let snapshot = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(target.id)
+                let saved = try XCTUnwrap(snapshot)
+                let persisted = try JSONDecoder().decode(WorkspaceModel.self, from: saved.document.documentBytes)
+                XCTAssertEqual(persisted.color, "teal")
+                XCTAssertEqual(saved.document.fileURL, manager.workspaceFileURL(for: target))
+                let disk = try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: saved.document.fileURL))
+                XCTAssertEqual(disk.color, "teal")
+                XCTAssertNil(saved.revisions.dirtyRevision)
+            }
+        }
+
+        func testReselectingColorRetriesAfterFailedWrite() async throws {
+            try await withProjectionSaveFixture { fixture in
+                let manager = fixture.manager
+                let target = try XCTUnwrap(manager.workspace(withID: fixture.workspace.id))
+                manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { id, _, _ in
+                    guard id == target.id else { return }
+                    await MainActor.run {
+                        guard let index = manager.workspaces.firstIndex(where: { $0.id == id }) else { return }
+                        manager.workspaces[index].dateModified.addTimeInterval(1)
+                        manager.markWorkspaceDirty(workspaceID: id)
+                    }
+                }
+                manager.setWorkspaceColor(target, color: .teal)
+                try await awaitColorSaveCompletion(manager, workspaceID: target.id)
+                manager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil)
+                let before = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(target.id)
+                let unsaved = try JSONDecoder().decode(WorkspaceModel.self, from: XCTUnwrap(before).document.documentBytes)
+                XCTAssertNil(unsaved.color)
+                XCTAssertEqual(manager.workspace(withID: target.id)?.color, "teal")
+
+                let prepared = expectation(description: "same-swatch retry prepared")
+                let gate = WorkspaceDeleteSuspensionGate()
+                manager.setWorkspaceSavePreparationDidFinishHandlerForTesting { id, _, remaining in
+                    guard id == target.id, remaining == 1 else { return }
+                    prepared.fulfill()
+                    await gate.wait()
+                }
+                manager.setWorkspaceColor(target, color: .teal)
+                do {
+                    try await self.awaitSaveCheckpoint(prepared)
+                    let generation = fixture.bridge.projectionObservationStateForTesting.generation
+                    _ = try await self.restoreArchivedTabRemotely(in: fixture)
+                    let catalog = await fixture.runtime.workspaceStore.snapshot()
+                    let adopted = await fixture.observer.waitForProjection(
+                        afterGeneration: generation, through: catalog.publicationSequence, requireCatalogApplication: true
+                    )
+                    _ = try XCTUnwrap(adopted)
+                    XCTAssertNil(manager.workspace(withID: target.id)?.color)
+                } catch {
+                    await gate.open()
+                    throw error
+                }
+                await gate.open()
+                try await awaitColorSaveCompletion(manager, workspaceID: target.id)
+                let after = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(target.id)
+                let saved = try JSONDecoder().decode(WorkspaceModel.self, from: XCTUnwrap(after).document.documentBytes)
+                XCTAssertEqual(saved.color, "teal")
+                XCTAssertTrue(saved.composeTabs.contains { $0.id == fixture.restoredTab.id })
+            }
+        }
+
         func testCloseWithPendingInactiveMetadataWithoutReinstall() async throws {
             try await assertCloseWithPendingInactiveMetadata(reinstall: false)
         }

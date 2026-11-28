@@ -1990,6 +1990,14 @@ class WorkspaceManagerViewModel: ObservableObject {
     /// that commits later, does not stop it. These are values, not authorship: another window that
     /// saves one of them is treated the same way.
     private var workspaceRenamePriorNamesByID: [UUID: Set<String>] = [:]
+    private struct WorkspaceColorRetryWitness {
+        let colorID: String?
+        let compatibleColorIDs: Set<String?>
+        let fileURL: URL
+        let workspaceFence: UInt64
+    }
+
+    private var failedWorkspaceColorByID: [UUID: WorkspaceColorRetryWitness] = [:]
     private var workspaceColorPriorIDsByID: [UUID: Set<String?>] = [:]
     private var workspaceCreationTasksByID: [UUID: Task<Void, Never>] = [:]
     private var domainWorkspaceCatalogRevision: UInt64 = 0
@@ -15539,6 +15547,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         workspaceRenamePriorNamesByID.removeValue(forKey: workspace.id)
         workspaceHiddenIntentByID.removeValue(forKey: workspace.id)
         workspaceColorIntentByID.removeValue(forKey: workspace.id)
+        failedWorkspaceColorByID.removeValue(forKey: workspace.id)
         workspaceColorPriorIDsByID.removeValue(forKey: workspace.id)
         removeConsolidatedRestoreTracking(workspaceID: workspace.id)
         if activeWorkspaceID == workspace.id {
@@ -15729,7 +15738,12 @@ class WorkspaceManagerViewModel: ObservableObject {
         let previousColorID = workspaces[index].color
         let hasPendingChoice = workspaceColorIntentByID[workspaceID] != nil
         // Choosing the shown colour again still replaces a pending save of a different choice.
-        guard previousColorID != colorID || hasPendingChoice else { return }
+        let fileURL = workspaceFileURL(for: workspaces[index])
+        let fence = ownSaveFenceByWorkspaceID[workspaceID, default: 0]
+        let failed = failedWorkspaceColorByID.removeValue(forKey: workspaceID).flatMap { failed in
+            failed.fileURL == fileURL && failed.workspaceFence == fence && failed.colorID == previousColorID ? failed : nil
+        }
+        guard previousColorID != colorID || hasPendingChoice || failed != nil else { return }
         workspaces[index].color = colorID
         workspaces[index].dateModified = Date()
         guard !workspaces[index].isEphemeral else {
@@ -15743,10 +15757,13 @@ class WorkspaceManagerViewModel: ObservableObject {
         // this request, while a newer colour choice supersedes the older task.
         let intentID = UUID()
         let intentDateModified = workspaces[index].dateModified
-        let priorColorIDs = (hasPendingChoice ? workspaceColorPriorIDsByID[workspaceID] ?? [] : [])
+        let priorColorIDs = (workspaceColorPriorIDsByID[workspaceID] ?? failed?.compatibleColorIDs ?? [])
             .union([previousColorID])
+        let compatibleColorIDs = priorColorIDs.union([colorID])
         workspaceColorIntentByID[workspaceID] = intentID
-        workspaceColorPriorIDsByID[workspaceID] = priorColorIDs.union([colorID])
+        workspaceColorPriorIDsByID[workspaceID] = compatibleColorIDs
+        let authorityCreation = pendingPersistentWorkspaceCreationsByWorkspaceID[workspaceID]
+        let legacyCreation = workspaceCreationTasksByID[workspaceID]
         let intent = WorkspaceSaveFieldIntent { [weak self] workspace in
             guard self?.workspaceColorIntentByID[workspaceID] == intentID,
                   Self.acceptsWorkspaceColor(workspace),
@@ -15764,28 +15781,51 @@ class WorkspaceManagerViewModel: ObservableObject {
                     workspaceColorPriorIDsByID.removeValue(forKey: workspaceID)
                 }
             }
-            // The workspace may have been reclassified since admission; such a record is not saved.
-            guard var workspaceToSave = workspaces.first(where: { $0.id == workspaceID }),
-                  intent.apply(&workspaceToSave)
-            else { return }
-            if let currentIndex = workspaces.firstIndex(where: { $0.id == workspaceID }) {
-                workspaces[currentIndex].color = workspaceToSave.color
-                workspaces[currentIndex].dateModified = workspaceToSave.dateModified
-            }
             do {
+                await legacyCreation?.value
+                _ = try await authorityCreation?.publishedWorkspace()
+                // The creation receipt can arrive before its saved document is adopted.
+                if domainWorkspaceAuthorityClient != nil, fullDocumentWriteBaseline(workspaceID: workspaceID) == nil,
+                   let refresh = domainCatalogRefreshAwaiter
+                {
+                    _ = await refresh()
+                }
+                guard let index = workspaceIndex(for: workspaceID) else { return }
+                var workspaceToSave = workspaces[index]
+                guard intent.apply(&workspaceToSave) else { return }
+                if workspaces[index] != workspaceToSave { workspaces[index] = workspaceToSave }
                 let finalURL = try await saveWorkspaceToFileAsync(
                     workspaceToSave, source: .setWorkspaceColor, fieldIntent: intent
                 )
                 await workspaceDiskWriter.flush(url: finalURL)
+                if domainWorkspaceAuthorityClient == nil {
+                    try await verifyLegacyWorkspaceColor(workspaceID: workspaceID, colorID: colorID, fileURL: finalURL)
+                }
                 NotificationCenter.default.post(
                     name: .workspaceListDidChange,
                     object: nil,
                     userInfo: ["managerID": instanceID]
                 )
+            } catch let failure as WorkspacePersistenceFailure where failure.category == .cancelled {
+                // The intent was superseded or no longer applies.
             } catch {
+                if workspaceColorIntentByID[workspaceID] == intentID {
+                    failedWorkspaceColorByID[workspaceID] = WorkspaceColorRetryWitness(
+                        colorID: colorID, compatibleColorIDs: compatibleColorIDs, fileURL: fileURL, workspaceFence: fence
+                    )
+                }
                 print("Error saving color for workspace: \(error)")
             }
         }
+    }
+
+    private func verifyLegacyWorkspaceColor(workspaceID: UUID, colorID: String?, fileURL: URL) async throws {
+        // A coalesced legacy write can be replaced by a later payload before the flush.
+        let persisted = try await Task.detached {
+            let model = try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: fileURL))
+            return model.id == workspaceID && model.color == colorID
+        }.value
+        guard persisted else { throw WorkspacePersistenceFailure(category: .workspaceChanged) }
     }
 
     private static func acceptsWorkspaceColor(_ workspace: WorkspaceModel) -> Bool {
